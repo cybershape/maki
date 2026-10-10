@@ -9,7 +9,6 @@ rust-version.workspace = true
 
 [dependencies]
 arc-swap = { workspace = true }
-async-lock = { workspace = true }
 base64 = { workspace = true }
 image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 crossterm = { workspace = true }
@@ -23,6 +22,7 @@ maki-pack = { workspace = true }
 maki-providers = { workspace = true }
 mlua = { workspace = true }
 nucleo-matcher = { workspace = true }
+open = { workspace = true }
 serde = { workspace = true }
 shell-words = { workspace = true }
 serde_json = { workspace = true }
@@ -51,6 +51,7 @@ toml = { workspace = true }
 tree-sitter-bash = { workspace = true }
 tree-sitter-c = { workspace = true }
 tree-sitter-c-sharp = { workspace = true }
+tree-sitter-clojure-orchard = { workspace = true }
 tree-sitter-cpp = { workspace = true }
 tree-sitter-elixir = { workspace = true }
 tree-sitter-gleam = { workspace = true }
@@ -89,7 +90,9 @@ rustix = { workspace = true }
 base64 = { workspace = true }
 criterion = { workspace = true }
 image = { workspace = true }
+jiff = { workspace = true }
 maki-agent = { workspace = true }
+maki-providers = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 test-case = { workspace = true }
 

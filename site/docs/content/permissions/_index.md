@@ -226,11 +226,48 @@ Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to th
 It runs after [folder trust](/docs/folder-trust/) has let the Lua file load, and
 limits which APIs the file reaches rather than sandboxing the file.
 
+### Plugin egress: net_hosts
+
+`net = true` lets a plugin reach any public host. `net_hosts` in the same
+table narrows that to an allowlist:
+
+```toml
+[permissions]
+net = true
+net_hosts = ["api.acme.com", "*.acme.dev", "127.0.0.1:7777"]
+```
+
+A pattern is an exact host or a single leading `*.` label. `*.acme.dev` matches
+`api.acme.dev`, and it does not match `acme.dev` or `evilacme.dev`. An empty
+list reaches no host at all, which differs from leaving the key out.
+
+Add `:port` to allow one port only, as in `api.acme.com:443` or
+`*.acme.dev:8443`. Write an IPv6 address in brackets when it has a port, as in
+`[::1]:7777`. A pattern without a port allows every port on that host. Maki
+ignores a pattern it cannot read, such as `acme.com:x` or a bare `*`, and logs a
+warning naming the plugin.
+
+The list covers the plugin's `maki.net` calls and the `base_url` of any
+[provider it registers](/docs/providers/#plugin-providers), so an auth hook
+cannot send credentials to a host the manifest does not name. A plugin that
+calls `maki.provider.register` must declare a non-empty list.
+
+`maki.net.connect` opens raw TCP and only reaches hosts in `net_hosts`, so
+`net = true` alone is not enough for it. Give these entries a port, as in
+`127.0.0.1:7777`. A loopback or LAN address also needs
+`net.allowed_private_hosts`, as described below.
+
+For an installed [package](/docs/packages/#package-permissions), Maki stores
+the hosts with the approval and asks again when an update widens or drops the
+list.
+
 ## Network Addresses
 
 `webfetch`, `websearch` and every plugin that calls `maki.net` go through one guard. A request to a private, loopback or link-local address is refused, and so is a redirect that lands on one. The model picks these URLs, so a page it reads could otherwise talk it into fetching `http://169.254.169.254/` or an admin panel on your LAN.
 
 To reach a service on your own machine or network, list it in [`net.allowed_private_hosts`](/docs/configuration/#net). An allowed host also keeps plain `http://` instead of being upgraded to `https://`, since a service on your LAN rarely has a certificate.
+
+A provider plugin calling its own origin also skips the guard, since chat requests already go there. This covers an origin you set with `<SLUG>_BASE_URL` or `providers.toml`, and a built-in provider's default. It does not cover a `base_url` that a third-party plugin declares.
 
 ## Session Persistence
 

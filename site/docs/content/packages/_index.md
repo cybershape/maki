@@ -14,7 +14,9 @@ on disk, or it can install one from a Git repository and lock it to one commit.
 A package directory holds sorted `plugin/*.lua` entry files, modules at
 `lua/<module>.lua` or `lua/<module>/init.lua`, and a `plugin.toml` manifest.
 The entry files share one environment and use the API the
-[plugin guide](/docs/plugins/) describes.
+[plugin guide](/docs/plugins/) describes. A global set in one file is visible
+to the others. Built-in globals such as `string` or `print` stay fixed, so
+defining your own `print` in one file does not change it in another.
 
 ## Install from Git
 
@@ -157,6 +159,11 @@ in a separate prompt. A package with no `plugin.toml` asks for nothing, and
 every guarded call it makes fails. The
 [permission list](/docs/lua-api/#plugin-permissions) covers what each name
 gates.
+
+Maki stores a package's [`net_hosts`](/docs/permissions/#plugin-egress-net-hosts)
+with its approval. An update that widens the list or drops it asks again before
+it loads. An approval from before Maki stored hosts counts as every host, so
+adding a list to that package never prompts.
 
 An approval applies only to the same package name and source. Maki keeps
 approvals in `<maki-data>/site/pack-approvals.json`, where `<maki-data>` is the

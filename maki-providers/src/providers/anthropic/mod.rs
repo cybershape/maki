@@ -14,6 +14,7 @@ use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::debug;
+use url::Url;
 
 use maki_config::providers::Protocol;
 
@@ -21,7 +22,7 @@ use crate::model::{Model, ModelFamily};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::aperture::NO_PATH_PREFIX;
 use crate::spec::{
-    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+    ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
 };
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
@@ -31,11 +32,13 @@ use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 
 const API_VERSION: &str = "2023-06-01";
 const API_ORIGIN: &str = "https://api.anthropic.com";
+const API_HOST: &str = "api.anthropic.com";
 const MESSAGES_PATH: &str = "/v1/messages";
 const MODELS_PATH: &str = "/v1/models?limit=1000";
 const USAGE_PATH: &str = "/api/oauth/usage";
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
+const BLOCK_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 const MONEY_EXPONENT: u32 = 2;
 const LABEL_SESSION: &str = "Current session";
 const LABEL_WEEK_ALL: &str = "Current week (all models)";
@@ -43,7 +46,7 @@ const LABEL_WEEK_ALL: &str = "Current week (all models)";
 pub(crate) const SLUG: &str = "anthropic";
 pub(crate) const DISPLAY_NAME: &str = "Anthropic";
 const ENV_VAR: &str = "ANTHROPIC_API_KEY";
-const API_KEY_HEADER: &str = "x-api-key";
+pub(crate) const API_KEY_HEADER: &str = "x-api-key";
 const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-6";
 const LOGIN_URL: &str = "https://console.anthropic.com/settings/keys";
 /// The messages endpoint, which is what the docs quote; the provider itself
@@ -74,17 +77,18 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Claude,
     supports_thinking: true,
+    supports_deferred_tools: true,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(128_000),
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/anthropic.toml"),
     pricing_schedule: None,
-    native: Some(Native {
+    build: Build::Native(Native {
         new: create,
         with_auth: create_with_auth,
-        aperture: Some(ApertureRoute {
-            path_prefix: NO_PATH_PREFIX,
-        }),
+    }),
+    aperture: Some(ApertureRoute {
+        path_prefix: NO_PATH_PREFIX,
     }),
     login: Some(LoginConfig {
         protocol: Protocol::Anthropic,
@@ -130,6 +134,17 @@ fn apply_fast_mode(body: &mut Value, model: &Model, opts: RequestOptions) -> boo
         body["speed"] = json!("fast");
     }
     on
+}
+
+/// The beta header alone makes the API list thinking blocks that fail the
+/// prefix check in `input_transformations` without changing what the model
+/// reads, so a moved prefix shows up in the logs. Setting
+/// `prefix_mismatch_behavior` instead would opt an older account into
+/// enforcement and drop reasoning it still reads. Where the check is enforced
+/// the request fails, see [`crate::AgentError::is_thinking_unbound`]. Only
+/// the Anthropic API itself gets it, because a gateway may reject the header.
+fn reports_block_binding(body: &Value, anthropic_api: bool) -> bool {
+    anthropic_api && body.get("thinking").is_some()
 }
 
 #[derive(Deserialize, Default)]
@@ -293,20 +308,31 @@ fn origin(base_url: &str) -> &str {
 /// True when `base_url` targets the real Anthropic API, directly or via the
 /// construction-time base-URL override (so quota stays visible behind a proxy).
 fn first_party(base_url: &str, configured_override: Option<&str>) -> bool {
-    let target = origin(base_url);
-    target.contains("api.anthropic.com")
-        || configured_override.is_some_and(|configured| origin(configured) == target)
+    is_anthropic_api(base_url)
+        || configured_override.is_some_and(|configured| origin(configured) == origin(base_url))
+}
+
+/// True only for the Anthropic API itself, not a proxy configured in front of
+/// it. Compares the parsed host, so a gateway whose URL merely mentions the
+/// API host does not pass.
+fn is_anthropic_api(base_url: &str) -> bool {
+    Url::parse(base_url).is_ok_and(|url| url.host_str() == Some(API_HOST))
 }
 
 /// Subscription quota only exists for OAuth tokens against the real Anthropic
 /// API; API keys and anthropic-protocol third-party endpoints have none.
-fn usage_eligible(auth: &super::ResolvedAuth, configured_override: Option<&str>) -> bool {
+fn usage_eligible(
+    auth: &super::ResolvedAuth,
+    fallback_base_url: Option<&str>,
+    configured_override: Option<&str>,
+) -> bool {
     auth.headers
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
         && auth
             .base_url
             .as_deref()
+            .or(fallback_base_url)
             .is_none_or(|url| first_party(url, configured_override))
 }
 
@@ -334,6 +360,9 @@ pub struct Anthropic {
     /// Env / `providers.toml` / inventory default, resolved once at construction.
     /// Reused by key rotation / reload so they do not re-parse providers.toml.
     resolved_base_url: Option<String>,
+    /// Where a codec caller sends requests when its auth carries no origin.
+    /// Kept out of the auth cell, because an origin there outranks the user's.
+    fallback_base_url: Option<String>,
 }
 
 impl Anthropic {
@@ -349,6 +378,7 @@ impl Anthropic {
             system_prefix: None,
             stream_timeout: timeouts.stream,
             resolved_base_url,
+            fallback_base_url: None,
         })
     }
 
@@ -366,6 +396,7 @@ impl Anthropic {
             // anthropic override would make every third-party endpoint look
             // first party and poll `/api/oauth/usage` against it.
             resolved_base_url: None,
+            fallback_base_url: None,
         }
     }
 
@@ -374,10 +405,23 @@ impl Anthropic {
         self
     }
 
+    pub(crate) fn with_fallback_base_url(mut self, base_url: Option<String>) -> Self {
+        self.fallback_base_url = base_url;
+        self
+    }
+
+    /// Where requests go. Everything that asks "is this the real API?" must ask
+    /// here, or a plugin's `base_url` (kept in the fallback) reads as Anthropic.
+    fn base_url<'a>(&'a self, auth: &'a super::ResolvedAuth) -> &'a str {
+        auth.base_url
+            .as_deref()
+            .or(self.fallback_base_url.as_deref())
+            .unwrap_or(API_ORIGIN)
+    }
+
     fn build_request(&self, method: &str, path: &str) -> isahc::http::request::Builder {
         let auth = self.auth.lock().unwrap();
-        let base = auth.base_url.as_deref().unwrap_or(API_ORIGIN);
-        let url = format!("{}{path}", origin(base));
+        let url = format!("{}{path}", origin(self.base_url(&auth)));
         auth.configure_request(
             Request::builder()
                 .method(method)
@@ -391,20 +435,12 @@ impl Anthropic {
         &self,
         body: &Value,
         event_tx: &Sender<ProviderEvent>,
-        fast: bool,
-        long_context: bool,
+        betas: &[&str],
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
         let mut builder = self
             .build_request("POST", MESSAGES_PATH)
             .header("content-type", "application/json");
-        let mut betas = Vec::new();
-        if fast {
-            betas.push(FAST_MODE_BETA);
-        }
-        if long_context {
-            betas.push(shared::LONG_CONTEXT_BETA);
-        }
         if !betas.is_empty() {
             builder = builder.header("anthropic-beta", betas.join(","));
         }
@@ -441,13 +477,16 @@ impl Anthropic {
                 models.extend(discovered_model_infos(m));
             }
 
-            if !page.has_more {
-                break;
+            match page.last_id {
+                Some(cursor) if page.has_more && after_id.as_ref() != Some(&cursor) => {
+                    after_id = Some(cursor)
+                }
+                _ => break,
             }
-            after_id = page.last_id;
         }
 
         models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.dedup_by(|a, b| a.id == b.id);
         Ok(models)
     }
 }
@@ -485,21 +524,36 @@ impl Provider for Anthropic {
                 }]
             };
 
+            let (top_p, anthropic_api) = {
+                let auth = self.auth.lock().unwrap();
+                (auth.top_p, is_anthropic_api(self.base_url(&auth)))
+            };
             let mut body = shared::build_request_body_with_system(
                 model,
                 messages,
                 &system_blocks,
                 tools,
                 opts.thinking,
+                top_p,
             );
             body["model"] = json!(shared::strip_long_context(&model.id));
             body["stream"] = json!(true);
-            let fast = apply_fast_mode(&mut body, model, opts);
-            let long_context = model.id.ends_with(shared::LONG_CONTEXT_SUFFIX);
+            let mut betas = Vec::new();
+            if apply_fast_mode(&mut body, model, opts) {
+                betas.push(FAST_MODE_BETA);
+            }
+            if model.id.ends_with(shared::LONG_CONTEXT_SUFFIX) {
+                betas.push(shared::LONG_CONTEXT_BETA);
+            }
+            if shared::has_deferred_tools(tools) {
+                betas.push(shared::BETA_DEFERRED_TOOLS);
+            }
+            if reports_block_binding(&body, anthropic_api) {
+                betas.push(BLOCK_BINDING_BETA);
+            }
 
-            debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, fast, long_context, "sending API request");
-            self.do_stream_request(&body, event_tx, fast, long_context)
-                .await
+            debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, ?betas, "sending API request");
+            self.do_stream_request(&body, event_tx, &betas).await
         })
     }
 
@@ -509,6 +563,11 @@ impl Provider for Anthropic {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
+            // Credentials handed in through `with_auth` belong to the caller,
+            // and our vendor key must never follow them to a third-party origin.
+            if self.key_pool.is_none() {
+                return Ok(());
+            }
             let pool = KeyPool::resolve("anthropic", ENV_VAR)?;
             *self.auth.lock().unwrap() =
                 resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
@@ -529,6 +588,7 @@ impl Provider for Anthropic {
         Box::pin(async move {
             if !usage_eligible(
                 &self.auth.lock().unwrap(),
+                self.fallback_base_url.as_deref(),
                 self.resolved_base_url.as_deref(),
             ) {
                 return Ok(None);
@@ -593,6 +653,8 @@ fn discovered_model_infos(m: ApiModelInfo) -> Vec<crate::model::ModelInfo> {
 #[derive(Deserialize)]
 struct ModelsPage {
     data: Vec<ApiModelInfo>,
+    /// OpenAI-shaped `/v1/models` replies (older LiteLLM) omit it: one page.
+    #[serde(default)]
     has_more: bool,
     last_id: Option<String>,
 }
@@ -634,7 +696,11 @@ pub(crate) async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContentBlock, EMPTY_RESPONSE_MARKER, ProviderEvent, Role, StopReason, TokenUsage};
+    use crate::test_support::{Canned, serve};
+    use crate::{
+        ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, ProviderEvent, Role, StopReason,
+        TokenUsage,
+    };
     use serde_json::{Value, json};
     use shared::build_wire_messages;
     use std::time::Duration;
@@ -642,6 +708,7 @@ mod tests {
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const THIRD_PARTY_BASE_URL: &str = "https://proxy.example.com/v1/messages";
+    const THINKING_SIGNATURE: &str = "sig";
 
     const USAGE_BODY: &str = r#"{
         "five_hour": {"utilization": 14.0, "resets_at": "2026-02-06T22:00:00+00:00"},
@@ -732,7 +799,7 @@ mod tests {
             base_url.map(String::from),
             vec![(header.into(), "token".into())],
         );
-        assert_eq!(usage_eligible(&auth, None), expected);
+        assert_eq!(usage_eligible(&auth, None, None), expected);
     }
 
     #[test]
@@ -748,8 +815,35 @@ mod tests {
         assert!(provider.resolved_base_url.is_none());
         assert!(!usage_eligible(
             &provider.auth.lock().unwrap(),
+            None,
             provider.resolved_base_url.as_deref()
         ));
+    }
+
+    #[test]
+    fn reload_auth_keeps_caller_owned_credentials() {
+        let headers = vec![("authorization".to_owned(), "Bearer gateway".to_owned())];
+        let auth = crate::providers::ResolvedAuth::for_test(None, headers.clone());
+        let provider = Anthropic::with_auth(
+            Arc::new(Mutex::new(auth)),
+            crate::providers::Timeouts::default(),
+        )
+        .with_fallback_base_url(Some(THIRD_PARTY_BASE_URL.into()));
+        smol::block_on(provider.reload_auth()).unwrap();
+        assert_eq!(provider.auth.lock().unwrap().headers, headers);
+    }
+
+    #[test_case(None, true ; "no_fallback_is_anthropic")]
+    #[test_case(Some(THIRD_PARTY_BASE_URL), false ; "plugin_fallback_is_third_party")]
+    fn fallback_base_url_decides_anthropic_api(fallback: Option<&str>, expected: bool) {
+        let auth = crate::providers::ResolvedAuth::for_test(None, Vec::new());
+        let provider = Anthropic::with_auth(
+            Arc::new(Mutex::new(auth)),
+            crate::providers::Timeouts::default(),
+        )
+        .with_fallback_base_url(fallback.map(String::from));
+        let auth = provider.auth.lock().unwrap();
+        assert_eq!(is_anthropic_api(provider.base_url(&auth)), expected);
     }
 
     #[test]
@@ -758,9 +852,10 @@ mod tests {
             Some(THIRD_PARTY_BASE_URL.into()),
             vec![("Authorization".into(), "token".into())],
         );
-        assert!(usage_eligible(&auth, Some(THIRD_PARTY_BASE_URL)));
+        assert!(usage_eligible(&auth, None, Some(THIRD_PARTY_BASE_URL)));
         assert!(!usage_eligible(
             &auth,
+            None,
             Some("https://other-proxy.example.com")
         ));
     }
@@ -774,8 +869,8 @@ mod tests {
         assert_eq!(origin(input), expected);
     }
 
-    fn mock_response(data: &'static [u8]) -> isahc::Response<isahc::AsyncBody> {
-        let body = isahc::AsyncBody::from_bytes_static(data);
+    fn mock_response(data: impl Into<Vec<u8>>) -> isahc::Response<isahc::AsyncBody> {
+        let body = isahc::AsyncBody::from(data.into());
         isahc::Response::builder().status(200).body(body).unwrap()
     }
 
@@ -832,6 +927,117 @@ data: {\"type\":\"message_stop\"}\n";
             }
             assert_eq!(deltas, vec!["Hello", " world"]);
         })
+    }
+
+    #[test_case(
+        r#"{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}"# ;
+        "zeros_in_message_start"
+    )]
+    #[test_case(
+        r#"{"input_tokens":42,"cache_creation_input_tokens":5,"cache_read_input_tokens":8}"# ;
+        "same_counts_in_message_start"
+    )]
+    fn parse_sse_usage_in_message_delta(start_usage: &str) {
+        smol::block_on(async {
+            let sse_data = format!(
+                "event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{start_usage}}}}}\n\
+\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"input_tokens\":42,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":8,\"output_tokens\":10}}}}\n\
+\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n"
+            );
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                resp.usage,
+                TokenUsage {
+                    input: 42,
+                    output: 10,
+                    cache_creation: 5,
+                    cache_read: 8,
+                    cost: None,
+                }
+            );
+        })
+    }
+
+    const DROPPED_PATH: &str = "messages.1.content.0";
+    const PREFIX_MISMATCH: &str = "prefix_binding_mismatch";
+    const THINKING_DROPPED: &str = "thinking_dropped";
+    const STARTED_INPUT_TOKENS: u32 = 42;
+    const DELTA_OUTPUT_TOKENS: u32 = 10;
+
+    fn dropped_thinking() -> InputTransformation {
+        InputTransformation {
+            kind: THINKING_DROPPED.into(),
+            path: DROPPED_PATH.into(),
+            reason: PREFIX_MISMATCH.into(),
+        }
+    }
+
+    /// The wire form of [`dropped_thinking`], with a field this build ignores.
+    fn dropped_thinking_entry() -> String {
+        format!(
+            r#"{{"type":"{THINKING_DROPPED}","path":"{DROPPED_PATH}","reason":"{PREFIX_MISMATCH}","block_index":3}}"#
+        )
+    }
+
+    /// `start` and `delta` are the `input_transformations` arrays of the two
+    /// events. `None` leaves the field out of the delta.
+    fn parse_transformations(start: &str, delta: Option<&str>) -> StreamResponse {
+        let delta_field = delta
+            .map(|list| format!(",\"input_transformations\":{list}"))
+            .unwrap_or_default();
+        let sse_data = format!(
+            "event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":{STARTED_INPUT_TOKENS}}},\"input_transformations\":{start}}}}}\n\
+\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":{DELTA_OUTPUT_TOKENS}}}{delta_field}}}\n\
+\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n"
+        );
+        smol::block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap()
+        })
+    }
+
+    #[test_case(None, true ; "from_message_start")]
+    #[test_case(Some("[]"), false ; "fallback_delta_replaces_start")]
+    fn parse_sse_input_transformations(delta: Option<&str>, kept: bool) {
+        let resp = parse_transformations(&format!("[{}]", dropped_thinking_entry()), delta);
+        let expected = if kept {
+            vec![dropped_thinking()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(resp.input_transformations, expected);
+    }
+
+    /// The field is in beta, so one odd entry must not cost the whole event,
+    /// with the usage billed and the stop reason that keeps a tool loop going.
+    #[test]
+    fn parse_sse_odd_input_transformation_keeps_the_event() {
+        let list = format!(r#"[{{"path":"p"}},{}]"#, dropped_thinking_entry());
+        let resp = parse_transformations(&list, Some(&list));
+
+        assert_eq!(
+            (resp.usage.input, resp.usage.output),
+            (STARTED_INPUT_TOKENS, DELTA_OUTPUT_TOKENS)
+        );
+        assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(resp.input_transformations, vec![dropped_thinking()]);
     }
 
     #[test]
@@ -917,6 +1123,13 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
     fn thinking_block(thinking: &str) -> ContentBlock {
         ContentBlock::Thinking {
             thinking: thinking.into(),
+            signature: Some(THINKING_SIGNATURE.into()),
+        }
+    }
+
+    fn unsigned_thinking_block(thinking: &str) -> ContentBlock {
+        ContentBlock::Thinking {
+            thinking: thinking.into(),
             signature: None,
         }
     }
@@ -936,11 +1149,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
             Message::user("first".into()),
             message(Role::Assistant, vec![text_block("reply")]),
             message(Role::User, vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "ok".into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result("t1", "ok", false),
                 text_block("second"),
             ]),
         ],
@@ -960,7 +1169,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         ; "skips_thinking_blocks"
     )]
     fn cache_control_placement(messages: Vec<Message>, expected: &[(usize, usize)]) {
-        let json: Value = serde_json::to_value(build_wire_messages(&messages)).unwrap();
+        let json: Value = serde_json::to_value(build_wire_messages(&messages, &json!([]))).unwrap();
 
         let marked: Vec<(usize, usize)> = json
             .as_array()
@@ -986,7 +1195,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
             message(Role::Assistant, vec![text_block(" \n"), text_block("kept")]),
             message(Role::Assistant, vec![text_block("   ")]),
         ];
-        let json: Value = serde_json::to_value(build_wire_messages(&messages)).unwrap();
+        let json: Value = serde_json::to_value(build_wire_messages(&messages, &json!([]))).unwrap();
 
         assert_eq!(json[0]["content"].as_array().unwrap().len(), 1);
         assert_eq!(json[0]["content"][0]["text"], "kept");
@@ -994,16 +1203,38 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         assert_eq!(json[1]["content"][0]["text"], EMPTY_RESPONSE_MARKER);
     }
 
+    #[test_case(
+        vec![unsigned_thinking_block("summary"), text_block("reply")],
+        json!([{"type": "text", "text": "reply"}])
+        ; "unsigned_thinking_dropped"
+    )]
+    #[test_case(
+        vec![thinking_block("hmm"), text_block("reply")],
+        json!([
+            {"type": "thinking", "thinking": "hmm", "signature": THINKING_SIGNATURE},
+            {"type": "text", "text": "reply"},
+        ])
+        ; "signed_thinking_kept"
+    )]
+    #[test_case(
+        vec![unsigned_thinking_block("summary")],
+        json!([{"type": "text", "text": EMPTY_RESPONSE_MARKER}])
+        ; "only_unsigned_thinking_falls_back"
+    )]
+    fn wire_messages_replay_only_signed_thinking(content: Vec<ContentBlock>, expected: Value) {
+        let messages = vec![message(Role::Assistant, content)];
+        let json: Value =
+            serde_json::to_value(shared::wire_messages(&messages, &json!([]))).unwrap();
+
+        assert_eq!(json[0]["content"], expected);
+    }
+
     #[test]
     fn tool_result_with_trailing_image_serializes_valid_wire_blocks() {
         let messages = vec![Message {
             role: Role::User,
             content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "[image: pic.png 1KB]".into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result("t1", "[image: pic.png 1KB]", false),
                 ContentBlock::Image {
                     source: crate::ImageSource::new(
                         crate::ImageMediaType::Png,
@@ -1013,7 +1244,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
             ],
             ..Default::default()
         }];
-        let wire = build_wire_messages(&messages);
+        let wire = build_wire_messages(&messages, &json!([]));
         let json: Value = serde_json::to_value(&wire).unwrap();
 
         assert_eq!(json[0]["content"][0]["type"], "tool_result");
@@ -1030,6 +1261,176 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
                 "cache_control": {"type": "ephemeral"},
             })
         );
+    }
+
+    const DEFERRED_TOOL: &str = "srv__fetch";
+    const SEARCH_TEXT: &str = "Loaded 1 tool";
+
+    fn deferred_tools() -> Value {
+        json!([
+            {"name": "read", "input_schema": {}},
+            {"name": DEFERRED_TOOL, "input_schema": {}, "defer_loading": true},
+            {"name": "tool_search", "input_schema": {}},
+        ])
+    }
+
+    fn search_result(loaded: &[&str]) -> Vec<Message> {
+        vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: SEARCH_TEXT.into(),
+                is_error: false,
+                loaded_tools: loaded.iter().map(|s| s.to_string()).collect(),
+            }],
+            ..Default::default()
+        }]
+    }
+
+    fn wire_content(messages: &[Message], tools: &Value) -> Value {
+        let mut json: Value = serde_json::to_value(build_wire_messages(messages, tools)).unwrap();
+        json[0]["content"].take()
+    }
+
+    fn set_result<F: FnOnce(&mut String, &mut bool)>(messages: &mut [Message], f: F) {
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &mut messages[0].content[0]
+        else {
+            unreachable!()
+        };
+        f(content, is_error);
+    }
+
+    /// The API refuses a `tool_result` mixing references with anything else
+    /// (verified live: "Tool definitions ... cannot be mixed with other
+    /// content"), so the text moves to a sibling block. A name the request
+    /// does not defer is dropped from the references, since the API rejects
+    /// one it was not handed a definition for.
+    #[test_case(&[DEFERRED_TOOL] ; "all_deferred")]
+    #[test_case(&["gone__tool", DEFERRED_TOOL] ; "one_server_gone")]
+    fn loaded_deferred_tools_replay_as_tool_references(loaded: &[&str]) {
+        assert_eq!(
+            wire_content(&search_result(loaded), &deferred_tools()),
+            json!([
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": [{"type": "tool_reference", "tool_name": DEFERRED_TOOL}],
+                },
+                {
+                    "type": "text",
+                    "text": SEARCH_TEXT,
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ])
+        );
+    }
+
+    #[test_case(&["gone__tool"], json!([]) ; "unknown_name")]
+    #[test_case(&[DEFERRED_TOOL], json!([{"name": DEFERRED_TOOL, "input_schema": {}}]) ; "name_no_longer_deferred")]
+    fn unreferencable_loads_replay_as_text_only(loaded: &[&str], tools: Value) {
+        assert_eq!(
+            wire_content(&search_result(loaded), &tools)[0]["content"],
+            json!([{"type": "text", "text": SEARCH_TEXT}])
+        );
+    }
+
+    /// A deferred tool called straight from the catalog records its load
+    /// even when the call failed.
+    #[test_case(&[DEFERRED_TOOL] ; "referenced")]
+    #[test_case(&["gone__tool"] ; "text_only")]
+    fn rebuilt_result_keeps_is_error(loaded: &[&str]) {
+        let mut messages = search_result(loaded);
+        set_result(&mut messages, |_, is_error| *is_error = true);
+        assert_eq!(
+            wire_content(&messages, &deferred_tools())[0]["is_error"],
+            true
+        );
+    }
+
+    /// The API rejects blank text blocks.
+    #[test_case(&[DEFERRED_TOOL], |content| &content[1]["text"] ; "displaced_text")]
+    #[test_case(&["gone__tool"], |content| &content[0]["content"][0]["text"] ; "in_place_text")]
+    fn empty_loading_result_replays_the_marker(loaded: &[&str], text_at: fn(&Value) -> &Value) {
+        let mut messages = search_result(loaded);
+        set_result(&mut messages, |content, _| content.clear());
+        let content = wire_content(&messages, &deferred_tools());
+        assert_eq!(text_at(&content), EMPTY_RESPONSE_MARKER);
+    }
+
+    /// Parallel calls share one user message, and the API wants every
+    /// `tool_result` ahead of other content, so displaced texts may not
+    /// interleave with the results they came from.
+    #[test]
+    fn displaced_texts_follow_every_result_in_the_message() {
+        const OTHER_DEFERRED: &str = "srv__list";
+        const OTHER_TEXT: &str = "listed";
+        let mut tools = deferred_tools();
+        tools
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": OTHER_DEFERRED, "input_schema": {}, "defer_loading": true}));
+        let mut messages = search_result(&[DEFERRED_TOOL]);
+        messages[0].content.push(ContentBlock::ToolResult {
+            tool_use_id: "t2".into(),
+            content: OTHER_TEXT.into(),
+            is_error: false,
+            loaded_tools: vec![OTHER_DEFERRED.into()],
+        });
+        let content = wire_content(&messages, &tools);
+        let kinds: Vec<&str> = content
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["tool_result", "tool_result", "text", "text"]);
+        assert_eq!(content[2]["text"], SEARCH_TEXT);
+        assert_eq!(content[3]["text"], OTHER_TEXT);
+    }
+
+    /// Every call to a deferred tool records its load, and only the first
+    /// one in the request references it, so later outputs stay in their own
+    /// result rather than in an unlabeled sibling text.
+    #[test]
+    fn a_tool_is_referenced_once_per_request() {
+        const LATER_TEXT: &str = "second call";
+        let mut messages = search_result(&[DEFERRED_TOOL]);
+        let mut later = search_result(&[DEFERRED_TOOL]);
+        set_result(&mut later, |content, _| *content = LATER_TEXT.into());
+        messages.append(&mut later);
+
+        let wire: Value =
+            serde_json::to_value(build_wire_messages(&messages, &deferred_tools())).unwrap();
+        assert_eq!(
+            wire[1]["content"],
+            json!([{
+                "type": "tool_result",
+                "tool_use_id": "t1",
+                "content": [{"type": "text", "text": LATER_TEXT}],
+                "cache_control": {"type": "ephemeral"},
+            }])
+        );
+    }
+
+    #[test]
+    fn result_without_loads_replays_verbatim() {
+        assert_eq!(
+            wire_content(&search_result(&[]), &deferred_tools())[0]["content"],
+            SEARCH_TEXT
+        );
+    }
+
+    #[test]
+    fn tools_cache_breakpoint_skips_deferred_definitions() {
+        let tools = json!([
+            {"name": "read", "input_schema": {}},
+            {"name": DEFERRED_TOOL, "input_schema": {}, "defer_loading": true},
+        ]);
+        let wire = shared::build_wire_tools(&tools);
+        assert_eq!(wire[0]["cache_control"], json!({"type": "ephemeral"}));
+        assert!(wire[1].get("cache_control").is_none());
     }
 
     #[test]
@@ -1074,6 +1475,21 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         assert!(body.get("speed").is_none());
     }
 
+    /// A configured base URL counts as first party for quota, but may be a
+    /// gateway that rejects the header, so only the API itself gets it.
+    #[test_case(json!({"thinking": {"type": "adaptive"}}), API_ORIGIN, true ; "thinking_anthropic_api")]
+    #[test_case(json!({"thinking": {"type": "adaptive"}}), "https://gateway.example.com", false ; "thinking_configured_gateway")]
+    #[test_case(json!({}), API_ORIGIN, false ; "no_thinking")]
+    #[test_case(json!({"thinking": {"type": "adaptive"}}), "https://api.anthropic.com.corp.example", false ; "host_lookalike")]
+    #[test_case(json!({"thinking": {"type": "adaptive"}}), "https://proxy.example/api.anthropic.com", false ; "host_in_path")]
+    #[test_case(json!({"thinking": {"type": "adaptive"}}), "https://api.anthropic.com/v1/messages?beta=true", true ; "api_with_path_and_query")]
+    fn reports_block_binding_gates(body: Value, base_url: &str, expected: bool) {
+        assert_eq!(
+            reports_block_binding(&body, is_anthropic_api(base_url)),
+            expected
+        );
+    }
+
     #[test]
     fn long_context_spec_resolves_to_1m_window() {
         let model = Model::from_spec("anthropic/claude-opus-4-8-1m").unwrap();
@@ -1082,6 +1498,17 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         assert!(model.id.ends_with(shared::LONG_CONTEXT_SUFFIX));
         // The API has never heard of `-1m`, so strip it before sending.
         assert_eq!(shared::strip_long_context(&model.id), "claude-opus-4-8");
+    }
+
+    #[test]
+    fn models_page_without_has_more_is_one_page() {
+        let page: ModelsPage = serde_json::from_str(
+            r#"{"object": "list", "data": [{"id": "claude-opus-5", "object": "model"}]}"#,
+        )
+        .unwrap();
+
+        assert!(!page.has_more);
+        assert_eq!(page.data[0].id, "claude-opus-5");
     }
 
     #[test]
@@ -1116,6 +1543,38 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
                 "claude-opus-4-8-1m".to_string(),
             ]
         );
+    }
+
+    const PAGE_WITHOUT_CURSOR: &[Canned] = &[Canned::json(
+        200,
+        r#"{"data": [{"id": "a"}], "has_more": true, "last_id": null}"#,
+    )];
+    const PAGE_A_WITH_MORE: Canned = Canned::json(
+        200,
+        r#"{"data": [{"id": "a"}], "has_more": true, "last_id": "a"}"#,
+    );
+    const TWO_PAGES: &[Canned] = &[
+        PAGE_A_WITH_MORE,
+        Canned::json(200, r#"{"data": [{"id": "b"}], "has_more": false}"#),
+    ];
+    const IGNORED_CURSOR: &[Canned] = &[PAGE_A_WITH_MORE, PAGE_A_WITH_MORE];
+
+    #[test_case(PAGE_WITHOUT_CURSOR, &["a"] ; "stops_when_has_more_without_last_id")]
+    #[test_case(IGNORED_CURSOR, &["a"] ; "stops_when_server_ignores_after_id")]
+    #[test_case(TWO_PAGES, &["a", "b"] ; "follows_last_id_cursor")]
+    fn list_models_pagination(script: &'static [Canned], expected: &[&str]) {
+        let (base_url, requests) = serve(script);
+        let auth = crate::providers::ResolvedAuth::for_test(Some(base_url), Vec::new());
+        let provider = Anthropic::with_auth(
+            Arc::new(Mutex::new(auth)),
+            crate::providers::Timeouts::default(),
+        );
+
+        let models = smol::block_on(provider.list_models()).unwrap();
+
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, expected);
+        assert_eq!(requests.lock().unwrap().len(), script.len());
     }
 
     #[test]

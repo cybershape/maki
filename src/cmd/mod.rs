@@ -68,6 +68,11 @@ fn load_plugins(
     interaction: Interaction,
     build_config: impl FnOnce(&PluginHost, &KnownNames<'_>, &mut Vec<String>) -> Result<Config>,
 ) -> Result<(Config, Vec<String>)> {
+    // Opens the provider registration window and drops what the previous load
+    // registered: on a `/reload` this host is a new one, and an entry the old
+    // one left behind answers on a channel nobody serves.
+    maki_providers::plugin::begin_load();
+
     let discovery = maki_lua::discover_installed(no_plugins);
     // Includes the names discovery refused, so a package it could not read does
     // not become a config error pointing at the user's `plugins.<name>` table.
@@ -114,6 +119,15 @@ fn load_plugins(
         .collect();
     warnings.extend(host.load_declared_packages(&available, &declared, &config.plugins));
 
+    // Last, so it covers every load above. Taking empties it, so a later
+    // `/reload` only reports what that load found.
+    warnings.extend(host.take_key_warning());
+
+    // Publishes this load's providers in one step. Until here every reader
+    // still sees the generation that was serving, so a `/reload` never opens a
+    // window in which a registered provider answers "unknown".
+    maki_providers::plugin::commit_load();
+
     Ok((config, sanitize_warnings(&warnings)))
 }
 
@@ -121,9 +135,10 @@ fn declared_packages(host: &PluginHost) -> Result<Vec<maki_lua::Declared>> {
     host.declared_packages().context("read declared packages")
 }
 
-/// Everything a non-session subcommand needs before it can do work: project
-/// trust, `.env`, the plugin host, the effective config, and the log subscriber
-/// so a plugin's `maki.log.*` has somewhere to go. One function, so the next
+/// Everything a non-session subcommand needs before it can do work: the model
+/// registry, project trust, `.env`, the plugin host, the effective config, and
+/// the TUI's logging and telemetry, so a plugin's `maki.log.*` has somewhere to
+/// go. One function, so the next
 /// subcommand cannot forget a step the way all three of these did.
 ///
 /// Plugins still load before the subscriber exists, because the config that
@@ -133,6 +148,10 @@ fn cli_stack(
     no_jit: bool,
     trust_mode: TrustMode,
 ) -> Result<(PluginHost, Config)> {
+    // First, as in `cmd::tui::run`, so anything that resolves a model sees the
+    // models the TUI would.
+    let storage = StateDir::resolve().context("resolve data directory")?;
+    maki_providers::model_registry::load_from_storage(&storage);
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     // The `trust.paths` policy deliberately stops at the session entry points
     // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the
@@ -140,8 +159,12 @@ fn cli_stack(
     let trust = project::resolve_noninteractive(&cwd, trust_mode);
     load_env_files(&trust.project_config);
 
-    let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
-        .context("initialize lua plugin host")?;
+    let mut host = PluginHost::start(
+        Arc::clone(ToolRegistry::global_arc()),
+        Interaction::None,
+        !no_jit,
+    )
+    .context("initialize lua plugin host")?;
     let (config, warnings) = load_plugins(
         &mut host,
         no_plugins,
@@ -167,6 +190,8 @@ fn cli_stack(
         },
     )?;
     setup::init_logging(&config.storage);
+    setup::init_telemetry(&config.telemetry);
+    setup::install_panic_log_hook();
     report_warnings(warnings);
     Ok((host, config))
 }
@@ -182,6 +207,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
+            // Providers registered by a Lua plugin only reach the registry once
+            // plugin load has published them, and `login`/`logout` drive a hook
+            // that runs on the host's Lua thread, so `_host` stays bound for the
+            // whole arm.
+            let _host = cli_stack(cli.no_plugins, cli.no_jit, trust_mode)?;
             match action {
                 AuthAction::Login { provider } => {
                     subcmd::auth_login(provider.as_deref(), &storage)?
@@ -199,7 +229,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Session { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             match action {
-                SessionAction::List { global } => session::list(global, &storage)?,
+                SessionAction::List { global, json } => session::list(global, json, &storage)?,
                 SessionAction::Delete { session_id, force } => {
                     session::delete(&session_id, force, &storage)?
                 }
@@ -223,6 +253,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,
+            MigrateAction::Providers => {
+                // A script counts as ported once a plugin registers its slug.
+                let _host = cli_stack(cli.no_plugins, cli.no_jit, trust_mode)?;
+                migrate::providers()?
+            }
         },
         Some(Command::Trust { action }) => {
             let storage = StateDir::resolve().context("resolve state directory")?;

@@ -9,7 +9,6 @@ local ListPicker = require("maki.list_picker")
 local FILTER_PREFIX = "❯ "
 local RENAME_PREFIX = "Rename: "
 local CONFIRM_HINT = "  Ctrl+D again to delete"
-local DELETE_FOCUSED_HINT = "Cannot delete the current session"
 local RENAME_USAGE = "Usage: /rename <title>"
 local EMPTY_HINT = "  No sessions yet. Press Ctrl+N to start one."
 local NO_MATCHES_HINT = "  No matches"
@@ -40,6 +39,9 @@ local RENAME_KEYS = {
 }
 
 local board = nil
+-- Filter text staged when the picker deletes the session hosting its own
+-- window; open() relaunches right away with it.
+local reopen_filter = nil
 
 local function icon_of(s)
   if s.status == "needs_input" then
@@ -320,13 +322,28 @@ local function open_blank()
   close()
 end
 
+-- The picker window belongs to the focused session's App, so deleting the
+-- current session destroys the live picker no matter the call order. Close
+-- it deliberately, drop into a fresh session to step around the host's
+-- refusal to delete the focused one, delete the old one, and let open()
+-- relaunch the picker with the same filter.
+local function delete_current(s)
+  reopen_filter = board.input:value()
+  close()
+  local _, err = maki.session.new({ focus = true })
+  if err then
+    maki.ui.flash(err)
+    return
+  end
+  local _, del_err = maki.session.delete(s.id)
+  if del_err then
+    maki.ui.flash(del_err)
+  end
+end
+
 local function delete_selected()
   local s = selected()
   if not s then
-    return
-  end
-  if s.focused then
-    maki.ui.flash(DELETE_FOCUSED_HINT)
     return
   end
   if board.confirm ~= s.id then
@@ -335,6 +352,10 @@ local function delete_selected()
     return
   end
   board.confirm = nil
+  if s.focused then
+    delete_current(s)
+    return
+  end
   local _, err = maki.session.delete(s.id)
   if err then
     maki.ui.flash(err)
@@ -387,11 +408,11 @@ local function commit_rename()
 end
 
 local function handle_rename_key(key)
-  if key == "esc" then
+  if key == "<Esc>" then
     stop_rename()
-  elseif key == "enter" then
+  elseif key == "<CR>" then
     commit_rename()
-  elseif key ~= "up" and key ~= "down" then
+  elseif key ~= "<Up>" and key ~= "<Down>" then
     if board.rename.input:handle_key(key) ~= "ignored" then
       render()
     end
@@ -399,11 +420,11 @@ local function handle_rename_key(key)
 end
 
 local function handle_key(key)
-  if key == "ctrl+c" then
+  if key == "<C-c>" then
     close()
   elseif board.rename then
     handle_rename_key(key)
-  elseif key == "esc" then
+  elseif key == "<Esc>" then
     if board.confirm then
       board.confirm = nil
       render()
@@ -414,21 +435,21 @@ local function handle_key(key)
     else
       close()
     end
-  elseif key == "up" then
+  elseif key == "<Up>" then
     move_sel(-1, true)
-  elseif key == "down" then
+  elseif key == "<Down>" then
     move_sel(1, true)
-  elseif key == "pageup" then
+  elseif key == "<PageUp>" then
     move_sel(-page_size())
-  elseif key == "pagedown" then
+  elseif key == "<PageDown>" then
     move_sel(page_size())
-  elseif key == "enter" then
+  elseif key == "<CR>" then
     open_selected()
-  elseif key == "ctrl+n" then
+  elseif key == "<C-n>" then
     open_blank()
-  elseif key == "ctrl+r" then
+  elseif key == "<C-r>" then
     start_rename()
-  elseif key == "ctrl+d" then
+  elseif key == "<C-d>" then
     delete_selected()
   else
     local r = board.input:handle_key(key)
@@ -443,7 +464,7 @@ local function handle_key(key)
   end
 end
 
-local function open()
+local function open_picker(filter)
   if board then
     return
   end
@@ -473,6 +494,9 @@ local function open()
     frame = 0,
     loading = true,
   }
+  if filter then
+    board.input:insert_text(filter)
+  end
   -- Two-phase load: live sessions are cheap, so they show up and take keys
   -- right away; the stored scan can be slow, so a background task merges it
   -- in once it lands.
@@ -528,6 +552,16 @@ local function open()
       render()
     end
   end
+end
+
+-- Deleting the current session destroys this window, so relaunch with the
+-- staged filter instead of making the user reopen the picker by hand.
+local function open()
+  local filter = nil
+  repeat
+    open_picker(filter)
+    filter, reopen_filter = reopen_filter, nil
+  until filter == nil
 end
 
 -- A background agent flipping state deserves a heads-up even with the picker

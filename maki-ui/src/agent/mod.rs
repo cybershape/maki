@@ -19,8 +19,7 @@ use maki_lua::EventHandle;
 use maki_storage::id::SessionRef;
 
 use self::run_cancels::RunCancels;
-use maki_providers::provider::Provider;
-use maki_providers::{Message, Model};
+use maki_providers::Message;
 use tracing::{info, warn};
 
 use crate::app::App;
@@ -28,11 +27,7 @@ use crate::app::App;
 use self::agent_loop::AgentLoop;
 pub(crate) use self::model_slots::ModelSlots;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
-
-pub(crate) struct ModelSlot {
-    pub(crate) model: Model,
-    pub(crate) provider: Arc<dyn Provider>,
-}
+pub(crate) use maki_agent::ModelSlot;
 
 /// Input channels (`answer_tx`, `queue`) are per-agent, so an old loop can
 /// never steal new input. The output channel (`agent_tx`/`agent_rx`) is
@@ -44,7 +39,6 @@ pub(crate) struct AgentHandles {
     pub(crate) agent_tx: flume::Sender<Envelope>,
     pub(crate) answer_tx: flume::Sender<String>,
     pub(crate) history: SharedMessages,
-    pub(crate) btw_system: Arc<ArcSwap<String>>,
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) mcp_config_errors: McpConfigErrors,
     pub(crate) queue: QueueSender,
@@ -97,7 +91,6 @@ impl AgentHandles {
     pub(crate) fn apply_to_app(&self, app: &mut App) {
         app.answer_tx = Some(self.answer_tx.clone());
         app.shared_history = Some(Arc::clone(&self.history));
-        app.btw_system = Some(Arc::clone(&self.btw_system));
         app.queue.set_shared(self.queue.clone());
         let restore_tx =
             maki_agent::EventSender::new(self.agent_tx.clone(), crate::app::RESTORE_RUN_ID);
@@ -160,6 +153,8 @@ impl AgentHandles {
                 // A respawn carries the app's last reported count across, so
                 // the next request is not left guessing at its own prompt.
                 context_size: app.state.context_size,
+                frame: app.state.session.frame().cloned(),
+                session: None,
             },
             config,
             tool_output_lines,
@@ -238,7 +233,7 @@ fn spawn_agent_internal(
     // synchronously, before any handle escapes.
     let shared_history: SharedMessages =
         Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
-    let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
+    maki_agent::agent::publish_live_history(resumed.id.id(), &shared_history);
     let cancels = RunCancels::new();
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
     let mailbox = SessionMailbox::register(resumed.id.id());
@@ -249,7 +244,6 @@ fn spawn_agent_internal(
         tool_output_lines,
         resumed,
         Arc::clone(&shared_history),
-        Arc::clone(&btw_system),
         mcp_handle.clone(),
         Arc::clone(permissions),
         agent_tx.clone(),
@@ -270,7 +264,6 @@ fn spawn_agent_internal(
         agent_tx,
         answer_tx,
         history: shared_history,
-        btw_system,
         mcp_handle,
         mcp_config_errors,
         queue: queue_tx,
@@ -288,11 +281,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
-    use maki_agent::{AgentEvent, AgentInput, AgentMode};
+    use maki_agent::{AgentEvent, AgentInput, AgentMode, InputSource};
     use maki_config::{PermissionsConfig, ProjectConfig};
-    use maki_providers::provider::BoxFuture;
+    use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        AgentError, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
+        AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
     };
 
     use super::shared_queue::{QueueItem, QueuedInput};
@@ -479,10 +472,12 @@ mod tests {
                 mode: AgentMode::default(),
                 images: Vec::new(),
                 preamble: Vec::new(),
+                earlier: Vec::new(),
                 thinking: ThinkingConfig::default(),
                 fast: false,
                 workflow: false,
                 prompt: None,
+                source: InputSource::Tui,
             },
             run_id,
             displayed: true,

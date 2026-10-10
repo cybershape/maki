@@ -18,17 +18,19 @@ pub(crate) mod tests;
 pub(crate) mod view;
 
 use std::collections::HashMap;
+use std::env;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::AppSession;
+use crate::OpenSession;
 use crate::app::tasks::TaskOutcome;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
+use crate::components::alert_modal::AlertModal;
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
@@ -51,11 +53,10 @@ use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
-use crate::image;
 use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
 use maki_agent::{
@@ -65,13 +66,15 @@ use maki_agent::{
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, KeymapReader,
+    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, Key, KeymapReader,
     LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
     PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, WinView, is_reserved,
 };
+use maki_providers::models_cache::ModelList;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
+use maki_storage::model::persist_thinking;
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
@@ -345,6 +348,7 @@ pub struct App {
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
     pub(super) rewind_picker: RewindPicker,
+    pub(super) alert_modal: AlertModal,
     pub(super) help_modal: HelpModal,
     pub(super) usage_modal: UsageModal,
     pub(super) btw_modal: BtwModal,
@@ -378,8 +382,8 @@ pub struct App {
     pub(crate) trust_question: Option<TrustQuestion>,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<SharedMessages>,
-    pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
+    pub(crate) primary_paste_rx: Vec<flume::Receiver<Option<String>>>,
     storage_writer: Arc<StorageWriter>,
     last_sent: Option<Sent>,
     pub(crate) shell: shell::ShellState,
@@ -420,9 +424,9 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: &Model,
-        session: AppSession,
+        session: OpenSession,
         storage: StateDir,
-        available_models: Arc<ArcSwapOption<Vec<String>>>,
+        available_models: Arc<ArcSwapOption<ModelList>>,
         mcp_reader: McpSnapshotReader,
         mcp_config_errors: McpConfigErrors,
         lua_command_reader: LuaCommandReader,
@@ -441,7 +445,11 @@ impl App {
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
         let input_box = InputBox::new(
-            InputHistory::load(&storage, input_history_size),
+            InputHistory::load(
+                &storage,
+                &env::current_dir().unwrap_or_else(|_| PathBuf::from(&state.session.cwd)),
+                input_history_size,
+            ),
             ui_config.max_input_lines,
         );
         let mut app = Self {
@@ -465,6 +473,7 @@ impl App {
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
+            alert_modal: AlertModal::new(),
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
             btw_modal: BtwModal::new(typewriter, ui_config.show_thinking),
@@ -493,8 +502,8 @@ impl App {
             trust_question: None,
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
-            btw_system: None,
             image_paste_rx: vec![],
+            primary_paste_rx: vec![],
             storage_writer,
             last_sent: None,
             shell: shell::ShellState::default(),
@@ -537,8 +546,41 @@ impl App {
         self.active_chat == 0
     }
 
-    fn plan_form_active(&self) -> bool {
+    /// Whether the chat in front shows the input box. A running subagent's
+    /// chat does, so a message can be queued for that subagent while it is
+    /// watched. A finished one is a transcript, so it does not.
+    pub(super) fn chat_accepts_input(&self) -> bool {
+        self.is_main_chat() || !self.chats[self.active_chat].is_finished()
+    }
+
+    /// One input box serves every chat, so the draft in it moves to the chat
+    /// being left and the new chat's draft comes back. Without this, `Enter`
+    /// in a subagent's chat would send a message typed for the main agent.
+    pub(super) fn set_active_chat(&mut self, idx: usize) {
+        if idx == self.active_chat {
+            return;
+        }
+        let draft = mem::take(&mut self.chats[idx].draft);
+        self.chats[self.active_chat].draft = self.input_box.swap_draft(draft);
+        self.active_chat = idx;
+    }
+
+    /// The session's draft is the main agent's, which the box only holds while
+    /// the main chat is in front.
+    pub(super) fn main_draft(&self) -> String {
+        if self.is_main_chat() {
+            self.input_box.draft_text()
+        } else {
+            self.chats[0].draft.text.clone()
+        }
+    }
+
+    fn plan_form_open(&self) -> bool {
         self.state.mode == Mode::Plan && self.plan_form.is_visible()
+    }
+
+    fn plan_form_active(&self) -> bool {
+        self.is_main_chat() && self.plan_form_open()
     }
 
     /// One diff per frame covers every way a model can change (the picker,
@@ -564,6 +606,11 @@ impl App {
     ///
     /// Stores the clamped value rather than the typed one, so the status bar
     /// can never read `off` on a model that is really sending minimal effort.
+    ///
+    /// The value is also written to disk here, and only here: the next run
+    /// seeds its sessions from it (`SessionDefaults`), the same way the model
+    /// is remembered. A clamp on model change is not the user's choice, so it
+    /// does not overwrite the file.
     pub(crate) fn set_thinking(&mut self, input: &str) -> Result<ThinkingConfig, String> {
         if !self.state.model.supports_thinking() {
             return Err(THINKING_UNSUPPORTED_MSG.into());
@@ -571,6 +618,8 @@ impl App {
         self.state.thinking = ThinkingConfig::parse(input.trim(), self.state.thinking)
             .map_err(str::to_owned)?
             .clamped(&self.state.model);
+        self.state.pending_thinking = None;
+        persist_thinking(&self.storage, self.state.thinking.into());
         Ok(self.state.thinking)
     }
 
@@ -746,6 +795,12 @@ impl App {
         self.status_bar.flash(msg);
     }
 
+    /// For a warning the user did not ask for, so a run that produced several
+    /// shows all of them rather than whichever was reported last.
+    pub(crate) fn queue_flash(&mut self, msg: String) {
+        self.status_bar.queue_flash(msg);
+    }
+
     pub(crate) fn fire_session_autocmd(&self, event: &str, mut data: serde_json::Value) {
         if let Some(map) = data.as_object_mut() {
             map.insert(
@@ -790,24 +845,12 @@ impl App {
         match msg {
             Msg::Key(key) => self.handle_key(key),
             Msg::Paste(text) => {
-                let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 if text.is_empty() {
-                    if self.is_main_chat() && self.image_paste_rx.is_empty() {
+                    if self.chat_accepts_input() && self.image_paste_rx.is_empty() {
                         self.start_image_paste();
                     }
                 } else {
-                    let mut any_image = false;
-                    if self.is_main_chat() {
-                        for line in text.lines() {
-                            if let Some((path, mt)) = image::try_parse_image_path(line) {
-                                self.start_file_image_paste(path, mt);
-                                any_image = true;
-                            }
-                        }
-                    }
-                    if !any_image {
-                        self.route_text_paste(&text);
-                    }
+                    self.insert_pasted(text);
                 }
                 vec![]
             }
@@ -880,7 +923,7 @@ impl App {
         }
         if key::QUIT.matches(key) {
             self.command_palette.close();
-            return Some(if !self.is_main_chat() || self.input_box.is_empty() {
+            return Some(if !self.chat_accepts_input() || self.input_box.is_empty() {
                 if self.status == Status::Streaming {
                     return Some(self.handle_cancel());
                 }
@@ -915,6 +958,12 @@ impl App {
     }
 
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        // Drawn above everything else, so it answers keys before anything else.
+        if self.alert_modal.is_open() {
+            self.alert_modal.handle_key(key);
+            return Some(vec![]);
+        }
+
         // With both up the permission prompt goes first: a tool is blocked on
         // it and it owns the bottom panel. The pack review waits on nothing.
         if self.permission_prompt.is_open() {
@@ -1012,7 +1061,9 @@ impl App {
             });
         }
 
-        if self.queue.focus().is_some() {
+        // The panel in a subagent chat shows that subagent's inbox, which
+        // the session queue's focus does not reach.
+        if self.is_main_chat() && self.queue.focus().is_some() {
             match key.code {
                 KeyCode::Up => self.queue.move_focus_up(),
                 KeyCode::Down => self.queue.move_focus_down(),
@@ -1098,7 +1149,8 @@ impl App {
         //
         // Ctrl keys pass it by, as they always did: `Ctrl+C` closes it and the
         // rest belong to the input box and the built-in bindings. So does every
-        // key in a subagent chat, where there is no input to complete.
+        // key in a subagent chat, where the text is for the subagent and slash
+        // commands would act on the session behind it.
         if self.is_main_chat() && !is_ctrl(&key) {
             match self
                 .command_palette
@@ -1155,12 +1207,10 @@ impl App {
                 };
             }
             BuiltinAction::EditInput => return vec![Action::EditInputInEditor],
-            BuiltinAction::PopQueue => {
-                self.queue.remove(0);
-            }
-            BuiltinAction::PrevChat => self.active_chat = self.active_chat.saturating_sub(1),
+            BuiltinAction::PopQueue => self.pop_active_queue(),
+            BuiltinAction::PrevChat => self.set_active_chat(self.active_chat.saturating_sub(1)),
             BuiltinAction::NextChat => {
-                self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
+                self.set_active_chat((self.active_chat + 1).min(self.chats.len() - 1));
             }
             BuiltinAction::ModelPicker => {
                 self.model_picker.open(&self.state.model.spec());
@@ -1220,25 +1270,7 @@ impl App {
             return vec![];
         }
 
-        if !self.is_main_chat() {
-            return match key.code {
-                KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
-                KeyCode::Esc if !self.chats[self.active_chat].is_finished() => {
-                    if let Some(t) = self.last_esc.take()
-                        && t.elapsed() < self.status_bar.flash_duration
-                    {
-                        self.handle_subagent_cancel()
-                    } else {
-                        self.last_esc = Some(Instant::now());
-                        self.status_bar.flash(FLASH_CANCEL.into());
-                        vec![]
-                    }
-                }
-                _ => vec![],
-            };
-        }
-
-        self.handle_main_chat_key(key)
+        self.handle_chat_key(key)
     }
 
     /// The keys the host answers before any plugin *binding* sees them.
@@ -1274,13 +1306,27 @@ impl App {
     /// the keystroke the user pressed: no binding matched, the plugin has too
     /// many callbacks in flight, or its load is gone. The built-in binding
     /// then runs below, with the UI exactly as the user left it. Nothing comes
-    /// back from the Lua thread to be replayed.
+    /// back from the Lua thread to be replayed. A key no notation names is one
+    /// no plugin could have bound, so it falls through too.
     fn dispatch_override(&self, key: KeyEvent) -> bool {
-        self.keymap_reader
-            .dispatch(key, |bind| self.lua_event_handle.run_keybind_callback(bind))
+        Key::from_event(key).is_some_and(|k| {
+            self.keymap_reader
+                .dispatch(k, |bind| self.lua_event_handle.run_keybind_callback(bind))
+        })
     }
 
-    fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
+    /// A message typed while watching a running subagent is for that
+    /// subagent, see [`Self::queue_for_subagent`]. `Esc` follows the chat in front
+    /// too: armed twice in a running subagent's chat it cancels that subagent
+    /// alone. A finished subagent's chat has no input, so only the mode
+    /// toggle answers there.
+    fn handle_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        if !self.chat_accepts_input() {
+            return match key.code {
+                KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
+                _ => vec![],
+            };
+        }
         if key::EDIT_INPUT.matches(key) {
             return self.run_builtin(BuiltinAction::EditInput);
         }
@@ -1325,33 +1371,37 @@ impl App {
                         vec![]
                     }
                     KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
-                    KeyCode::Esc => {
-                        if let Some(t) = self.last_esc.take()
-                            && t.elapsed() < self.status_bar.flash_duration
-                        {
-                            if streaming {
-                                self.handle_cancel()
-                            } else {
-                                self.open_rewind_picker()
-                            }
-                        } else {
-                            self.last_esc = Some(Instant::now());
-                            self.status_bar.flash(
-                                if streaming {
-                                    FLASH_CANCEL
-                                } else {
-                                    FLASH_REWIND
-                                }
-                                .into(),
-                            );
-                            vec![]
-                        }
-                    }
+                    KeyCode::Esc => self.handle_esc(streaming),
                     _ => vec![],
                 }
             }
             InputAction::ContinueLine | InputAction::None => vec![],
         }
+    }
+
+    fn handle_esc(&mut self, streaming: bool) -> Vec<Action> {
+        let in_subagent = !self.is_main_chat();
+        let armed = self
+            .last_esc
+            .take()
+            .is_some_and(|t| t.elapsed() < self.status_bar.flash_duration);
+        if armed {
+            return if in_subagent {
+                self.handle_subagent_cancel()
+            } else if streaming {
+                self.handle_cancel()
+            } else {
+                self.open_rewind_picker()
+            };
+        }
+        self.last_esc = Some(Instant::now());
+        let hint = if in_subagent || streaming {
+            FLASH_CANCEL
+        } else {
+            FLASH_REWIND
+        };
+        self.status_bar.flash(hint.into());
+        vec![]
     }
 
     fn quit(&mut self) -> Vec<Action> {
@@ -1394,6 +1444,9 @@ impl App {
         }
         if sub.is_empty() {
             return vec![];
+        }
+        if !self.is_main_chat() {
+            return self.queue_for_subagent(sub.into());
         }
         if sub.text.trim() == "exit" {
             return self.quit();
@@ -1617,14 +1670,28 @@ impl App {
         if let ChatEventResult::QueueItemConsumed { text, images } = result {
             if chat_idx == 0 {
                 self.on_queue_item_consumed(text, images);
+            } else {
+                self.chats[chat_idx].show_user_message(text, images);
             }
             return vec![];
         }
 
-        if let ChatEventResult::PermissionRequest { id, tool, scopes } = result {
+        if let ChatEventResult::PermissionRequest {
+            id,
+            tool,
+            scopes,
+            reason,
+        } = result
+        {
             let project_trusted = self.permissions.project_is_trusted();
-            self.permission_prompt
-                .push(id, tool, scopes, subagent_id.clone(), project_trusted);
+            self.permission_prompt.push(
+                id,
+                tool,
+                scopes,
+                subagent_id.clone(),
+                project_trusted,
+                reason,
+            );
             return vec![];
         }
 
@@ -1713,6 +1780,7 @@ impl App {
         chat.set_restore_channel(self.restore_event_tx.clone());
         chat.model_id = subagent.model.clone();
         chat.opts = subagent.opts;
+        chat.inbox = subagent.inbox.clone();
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
         }
@@ -1987,9 +2055,16 @@ impl App {
                 None => PathBuf::from(args),
             }
         };
-        match std::env::set_current_dir(&path) {
+        self.save_input_history();
+        match env::set_current_dir(&path) {
             Ok(()) => {
-                if let Ok(canonical) = std::env::current_dir() {
+                if let Ok(canonical) = env::current_dir() {
+                    let max_entries = self.input_box.history().max_entries();
+                    self.input_box.set_history(InputHistory::load(
+                        &self.storage,
+                        &canonical,
+                        max_entries,
+                    ));
                     self.state
                         .session_mut()
                         .set_cwd(canonical.to_string_lossy().into_owned());
@@ -2002,8 +2077,9 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 13] {
+    fn overlays(&self) -> [&dyn Overlay; 14] {
         [
+            &self.alert_modal,
             &self.help_modal,
             &self.usage_modal,
             &self.btw_modal,
@@ -2020,8 +2096,9 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
         [
+            &mut self.alert_modal,
             &mut self.help_modal,
             &mut self.usage_modal,
             &mut self.btw_modal,
@@ -2066,7 +2143,7 @@ impl App {
         if matches!(self.pending_input, PendingInput::AuthRetry { .. }) {
             return Some(Notification::AuthenticationRequired);
         }
-        if self.status != Status::Streaming && self.plan_form_active() {
+        if self.status != Status::Streaming && self.plan_form_open() {
             return Some(Notification::PlanReady);
         }
         self.float_mgr
@@ -2101,6 +2178,7 @@ impl App {
             | self.tick_edge_scroll()
             | self.tick_error_expiry()
             | self.poll_image_paste()
+            | self.poll_primary_paste()
             | self.btw_modal.poll()
             | self.status_bar.poll_branch_update()
             | self.status_bar.clear_expired_hint()
@@ -2265,7 +2343,7 @@ impl App {
     pub fn cadence(&self) -> Cadence {
         Cadence::any([
             Cadence::any(self.overlays().into_iter().map(Overlay::cadence)),
-            StatusBar::cadence(
+            self.status_bar.cadence(
                 &self.status,
                 self.restoring.load(Ordering::Relaxed),
                 self.retry_info.is_some(),
@@ -2341,7 +2419,7 @@ impl App {
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);
-        if !self.is_main_chat() {
+        if !self.chat_accepts_input() {
             return;
         }
         if let InputAction::Changed = self.input_box.handle_paste(text) {

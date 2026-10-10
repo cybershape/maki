@@ -14,7 +14,7 @@ use self::segment::{Segment, SegmentCache};
 use super::tool_display::{
     RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info, assistant_style,
     build_instructions_lines, build_tool_lines, done_style, error_style, format_timestamp_now,
-    instructions_search_text, search_text_for, thinking_indicator, thinking_style,
+    instructions_search_text, notice_style, search_text_for, thinking_indicator, thinking_style,
     truncate_to_header, user_style,
 };
 use super::{
@@ -463,6 +463,7 @@ impl MessagesPanel {
             .collect();
         for (id, tool) in ids {
             self.tool_done(ToolDoneEvent {
+                call: None,
                 id,
                 tool,
                 output: Arc::new(ToolOutput::Plain(message.clone().into())),
@@ -1656,6 +1657,7 @@ fn message_style(role: &DisplayRole) -> RoleStyle {
         DisplayRole::Thinking => thinking_style(),
         DisplayRole::Error => error_style(),
         DisplayRole::Done => done_style(),
+        DisplayRole::Notice => notice_style(),
         DisplayRole::Tool(_) => unreachable!(),
     }
 }

@@ -9,8 +9,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use maki_storage::id::MakiId;
 use maki_storage::paths;
-use maki_storage::sessions::{SessionError, SessionSummary};
-use maki_storage::{StateDir, StorageError, now_epoch};
+use maki_storage::sessions::{SessionClaim, SessionSummary};
+use maki_storage::{StateDir, now_epoch};
 use maki_ui::AppSession;
 
 /// Mirrors `AGE_UNITS` in the `sessions` picker plugin.
@@ -35,7 +35,7 @@ const NO_SESSIONS_HERE: &str = "No sessions found in this directory (try --globa
 const NEEDS_TTY: &str = "refusing to delete without a terminal to confirm on, pass --force";
 const CANCELLED: &str = "Cancelled";
 
-pub fn list(global: bool, storage: &StateDir) -> Result<()> {
+pub fn list(global: bool, json: bool, storage: &StateDir) -> Result<()> {
     let summaries = if global {
         AppSession::list_all(storage)
     } else {
@@ -43,6 +43,14 @@ pub fn list(global: bool, storage: &StateDir) -> Result<()> {
         AppSession::list(&cwd.to_string_lossy(), storage)
     }
     .context("list sessions")?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&summaries).context("serialize session summaries")?
+        );
+        return Ok(());
+    }
 
     if summaries.is_empty() {
         if global {
@@ -65,11 +73,12 @@ pub fn delete(session_id: &str, force: bool, storage: &StateDir) -> Result<()> {
         println!("{CANCELLED}");
         return Ok(());
     }
-    match AppSession::delete(id, storage) {
+    // Refusing to delete a session another maki is writing beats unlinking the
+    // file it keeps appending to.
+    let claim = SessionClaim::acquire(id, storage).context("claim session")?;
+    match AppSession::delete(&claim, storage) {
         Ok(()) => println!("Deleted session {id}"),
-        Err(SessionError::Storage(StorageError::NotFound(_))) => {
-            bail!("session {session_id} not found")
-        }
+        Err(e) if e.is_not_found() => bail!("session {session_id} not found"),
         Err(e) => return Err(e).context("delete session"),
     }
     Ok(())

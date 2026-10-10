@@ -1,6 +1,7 @@
 use super::*;
+use crate::AppSession;
 use crate::agent::shared_queue;
-use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
+use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
@@ -11,13 +12,14 @@ use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
+use crate::theme;
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::{
     AgentMode, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus,
-    McpSnapshot, McpSnapshotReader, SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent,
+    McpSnapshot, McpSnapshotReader, SharedBuf, SubagentInbox, ToolDoneEvent, ToolOutput,
+    ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
@@ -27,15 +29,16 @@ use maki_lua::{
     WinCommand, WinEvent,
 };
 use maki_providers::{
-    ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, TokenUsage,
+    ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, ThinkingSupport,
+    TokenUsage,
 };
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionMeta, StoredMode, StoredThinking};
+use maki_storage::model::read_thinking;
+use maki_storage::sessions::{SessionClaim, SessionMeta, StoredMode, StoredThinking};
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Modifier;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,6 +47,7 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const ALL_LANDED: &str = "a drain that wrote everything reports nothing unsaved";
 const TASK_ID: &str = "task1";
 const PACKUPDATE: &str = "/packupdate";
 const PACK_NAME: &str = "demo";
@@ -54,6 +58,7 @@ pub(crate) const RESEARCH_NAME: &str = "research";
 const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
 const LATE_MODEL_SPEC: &str = "zai/glm-5";
+const PRIMARY_TEXT: &str = "selected text";
 const HINT_PLUGIN: &str = "statusline";
 const HINT_TEXT: &str = "2/4 staged";
 const HINT_STYLE: &str = "fg";
@@ -83,8 +88,8 @@ const WAIT_AHEAD: Duration = Duration::from_secs(60);
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 const CURSOR_STAYS_HIDDEN: &str = "the hardware cursor must never be shown";
 const CURSOR_ON_SCREEN: &str = "the reported cursor must be on screen";
-const CURSOR_ON_REVERSED_CELL: &str = "the focused input box owns a reversed cursor cell";
-const OVERLAY_TAKES_THE_CURSOR: &str = "an overlay unfocuses the input box, so no cell is reversed";
+const CURSOR_ON_STYLED_CELL: &str = "the focused input box owns a cell painted as the cursor";
+const OVERLAY_TAKES_THE_CURSOR: &str = "an overlay unfocuses the input box, so no cell is a cursor";
 /// Stands in for a size the provider measured, baseline included.
 const MEASURED_CONTEXT: u32 = 100_000;
 const TEST_MODEL_SPEC: &str = "test-model";
@@ -102,6 +107,8 @@ const FIRST_ASK: &str = "ask-a";
 const SECOND_ASK: &str = "ask-b";
 const OTHER_SESSION_ID: &str = "11111111-1111-1111-1111-111111111111";
 const EDIT_PLUGIN: &str = "completion";
+const CD_TARGET_DIR: &str = "other";
+const CD_TARGET_PROMPT: &str = "typed in the other project";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -116,13 +123,8 @@ fn build_app_with_lua(
     writer: Arc<StorageWriter>,
     lua_commands: LuaCommandReader,
 ) -> App {
-    build_app_with_session(
-        dir,
-        writer,
-        lua_commands,
-        AppSession::new(TEST_MODEL_SPEC, TEST_CWD),
-        test_permissions(false),
-    )
+    let tab = OpenSession::fresh(TEST_MODEL_SPEC, TEST_CWD, &dir);
+    build_app_with_session(dir, writer, lua_commands, tab, test_permissions(false))
 }
 
 fn test_permissions(yolo: bool) -> Arc<PermissionManager> {
@@ -141,15 +143,15 @@ fn build_app_with_session(
     dir: StateDir,
     writer: Arc<StorageWriter>,
     lua_commands: LuaCommandReader,
-    session: AppSession,
+    tab: OpenSession,
     permissions: Arc<PermissionManager>,
 ) -> App {
     // Mirrors the event loop, where the session's own spec decides and the
     // startup model catches one that will not resolve.
-    let model = Model::from_spec(&session.model).unwrap_or_else(|_| test_model());
+    let model = Model::from_spec(&tab.session.model).unwrap_or_else(|_| test_model());
     App::new(
         &model,
-        session,
+        tab,
         dir,
         Arc::new(ArcSwapOption::empty()),
         McpSnapshotReader::empty(),
@@ -173,7 +175,7 @@ fn test_writer(dir: StateDir) -> StorageWriter {
 
 pub(crate) fn test_app() -> App {
     spawned_app(
-        AppSession::new(TEST_MODEL_SPEC, TEST_CWD),
+        tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD)),
         test_permissions(false),
     )
 }
@@ -181,14 +183,22 @@ pub(crate) fn test_app() -> App {
 /// A tab the way `Ctrl-N` and a resume build one. `App::new` takes the session
 /// plus a fork of the prototype manager, and everything the permissions do has
 /// to come back out of that meta.
-fn spawned_app(session: AppSession, permissions: Arc<PermissionManager>) -> App {
-    let dir = StateDir::from_path(env::temp_dir());
+fn spawned_app(tab: OpenSession, permissions: Arc<PermissionManager>) -> App {
+    let dir = tmp_state();
     let writer = Arc::new(test_writer(dir.clone()));
-    let mut app =
-        build_app_with_session(dir, writer, LuaCommandReader::empty(), session, permissions);
+    let mut app = build_app_with_session(dir, writer, LuaCommandReader::empty(), tab, permissions);
     let (shared_queue, _rx) = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
+}
+
+fn tmp_state() -> StateDir {
+    StateDir::from_path(env::temp_dir())
+}
+
+/// A hand-built session opened the way [`spawned_app`] stores it.
+fn tmp_tab(session: AppSession) -> OpenSession {
+    OpenSession::claimed(session, &tmp_state())
 }
 
 /// A `test_app` past its idle splash, whose drifting starfield would mask
@@ -204,7 +214,7 @@ fn app_without_splash() -> App {
 
 /// Hands back the slot providers publish their model lists into, since the app
 /// keeps no handle to it once the picker owns it.
-fn app_with_model_slot() -> (App, Arc<ArcSwapOption<Vec<String>>>) {
+fn app_with_model_slot() -> (App, Arc<ArcSwapOption<ModelList>>) {
     let models = Arc::new(ArcSwapOption::empty());
     let mut app = test_app();
     app.model_picker = ModelPicker::new(Arc::clone(&models));
@@ -234,8 +244,8 @@ fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
 /// What the event loop does on a load. It reads the session, resolves its
 /// model and hands both to the app, which adopts them.
 fn load_session(app: &mut App, id: MakiId, model: &Model) {
-    let session = AppSession::load(id, &app.storage).unwrap();
-    app.apply_loaded_session(session, model);
+    let tab = OpenSession::load(id, &app.storage).unwrap();
+    app.apply_loaded_session(tab, model);
 }
 
 fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Msg {
@@ -295,6 +305,7 @@ fn subagent_info_with_tx(
         model: None,
         opts: None,
         answer_tx,
+        inbox: None,
     }
 }
 
@@ -436,7 +447,7 @@ fn ctrl_c_quits_when_input_empty() {
 }
 
 #[test_case(done(), ExitRequest::Success ; "done_exits_success")]
-#[test_case(AgentEvent::Error { message: "boom".into() }, ExitRequest::Error ; "error_exits_error")]
+#[test_case(AgentEvent::Error { message: "boom".into(), auth: false }, ExitRequest::Error ; "error_exits_error")]
 fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
     let mut app = test_app();
     app.exit_on_done = true;
@@ -517,6 +528,7 @@ fn tool_done_transitions_plan_to_ready(
     app.run_id = 1;
 
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "write".into(),
         output: Arc::new(output),
@@ -567,6 +579,28 @@ fn paste_file_path_triggers_image_load() {
     app.update(Msg::Paste("file:///tmp/nonexistent.png".into()));
     assert!(!app.image_paste_rx.is_empty());
     assert_eq!(app.input_box.buffer.value(), "");
+}
+
+#[test]
+fn paste_loads_every_image_path_in_the_text() {
+    let mut app = test_app();
+    app.update(Msg::Paste(
+        "file:///tmp/one.png\nnot an image\nfile:///tmp/two.jpg".into(),
+    ));
+    assert_eq!(app.image_paste_rx.len(), 2);
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+#[test_case(Some(PRIMARY_TEXT), PRIMARY_TEXT ; "selection_inserted")]
+#[test_case(None,               ""           ; "empty_selection_ignored")]
+fn primary_selection_read_lands_on_tick(selection: Option<&str>, expected: &str) {
+    let mut app = test_app();
+    let (tx, rx) = flume::bounded(1);
+    app.primary_paste_rx.push(rx);
+    tx.send(selection.map(String::from)).unwrap();
+    assert_eq!(app.tick(), Dirty::YES);
+    assert_eq!(app.input_box.buffer.value(), expected);
+    assert!(app.primary_paste_rx.is_empty());
 }
 
 #[test]
@@ -640,7 +674,10 @@ fn queue_item_consumed_marks_agent_streaming() {
 fn agent_error_lands_in_chat(message: String, expected: String) {
     let mut app = test_app();
     app.run_id = 1;
-    app.update(agent_msg(AgentEvent::Error { message }));
+    app.update(agent_msg(AgentEvent::Error {
+        message,
+        auth: false,
+    }));
     assert_eq!(app.chats[0].last_message_role(), Some(&DisplayRole::Error));
     assert_eq!(app.chats[0].last_message_text(), expected);
 }
@@ -732,6 +769,7 @@ pub(crate) fn cancel_app(app: &mut App) {
 pub(crate) fn error_app(app: &mut App) {
     app.update(agent_msg(AgentEvent::Error {
         message: AGENT_ERROR_MSG.into(),
+        auth: false,
     }));
 }
 
@@ -781,6 +819,22 @@ fn ctrl_c_closes_palette() {
 
     app.update(Msg::Key(kb::QUIT.to_key_event()));
     assert!(!app.command_palette.is_active());
+}
+
+/// Plugins that only watch read the prompt here, instead of wrapping
+/// `agent.user_message` just to see it go by.
+#[test]
+fn turn_start_carries_what_the_user_typed() {
+    const TYPED: &str = "fix the parser";
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.start_from_queue(&queued_msg(TYPED));
+
+    let (event, data) = probe.try_recv_autocmd().expect("TurnStart fired");
+    assert_eq!(event, "TurnStart");
+    assert_eq!(data["text"], TYPED);
 }
 
 /// The event exists so plugins can drop what belonged to the session that
@@ -856,7 +910,7 @@ fn blank_session_carries_the_settings_that_outlive_a_turn() {
     app.permissions.set_session_yolo(Some(true));
     app.checkpoint();
 
-    let session = app.blank_session();
+    let session = app.blank_session().session;
 
     assert_eq!(
         session.meta,
@@ -914,14 +968,14 @@ fn a_spawned_tab_opens_on_the_settings_it_was_started_with() {
 fn a_spawned_tab_honours_the_yolo_turned_off_under_the_flag() {
     let prototype = test_permissions(true);
     let app = spawned_app(
-        AppSession::new(TEST_MODEL_SPEC, TEST_CWD),
+        tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD)),
         Arc::new(prototype.fork()),
     );
     assert!(app.permissions.is_yolo(), "--yolo seeds the first tab");
 
     app.permissions.toggle_yolo();
     let session = app.blank_session();
-    assert_eq!(session.meta.yolo, Some(false));
+    assert_eq!(session.session.meta.yolo, Some(false));
 
     let spawned = spawned_app(session, Arc::new(prototype.fork()));
 
@@ -1356,7 +1410,7 @@ fn a_pick_answered_after_another_session_loaded_submits_nothing() {
     loaded.meta.plan_path = Some(other_draft.display().to_string());
     loaded.meta.plan_written = true;
     let model = app.state.model.clone();
-    app.apply_loaded_session(loaded, &model);
+    app.apply_loaded_session(OpenSession::claimed(loaded, &app.storage), &model);
     assert!(
         app.plan_answers.form.is_none(),
         "the abandoned draft's menu answer does not follow the user"
@@ -1519,11 +1573,12 @@ fn load_session_clears_plan() {
     app.state
         .session_mut()
         .push_message(Message::user("test".into()));
-    app.state.session_mut().save(&app.storage).unwrap();
-    let id = app.state.session.id;
+    let claim = app.state.claim.clone();
+    app.state.session_mut().save(&claim, &app.storage).unwrap();
+    let session = AppSession::load(app.state.session.id, &app.storage).unwrap();
     app.state.mode = Mode::Build;
     app.state.plan = PlanState::Ready(PathBuf::from("old-plan.md"));
-    load_session(&mut app, id, &test_model());
+    app.apply_loaded_session(OpenSession { session, claim }, &test_model());
     assert_eq!(app.state.mode, Mode::Build);
     assert_eq!(app.state.plan.path(), None);
 }
@@ -1544,6 +1599,7 @@ fn tool_lifecycle_events_name_the_session_and_tool() {
     assert_eq!(data["tool"], "bash");
 
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
         id: "tool-1".into(),
         tool: "bash".into(),
         output: Arc::new(ToolOutput::Plain("done".into())),
@@ -1783,7 +1839,7 @@ fn resumed_session_keeps_adding_to_the_restored_bill() {
     stored.token_usage = RESTORED_TOKENS;
     stored.add_model_usage(RESTORED_MODEL, RESTORED_TOKENS.billed(Some(RESTORED_COST)));
 
-    app.apply_loaded_session(stored, &test_model());
+    app.apply_loaded_session(OpenSession::claimed(stored, &app.storage), &test_model());
     assert_eq!(app.state.cost, Some(RESTORED_COST));
     assert_eq!(app.chats[0].cost, Some(RESTORED_COST));
 
@@ -1969,6 +2025,7 @@ pub(crate) fn close_subagent_transcript(app: &mut App, id: &str) {
 
 pub(crate) fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
         id: id.into(),
         tool: "task".into(),
         output: Arc::new(ToolOutput::Plain("result".into())),
@@ -2440,7 +2497,10 @@ fn model_list_arriving_in_the_background_owes_a_frame() {
     assert!(app.model_picker.is_open());
 
     assert_owes_one_frame(&mut app, || {
-        models.store(Some(Arc::new(vec![LATE_MODEL_SPEC.into()])));
+        models.store(Some(Arc::new(ModelList {
+            specs: vec![LATE_MODEL_SPEC.into()],
+            loading: false,
+        })));
     });
 }
 
@@ -2506,7 +2566,7 @@ fn rendered(app: &mut App) -> String {
 
 /// The event loop parks the terminal cursor on whatever `view` reports, so an
 /// IME anchors its preedit text there. The report has to be the very cell the
-/// input box reversed for its software cursor, and the hardware cursor has to
+/// input box painted for its software cursor, and the hardware cursor has to
 /// stay hidden: shown, it would invert that cell back to plain text.
 #[test]
 fn view_reports_the_reversed_input_cell_and_hides_the_hardware_cursor() {
@@ -2526,13 +2586,13 @@ fn view_reports_the_reversed_input_cell_and_hides_the_hardware_cursor() {
                 .buffer()
                 .cell(pos)
                 .expect(CURSOR_ON_SCREEN);
-            (pos, cell.modifier.contains(Modifier::REVERSED))
+            (pos, theme::is_caret_cell(cell))
         })
     };
 
     assert!(
         matches!(draw(&mut app), Some((_, true))),
-        "{CURSOR_ON_REVERSED_CELL}"
+        "{CURSOR_ON_STYLED_CELL}"
     );
 
     app.update(Msg::Key(kb::HELP.to_key_event()));
@@ -2772,6 +2832,7 @@ fn an_input_edit_meets_a_prompt_opened_since_the_last_frame() {
         vec!["execute".into()],
         None,
         true,
+        None,
     );
 
     let planned = planned_edit(&app, 0, 5, "bye");
@@ -3423,45 +3484,24 @@ fn submit_exit_quits() {
 }
 
 #[test]
-fn session_has_content_covers_each_branch() {
-    let mut session = AppSession::new("test-model", "/tmp/test");
-    assert!(!session_has_content(&session));
-
-    session.meta.input_draft = Some("draft".into());
-    assert!(session_has_content(&session));
-    session.meta.input_draft = None;
-
-    session.meta.queued_messages = vec!["queued".into()];
-    assert!(session_has_content(&session));
-    session.meta.queued_messages.clear();
-
-    session.meta.mode = Some(StoredMode::Plan);
-    assert!(session_has_content(&session));
-    session.meta.mode = Some(StoredMode::Build);
-
-    session.push_message(Message::user("hello".into()));
-    assert!(session_has_content(&session));
-}
-
-#[test]
-fn checkpoint_syncs_ephemeral_content_into_meta() {
+fn a_tab_stays_blank_until_the_user_touches_it() {
     let mut app = test_app();
     app.checkpoint();
-    assert!(!session_has_content(&app.state.session));
+    assert!(app.is_blank());
 
     app.update(Msg::Key(key(KeyCode::Char('x'))));
     app.checkpoint();
-    assert!(session_has_content(&app.state.session));
+    assert!(!app.is_blank());
 
     app.update(Msg::Key(key(KeyCode::Backspace)));
     app.checkpoint();
     assert!(app.state.session.meta.input_draft.is_none());
-    assert!(!session_has_content(&app.state.session));
+    assert!(app.is_blank());
 
     app.update(Msg::Key(key(KeyCode::Tab)));
     app.checkpoint();
     assert_eq!(app.state.session.meta.mode, Some(StoredMode::Plan));
-    assert!(session_has_content(&app.state.session));
+    assert!(!app.is_blank());
 
     let mut queued = app_with_queued_message();
     queued.checkpoint();
@@ -3470,7 +3510,14 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
     assert!(session.meta.input_draft.is_none());
     assert_eq!(session.meta.mode, Some(StoredMode::Build));
     assert_eq!(session.meta.queued_messages, vec!["queued".to_string()]);
-    assert!(session_has_content(session));
+    assert!(!queued.is_blank());
+
+    let mut chatted = test_app();
+    chatted
+        .state
+        .session_mut()
+        .push_message(Message::user("hello".into()));
+    assert!(!chatted.is_blank());
 }
 
 #[test]
@@ -3500,10 +3547,11 @@ fn checkpoint_persists_observations_without_using_them_as_title() {
 
 fn drain_writer(app: App, writer: Arc<StorageWriter>) {
     drop(app);
-    Arc::try_unwrap(writer)
+    let unsaved = Arc::try_unwrap(writer)
         .ok()
         .expect("app must hold the only other writer reference")
         .shutdown(WRITER_DRAIN_TIMEOUT);
+    assert!(unsaved.is_empty(), "{ALL_LANDED}");
 }
 
 #[test]
@@ -3528,11 +3576,8 @@ fn reload_leaves_empty_session_unpersisted_on_disk() {
     app.execute_command(cmd("/reload"), 0);
     drain_writer(app, writer);
 
-    let sessions_dir = tmp.path().join(maki_storage::sessions::SESSIONS_DIR);
-    let entries = std::fs::read_dir(&sessions_dir)
-        .map(|d| d.count())
-        .unwrap_or(0);
-    assert_eq!(entries, 0);
+    let storage = StateDir::from_path(tmp.path().to_path_buf());
+    assert!(AppSession::list_all(&storage).unwrap().is_empty());
 }
 
 #[test]
@@ -3555,7 +3600,7 @@ fn apply_loaded_session_defers_queued_messages_until_respawn() {
     session.push_message(Message::user("hello".into()));
 
     let model = app.state.model.clone();
-    app.apply_loaded_session(session, &model);
+    app.apply_loaded_session(OpenSession::claimed(session, &app.storage), &model);
 
     assert!(app.queue.is_empty());
     assert_eq!(app.state.session.meta.queued_messages, ["deferred"]);
@@ -3609,7 +3654,7 @@ fn session_with_yolo(stored: Option<bool>) -> AppSession {
 #[test_case(true,  Some(true)  => (true,  Some(true))  ; "the_flag_does_not_wipe_stored_on")]
 #[test_case(true,  Some(false) => (false, Some(false)) ; "stored_off_overrides_the_flag")]
 fn resume_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (bool, Option<bool>) {
-    let mut app = spawned_app(session_with_yolo(stored), test_permissions(seed));
+    let mut app = spawned_app(tmp_tab(session_with_yolo(stored)), test_permissions(seed));
 
     app.restore_resumed_session();
     app.checkpoint();
@@ -3626,12 +3671,15 @@ fn resume_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (bool, Option
 #[test_case(true,  Some(false) => (false, Some(false)) ; "stored_off_overrides_the_flag")]
 fn loading_a_session_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (bool, Option<bool>) {
     let mut app = spawned_app(
-        AppSession::new(TEST_MODEL_SPEC, TEST_CWD),
+        tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD)),
         test_permissions(seed),
     );
     let model = app.state.model.clone();
 
-    app.apply_loaded_session(session_with_yolo(stored), &model);
+    app.apply_loaded_session(
+        OpenSession::claimed(session_with_yolo(stored), &app.storage),
+        &model,
+    );
     app.checkpoint();
     (app.permissions.is_yolo(), app.state.session.meta.yolo)
 }
@@ -3643,7 +3691,10 @@ fn loading_a_session_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (b
 #[test_case(false => (true,  Some(true))  ; "a_fresh_session_keeps_the_toggle_on")]
 #[test_case(true  => (false, Some(false)) ; "a_fresh_session_keeps_the_toggle_off")]
 fn resetting_the_session_drops_what_the_last_one_was_granted(seed: bool) -> (bool, Option<bool>) {
-    let mut app = spawned_app(session_with_yolo(Some(!seed)), test_permissions(seed));
+    let mut app = spawned_app(
+        tmp_tab(session_with_yolo(Some(!seed))),
+        test_permissions(seed),
+    );
     app.permissions.load_session_rules(vec![session_rule()]);
     assert_eq!(app.permissions.is_yolo(), !seed);
 
@@ -3721,6 +3772,28 @@ fn cd_command_behavior() {
     );
     let flash = app.status_bar.flash_text().unwrap();
     assert!(flash.starts_with("cd: "), "error flash={flash:?}");
+}
+
+#[test]
+fn cd_swaps_input_history_to_the_new_dir() {
+    let (tmp, dir, _writer, mut app) = tempdir_app();
+    let target = tmp.path().join(CD_TARGET_DIR);
+    fs::create_dir(&target).unwrap();
+    let target = maki_storage::paths::canonicalize_clean(&target);
+    let mut seeded = InputHistory::load(&dir, &target, app.input_box.history().max_entries());
+    seeded.push(CD_TARGET_PROMPT.into());
+    seeded.save().unwrap();
+
+    app.execute_command(
+        ParsedCommand {
+            name: "/cd".into(),
+            args: target.to_string_lossy().into_owned(),
+            bang: false,
+        },
+        0,
+    );
+
+    assert_eq!(app.input_box.history().get(0), Some(CD_TARGET_PROMPT));
 }
 
 #[test]
@@ -3951,6 +4024,7 @@ fn compaction_lowers_the_stored_context_size() {
         context_size_before: MEASURED_CONTEXT,
         context_size_after: AFTER,
         context_window: 0,
+        summary: String::new(),
     }));
 
     assert_eq!(app.state.context_size, AFTER);
@@ -4107,6 +4181,7 @@ fn concurrent_subagent_permission_requests_are_each_answered() {
                 id: ask.into(),
                 tool: ToolKey::native("bash"),
                 scopes: vec!["ls".into()],
+                reason: None,
             },
             subagent: Some(subagent_info_with_tx(parent, RESEARCH_NAME, Some(tx))),
             run_id: 1,
@@ -4216,6 +4291,7 @@ fn search_reaches_output_that_lands_in_an_existing_segment() {
     app.update(Msg::Key(kb::SEARCH.to_key_event()));
 
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
         id: "tool-1".into(),
         tool: "bash".into(),
         output: Arc::new(ToolOutput::Plain(LATE_TEXT.into())),
@@ -4297,6 +4373,7 @@ fn mcp_toggle_dispatches_action() {
                 config_path: PathBuf::from("/tmp/config.toml"),
                 url: None,
                 oauth: None,
+                ca_file: None,
             }],
             prompts: vec![],
             pids: vec![],
@@ -4468,7 +4545,7 @@ fn streaming_app_with_history() -> App {
 /// next frame's checkpoint syncs the mirror whatever event arrived.
 #[test_case(done() ; "stale_done")]
 #[test_case(
-    AgentEvent::Error { message: "timeout".into() } ; "stale_error"
+    AgentEvent::Error { message: "timeout".into(), auth: false } ; "stale_error"
 )]
 fn checkpoint_after_cancel_persists_the_cancelled_turn(event: AgentEvent) {
     let mut app = streaming_app_with_history();
@@ -4564,6 +4641,7 @@ fn parent_error_refreshes_picker_and_persists_only_completed_children() {
 
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
+        auth: false,
     }));
 
     app.checkpoint();
@@ -4648,6 +4726,7 @@ fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
 
     app.update(agent_msg(AgentEvent::Error {
         message: "provider overloaded".into(),
+        auth: false,
     }));
 
     assert_eq!(app.chats[0].in_progress_count(), 1);
@@ -4702,6 +4781,7 @@ fn error_event_matching_run_id_saves_session_and_queued_messages() {
 
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
+        auth: false,
     }));
     app.checkpoint();
 
@@ -4722,6 +4802,7 @@ fn flush_restored_queue_drops_recovery_snapshot() {
     app.queue_and_notify(queued_msg("next"));
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
+        auth: false,
     }));
     app.checkpoint();
     assert_eq!(app.state.session.meta.queued_messages, ["next"]);
@@ -4753,6 +4834,7 @@ fn plan_app() -> App {
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(PathBuf::from("test-plan.md"));
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "write".into(),
         output: Arc::new(ToolOutput::Plain("wrote 42 bytes to test-plan.md".into())),
@@ -4772,6 +4854,7 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
     app.state.mode = mode;
     app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "write".into(),
         output: Arc::new(ToolOutput::Plain(
@@ -4806,6 +4889,7 @@ fn re_edit_keeps_plan_form_visible() {
 
     // Agent edits the plan again (second write to same path) — idempotent, stays Ready
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
         id: "t2".into(),
         tool: "write".into(),
         output: Arc::new(ToolOutput::Plain("wrote 50 bytes to test-plan.md".into())),
@@ -4876,6 +4960,7 @@ fn plan_form_open_editor() {
 
 fn rewrite_plan(app: &mut App) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
         id: "t2".into(),
         tool: "write".into(),
         output: Arc::new(ToolOutput::Plain("wrote 99 bytes to test-plan.md".into())),
@@ -4926,17 +5011,25 @@ fn ctrl_t_noop_when_plan_not_ready() {
     assert!(!app.plan_form.is_visible());
 }
 
+/// The plugin-boundary identity of a press a test names by code, which is how
+/// the host sees it once [`maki_lua::Key::from_event`] has normalized it.
+fn plugin_key(code: KeyCode, modifiers: KeyModifiers) -> maki_lua::Key {
+    maki_lua::Key::from_event(KeyEvent::new(code, modifiers)).expect(EXPECT_NAMEABLE)
+}
+
 fn install_override(
     app: &mut App,
     key: KeyCode,
     modifiers: KeyModifiers,
 ) -> maki_lua::test_support::RequestProbe {
-    app.keymap_reader = maki_lua::test_support::keymap_reader_with(vec![(key, modifiers)]);
+    app.keymap_reader =
+        maki_lua::test_support::keymap_reader_with(vec![plugin_key(key, modifiers)]);
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
     probe
 }
 
+const EXPECT_NAMEABLE: &str = "the test named a key no notation spells";
 const OVERRIDE_DISPATCHED: &str = "override callback must be dispatched";
 const OVERRIDE_NOT_DISPATCHED: &str = "override callback must not be dispatched";
 
@@ -5075,6 +5168,41 @@ fn streaming_cancel_wins_over_quit_override() {
     );
 }
 
+const HIDDEN_DRAFT: &str = "half a thought";
+
+/// Focus owns the keyboard whatever the press is. A key no notation names
+/// cannot be told to the float, but letting it by runs the chat behind it:
+/// `Super+Enter` submitted a draft the user could not see, `Super+Tab` flipped
+/// the mode and `Super+Backspace` cut the line.
+#[test_case(KeyCode::Enter ; "enter")]
+#[test_case(KeyCode::Tab ; "tab")]
+#[test_case(KeyCode::Backspace ; "backspace")]
+fn a_key_no_notation_names_never_reaches_the_chat_behind_a_focused_float(code: KeyCode) {
+    let mut app = test_app();
+    app.input_box.set_input(HIDDEN_DRAFT.into());
+    app.input_box.buffer.move_to_end();
+    let mode = app.state.mode;
+    let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+    app.float_mgr.open(
+        Arc::new(SharedBuf::new()),
+        FloatConfig::default(),
+        true,
+        event_tx,
+        cmd_rx,
+    );
+
+    let actions = app.update(Msg::Key(KeyEvent::new(code, KeyModifiers::SUPER)));
+
+    assert!(actions.is_empty(), "the float spends the key");
+    assert_eq!(app.input_box.buffer.value(), HIDDEN_DRAFT);
+    assert_eq!(app.state.mode, mode);
+    assert!(
+        !event_rx.drain().any(|e| matches!(e, WinEvent::Key { .. })),
+        "a key no notation names has no event to send"
+    );
+}
+
 const CLAIM_DELIVERED: &str = "the popup that claimed the key must be handed it";
 const CLAIM_NOT_DELIVERED: &str = "the popup must not be handed a key it never claimed";
 
@@ -5091,7 +5219,7 @@ fn open_claiming_popup_keys(
     let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
     let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
     let config = FloatConfig {
-        keys: keys.to_vec(),
+        keys: keys.iter().map(|(c, m)| plugin_key(*c, *m)).collect(),
         ..FloatConfig::default()
     };
     app.float_mgr
@@ -5314,16 +5442,17 @@ fn the_first_esc_arms_the_streaming_cancel_with_no_popup_up() {
 #[test]
 fn the_keys_a_plugin_cannot_bind_are_the_keys_the_host_answers_itself() {
     let app = test_app();
-    let reserved: Vec<(KeyCode, KeyModifiers)> = [kb::QUIT, kb::SUSPEND]
+    let reserved: Vec<maki_lua::Key> = [kb::QUIT, kb::SUSPEND]
         .iter()
-        .map(|b| (b.code, b.modifiers))
+        .map(|b| plugin_key(b.code, b.modifiers))
         .collect();
 
     assert_eq!(reserved, maki_lua::RESERVED_KEYS.to_vec());
-    for (code, modifiers) in maki_lua::RESERVED_KEYS {
+    for reserved in maki_lua::RESERVED_KEYS {
         assert!(
-            app.reserved_by_host(KeyEvent::new(code, modifiers)),
-            "the host has to answer {code:?} itself, whatever a plugin bound"
+            app.reserved_by_host(KeyEvent::new(reserved.code(), reserved.modifiers())),
+            "the host has to answer {} itself, whatever a plugin bound",
+            reserved.notation()
         );
     }
 }
@@ -5441,6 +5570,7 @@ fn a_pending_permission_prompt_answers_before_the_package_review() {
         vec!["execute".into()],
         None,
         true,
+        None,
     );
 
     app.update(Msg::Key(KeyEvent::from(KeyCode::Char('y'))));
@@ -5462,7 +5592,11 @@ fn thinking_restored_from_session_meta() {
     let mut session = AppSession::new("test-model", "/tmp/test");
     session.meta.thinking = Some(StoredThinking::Budget { tokens: 4096 });
 
-    let state = SessionState::from_session(session, &test_model(), &storage);
+    let state = SessionState::from_session(
+        OpenSession::claimed(session, &storage),
+        &test_model(),
+        &storage,
+    );
     assert_eq!(state.thinking, ThinkingConfig::Budget(4096));
 }
 
@@ -5547,8 +5681,11 @@ fn fast_restored_from_session_meta() {
     let mut session = AppSession::new(OPUS_SPEC, "/tmp/test");
     session.meta.fast = true;
 
-    let state =
-        SessionState::from_session(session, &Model::from_spec(OPUS_SPEC).unwrap(), &storage);
+    let state = SessionState::from_session(
+        OpenSession::claimed(session, &storage),
+        &Model::from_spec(OPUS_SPEC).unwrap(),
+        &storage,
+    );
     assert!(state.fast);
 }
 
@@ -5561,7 +5698,11 @@ fn fast_normalized_off_when_restored_onto_ineligible_model() {
     let mut session = AppSession::new(SONNET_SPEC, "/tmp/test");
     session.meta.fast = true;
 
-    let state = SessionState::from_session(session, &test_model(), &storage);
+    let state = SessionState::from_session(
+        OpenSession::claimed(session, &storage),
+        &test_model(),
+        &storage,
+    );
     assert!(!state.fast);
 }
 
@@ -5639,11 +5780,58 @@ fn model_state_carries_the_thinking_ladder() {
 #[test]
 fn set_thinking_clamps_to_what_the_model_will_run() {
     let mut app = test_app();
-    app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::Required);
+    app.state.model.thinking_override = Some(ThinkingSupport::Required);
 
     let lifted = ThinkingConfig::Effort(Effort::Minimal);
     assert_eq!(app.set_thinking("off").unwrap(), lifted);
     assert_eq!(app.state.thinking, lifted);
+}
+
+#[test_case("off", ThinkingConfig::Off)]
+#[test_case("low", ThinkingConfig::Effort(Effort::Low))]
+fn explicit_thinking_choice_replaces_pending_level(input: &str, expected: ThinkingConfig) {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    app.set_thinking("high").unwrap();
+    let mut model = app.state.model.clone();
+    model.thinking_override = Some(ThinkingSupport::No);
+    app.state.update_model(&model);
+    assert_eq!(app.state.thinking, ThinkingConfig::Off);
+
+    model.thinking_override = Some(ThinkingSupport::Yes);
+    app.state.model = model.clone();
+    assert_eq!(app.set_thinking(input).unwrap(), expected);
+    app.state.update_model(&model);
+    app.checkpoint();
+
+    assert_eq!(app.state.thinking, expected);
+    assert_eq!(app.state.session.meta.thinking, Some(expected.into()));
+    assert_eq!(read_thinking(&app.storage), Some(expected.into()));
+}
+
+#[test_case(StoredThinking::Adaptive)]
+#[test_case(StoredThinking::Effort { level: Effort::High })]
+#[test_case(StoredThinking::Budget { tokens: 8192 })]
+fn checkpoint_preserves_thinking_until_discovery_finishes(stored: StoredThinking) {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let mut model = test_model();
+    model.thinking_override = Some(ThinkingSupport::No);
+    let mut session = AppSession::new(TEST_MODEL_SPEC, TEST_CWD);
+    session.meta.thinking = Some(stored);
+    session.push_message(Message::user(RESUMED_PROMPT.into()));
+    app.apply_loaded_session(OpenSession::claimed(session, &dir), &model);
+    assert_eq!(app.state.thinking, ThinkingConfig::Off);
+
+    app.checkpoint();
+    assert_eq!(app.state.session.meta.thinking, Some(stored));
+    assert_eq!(app.blank_session().session.meta.thinking, Some(stored));
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+
+    let session = AppSession::load(id, &dir).unwrap();
+    assert_eq!(session.meta.thinking, Some(stored));
+    model.thinking_override = Some(ThinkingSupport::Yes);
+    let state = SessionState::from_session(OpenSession::claimed(session, &dir), &model, &dir);
+    assert_eq!(state.thinking, ThinkingConfig::from(stored));
 }
 
 /// A plugin redraws its badge from the payload alone, and only when the model
@@ -5685,7 +5873,10 @@ fn loading_a_session_on_another_model_announces_the_swap() {
     app.lua_event_handle = handle;
     let resolved = Model::from_spec(OPUS_SPEC).unwrap();
 
-    app.apply_loaded_session(AppSession::new(OPUS_SPEC, "/tmp/test"), &resolved);
+    app.apply_loaded_session(
+        OpenSession::claimed(AppSession::new(OPUS_SPEC, "/tmp/test"), &app.storage),
+        &resolved,
+    );
     app.emit_model_change();
 
     let (event, data) = probe.try_recv_autocmd().expect(MODEL_CHANGED_EVENT);
@@ -6039,7 +6230,7 @@ fn set_thinking_keeps_state_on_rejected_input(supported: bool, input: &str, expe
     let mut app = test_app();
     app.set_thinking("high").unwrap();
     if !supported {
-        app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::No);
+        app.state.model.thinking_override = Some(ThinkingSupport::No);
     }
 
     assert_eq!(app.set_thinking(input).unwrap_err(), expected);
@@ -6093,6 +6284,7 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
     let error_msg = "Provider is overloaded";
     app.update(agent_msg(AgentEvent::Error {
         message: error_msg.into(),
+        auth: false,
     }));
 
     assert_eq!(app.main_chat().in_progress_count(), 0);
@@ -6112,6 +6304,7 @@ fn ctrl_c_denies_permission_prompt() {
         vec!["execute".into()],
         None,
         true,
+        None,
     );
     assert!(app.permission_prompt.is_open());
 
@@ -6247,7 +6440,7 @@ fn split_question_keeps_transcript_selectable_and_keyboard_focus(dir: Split) {
     assert!(
         event_rx
             .try_iter()
-            .any(|event| matches!(event, WinEvent::Key { key } if key == "j"))
+            .any(|event| matches!(event, WinEvent::Key { key } if key == plugin_key(KeyCode::Char('j'), KeyModifiers::NONE)))
     );
     assert!(app.input_box.is_empty());
     assert!(app.awaiting_input());
@@ -6331,6 +6524,7 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
         vec!["ls".into()],
         None,
         true,
+        None,
     );
 
     let (_msg, _bottom, _status, _input, splits) = app.layout_geometry(TEST_AREA);
@@ -6450,6 +6644,171 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
     assert!(!app.chats[0].is_finished());
 }
 
+/// A subagent whose session handed the UI its inbox, the way `sess:prompt`
+/// does through `SubagentInfo`, with that chat in front.
+fn app_with_subagent_inbox() -> (App, Arc<SubagentInbox>) {
+    let inbox = Arc::new(SubagentInbox::default());
+    let mut app = streaming_app();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.inbox = Some(Arc::clone(&inbox));
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta { text: "x".into() },
+        subagent: Some(info),
+        run_id: 1,
+    })));
+    app.run_builtin(BuiltinAction::NextChat);
+    assert_eq!(app.active_chat, 1);
+    (app, inbox)
+}
+
+/// A message typed in a running subagent's chat is for that subagent: it
+/// waits in its inbox, shows in that chat's queue panel, and leaves the
+/// session queue and the main chat alone.
+#[test]
+fn submit_in_subagent_chat_queues_for_that_subagent() {
+    let (mut app, inbox) = app_with_subagent_inbox();
+    let main_messages = app.chats[0].message_count();
+    let actions = type_and_submit(&mut app, "q");
+    assert!(actions.is_empty());
+    assert_eq!(inbox.texts(), ["q"]);
+    assert!(app.queue.is_empty());
+    assert_eq!(app.active_queue_entries()[0].text, "q");
+    assert_eq!(
+        app.active_chat, 1,
+        "queueing keeps the subagent chat in front"
+    );
+    assert_eq!(app.chats[0].message_count(), main_messages);
+    assert!(app.input_box.is_empty());
+}
+
+/// The subagent's loop reports the pickup like the main one does, and the
+/// bubble lands in the chat the message was typed in.
+#[test]
+fn inbox_consumed_draws_in_subagent_chat() {
+    let (mut app, _inbox) = app_with_subagent_inbox();
+    let main_messages = app.chats[0].message_count();
+    app.update(subagent_msg(
+        AgentEvent::QueueItemConsumed {
+            text: "q".into(),
+            images: Vec::new(),
+        },
+        TASK_ID,
+        None,
+    ));
+    assert_eq!(app.chats[1].last_message_text(), "q");
+    assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::User));
+    assert_eq!(app.chats[0].message_count(), main_messages);
+}
+
+#[test]
+fn submit_in_subagent_chat_without_inbox_flashes() {
+    let mut app = app_with_active_subagent();
+    let actions = type_and_submit(&mut app, "q");
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text().unwrap(), queue::NO_INBOX_ERR);
+    assert!(app.queue.is_empty());
+}
+
+#[test]
+fn pop_queue_in_subagent_chat_drops_its_inbox_head() {
+    let (mut app, inbox) = app_with_subagent_inbox();
+    type_and_submit(&mut app, "a");
+    type_and_submit(&mut app, "b");
+    app.update(Msg::Key(kb::POP_QUEUE.to_key_event()));
+    assert_eq!(inbox.texts(), ["b"]);
+}
+
+/// Nothing drains the inbox once the subagent is gone, so what was left in it
+/// is reported in the transcript rather than lost in silence.
+#[test]
+fn finished_subagent_reports_undelivered_messages() {
+    let (mut app, inbox) = app_with_subagent_inbox();
+    type_and_submit(&mut app, "a");
+    finish_subagent_task(&mut app, false);
+    assert!(app.chats[1].inbox.is_none());
+    assert_eq!(inbox.len(), 1);
+    let notice = app.chats[1]
+        .message_at(app.chats[1].message_count() - 2)
+        .unwrap();
+    assert_eq!(notice.text, format!("1{INBOX_DROPPED_SUFFIX}"));
+    assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
+}
+
+/// A finished subagent's chat is a transcript: no box to type into, and a
+/// draft typed elsewhere is left alone.
+#[test]
+fn finished_subagent_chat_takes_no_prompt() {
+    let mut app = app_with_active_subagent();
+    finish_subagent_task(&mut app, false);
+    app.update(Msg::Key(key(KeyCode::Char('q'))));
+    app.update(Msg::Paste("hi".into()));
+    assert!(app.input_box.is_empty());
+    assert!(!app.input_live(Rect::new(0, 0, 80, 24)));
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(actions.is_empty());
+    assert!(app.queue.is_empty());
+}
+
+#[test]
+fn paste_in_subagent_chat_lands_in_input() {
+    let mut app = app_with_active_subagent();
+    app.update(Msg::Paste("hi".into()));
+    assert_eq!(app.input_box.buffer.value(), "hi");
+}
+
+#[test]
+fn draft_stays_with_the_chat_it_was_typed_in() {
+    let (mut app, inbox) = app_with_subagent_inbox();
+    app.run_builtin(BuiltinAction::PrevChat);
+    app.update(Msg::Paste("for main".into()));
+
+    app.run_builtin(BuiltinAction::NextChat);
+    assert!(app.input_box.is_empty());
+    app.update(Msg::Paste("for sub".into()));
+
+    app.run_builtin(BuiltinAction::PrevChat);
+    assert_eq!(app.input_box.buffer.value(), "for main");
+
+    app.focus_task(TASK_ID).unwrap();
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(inbox.texts(), ["for sub"]);
+    assert!(app.queue.is_empty());
+}
+
+/// The box holds whichever chat is in front, and the session saved the box,
+/// so the main draft went missing from it and a subagent's took its place.
+#[test]
+fn the_session_keeps_the_main_draft_while_a_subagent_chat_is_in_front() {
+    const MAIN_DRAFT: &str = "for main";
+    const SUB_DRAFT: &str = "for sub";
+    let (mut app, _inbox) = app_with_subagent_inbox();
+    app.run_builtin(BuiltinAction::PrevChat);
+    app.update(Msg::Paste(MAIN_DRAFT.into()));
+    app.run_builtin(BuiltinAction::NextChat);
+    app.update(Msg::Paste(SUB_DRAFT.into()));
+
+    app.checkpoint();
+    assert_eq!(
+        app.state.session.meta.input_draft.as_deref(),
+        Some(MAIN_DRAFT)
+    );
+
+    app.reset_ui_chrome();
+    assert_eq!(app.input_box.buffer.value(), MAIN_DRAFT);
+}
+
+#[test]
+fn ctrl_c_in_subagent_chat_discards_draft_before_cancelling() {
+    let mut app = app_with_active_subagent();
+    app.update(Msg::Key(key(KeyCode::Char('a'))));
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(actions.is_empty());
+    assert!(app.input_box.is_empty());
+
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(matches!(&actions[0], Action::CancelAgent { .. }));
+}
+
 // -- Every frame checkpoints: one way in for a history, one trigger to save --
 
 /// Long enough that a waiting change is still waiting when the assert runs, on
@@ -6542,6 +6901,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         vec!["execute".into()],
         None,
         true,
+        None,
     );
     assert_eq!(
         app.attention(),
@@ -6557,6 +6917,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         vec![],
         None,
         true,
+        None,
     );
     assert_eq!(
         app.attention(),
@@ -6590,6 +6951,29 @@ fn attention_classifies_auth_and_ready_plan() {
     assert_eq!(app.attention(), None);
 }
 
+#[test]
+fn plan_form_on_a_subtask_leaves_keys_alone_but_still_wants_attention() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "sub".into() },
+        TASK_ID,
+        Some("research"),
+    ));
+    app.status = Status::Idle;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
+    app.plan_form.on_plan_ready();
+    app.run_builtin(BuiltinAction::NextChat);
+    assert_eq!(app.active_chat, 1);
+
+    let parallel = app.plan_form.parallel();
+    app.update(Msg::Key(key(KeyCode::Char(' '))));
+    assert_eq!(app.plan_form.parallel(), parallel);
+    assert_eq!(app.attention(), Some(Notification::PlanReady));
+}
+
 fn tool_use_msg(id: &str) -> Message {
     Message {
         role: Role::Assistant,
@@ -6601,11 +6985,7 @@ fn tool_use_msg(id: &str) -> Message {
 fn tool_result_msg(id: &str, text: &str) -> Message {
     Message {
         role: Role::User,
-        content: vec![ContentBlock::ToolResult {
-            tool_use_id: id.into(),
-            content: text.into(),
-            is_error: false,
-        }],
+        content: vec![ContentBlock::tool_result(id, text, false)],
         display_text: Some(String::new()),
         ..Default::default()
     }
@@ -6623,23 +7003,21 @@ fn attach_live_history(app: &mut App, messages: Vec<Message>) -> maki_agent::His
     history
 }
 
-/// Types [`TYPED_DRAFT`] one key per frame and hands back the stamp of the
-/// write the first key caused. The soft delay never elapses, so every key after
-/// the first is still waiting when the caller looks.
-fn type_draft_leaving_last_key_waiting(app: &mut App) -> Sent {
-    let mut keys = TYPED_DRAFT.chars();
-    app.update(Msg::Key(key(KeyCode::Char(keys.next().unwrap()))));
+/// Saves a session with one message, then types [`TYPED_DRAFT`] one key per
+/// frame. The soft delay never runs out, so every key is still waiting when
+/// the caller looks. Hands back the stamp of the save.
+fn type_draft_into_saved_session(app: &mut App) -> Sent {
+    app.state
+        .session_mut()
+        .push_message(Message::user(LIVE_AGENT_TEXT.into()));
     app.checkpoint();
-    let first = app
-        .last_sent
-        .clone()
-        .expect("the first keystroke puts the session on disk");
+    let saved = app.last_sent.clone().expect("a message puts it on disk");
 
-    for c in keys {
+    for c in TYPED_DRAFT.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
         app.checkpoint_with(SOFT_DELAY_HELD);
     }
-    first
+    saved
 }
 
 /// Checkpointing mid-batch used to freeze the tools as failed forever. The
@@ -6682,7 +7060,9 @@ fn loading_a_session_stamps_its_restores_as_a_load_of_that_session() {
     let mut stored = AppSession::new(TEST_MODEL_SPEC, TEST_CWD);
     stored.push_message(tool_use_msg(SUB_TOOL_ID));
     stored.push_message(tool_result_msg(SUB_TOOL_ID, &tool_text(SUB_TOOL_ID)));
-    stored.save(&dir).unwrap();
+    stored
+        .save(&SessionClaim::acquire(stored.id, &dir).unwrap(), &dir)
+        .unwrap();
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
     app.restore_event_tx = Some(maki_agent::EventSender::new(flume::unbounded().0, 0));
@@ -6813,7 +7193,7 @@ fn rewind_gesture(app: &mut App) -> Vec<Message> {
 fn load_gesture(app: &mut App) -> Vec<Message> {
     let mut stored = AppSession::new(TEST_MODEL_SPEC, TEST_CWD);
     stored.push_message(Message::user(STORED_SESSION_TEXT.into()));
-    app.apply_loaded_session(stored, &test_model())
+    app.apply_loaded_session(OpenSession::claimed(stored, &app.storage), &test_model())
 }
 
 /// The three gestures that hand the agent a history it did not produce. Each
@@ -6863,13 +7243,18 @@ fn loading_ends_the_previous_session_only_when_the_id_changes(same: bool) {
     let previous = app.state.session.id;
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
-    let session = if same {
-        (*app.state.session).clone()
+    // Reopening the session a tab holds shares its claim, as every holder in
+    // one process must.
+    let tab = if same {
+        OpenSession {
+            session: (*app.state.session).clone(),
+            claim: app.state.claim.clone(),
+        }
     } else {
-        AppSession::new(TEST_MODEL_SPEC, TEST_CWD)
+        OpenSession::claimed(AppSession::new(TEST_MODEL_SPEC, TEST_CWD), &app.storage)
     };
 
-    app.apply_loaded_session(session, &test_model());
+    app.apply_loaded_session(tab, &test_model());
 
     assert_eq!(
         probe.try_recv_end_session(),
@@ -6891,7 +7276,9 @@ fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
     let mut stored = AppSession::new("test-model", "/tmp/test");
     stored.push_message(Message::user(STORED_SESSION_TEXT.into()));
-    stored.save(&dir).unwrap();
+    stored
+        .save(&SessionClaim::acquire(stored.id, &dir).unwrap(), &dir)
+        .unwrap();
 
     let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
     app.input_box.set_input(UNSENT_DRAFT.into());
@@ -6943,23 +7330,22 @@ fn idle_checkpoint_changes_nothing() {
 }
 
 /// Issue #675: a crash between a keystroke and submit threw the draft away,
-/// because nothing was written until the turn ended. The first key lands within
-/// a frame now, and the keys behind it ride along on a later write rather than
-/// each costing an `fsync`.
+/// because nothing was written until the turn ended. Now the keys land once
+/// the soft delay is up, all in one write rather than one `fsync` each.
 #[test]
-fn first_draft_keystroke_lands_and_the_rest_coalesce() {
+fn draft_keystrokes_wait_and_land_in_one_write() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
-    let first = type_draft_leaving_last_key_waiting(&mut app);
+    let saved_stamp = type_draft_into_saved_session(&mut app);
     assert_eq!(
         app.last_sent.as_ref(),
-        Some(&first),
+        Some(&saved_stamp),
         "a keystroke on its own waits instead of costing a write",
     );
 
     app.checkpoint_with(Duration::ZERO);
     assert_ne!(
         app.last_sent.as_ref(),
-        Some(&first),
+        Some(&saved_stamp),
         "and lands once the delay is up"
     );
 
@@ -6967,13 +7353,12 @@ fn first_draft_keystroke_lands_and_the_rest_coalesce() {
     drain_writer(app, writer);
     let saved = AppSession::load(id, &dir).unwrap();
     assert_eq!(saved.meta.input_draft.as_deref(), Some(TYPED_DRAFT));
-    assert!(saved.messages().is_empty());
 }
 
 #[test]
 fn a_content_change_writes_the_waiting_draft_with_it() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
-    type_draft_leaving_last_key_waiting(&mut app);
+    type_draft_into_saved_session(&mut app);
 
     app.state
         .session_mut()
@@ -6983,14 +7368,14 @@ fn a_content_change_writes_the_waiting_draft_with_it() {
     let id = app.state.session.id;
     drain_writer(app, writer);
     let saved = AppSession::load(id, &dir).unwrap();
-    assert_eq!(saved.messages().len(), 1, "content never waits");
+    assert_eq!(saved.messages().len(), 2, "content never waits");
     assert_eq!(saved.meta.input_draft.as_deref(), Some(TYPED_DRAFT));
 }
 
 #[test]
 fn shutdown_writes_a_draft_that_is_still_waiting() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
-    type_draft_leaving_last_key_waiting(&mut app);
+    type_draft_into_saved_session(&mut app);
 
     app.checkpoint_now();
 
@@ -7000,37 +7385,32 @@ fn shutdown_writes_a_draft_that_is_still_waiting() {
     assert_eq!(saved.meta.input_draft.as_deref(), Some(TYPED_DRAFT));
 }
 
-/// Submitting empties the draft a frame before the agent mirrors the prompt
-/// back. Delete the session in that gap and the user loses the one they were
-/// just starting.
 #[test]
-fn submitting_the_draft_keeps_the_session_on_disk() {
+fn a_draft_in_plan_mode_is_not_saved_without_a_message() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
-    type_draft_leaving_last_key_waiting(&mut app);
-    let id = app.state.session.id;
-
-    app.update(Msg::Key(key(KeyCode::Enter)));
-    app.checkpoint();
-    assert!(!app.has_content(), "the submit window is what this covers");
+    for c in TYPED_DRAFT.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    app.checkpoint_now();
 
     drain_writer(app, writer);
-    assert!(AppSession::load(id, &dir).is_ok());
+    assert!(AppSession::list_all(&dir).unwrap().is_empty());
 }
 
-/// The draft put the session on disk, and deleting it leaves nothing worth
-/// keeping. Without the delete the file survives with the abandoned draft in
-/// it, and the picker offers an empty session to resume.
 #[test]
-fn deleting_the_draft_takes_the_session_off_disk() {
+fn rewinding_to_the_first_prompt_takes_the_session_off_disk() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
-    type_draft_leaving_last_key_waiting(&mut app);
+    let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
+    app.checkpoint();
     let id = app.state.session.id;
 
-    for _ in TYPED_DRAFT.chars() {
-        app.update(Msg::Key(key(KeyCode::Backspace)));
-    }
+    app.rewind_to(RewindEntry {
+        turn_index: 0,
+        prompt_preview: LIVE_AGENT_TEXT.into(),
+        prompt_text: LIVE_AGENT_TEXT.into(),
+    });
     app.checkpoint();
-    assert!(app.last_sent.is_none(), "nothing is on disk to stamp");
 
     drain_writer(app, writer);
     assert!(AppSession::load(id, &dir).is_err());
@@ -7049,6 +7429,7 @@ fn two_tool_results_checkpointed_separately_both_reach_disk() {
 
     for tool_id in TOOL_IDS {
         app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            call: None,
             id: tool_id.into(),
             tool: "bash".into(),
             output: Arc::new(ToolOutput::Plain(tool_text(tool_id).into())),

@@ -44,7 +44,7 @@ Dev builds skip debug info for deps and vendored C (our crates keep it); to debu
 
 ## Nix
 
-`nix develop` (dev shell; exports `OPENSSL_NO_VENDOR`, saves ~80s cold build - export it yourself outside the shell if you have libssl-dev), `nix build`, `nix fmt` (nixfmt), `nix flake check` (includes git-dep-hashes drift).
+`nix develop` (dev shell), `nix build`, `nix fmt` (nixfmt), `nix flake check` (includes git-dep-hashes drift).
 
 ## Architecture
 
@@ -60,6 +60,8 @@ Rust workspace, key crates in root dir:
 - maki-acp: ACP ndjson stdio server
 
 Built-in lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), bash, glob, question, skill, memory, webfetch, websearch, todo_write, read, write, edit, task, code_execution (python sandbox), batch.
+
+Invariant: requests are append-only. Never rebuild `system`/`tools` or edit earlier messages mid-session: it voids the prompt cache everywhere and invalidates (or 400s) Anthropic thinking blocks bound to the prefix. Use a context update (`context_update` in `maki-agent/src/agent/frame.rs`) or an announced new frame. Contract tests: `assert_append_only` in `maki-agent/src/agent/run.rs`.
 
 ## Docs
 

@@ -10,21 +10,28 @@ use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
 use crate::agent::CallInstructions;
-use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
+use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, ToolDeferral, UNKNOWN_MCP, is_wire_name};
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
-use crate::tools::registry::{InstalledHook, RegisteredTool, ToolInvocation};
+use crate::tools::registry::{InstalledHook, RegisteredTool, Tool, ToolInvocation};
 use crate::tools::{
-    CallOrigin, Deadline, FileKey, LocalTool, LocalToolFn, ToolAudience, ToolContext,
-    truncate_bytes,
+    CallOrigin, Deadline, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience,
+    ToolContext, truncate_bytes,
 };
-use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use crate::{
+    AgentError, AgentEvent, CallRecord, TextOutput, ToolDoneEvent, ToolOutput, ToolStartEvent,
+};
 use maki_config::ToolKey;
 use maki_storage::id::SessionRef;
 
 const DOOM_LOOP_THRESHOLD: usize = 3;
-const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
+const DOOM_LOOP_MESSAGE: &str = "You have called this tool with the same (or nearly identical) input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
+/// A frame never drops a tool, so a server that went away, or stopped
+/// publishing one, leaves its names listed. Saying so stops the model from
+/// retrying them.
+const MCP_SERVER_GONE: &str =
+    "Its MCP server is not connected or no longer offers it, so it cannot be called now.";
 const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
 
 const SOURCE_NATIVE: &str = "native";
@@ -60,7 +67,13 @@ impl RecentCalls {
         Self(VecDeque::new())
     }
 
+    /// Sorts keys and trims strings first, so key reordering and whitespace
+    /// churn around a value do not dodge the guard. Interior whitespace is
+    /// kept, it can matter inside a command or pattern.
     fn hash_input(input: &Value) -> u64 {
+        let mut input = input.clone();
+        input.sort_all_objects();
+        trim_strings(&mut input);
         let mut h = DefaultHasher::new();
         input.to_string().hash(&mut h);
         h.finish()
@@ -85,6 +98,15 @@ impl RecentCalls {
     }
 }
 
+fn trim_strings(value: &mut Value) {
+    match value {
+        Value::String(s) => *s = s.trim().to_owned(),
+        Value::Array(items) => items.iter_mut().for_each(trim_strings),
+        Value::Object(map) => map.values_mut().for_each(trim_strings),
+        _ => {}
+    }
+}
+
 /// Every tool call in maki lands here (native, Lua, MCP, subagents, batch
 /// children), which makes it the one place telemetry has to wrap, the one
 /// place [hooks] fire, and the one place a model call's [`CallInstructions`]
@@ -106,15 +128,26 @@ pub async fn run(
         Some(hook) => hook.filter_input(&id, input).await,
         None => Verdict::Unchanged,
     };
-    let input = match verdict {
-        Verdict::Unchanged => Cow::Borrowed(input),
+    let (input, ask) = match verdict {
+        Verdict::Unchanged => (Cow::Borrowed(input), None),
         Verdict::Replaced(value) => {
             debug!(tool = %name, "input hook rewrote the call");
-            Cow::Owned(value)
+            (Cow::Owned(value), None)
+        }
+        Verdict::Ask {
+            reason,
+            input: rewritten,
+        } => {
+            debug!(tool = %name, reason = %reason, "input hook escalated the call to the user");
+            (
+                rewritten.map_or(Cow::Borrowed(input), Cow::Owned),
+                Some(reason),
+            )
         }
         Verdict::Denied(reason) => {
             warn!(tool = %name, reason = %reason, "input hook stopped the call");
             return ToolDoneEvent {
+                call: None,
                 id,
                 tool: Arc::from(name),
                 output: Arc::new(ToolOutput::Plain(reason.into())),
@@ -125,17 +158,23 @@ pub async fn run(
         }
     };
 
-    let telemetry = maki_otel::enabled().then(|| (resolved.route.source(), Instant::now()));
-    let mut done = run_inner(resolved, id, &input, ctx, origin).await;
+    let source = maki_otel::enabled().then(|| resolved.route.source());
+    let started = Instant::now();
+    let mut done = run_inner(resolved, id, &input, ctx, origin, ask.as_deref()).await;
+    let took = started.elapsed();
     if let Some(hook) = &hook {
-        hook.filter_output(&mut done).await;
+        hook.filter_output(&mut done, &input).await;
     }
     if origin.is_model() {
         attach_call_instructions(ctx, &mut done);
     }
-    if let Some((source, started)) = telemetry {
-        report(&done, name, &source, &input, started.elapsed());
+    if let Some(source) = source {
+        report(&done, name, &source, &input, took);
     }
+    done.call = Some(Box::new(CallRecord {
+        input: input.into_owned(),
+        duration: took,
+    }));
     done
 }
 
@@ -175,6 +214,9 @@ struct Hook<'a> {
     installed: InstalledHook,
     ctx: &'a ToolContext,
     tool: &'a str,
+    /// Held for `tool_kind`, which borrows from it. Copying the kind out would
+    /// cost an allocation on every call, even the ones no layer reads.
+    native: Option<Arc<dyn Tool>>,
     origin: CallOrigin,
     authority: Authority,
 }
@@ -185,6 +227,10 @@ impl<'a> Hook<'a> {
             installed: ctx.registry.hook()?,
             ctx,
             tool: resolved.name,
+            native: match &resolved.route {
+                Route::Native(entry) => Some(Arc::clone(&entry.tool)),
+                _ => None,
+            },
             origin,
             authority: resolved.route.authority()?,
         })
@@ -195,13 +241,13 @@ impl<'a> Hook<'a> {
             return Verdict::Unchanged;
         }
         let cancelled = Verdict::Denied(ERROR_CANCELLED.to_owned());
-        self.fire(HookStage::Input, tool_id, input.clone(), cancelled)
+        self.fire(HookStage::Input, tool_id, input.clone(), None, cancelled)
             .await
     }
 
     /// Rewrites the finished event in place. Text and error flag move together,
     /// so a hook that cannot reach the text cannot flip the flag either.
-    async fn filter_output(&self, done: &mut ToolDoneEvent) {
+    async fn filter_output(&self, done: &mut ToolDoneEvent, input: &Value) {
         if !self.installed.wraps(self.tool, HookStage::Output) {
             return;
         }
@@ -224,10 +270,16 @@ impl<'a> Hook<'a> {
         };
         let value = json!({ OUTPUT_TEXT: &*text, OUTPUT_IS_ERROR: was_error });
         let (rewritten, is_error) = match self
-            .fire(HookStage::Output, &done.id, value, Verdict::Unchanged)
+            .fire(
+                HookStage::Output,
+                &done.id,
+                value,
+                Some(input),
+                Verdict::Unchanged,
+            )
             .await
         {
-            Verdict::Unchanged => return,
+            Verdict::Unchanged | Verdict::Ask { .. } => return,
             // Nothing left to stop, so the reason becomes what the model reads.
             Verdict::Denied(reason) => (reason, true),
             Verdict::Replaced(value) => match value.get(OUTPUT_TEXT).and_then(Value::as_str) {
@@ -260,11 +312,14 @@ impl<'a> Hook<'a> {
         stage: HookStage,
         tool_id: &str,
         value: Value,
+        input: Option<&Value>,
         on_cancel: Verdict,
     ) -> Verdict {
         let call = HookCall {
             tool: self.tool,
             tool_id,
+            tool_kind: self.native.as_deref().and_then(Tool::tool_kind),
+            input,
             session_id: self.ctx.session_id.as_ref().map(SessionRef::as_str),
             origin: self.origin,
             authority: self.authority,
@@ -485,29 +540,46 @@ fn identifier_alias(name: &str) -> Option<String> {
 
 /// Pure router: every arm owns its own start event, permission gate and
 /// telemetry, so adding a source never means editing another one's path.
+///
+/// `ask` is an input layer's reason to show the call to the user. Native and
+/// MCP tools raise it at their own gate, so the prompt names the scopes their
+/// rules would have judged. Local tools and tool search have no gate, so they
+/// get one here.
 async fn run_inner(
     resolved: Resolved<'_>,
     id: String,
     input: &Value,
     ctx: &ToolContext,
     origin: CallOrigin,
+    ask: Option<&str>,
 ) -> ToolDoneEvent {
     let name = resolved.name;
+    if let (Some(_), Route::Local(_) | Route::ToolSearch(_)) = (ask, &resolved.route)
+        && let Err(e) = gate_on_input(ctx, &ToolKey::native(name), &id, input, ask).await
+    {
+        return ToolDoneEvent {
+            tool: Arc::from(name),
+            ..ToolDoneEvent::error(id, e)
+        };
+    }
     match resolved.route {
         Route::Local(local) => run_local_tool(&local.handler, id, name, input, ctx, origin).await,
-        Route::Native(entry) => run_native_tool(entry, id, name, input, ctx, origin).await,
+        Route::Native(entry) => run_native_tool(entry, id, name, input, ctx, origin, ask).await,
         Route::ToolSearch(mcp) => run_tool_search(mcp, id, input, ctx, origin),
         Route::Mcp(mcp, qualified) => {
-            execute_mcp_tool(ctx, mcp, &id, qualified, input, origin).await
+            execute_mcp_tool(ctx, mcp, &id, qualified, input, origin, ask).await
         }
         Route::Unknown => {
             warn!(tool = %name, "unknown tool");
+            let mut text = format!("{UNKNOWN_TOOL_PREFIX}: {name}");
+            if ctx.mcp.is_some() && is_wire_name(name) {
+                text = format!("{text}. {MCP_SERVER_GONE}");
+            }
             ToolDoneEvent {
+                call: None,
                 id,
                 tool: Arc::from(UNKNOWN_MCP),
-                output: Arc::new(ToolOutput::Plain(
-                    format!("{UNKNOWN_TOOL_PREFIX}: {name}").into(),
-                )),
+                output: Arc::new(ToolOutput::Plain(text.into())),
                 is_error: true,
                 annotation: None,
                 written_path: None,
@@ -524,11 +596,13 @@ async fn run_native_tool(
     input: &Value,
     ctx: &ToolContext,
     origin: CallOrigin,
+    ask: Option<&str>,
 ) -> ToolDoneEvent {
     let tool_id: Arc<str> = Arc::from(entry.tool.name());
     let started = Instant::now();
 
     let done_error = |msg: String| ToolDoneEvent {
+        call: None,
         id: id.clone(),
         tool: Arc::clone(&tool_id),
         output: Arc::new(ToolOutput::Plain(msg.into())),
@@ -594,7 +668,7 @@ async fn run_native_tool(
 
     invocation.start(ctx).await;
 
-    if let Err(e) = enforce_permission(invocation.as_ref(), name, ctx, &id).await {
+    if let Err(e) = enforce_permission(invocation.as_ref(), name, input, ctx, &id, ask).await {
         return done_error(e);
     }
 
@@ -640,6 +714,7 @@ async fn run_native_tool(
                 "tool ok"
             );
             ToolDoneEvent {
+                call: None,
                 id,
                 tool: tool_id,
                 output: Arc::new(output),
@@ -699,14 +774,16 @@ fn run_tool_search(
     let tool_id: Arc<str> = Arc::from(TOOL_SEARCH_TOOL_NAME);
     let query = input["query"].as_str().unwrap_or_default();
     emit_raw_start(ctx, origin, &id, &tool_id, query.to_owned(), input);
-    let (output, is_error) = match mcp.search_tools(query, origin) {
-        Ok(out) => (out, false),
-        Err(e) => (e, true),
+    let deferral = ToolDeferral::for_model(&ctx.model);
+    let (output, is_error) = match mcp.search_tools(query, origin, deferral) {
+        Ok(found) => (found, false),
+        Err(e) => (e.into(), true),
     };
     ToolDoneEvent {
+        call: None,
         id,
         tool: tool_id,
-        output: Arc::new(ToolOutput::Markdown(output.into())),
+        output: Arc::new(ToolOutput::Markdown(output)),
         is_error,
         annotation: None,
         written_path: None,
@@ -735,6 +812,7 @@ async fn run_local_tool(
         }
     };
     ToolDoneEvent {
+        call: None,
         id,
         tool: tool_id,
         output: Arc::new(ToolOutput::Plain(output.into())),
@@ -751,30 +829,57 @@ async fn run_local_tool(
 async fn enforce_permission(
     inv: &dyn ToolInvocation,
     name: &str,
+    input: &Value,
     ctx: &ToolContext,
     id: &str,
+    ask: Option<&str>,
 ) -> Result<(), String> {
     if name.contains('.') {
         return Err(format!(
             "enforce_permission called with dotted name: {name}"
         ));
     }
-    if let Some(scopes) = inv.permission_scopes().await {
-        let tool_key = ToolKey::native(name);
-        ctx.permissions
-            .enforce(
-                &tool_key,
-                &scopes,
-                &ctx.event_tx,
-                ctx.user_response_rx.as_deref(),
-                id,
-                &ctx.cancel,
-                ctx.mode.plan_path(),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+    match (inv.permission_scopes().await, ask) {
+        (Some(scopes), ask) => gate(ctx, &ToolKey::native(name), &scopes, id, ask).await,
+        (None, Some(_)) => gate_on_input(ctx, &ToolKey::native(name), id, input, ask).await,
+        (None, None) => Ok(()),
     }
-    Ok(())
+}
+
+async fn gate(
+    ctx: &ToolContext,
+    tool: &ToolKey,
+    scopes: &PermissionScopes,
+    id: &str,
+    ask: Option<&str>,
+) -> Result<(), String> {
+    ctx.permissions
+        .enforce(
+            tool,
+            scopes,
+            &ctx.event_tx,
+            ctx.user_response_rx.as_deref(),
+            id,
+            &ctx.cancel,
+            ctx.mode.plan_path(),
+            ask,
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// For a call with no scopes of its own, like an MCP call or an escalated tool
+/// without a gate. The input becomes the scope, so the prompt has something
+/// to show.
+async fn gate_on_input(
+    ctx: &ToolContext,
+    tool: &ToolKey,
+    id: &str,
+    input: &Value,
+    ask: Option<&str>,
+) -> Result<(), String> {
+    let scope = truncate_bytes(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
+    gate(ctx, tool, &PermissionScopes::single(scope), id, ask).await
 }
 
 async fn execute_mcp_tool(
@@ -784,12 +889,14 @@ async fn execute_mcp_tool(
     tool: Arc<str>,
     input: &Value,
     origin: CallOrigin,
+    ask: Option<&str>,
 ) -> ToolDoneEvent {
     emit_raw_start(ctx, origin, id, &tool, format!("mcp: {tool}"), input);
-    let done = |output: String, is_error: bool| ToolDoneEvent {
+    let done = |output: TextOutput, is_error: bool| ToolDoneEvent {
+        call: None,
         id: id.to_owned(),
         tool: Arc::clone(&tool),
-        output: Arc::new(ToolOutput::Plain(output.into())),
+        output: Arc::new(ToolOutput::Plain(output)),
         is_error,
         annotation: None,
         written_path: None,
@@ -798,35 +905,26 @@ async fn execute_mcp_tool(
     let perm_tool = match ToolKey::parse(&tool) {
         Ok(k) => k,
         Err(e) => {
-            return done(format!("invalid MCP tool key '{tool}': {e}"), true);
+            return done(format!("invalid MCP tool key '{tool}': {e}").into(), true);
         }
     };
-    let perm_scope = truncate_bytes(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
-    let perm_scopes = crate::tools::PermissionScopes::single(perm_scope);
-
-    if let Err(e) = ctx
-        .permissions
-        .enforce(
-            &perm_tool,
-            &perm_scopes,
-            &ctx.event_tx,
-            ctx.user_response_rx.as_deref(),
-            id,
-            &ctx.cancel,
-            ctx.mode.plan_path(),
-        )
-        .await
-    {
-        return done(e.to_string(), true);
+    if let Err(e) = gate_on_input(ctx, &perm_tool, id, input, ask).await {
+        return done(e.into(), true);
     }
 
-    // A permitted call counts as loading the tool, so its definition joins the
-    // next request; a denied one must not load anything.
-    mcp.mark_loaded(&tool, origin);
-    match mcp.call_tool(&tool, input).await {
-        Ok(text) => done(text, false),
-        Err(e) => done(e.to_string(), true),
-    }
+    // Only a permitted call loads the tool.
+    let loaded_tools = mcp.load_called(&tool, origin, ToolDeferral::for_model(&ctx.model));
+    let (text, is_error) = match mcp.call_tool(&tool, input).await {
+        Ok(text) => (text, false),
+        Err(e) => (e.to_string(), true),
+    };
+    done(
+        TextOutput {
+            loaded_tools,
+            ..text.into()
+        },
+        is_error,
+    )
 }
 
 /// Deduplicates doom-loop repeats, then runs remaining calls in parallel.
@@ -988,28 +1086,33 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use flume::Receiver;
     use maki_config::{
         Effect, Permission, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
     };
+    use smol::lock::Mutex as AsyncMutex;
     use test_case::test_case;
 
     use super::*;
     use crate::cancel::CancelToken;
     use crate::mcp::test_support::stub_session;
-    use crate::mcp::tool_names;
-    use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
+    use crate::mcp::{ToolDeferral, tool_names};
+    use crate::permissions::{
+        PERMISSION_DENIED_PREFIX, PermissionAnswer, PermissionManager, TaggedAnswer,
+    };
     use crate::template::Vars;
     use crate::tools::registry::{ToolRegistry, ToolSource};
     use crate::tools::schema::{JsonPath, ToolInputErrorKind};
     use crate::tools::test_support::{
-        GUARDED_TOOL_NAME, GuardedMock, mock_tool, stub_ctx, stub_ctx_with_permissions,
+        GUARDED_TOOL_NAME, GuardedMock, mock_tool, mock_tool_with_schema, stub_ctx,
+        stub_ctx_with_permissions,
     };
     use crate::tools::{
         BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
         PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience, ToolExecResult,
         ToolHook, local_tool,
     };
-    use crate::{AgentMode, InstructionBlock};
+    use crate::{AgentMode, Envelope, EventSender, InstructionBlock};
 
     const TEST_ID: &str = "t1";
     const PROBE_WIRE: &str = "srv__probe";
@@ -1048,6 +1151,11 @@ mod tests {
     /// Real elapsed time inside the call, so the gap between the two stages'
     /// windows is a measurement rather than a race.
     const HOOK_SLOW_RUN: Duration = Duration::from_millis(20);
+    const HOOK_TOOL_KIND: &str = "execute";
+    const HOOK_ASK_REASON: &str = "a human should see this";
+    const SCOPELESS_TOOL_NAME: &str = "scopeless";
+    const SEARCH_QUERY_FIELD: &str = "query";
+    const SEARCH_QUERY: &str = "probe";
 
     fn recent_calls(entries: &[(&str, Value)]) -> RecentCalls {
         let mut rc = RecentCalls::new();
@@ -1062,6 +1170,7 @@ mod tests {
     #[test_case("read", &[("read", "/a"), ("read", "/b")], false ; "different_input_breaks_chain")]
     #[test_case("grep", &[("glob", "/a"), ("glob", "/a")], false ; "different_tool_name")]
     #[test_case("bash", &[("bash", "/a"), ("bash", "/b"), ("bash", "/a")], false ; "interrupted_chain")]
+    #[test_case("bash", &[("bash", "/a"), ("bash", "/a ")], true  ; "near_duplicate_whitespace_triggers")]
     fn doom_loop_detection(name: &str, history: &[(&str, &str)], expected: bool) {
         let entries: Vec<_> = history
             .iter()
@@ -1069,6 +1178,17 @@ mod tests {
             .collect();
         let input = serde_json::json!({"path": "/a"});
         assert_eq!(recent_calls(&entries).is_doom_loop(name, &input), expected);
+    }
+
+    #[test_case(json!({"path": "/a "}), json!({"path": "\n/a"}), true ; "trimmed_whitespace")]
+    #[test_case(json!({"path": "/a", "offset": 1}), json!({"offset": 1, "path": "/a"}), true ; "reordered_keys")]
+    #[test_case(json!({"command": "grep \"a  b\""}), json!({"command": "grep \"a b\""}), false ; "interior_whitespace_kept")]
+    #[test_case(json!({"path": "/a", "offset": 1}), json!({"path": "/a", "offset": 201}), false ; "paginated_read")]
+    fn doom_loop_input_normalization(a: Value, b: Value, same: bool) {
+        assert_eq!(
+            RecentCalls::hash_input(&a) == RecentCalls::hash_input(&b),
+            same
+        );
     }
 
     fn local_ctx(
@@ -1135,12 +1255,19 @@ mod tests {
     }
 
     fn ruled_ctx(mode: &AgentMode, tool: ToolKey, effect: Effect) -> ToolContext {
-        let config = PermissionsConfig {
-            rules: vec![PermissionRule {
+        rules_ctx(
+            mode,
+            vec![PermissionRule {
                 tool,
                 scope: None,
                 effect,
             }],
+        )
+    }
+
+    fn rules_ctx(mode: &AgentMode, rules: Vec<PermissionRule>) -> ToolContext {
+        let config = PermissionsConfig {
+            rules,
             ..Default::default()
         };
         let permissions = Arc::new(PermissionManager::new(
@@ -1230,6 +1357,9 @@ mod tests {
         fn required_permission(&self) -> Option<Permission> {
             self.0
         }
+        fn tool_kind(&self) -> Option<&str> {
+            Some(HOOK_TOOL_KIND)
+        }
         fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
             match input[HOOK_FIELD].as_str() {
                 Some(command) => Ok(Box::new(HookMockInvocation(command.to_owned()))),
@@ -1245,6 +1375,8 @@ mod tests {
         authority: Authority,
         tool: String,
         tool_id: String,
+        tool_kind: Option<String>,
+        input: Option<Value>,
         session_id: Option<String>,
         origin: CallOrigin,
         value: Value,
@@ -1343,6 +1475,8 @@ mod tests {
                 authority: call.authority,
                 tool: call.tool.to_owned(),
                 tool_id: call.tool_id.to_owned(),
+                tool_kind: call.tool_kind.map(str::to_owned),
+                input: call.input.cloned(),
                 session_id: call.session_id.map(str::to_owned),
                 origin: call.origin,
                 value: value.clone(),
@@ -1697,6 +1831,230 @@ mod tests {
         });
     }
 
+    /// The call record is what plugins read back later, so it has to name the
+    /// call that ran, and a call that never ran has none.
+    #[test_case(HOOK_PLAIN,          Some(HOOK_PLAIN)        ; "an_untouched_call_records_its_input")]
+    #[test_case(HOOK_REWRITTEN_FROM, Some(HOOK_REWRITTEN_TO) ; "a_rewritten_call_records_the_rewrite")]
+    #[test_case(HOOK_DENIED,         None                    ; "a_stopped_call_records_nothing")]
+    fn the_call_record_holds_the_input_that_ran(command: &str, expected: Option<&str>) {
+        smol::block_on(async {
+            let (ctx, _hook) = hooked_ctx(build_ctx());
+            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(command)).await;
+
+            assert_eq!(done.call.map(|c| c.input), expected.map(call_input));
+        });
+    }
+
+    /// A layer judging a result sees the call that produced it, not the one
+    /// the model sent before the input stage had its say.
+    #[test]
+    fn the_output_stage_sees_the_input_that_ran_and_the_tool_kind() {
+        smol::block_on(async {
+            let (ctx, hook) = hooked_ctx(build_ctx());
+            dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_REWRITTEN_FROM)).await;
+
+            let input = hook.at(HookStage::Input).expect("the input stage fired");
+            let output = hook.at(HookStage::Output).expect("the output stage fired");
+            assert_eq!(
+                input.input, None,
+                "the input stage gets the input as its value"
+            );
+            assert_eq!(output.input, Some(call_input(HOOK_REWRITTEN_TO)));
+            for firing in [input, output] {
+                assert_eq!(firing.tool_kind.as_deref(), Some(HOOK_TOOL_KIND));
+            }
+        });
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Prompt {
+        tool: ToolKey,
+        scopes: Vec<String>,
+        reason: Option<String>,
+    }
+
+    fn asked(tool: ToolKey, scope: String) -> Prompt {
+        Prompt {
+            tool,
+            scopes: vec![scope],
+            reason: Some(HOOK_ASK_REASON.to_owned()),
+        }
+    }
+
+    /// Queues the answer before anything asks, so a call that prompts finds it
+    /// waiting and one that does not leaves it unread.
+    fn answered(
+        mut ctx: ToolContext,
+        answer: PermissionAnswer,
+    ) -> (ToolContext, Receiver<Envelope>) {
+        let (event_tx, events) = flume::unbounded();
+        let (answer_tx, answer_rx) = flume::unbounded();
+        answer_tx
+            .send(TaggedAnswer::new(TEST_ID, answer).encode())
+            .unwrap();
+        ctx.event_tx = EventSender::new(event_tx, 0);
+        ctx.user_response_rx = Some(Arc::new(AsyncMutex::new(answer_rx)));
+        (ctx, events)
+    }
+
+    fn prompts(events: &Receiver<Envelope>) -> Vec<Prompt> {
+        events
+            .try_iter()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::PermissionRequest {
+                    tool,
+                    scopes,
+                    reason,
+                    ..
+                } => Some(Prompt {
+                    tool,
+                    scopes,
+                    reason,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ask_as_is(stage: HookStage, _value: &Value) -> Verdict {
+        match stage {
+            HookStage::Input => Verdict::Ask {
+                reason: HOOK_ASK_REASON.into(),
+                input: None,
+            },
+            HookStage::Output => Verdict::Unchanged,
+        }
+    }
+
+    fn ask_with_a_rewrite(stage: HookStage, _value: &Value) -> Verdict {
+        match stage {
+            HookStage::Input => Verdict::Ask {
+                reason: HOOK_ASK_REASON.into(),
+                input: Some(call_input(HOOK_REWRITTEN_TO)),
+            },
+            HookStage::Output => Verdict::Unchanged,
+        }
+    }
+
+    fn allow_ruled_ctx() -> ToolContext {
+        ruled_ctx(
+            &AgentMode::Build,
+            ToolKey::native(HOOK_TOOL_NAME),
+            Effect::Allow,
+        )
+    }
+
+    fn yolo_ctx() -> ToolContext {
+        let ctx = rules_ctx(&AgentMode::Build, Vec::new());
+        ctx.permissions.toggle_yolo();
+        ctx
+    }
+
+    /// Escalating only ever makes a call harder to run: whatever would have
+    /// let it through on its own, the user is asked, and their answer decides.
+    #[test_case(build_ctx,       PermissionAnswer::AllowOnce, ran(HOOK_PLAIN)                     ; "a_default_allow_still_asks")]
+    #[test_case(allow_ruled_ctx, PermissionAnswer::AllowOnce, ran(HOOK_PLAIN)                     ; "an_allow_rule_still_asks")]
+    #[test_case(yolo_ctx,        PermissionAnswer::AllowOnce, ran(HOOK_PLAIN)                     ; "yolo_still_asks")]
+    #[test_case(allow_ruled_ctx, PermissionAnswer::Deny,      PERMISSION_DENIED_PREFIX.to_owned() ; "the_user_can_refuse")]
+    fn an_input_ask_prompts_whatever_the_rules_allow(
+        build: fn() -> ToolContext,
+        answer: PermissionAnswer,
+        expected_start: String,
+    ) {
+        smol::block_on(async {
+            let (ctx, events) = answered(build(), answer);
+            let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_as_is));
+            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+
+            assert_eq!(
+                prompts(&events),
+                vec![asked(
+                    ToolKey::native(HOOK_TOOL_NAME),
+                    HOOK_PLAIN.to_owned()
+                )]
+            );
+            let text = done.output.as_text();
+            assert!(text.starts_with(&expected_start), "got: {text}");
+        });
+    }
+
+    /// The rewrite riding along with an ask is what the user approves and what
+    /// runs, or approving one command would run another.
+    #[test]
+    fn an_ask_with_a_rewrite_prompts_for_and_runs_the_rewrite() {
+        smol::block_on(async {
+            let (ctx, events) = answered(build_ctx(), PermissionAnswer::AllowOnce);
+            let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_with_a_rewrite));
+            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+
+            assert_eq!(
+                prompts(&events),
+                vec![asked(
+                    ToolKey::native(HOOK_TOOL_NAME),
+                    HOOK_REWRITTEN_TO.to_owned()
+                )]
+            );
+            assert_eq!(done.output.as_text(), ran(HOOK_REWRITTEN_TO));
+            assert_eq!(
+                done.call.map(|c| c.input),
+                Some(call_input(HOOK_REWRITTEN_TO))
+            );
+        });
+    }
+
+    /// The queued allow is the control: were the user asked, the call would run.
+    #[test]
+    fn a_deny_rule_refuses_an_ask_without_prompting() {
+        smol::block_on(async {
+            let (ctx, events) = answered(
+                denying_ctx(ToolKey::native(HOOK_TOOL_NAME)),
+                PermissionAnswer::AllowOnce,
+            );
+            let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_as_is));
+            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+
+            assert!(done.is_error);
+            let text = done.output.as_text();
+            assert!(text.starts_with(PERMISSION_DENIED_PREFIX), "got: {text}");
+            assert!(prompts(&events).is_empty());
+        });
+    }
+
+    fn scopeless_route_ctx() -> ToolContext {
+        let mut ctx = build_ctx();
+        ctx.registry = registered(mock_tool_with_schema(
+            SCOPELESS_TOOL_NAME,
+            ToolAudience::all(),
+            serde_json::json!({"type": "object"}),
+        ));
+        ctx
+    }
+
+    fn search_input() -> Value {
+        serde_json::json!({ SEARCH_QUERY_FIELD: SEARCH_QUERY })
+    }
+
+    /// A route with no scopes of its own still has to put the ask in front of
+    /// the user, so the input stands in as the scope.
+    #[test_case(host_route_ctx,      CLIENT_NAME,           ToolKey::native(CLIENT_NAME),           call_input(HOOK_PLAIN) ; "a_host_tool")]
+    #[test_case(scopeless_route_ctx, SCOPELESS_TOOL_NAME,   ToolKey::native(SCOPELESS_TOOL_NAME),   call_input(HOOK_PLAIN) ; "a_native_tool_without_scopes")]
+    #[test_case(mcp_route_ctx,       PROBE_WIRE,            ToolKey::parse(PROBE_QUALIFIED).unwrap(), call_input(HOOK_PLAIN) ; "an_mcp_tool")]
+    #[test_case(mcp_route_ctx,       TOOL_SEARCH_TOOL_NAME, ToolKey::native(TOOL_SEARCH_TOOL_NAME), search_input()         ; "tool_search")]
+    fn an_ask_on_a_route_without_scopes_prompts_on_the_input(
+        build: fn() -> ToolContext,
+        name: &str,
+        tool: ToolKey,
+        input: Value,
+    ) {
+        smol::block_on(async {
+            let (ctx, events) = answered(build(), PermissionAnswer::AllowOnce);
+            ctx.registry.set_hook(RecordingHook::answering(ask_as_is));
+            dispatch(&ctx, name, &input).await;
+
+            assert_eq!(prompts(&events), vec![asked(tool, input.to_string())]);
+        });
+    }
+
     #[test]
     fn local_tool_shadows_registry_and_maps_errors() {
         smol::block_on(async {
@@ -1850,7 +2208,7 @@ mod tests {
             assert!(done.output.as_text().contains(PROBE_WIRE));
 
             let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools);
+            mcp.extend_tools(&mut tools, ToolDeferral::Client);
             assert!(
                 tool_names(&tools).contains(&PROBE_WIRE),
                 "searched tool must join the next request"
@@ -1874,14 +2232,15 @@ mod tests {
     }
 
     #[test]
-    fn calling_deferred_mcp_tool_marks_it_loaded() {
+    fn calling_deferred_mcp_tool_loads_it_and_records_the_load_in_its_result() {
         smol::block_on(async {
             let mcp = stub_mcp(&[PROBE_QUALIFIED]);
             let done = dispatch(&mcp_ctx(&mcp), PROBE_WIRE, &serde_json::json!({})).await;
             assert_eq!(done.tool.as_ref(), PROBE_QUALIFIED, "must route to MCP");
+            assert_eq!(done.output.loaded_tools(), [PROBE_WIRE]);
 
             let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools);
+            mcp.extend_tools(&mut tools, ToolDeferral::Client);
             assert_eq!(
                 tool_names(&tools),
                 vec![PROBE_WIRE],
@@ -1890,9 +2249,9 @@ mod tests {
         });
     }
 
-    /// `McpSession::new` rebuilds the loaded set from the `ToolUse` blocks in
-    /// history, which hold no nested call, so loading one here would make the
-    /// live tool array differ from the resumed one.
+    /// `McpSession::new` rebuilds the loaded set from history, which holds no
+    /// nested call, so loading one here would make the live tool array differ
+    /// from the resumed one.
     #[test_case(PROBE_WIRE, serde_json::json!({}), PROBE_QUALIFIED ; "tool_call")]
     #[test_case(TOOL_SEARCH_TOOL_NAME, serde_json::json!({"query": "probe"}), TOOL_SEARCH_TOOL_NAME ; "tool_search")]
     fn nested_call_reaches_mcp_without_loading_anything(name: &str, input: Value, routed: &str) {
@@ -1900,9 +2259,10 @@ mod tests {
             let mcp = stub_mcp(&[PROBE_QUALIFIED]);
             let done = dispatch_nested(&mcp_ctx(&mcp), name, &input).await;
             assert_eq!(done.tool.as_ref(), routed, "must route to MCP");
+            assert!(done.output.loaded_tools().is_empty());
 
             let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools);
+            mcp.extend_tools(&mut tools, ToolDeferral::Client);
             assert_eq!(
                 tool_names(&tools),
                 vec![TOOL_SEARCH_TOOL_NAME],
@@ -1925,7 +2285,7 @@ mod tests {
             );
 
             let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools);
+            mcp.extend_tools(&mut tools, ToolDeferral::Client);
             assert_eq!(
                 tool_names(&tools),
                 vec![TOOL_SEARCH_TOOL_NAME],
@@ -2107,9 +2467,13 @@ mod tests {
     }
 
     /// The model only fixes names it recognizes, so it hears back what it sent.
-    #[test_case(None, "nonexistent.tool" ; "without_mcp")]
-    #[test_case(Some(PROBE_QUALIFIED), OTHER_WIRE ; "unpublished_wire_name")]
-    fn unknown_tool_errors_and_echoes_the_name_verbatim(published: Option<&str>, name: &str) {
+    #[test_case(None, "nonexistent.tool", false ; "without_mcp")]
+    #[test_case(Some(PROBE_QUALIFIED), OTHER_WIRE, true ; "unpublished_wire_name")]
+    fn unknown_tool_errors_and_echoes_the_name_verbatim(
+        published: Option<&str>,
+        name: &str,
+        server_gone: bool,
+    ) {
         smol::block_on(async {
             let mcp = published.map(|tool| stub_mcp(&[tool]));
             let ctx = match &mcp {
@@ -2122,6 +2486,7 @@ mod tests {
             let text = done.output.as_text();
             assert!(text.starts_with(UNKNOWN_TOOL_PREFIX), "got: {text}");
             assert!(text.contains(name), "got: {text}");
+            assert_eq!(text.contains(MCP_SERVER_GONE), server_gone, "got: {text}");
         });
     }
 
@@ -2151,7 +2516,10 @@ mod tests {
                 "plan mode must not block or deny the call, got: {text}"
             );
             let mut tools = serde_json::json!([]);
-            ctx.mcp.as_ref().unwrap().extend_tools(&mut tools);
+            ctx.mcp
+                .as_ref()
+                .unwrap()
+                .extend_tools(&mut tools, ToolDeferral::Client);
             assert!(
                 tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
                 "a permitted plan-mode call must load the definition"
@@ -2171,8 +2539,12 @@ mod tests {
             assert!(done.is_error);
             let text = done.output.as_text();
             assert!(text.starts_with(PERMISSION_DENIED_PREFIX), "got: {text}");
+            assert!(done.output.loaded_tools().is_empty());
             let mut tools = serde_json::json!([]);
-            ctx.mcp.as_ref().unwrap().extend_tools(&mut tools);
+            ctx.mcp
+                .as_ref()
+                .unwrap()
+                .extend_tools(&mut tools, ToolDeferral::Client);
             assert!(
                 !tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
                 "an unapproved call must not load the definition"

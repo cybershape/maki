@@ -16,7 +16,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
 use crossterm::event::{
-    Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
+    Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
@@ -31,24 +31,23 @@ use maki_lua::session_snapshot::{
     SessionSnapshot,
 };
 use maki_lua::{
-    EventHandle, HintReader, InputRequest, KeymapReader, LuaCommandReader, ModelRequest,
+    EventHandle, HintReader, InputRequest, Key, KeymapReader, LuaCommandReader, ModelRequest,
     PackCommand, PackPreparation, PlanRequest, SessionEndReason, SessionRequest, TaskRequest,
     UiAction, UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
-use maki_providers::provider::{Provider, fetch_all_models, from_model};
+use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
+use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
-use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::model::persist_model;
-use maki_storage::sessions::{SessionError, normalize_title};
+use maki_storage::sessions::normalize_title;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::AppSession;
 use crate::agent::{
     AgentHandles, ModelSlot, ModelSlots,
     shared_queue::{Compaction, QueueItem, QueuedInput},
@@ -63,6 +62,8 @@ use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 use crate::input::InputReader;
 use crate::repaint::{Dirty, IDLE_POLL};
+use crate::theme;
+use crate::{AppSession, OpenSession};
 
 use crate::storage_writer::StorageWriter;
 use crate::terminal;
@@ -81,18 +82,24 @@ const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
 /// disk round-trip; `session_has_content` tells which ones were saved.
 pub(crate) struct ShutdownReport {
     pub exit: ExitRequest,
-    pub tabs: Vec<AppSession>,
+    pub tabs: Vec<OpenSession>,
     pub focused: usize,
+    /// Sessions whose transcript never reached disk. The caller prints them
+    /// after dropping the terminal guard, so the line is not lost with the
+    /// alternate screen.
+    pub unsaved: Vec<MakiId>,
 }
 
 pub struct EventLoopParams {
     pub model: Model,
     pub needs_login: bool,
     pub commands: Vec<CustomCommand>,
-    pub sessions: Vec<AppSession>,
+    pub sessions: Vec<OpenSession>,
     pub focused: usize,
     pub startup_warnings: Vec<String>,
     pub startup_notice: Option<String>,
+    /// Shown in a popup that stays up until dismissed, not a flash.
+    pub startup_alert: Option<String>,
     pub storage: StateDir,
     pub config: AgentConfig,
     pub ui_config: UiConfig,
@@ -104,6 +111,7 @@ pub struct EventLoopParams {
     pub keymap_reader: KeymapReader,
     pub hint_reader: HintReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
+    pub ui_wake_rx: flume::Receiver<()>,
     pub ui_attachment: UiAttachment,
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
@@ -341,6 +349,7 @@ struct SessionRuntime {
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     last_status: SessionStatus,
+    last_title: String,
     /// Keyed by task id, never by position: a session reset reuses positions,
     /// so a new task would inherit the old one's status.
     last_tasks: Vec<(Arc<str>, TaskStatus)>,
@@ -395,14 +404,15 @@ struct SpawnCtx {
     lua_event_handle: EventHandle,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
-    available_models: Arc<ArcSwapOption<Vec<String>>>,
+    available_models: Arc<ArcSwapOption<ModelList>>,
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
     trust_question: Option<TrustQuestion>,
 }
 
 impl SpawnCtx {
-    fn spawn_runtime(&self, session: AppSession, slot: Arc<ModelSlot>) -> SessionRuntime {
+    fn spawn_runtime(&self, open: OpenSession, slot: Arc<ModelSlot>) -> SessionRuntime {
+        let session = &open.session;
         let resumed = !session.messages().is_empty();
         let permissions = Arc::new(self.permissions.fork());
         let cell = Arc::new(ArcSwap::from(Arc::clone(&slot)));
@@ -412,6 +422,11 @@ impl SpawnCtx {
                 id: SessionRef::from(session.id),
                 history: session.messages().to_vec(),
                 context_size: session.meta.context_size,
+                frame: session.frame().cloned(),
+                // The tab owns the session and persists it through
+                // `StorageWriter`, so the agent only gets the transcript and
+                // the frame it was sent under.
+                session: None,
             },
             self.config.clone(),
             self.ui_config.tool_output_lines,
@@ -424,7 +439,7 @@ impl SpawnCtx {
         );
         let mut app = App::new(
             &slot.model,
-            session,
+            open,
             self.storage.clone(),
             Arc::clone(&self.available_models),
             handles.mcp_reader(),
@@ -446,12 +461,14 @@ impl SpawnCtx {
             app.restore_resumed_session();
         }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
+        let last_title = app.state.session.title.clone();
         SessionRuntime {
             app,
             handles,
             shell_tx,
             shell_rx,
             last_status: SessionStatus::Idle,
+            last_title,
             last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
             slot: cell,
@@ -475,6 +492,7 @@ pub(crate) struct EventLoop<'t> {
     models_rx: flume::Receiver<()>,
     models_tx: flume::Sender<()>,
     ui_action_rx: flume::Receiver<UiAction>,
+    ui_wake_rx: flume::Receiver<()>,
     ui_attachment: UiAttachment,
     pack_tx: flume::Sender<Box<PackPreparation>>,
     pack_rx: flume::Receiver<Box<PackPreparation>>,
@@ -491,6 +509,9 @@ enum Wake {
     Input(Event),
     InputGone,
     Ui(UiAction),
+    /// Nothing to handle. The tick after every wake is what reads plugin
+    /// windows.
+    PluginWindow,
     Agent(usize, Box<maki_agent::Envelope>),
     Shell(usize, ShellEvent),
     Warn(String),
@@ -499,32 +520,12 @@ enum Wake {
 }
 
 struct BackgroundModels {
-    available: Arc<ArcSwapOption<Vec<String>>>,
+    available: Arc<ArcSwapOption<ModelList>>,
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     models_rx: flume::Receiver<()>,
     models_tx: flume::Sender<()>,
     task: smol::Task<()>,
-}
-
-fn merge_batch(
-    available: &Arc<ArcSwapOption<Vec<String>>>,
-    batch: maki_providers::provider::ModelBatch,
-    warn_tx: &flume::Sender<String>,
-) {
-    for w in batch.warnings {
-        let _ = warn_tx.try_send(w);
-    }
-    if batch.models.is_empty() {
-        return;
-    }
-    let mut merged = available.load().as_deref().cloned().unwrap_or_default();
-    for spec in &batch.models {
-        if !merged.contains(spec) {
-            merged.push(spec.clone());
-        }
-    }
-    available.store(Some(Arc::new(merged)));
 }
 
 /// The one way discovery starts, so startup and `/models refresh` cannot drift
@@ -533,25 +534,25 @@ fn merge_batch(
 /// next tick. The channel holds one slot, which collapses overlapping fetches
 /// into a single rebuild.
 fn fetch_models(
-    available: Arc<ArcSwapOption<Vec<String>>>,
+    available: Arc<ArcSwapOption<ModelList>>,
     policy: Arc<ModelPolicy>,
     warn_tx: flume::Sender<String>,
     models_tx: flume::Sender<()>,
 ) -> smol::Task<()> {
     smol::spawn(async move {
-        fetch_all_models(
-            &policy,
-            |batch| merge_batch(&available, batch, &warn_tx),
-            Some(Box::new(move || {
-                let _ = models_tx.try_send(());
-            })),
-        )
+        fetch_all_models_cached(&policy, |list, warnings| {
+            for w in warnings {
+                let _ = warn_tx.try_send(w);
+            }
+            available.store(Some(Arc::new(list)));
+        })
         .await;
+        let _ = models_tx.try_send(());
     })
 }
 
 fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
-    let available: Arc<ArcSwapOption<Vec<String>>> = Arc::new(ArcSwapOption::empty());
+    let available: Arc<ArcSwapOption<ModelList>> = Arc::new(ArcSwapOption::empty());
     let (warn_tx, warn_rx) = flume::unbounded::<String>();
     let (models_tx, models_rx) = flume::bounded::<()>(1);
     let task = fetch_models(
@@ -583,6 +584,7 @@ impl<'t> EventLoop<'t> {
             focused,
             mut startup_warnings,
             startup_notice,
+            startup_alert,
             storage,
             config,
             ui_config,
@@ -594,6 +596,7 @@ impl<'t> EventLoop<'t> {
             keymap_reader,
             hint_reader,
             ui_action_rx,
+            ui_wake_rx,
             ui_attachment,
             lua_event_handle,
             model_policy,
@@ -664,9 +667,9 @@ impl<'t> EventLoop<'t> {
 
         let mut runtimes: Vec<SessionRuntime> = sessions
             .into_iter()
-            .map(|session| {
-                let (slot, reason) = slots.get_or_fallback(&session.model);
-                let mut rt = ctx.spawn_runtime(session, slot);
+            .map(|open| {
+                let (slot, reason) = slots.get_or_fallback(&open.session.model);
+                let mut rt = ctx.spawn_runtime(open, slot);
                 if let Some(reason) = reason {
                     rt.app.flash(reason);
                 }
@@ -684,13 +687,16 @@ impl<'t> EventLoop<'t> {
         }
         if !ctx.mcp_config_errors.is_empty() {
             let msg = format!("MCP config error: {}", ctx.mcp_config_errors);
-            app.flash(msg);
+            app.queue_flash(msg);
         }
         if let Some(notice) = startup_notice {
-            app.flash(notice);
+            app.queue_flash(notice);
         }
         for warning in startup_warnings {
-            app.flash(warning);
+            app.queue_flash(warning);
+        }
+        if let Some(alert) = startup_alert {
+            app.alert_modal.open(alert);
         }
 
         let (pack_tx, pack_rx) = flume::unbounded();
@@ -709,6 +715,7 @@ impl<'t> EventLoop<'t> {
             models_rx: bg.models_rx,
             models_tx: bg.models_tx,
             ui_action_rx,
+            ui_wake_rx,
             ui_attachment,
             pack_tx,
             pack_rx,
@@ -817,6 +824,11 @@ impl<'t> EventLoop<'t> {
         if !self.ui_action_rx.is_disconnected() {
             sel = sel.recv(&self.ui_action_rx, |res| res.ok().map(Wake::Ui));
         }
+        if !self.ui_wake_rx.is_disconnected() {
+            sel = sel.recv(&self.ui_wake_rx, |res| {
+                res.ok().map(|()| Wake::PluginWindow)
+            });
+        }
         sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
         sel = sel.recv(&self.pack_rx, |res| res.ok().map(Wake::Pack));
         sel = sel.recv(&self.models_rx, |res| {
@@ -840,6 +852,7 @@ impl<'t> EventLoop<'t> {
             Wake::Input(ev) => self.handle_input(ev),
             Wake::InputGone => return Err(eyre!("terminal input reader stopped")),
             Wake::Ui(action) => self.handle_ui_action(action),
+            Wake::PluginWindow => {}
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
@@ -930,6 +943,7 @@ impl<'t> EventLoop<'t> {
         self.emit_focus_changes();
         dirty |= self.start_mailbox_runs();
         self.emit_status_changes();
+        self.emit_title_changes();
         self.emit_task_changes();
         self.emit_notifications();
         // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
@@ -1051,6 +1065,26 @@ impl<'t> EventLoop<'t> {
                     "session_id": rt.id(),
                     "title": rt.app.state.session.title,
                     "status": status.as_str(),
+                    "focused": i == self.focused,
+                }),
+            );
+        }
+    }
+
+    /// `/rename` and title auto-generation change the title without touching
+    /// the status diff above, so the title gets its own diff per frame.
+    fn emit_title_changes(&mut self) {
+        let handle = &self.ctx.lua_event_handle;
+        for (i, rt) in self.sessions.iter_mut().enumerate() {
+            if rt.app.state.session.title == rt.last_title {
+                continue;
+            }
+            rt.last_title = rt.app.state.session.title.clone();
+            handle.fire_autocmd(
+                "SessionTitleChanged",
+                json!({
+                    "session_id": rt.id(),
+                    "title": rt.last_title,
                     "focused": i == self.focused,
                 }),
             );
@@ -1182,6 +1216,7 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                 };
+                let mut claim = None;
                 if let Some(i) = self.position(id) {
                     if i == self.focused {
                         let _ = reply_tx.send(Err(DELETE_FOCUSED_ERR.into()));
@@ -1192,12 +1227,12 @@ impl<'t> EventLoop<'t> {
                         .lua_event_handle
                         .end_session(rt.id(), SessionEndReason::Delete);
                     rt.handles.cancel_all();
+                    claim = Some(rt.app.state.claim.clone());
                 }
-                self.ctx.storage_writer.delete(id, move |res| {
+                self.ctx.storage_writer.delete(id, claim, move |res| {
                     let reply = match res {
-                        Ok(()) | Err(SessionError::Storage(StorageError::NotFound(_))) => {
-                            Ok(json!(true))
-                        }
+                        Ok(()) => Ok(json!(true)),
+                        Err(e) if e.is_not_found() => Ok(json!(true)),
                         Err(e) => Err(e.to_string()),
                     };
                     let _ = reply_tx.send(reply);
@@ -1231,11 +1266,11 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(reply);
             }
             SessionRequest::New { prompt, focus } => {
-                let session = self.focused_app().blank_session();
+                let open = self.focused_app().blank_session();
                 // A blank session inherits the focused tab's model, whose slot
                 // is already built and sitting right here.
                 let slot = self.sessions[self.focused].slot.load_full();
-                let idx = self.push_runtime(self.ctx.spawn_runtime(session, slot));
+                let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
                 let id = self.sessions[idx].id();
                 maki_otel::emit::session_started(
                     maki_otel::emit::START_FRESH,
@@ -1283,10 +1318,10 @@ impl<'t> EventLoop<'t> {
                     if let Some(i) = self.position(id) {
                         self.sessions[i].app.state.session_mut().set_title(title);
                     } else {
-                        let mut session =
-                            AppSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
+                        let OpenSession { mut session, claim } =
+                            OpenSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
                         session.set_title(title);
-                        self.ctx.storage_writer.send(Arc::new(session));
+                        self.ctx.storage_writer.send(Arc::new(session), claim);
                     }
                     Ok(json!(true))
                 })();
@@ -1318,7 +1353,10 @@ impl<'t> EventLoop<'t> {
             ModelRequest::Available => {
                 let available = self.ctx.available_models.load();
                 Ok(json!(
-                    available.as_deref().map(Vec::as_slice).unwrap_or(&[])
+                    available
+                        .as_deref()
+                        .map(|list| list.specs.as_slice())
+                        .unwrap_or(&[])
                 ))
             }
             ModelRequest::Set {
@@ -1441,19 +1479,21 @@ impl<'t> EventLoop<'t> {
             self.focused = i;
             return Ok(());
         }
-        let session = AppSession::load(id, &self.ctx.storage)
+        // A session another maki owns is refused here, where it costs a flash,
+        // rather than at the first write, after a whole conversation.
+        let open = OpenSession::load(id, &self.ctx.storage)
             .map_err(|e| format!("Failed to load session: {e}"))?;
-        let (slot, reason) = self.slots.get_or_fallback(&session.model);
+        let (slot, reason) = self.slots.get_or_fallback(&open.session.model);
         let focused = &self.sessions[self.focused];
-        if SessionStatus::of(&focused.app) == SessionStatus::Idle && !focused.app.has_content() {
+        if SessionStatus::of(&focused.app) == SessionStatus::Idle && focused.app.is_blank() {
             let idx = self.focused;
             let history = self.sessions[idx]
                 .app
-                .apply_loaded_session(session, &slot.model);
+                .apply_loaded_session(open, &slot.model);
             self.apply_model(idx, slot);
             self.respawn_agent(idx, history);
         } else {
-            self.focused = self.push_runtime(self.ctx.spawn_runtime(session, slot));
+            self.focused = self.push_runtime(self.ctx.spawn_runtime(open, slot));
         }
         if let Some(reason) = reason {
             self.focused_app().flash(reason);
@@ -1475,19 +1515,34 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// Only a real focus report may recolor the caret: resume heuristics and
+    /// stray input prove nothing, and no FocusGained follows $EDITOR or fg.
+    fn sync_cursor(&self) {
+        theme::set_cursor_focused(self.focus != Focus::Unfocused);
+    }
+
     fn translate(&mut self, raw: Event) -> (Option<Msg>, Option<Event>) {
         match raw {
             Event::FocusGained => {
                 self.focus.report(Focus::Focused);
+                self.sync_cursor();
                 (None, None)
             }
             Event::FocusLost => {
                 self.focus.report(Focus::Unfocused);
+                self.sync_cursor();
                 (None, None)
             }
+            // The one place the host's view of a keypress is normalized, so
+            // it can never disagree with the identity a plugin is handed. A
+            // key no notation names passes through untouched: nothing to
+            // normalize, and `text_buffer` still reads its SUPER bit.
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 self.focus.note_input();
-                (Some(Msg::Key(key)), None)
+                (
+                    Some(Msg::Key(Key::from_event(key).map_or(key, KeyEvent::from))),
+                    None,
+                )
             }
             Event::Key(_) => (None, None),
             Event::Paste(text) => {
@@ -1654,9 +1709,11 @@ impl<'t> EventLoop<'t> {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();
                 let run_id = rt.app.run_id;
+                let workflow = rt.app.state.workflow;
                 rt.handles.queue.push(QueueItem::Compact(Compaction {
                     run_id,
                     instructions,
+                    workflow,
                 }));
             }
             Action::ToggleMcp(server_name, enabled) => {
@@ -1766,7 +1823,6 @@ impl<'t> EventLoop<'t> {
     }
 
     fn refresh_models(&self) {
-        self.ctx.available_models.store(None);
         fetch_models(
             Arc::clone(&self.ctx.available_models),
             Arc::clone(&self.ctx.model_policy),
@@ -1802,8 +1858,9 @@ impl<'t> EventLoop<'t> {
             .any(|rt| *rt.app.state.model.provider == *slug)
         {
             self.rebuild_models();
-        } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug)
-            && let Err(e) = self.change_model(builtin.default_model)
+        } else if let Some(default_model) =
+            maki_config::providers::builtin_provider(&slug).and_then(|b| b.default_model)
+            && let Err(e) = self.change_model(default_model)
         {
             self.focused_app().flash(e);
         }
@@ -1850,7 +1907,10 @@ impl<'t> EventLoop<'t> {
             app.checkpoint_now();
             // `app` drops at the end of this iteration, closing the
             // channels the agent loop waits on, so `join_all` can finish.
-            tabs.push(Arc::unwrap_or_clone(app.state.session));
+            tabs.push(OpenSession {
+                session: Arc::unwrap_or_clone(app.state.session),
+                claim: app.state.claim,
+            });
             agent_tasks.push(handles.into_task());
         }
         let save_sessions_ms = lap();
@@ -1860,12 +1920,13 @@ impl<'t> EventLoop<'t> {
             smol::block_on(h.shutdown());
         }
         let mcp_shutdown_ms = lap();
-        match Arc::try_unwrap(self.ctx.storage_writer) {
+        let unsaved = match Arc::try_unwrap(self.ctx.storage_writer) {
             Ok(writer) => writer.shutdown(AGENT_SHUTDOWN_TIMEOUT),
             Err(_) => {
-                warn!("storage writer has outstanding references, skipping graceful shutdown")
+                warn!("storage writer has outstanding references, skipping graceful shutdown");
+                Vec::new()
             }
-        }
+        };
         let storage_drain_ms = lap();
         info!(
             session_end_ms,
@@ -1881,6 +1942,7 @@ impl<'t> EventLoop<'t> {
             exit,
             tabs,
             focused: self.focused,
+            unsaved,
         }
     }
 }

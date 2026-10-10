@@ -6,7 +6,6 @@ use std::pin::pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
 use maki_agent::agent::{LoadedInstructions, tool_dispatch};
 use maki_agent::cancel::{CancelMap, CancelSlot};
@@ -19,20 +18,21 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
-    EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, McpSession, RunLedger,
-    SessionEvents, SubagentInfo, ToolDoneEvent, event_stream,
+    EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, InputSource, McpSession,
+    RunContext, RunContextBuilder, RunLedger, SessionEvents, SubagentInbox, SubagentInfo,
+    ToolDoneEvent, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{
-    ContentBlock, ContextGauge, Model, ModelError, RequestOptions, Role, ThinkingConfig,
-    TokenUsage, add_cost,
+    ContentBlock, ContextGauge, Model, RequestOptions, Role, ThinkingConfig, TokenUsage, add_cost,
 };
 use maki_storage::id::MakiId;
 use maki_storage::sessions::StoredThinking;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
+use smol::lock::Mutex as AsyncMutex;
 use tracing::info;
 
 use crate::api::tool::{audiences_to_lua, parse_audience};
@@ -43,13 +43,14 @@ use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::runtime::CANCELLED_MSG;
 
 const SESSION_CLOSED_ERR: &str = "session closed";
+const PROMPT_DROPPED_ERR: &str = "an `agent.user_message` layer dropped the prompt";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
     let Some(tier_str) = tier else {
         return Ok(Model::clone(&ctx.model));
     };
-    let requested: ModelTier = tier_str.parse().map_err(|e: ModelError| e.to_string())?;
+    let requested = tier_str.parse::<ModelTier>().map_err(|e| e.to_string())?;
     let effective = requested.capped_at(ctx.model.tier);
     if effective == ctx.model.tier {
         return Ok(Model::clone(&ctx.model));
@@ -603,6 +604,9 @@ async fn session(
     // the caller left out is also a name this session cannot dispatch or bind
     // inside its sandbox.
     let tools = RequestTools::assembled(tools_json, &agent_ctx.config, &model);
+    let system = system.unwrap_or_default();
+    let context: RunContextBuilder =
+        Arc::new(move |_, _| RunContext::fixed(system.clone(), tools.clone()));
 
     let state = SessionState {
         params: AgentParams {
@@ -627,8 +631,7 @@ async fn session(
             audience,
             model_policy: Arc::clone(&agent_ctx.model_policy),
         },
-        system: system.unwrap_or_default(),
-        tools,
+        context,
         opts,
         mcp: agent_ctx
             .mcp
@@ -643,6 +646,8 @@ async fn session(
         child_cancel,
         answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
         answer_tx: Some(answer_tx),
+        reauth: agent_ctx.reauth,
+        inbox: Arc::new(SubagentInbox::default()),
         parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
         ui_id,
         cancel_slot,
@@ -748,8 +753,8 @@ async fn dispatch_racing_live(
 
 struct SessionState {
     params: AgentParams,
-    system: String,
-    tools: RequestTools,
+    /// The caller's prompt and tools, fixed for the session's life.
+    context: RunContextBuilder,
     /// Already reconciled against `params.model`, so every reader agrees.
     opts: RequestOptions,
     /// Fresh per session so `tool_search` loads never leak between a
@@ -771,6 +776,10 @@ struct SessionState {
     child_cancel: maki_agent::cancel::CancelToken,
     answer_rx: Arc<AsyncMutex<flume::Receiver<String>>>,
     answer_tx: Option<flume::Sender<String>>,
+    reauth: bool,
+    /// Shared with the host through [`SubagentInfo`], so a user watching this
+    /// session can queue messages that its next turn boundary picks up.
+    inbox: Arc<SubagentInbox>,
     parent_cancels: Arc<CancelMap<String>>,
     /// Stable identity for UI, cancel, and history. Falls back to a synthetic
     /// id for workflow-mode sessions (no model-issued tool call exists).
@@ -868,6 +877,7 @@ async fn prompt(
             model: Some(s.params.model.spec()),
             opts: Some(s.opts),
             answer_tx: s.answer_tx.take(),
+            inbox: Some(Arc::clone(&s.inbox)),
         });
     }
 
@@ -877,12 +887,13 @@ async fn prompt(
         AgentRunParams {
             history: &mut s.history,
             gauge: &mut s.gauge,
-            system: s.system.clone(),
             event_tx: s.sub_event_tx.clone(),
-            tools: s.tools.clone(),
+            context: Arc::clone(&s.context),
         },
     )
     .with_user_response_rx(Arc::clone(&s.answer_rx))
+    .with_reauth(s.reauth)
+    .with_interrupt_source(Arc::clone(&s.inbox) as Arc<dyn maki_agent::InterruptSource>)
     .with_loaded_instructions(s.loaded_instructions.clone())
     .with_cancel(s.child_cancel.clone())
     .with_mcp(s.mcp.clone())
@@ -893,10 +904,12 @@ async fn prompt(
         mode: AgentMode::Build,
         images: Vec::new(),
         preamble: Vec::new(),
+        earlier: Vec::new(),
         thinking: s.opts.thinking,
         fast: s.opts.fast,
         workflow: false,
         prompt: None,
+        source: InputSource::Plugin,
     };
     let result = agent.run(input).await;
     drop(agent);
@@ -908,11 +921,18 @@ async fn prompt(
     let turn = &s.history.as_slice()[history_len.min(s.history.len())..];
     // A subagent can be cancelled on its own, and its caller should hear about
     // that instead of taking a half-finished answer for a real one, so cancel
-    // reads like an error here even though the run ended normally.
+    // reads like an error here even though the run ended normally. A dropped
+    // prompt never reached the model, so an empty answer would be a lie.
     let cut_short = match &result {
         Err(e) => Some(e.to_string()),
         Ok(DoneReason::Cancelled) => Some(CANCELLED_MSG.to_owned()),
-        Ok(_) => None,
+        Ok(DoneReason::Dropped) => Some(PROMPT_DROPPED_ERR.to_owned()),
+        Ok(
+            DoneReason::EndTurn
+            | DoneReason::MaxTokens
+            | DoneReason::MaxTurns
+            | DoneReason::Compact,
+        ) => None,
     };
     if let Some(err) = cut_short {
         let partial = turn
@@ -1077,6 +1097,7 @@ mod tests {
             model: None,
             opts: None,
             answer_tx: None,
+            inbox: None,
         })
         .unwrap();
         info
@@ -1099,6 +1120,7 @@ mod tests {
             turn(tokens(50, 10), 0.5),
             AgentEvent::Error {
                 message: IGNORED_ERROR.into(),
+                auth: false,
             },
             AgentEvent::Done {
                 usage: DONE_USAGE,

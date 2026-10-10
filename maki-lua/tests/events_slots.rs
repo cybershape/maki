@@ -2,6 +2,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use maki_agent::agent::{AgentCall, AgentSlot};
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
 use maki_agent::tools::{CallOrigin, ToolRegistry};
@@ -379,6 +380,8 @@ fn call_of<'a>(
     HookCall {
         tool,
         tool_id: TOOL_ID,
+        tool_kind: None,
+        input: None,
         session_id: None,
         origin,
         authority,
@@ -457,6 +460,7 @@ fn input_from(
         Verdict::Unchanged => (None, None),
         Verdict::Replaced(v) => (Some(v[COMMAND_FIELD].as_str().unwrap().to_owned()), None),
         Verdict::Denied(reason) => (None, Some(reason)),
+        Verdict::Ask { reason, .. } => unreachable!("no layer here escalates, got {reason}"),
     }
 }
 
@@ -469,6 +473,9 @@ fn output(reg: &ToolRegistry, tool: &str, text: &str, is_error: bool) -> Option<
             v[hook::OUTPUT_TEXT].as_str().unwrap().to_owned(),
             v[hook::OUTPUT_IS_ERROR].as_bool().unwrap_or(is_error),
         )),
+        Verdict::Ask { reason, .. } => {
+            unreachable!("an output layer cannot escalate, got {reason}")
+        }
     }
 }
 
@@ -539,6 +546,12 @@ fn load_granted(host: &PluginHost, plugin: &str, source: &str, granted: PluginPe
 fn only_run() -> PluginPermissions {
     let mut permissions = PluginPermissions::denied();
     permissions.set(Permission::Run, true);
+    permissions
+}
+
+fn only_net() -> PluginPermissions {
+    let mut permissions = PluginPermissions::denied();
+    permissions.set(Permission::Net, true);
     permissions
 }
 
@@ -813,6 +826,7 @@ fn a_parked_layer_ends_at_the_window_it_was_given() {
 #[test_case("tool.bash.input" ; "tool_stage")]
 #[test_case("ui.plan_form" ; "ui_surface")]
 #[test_case("ui.plan_form.actions" ; "ui_menu")]
+#[test_case("agent.stop" ; "agent_slot")]
 fn host_slot_names_are_reserved(name: &str) {
     let (_reg, host) = host();
     let err = host
@@ -1366,6 +1380,41 @@ fn an_output_layer_stops_the_call_with_its_reason() {
     );
 }
 
+/// Nothing can ask the user about an output, so an outer layer asking anyway
+/// must not throw away the redaction an inner plugin made.
+#[test]
+fn an_output_ask_keeps_the_rewrite_under_it() {
+    const REDACTED: &str = "[redacted]";
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        INNER_LAYER,
+        &layer(
+            SLOT_TOOL,
+            HookStage::Output,
+            &format!(
+                r#"value.{text} = "{REDACTED}"; return value"#,
+                text = hook::OUTPUT_TEXT
+            ),
+        ),
+    );
+    load(
+        &host,
+        OUTER_LAYER,
+        &layer(
+            SLOT_TOOL,
+            HookStage::Output,
+            r#"return prev(value, ctx), { ask = "why not" }"#,
+        ),
+    );
+
+    assert_eq!(
+        output(&reg, SLOT_TOOL, "secret", false),
+        Some((REDACTED.to_owned(), false))
+    );
+}
+
 /// One plugin's broken layer must not take the seam down or swallow the layers
 /// another plugin registered underneath it.
 #[test]
@@ -1398,6 +1447,145 @@ fn layers_compose_with_the_last_registered_outermost() {
     assert_eq!(
         input(&reg, SLOT_TOOL, COMMAND),
         (Some(format!("{COMMAND}{OUTER_MARK}{INNER_MARK}")), None)
+    );
+}
+
+const ANY_TOOL: &str = "*";
+
+/// The wildcard is loaded first, so load order alone would put it inside.
+#[test]
+fn wildcard_layers_wrap_every_tool_outside_the_specific_ones() {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    guarded_tool(&host);
+    load(&host, OUTER_LAYER, &marking_layer(ANY_TOOL, OUTER_MARK));
+    load(&host, INNER_LAYER, &marking_layer(SLOT_TOOL, INNER_MARK));
+
+    assert_eq!(
+        input(&reg, SLOT_TOOL, COMMAND),
+        (Some(format!("{COMMAND}{OUTER_MARK}{INNER_MARK}")), None)
+    );
+    assert_eq!(
+        input(&reg, GUARDED_TOOL, COMMAND),
+        (Some(format!("{COMMAND}{OUTER_MARK}")), None)
+    );
+}
+
+#[test]
+fn output_ctx_carries_the_input_and_kind() {
+    const KIND: &str = "execute";
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        LAYER_PLUGIN,
+        &layer(
+            ANY_TOOL,
+            HookStage::Output,
+            &format!(
+                r#"value.{text} = ctx.tool_kind .. ":" .. ctx.input.{COMMAND_FIELD}; return prev(value, ctx)"#,
+                text = hook::OUTPUT_TEXT
+            ),
+        ),
+    );
+    let cancel = CancelToken::none();
+    let tool_input = serde_json::json!({ COMMAND_FIELD: COMMAND });
+    let call = HookCall {
+        tool_kind: Some(KIND),
+        input: Some(&tool_input),
+        ..call_of(SLOT_TOOL, Authority::Unbounded, CallOrigin::Model, &cancel)
+    };
+
+    let verdict = fire_call(
+        &reg,
+        &call,
+        HookStage::Output,
+        serde_json::json!({ hook::OUTPUT_TEXT: "out", hook::OUTPUT_IS_ERROR: false }),
+    );
+    let Verdict::Replaced(value) = verdict else {
+        panic!("the layer rewrote the output, got {verdict:?}");
+    };
+    assert_eq!(value[hook::OUTPUT_TEXT], format!("{KIND}:{COMMAND}"));
+}
+
+/// Handing the value back untouched is a pass through and not a rewrite, so
+/// the prompt shows the call as the model made it.
+#[test_case("nil",                               None                  ; "ask_alone")]
+#[test_case("value",                             None                  ; "ask_after_a_pass_through_is_no_rewrite")]
+#[test_case(r#"{ command = "rm -rf /tmp/x" }"#, Some("rm -rf /tmp/x") ; "ask_with_a_rewrite")]
+fn input_layer_may_ask_the_user(answer: &str, rewritten: Option<&str>) {
+    const WHY: &str = "touches files outside the project";
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        LAYER_PLUGIN,
+        &layer(
+            SLOT_TOOL,
+            HookStage::Input,
+            &format!(r#"return {answer}, {{ ask = "{WHY}" }}"#),
+        ),
+    );
+
+    let verdict = fire(
+        &reg,
+        SLOT_TOOL,
+        CallOrigin::Model,
+        HookStage::Input,
+        serde_json::json!({ COMMAND_FIELD: COMMAND }),
+    );
+    let Verdict::Ask { reason, input } = verdict else {
+        panic!("the layer asked, got {verdict:?}");
+    };
+    assert_eq!(reason, WHY);
+    assert_eq!(
+        input,
+        rewritten.map(|r| serde_json::json!({ COMMAND_FIELD: r }))
+    );
+}
+
+const AGENT_MODEL: &str = "anthropic/claude-sonnet-4";
+const KEEP_GOING: &str = "keep going";
+const CONTINUE_FIELD: &str = "continue";
+
+fn stop_layer() -> String {
+    format!(
+        r#"maki.api.set_slot("agent.stop", function(prev, value, ctx)
+    assert(ctx.model == "{AGENT_MODEL}", ctx.model)
+    return {{ {CONTINUE_FIELD} = "{KEEP_GOING}" }}
+end)"#
+    )
+}
+
+/// Steering the agent is priced like a tool with no declared reach, so only a
+/// fully trusted plugin's layer runs.
+#[test_case(PluginPermissions::trusted, true  ; "trusted_layer_runs")]
+#[test_case(all_but_run,                false ; "almost_trusted_is_skipped")]
+fn agent_slot_layers_need_full_trust(granted: fn() -> PluginPermissions, runs: bool) {
+    let (reg, host) = host();
+    let hook = reg
+        .agent_hook()
+        .expect("the plugin host installs one at boot");
+    assert!(!hook.wraps(AgentSlot::Stop));
+    load_granted(&host, LAYER_PLUGIN, &stop_layer(), granted());
+    assert!(hook.wraps(AgentSlot::Stop));
+    assert!(!hook.wraps(AgentSlot::UserMessage));
+
+    let cancel = CancelToken::none();
+    let call = AgentCall {
+        session_id: None,
+        task_id: None,
+        model: AGENT_MODEL,
+        context_size: 0,
+        context_window: 0,
+        cancel: &cancel,
+        deadline: Instant::now() + DISPATCH_TIMEOUT,
+    };
+    let verdict = within(hook.run(AgentSlot::Stop, serde_json::json!({}), &call));
+    let kept_going = serde_json::json!({ CONTINUE_FIELD: KEEP_GOING });
+    assert_eq!(
+        matches!(verdict, Verdict::Replaced(value) if value == kept_going),
+        runs
     );
 }
 
@@ -1785,15 +1973,228 @@ fn get_slots_reports_owner_fillers_and_orphans() {
 maki.api.set_slot("orphan_slot", function(prev) return prev() end)
 maki.api.declare_slot("gs", function() return 1 end)
 maki.api.set_slot("gs", function(prev) return prev() end)
+maki.api.declare_slot("priced", function() return 1 end, { capability = { "net" } })
 local slots = maki.api.get_slots()
 local gs = slots["gs"]
 assert(gs.declared == true and gs.owner == "slots_introspect", tostring(gs.owner))
 assert(#gs.fillers == 1 and gs.fillers[1] == "slots_introspect")
+assert(gs.capability == nil, "naming no price is not the same as naming an empty one")
+local priced = slots["priced"].capability
+assert(#priced == 1 and priced[1] == "net", tostring(priced[1]))
 local orphan = slots["orphan_slot"]
 assert(orphan.declared == false and orphan.owner == nil)
 assert(orphan.fillers[1] == "slots_introspect")
 "#,
     );
+}
+
+/// The owner hands its callable out, because a slot is only observable from
+/// the far end of a call.
+const RENDER_OWNER: &str = r#"
+local render = maki.api.declare_slot("owner.render", function(text) return text end)
+maki.api.exec_autocmds("SlotShare", { data = { callable = render } })
+"#;
+
+/// The owner prices the slot at what its default actually reaches, so a layer
+/// pays for that and not for everything.
+const RENDER_OWNER_NET: &str = r#"
+local render = maki.api.declare_slot("owner.render", function(text) return text end, {
+  capability = { "net" },
+})
+maki.api.exec_autocmds("SlotShare", { data = { callable = render } })
+"#;
+
+/// Nothing the default does with {text} borrows anything, and the owner is the
+/// one who can say so.
+const RENDER_OWNER_FREE: &str = r#"
+local render = maki.api.declare_slot("owner.render", function(text) return text end, {
+  capability = {},
+})
+maki.api.exec_autocmds("SlotShare", { data = { callable = render } })
+"#;
+
+/// `set_slot` before `declare_slot`, from a plugin granted nothing: the shape
+/// `init.lua` has, since a config with no `plugin.toml` beside it is denied.
+const RENDER_SELF_LAYER_FIRST: &str = r#"
+maki.api.set_slot("owner.render", function(prev, text) return prev(text) .. "+self" end)
+local render = maki.api.declare_slot("owner.render", function(text) return text end)
+maki.api.exec_autocmds("SlotShare", { data = { callable = render } })
+"#;
+
+fn render_layer(mark: &str) -> String {
+    format!(
+        r#"maki.api.set_slot("owner.render", function(prev, text) return prev(text) .. "+{mark}" end)"#
+    )
+}
+
+/// The hole: a plugin nobody trusted steering a chain the owner's callers do.
+/// Registering it is free, and the chain drops it when it fires.
+#[test]
+fn a_foreign_layer_on_a_plugin_slot_costs_full_trust() {
+    let (reg, host) = host();
+    load(&host, "caller", SLOT_CALLER);
+    load(&host, "owner", RENDER_OWNER);
+
+    load_granted(
+        &host,
+        "attacker",
+        &render_layer("attacker"),
+        PluginPermissions::denied(),
+    );
+    assert_eq!(
+        exec_tool(&reg, "call_slot"),
+        "ok:world",
+        "a layer nobody trusted never steers another plugin's chain"
+    );
+
+    load_granted(
+        &host,
+        "trusted_wrapper",
+        &render_layer("trusted"),
+        PluginPermissions::trusted(),
+    );
+    assert_eq!(
+        exec_tool(&reg, "call_slot"),
+        "ok:world+trusted",
+        "full trust buys the layer, and the skipped one stays skipped"
+    );
+}
+
+/// Every permission is what a slot that named no price costs, not what every
+/// slot costs: the owner knows whether its default does anything with the
+/// arguments, so the owner sets the toll.
+#[test]
+fn an_owner_prices_its_slot_at_the_capability_it_names() {
+    let (reg, host) = host();
+    load(&host, "caller", SLOT_CALLER);
+    load(&host, "owner", RENDER_OWNER_NET);
+
+    load_granted(
+        &host,
+        "attacker",
+        &render_layer("attacker"),
+        PluginPermissions::denied(),
+    );
+    assert_eq!(
+        exec_tool(&reg, "call_slot"),
+        "ok:world",
+        "a narrower price is still a price"
+    );
+
+    load_granted(&host, "netonly", &render_layer("net"), only_net());
+    assert_eq!(
+        exec_tool(&reg, "call_slot"),
+        "ok:world+net",
+        "the named capability is the whole toll, not a floor"
+    );
+}
+
+/// A slot whose arguments are inert costs nothing, which is the case full
+/// trust priced wrong before the owner had any way to say so.
+#[test]
+fn an_owner_can_declare_its_slot_free_to_layer() {
+    let (reg, host) = host();
+    load(&host, "caller", SLOT_CALLER);
+    load(&host, "owner", RENDER_OWNER_FREE);
+    load_granted(
+        &host,
+        "stranger",
+        &render_layer("free"),
+        PluginPermissions::denied(),
+    );
+    assert_eq!(exec_tool(&reg, "call_slot"), "ok:world+free");
+}
+
+/// Pricing is not a way to advertise reach nobody granted you.
+#[test]
+fn a_plugin_cannot_price_a_slot_in_a_capability_it_lacks() {
+    let (_reg, host) = host();
+    let err = host
+        .load_source_with_permissions("poor", RENDER_OWNER_NET, PluginPermissions::denied())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("prices layers at") && err.contains("not granted"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Otherwise the price is advisory: wait for the owner to unload, re-declare
+/// its name free, and inherit the layers, and the callers, that trusted the
+/// old one.
+#[test]
+fn an_unloaded_owner_keeps_its_slot_name() {
+    let (_reg, host) = host();
+    load(&host, "owner", RENDER_OWNER);
+    host.unload("owner").unwrap();
+
+    let err = host
+        .load_source("squatter", RENDER_OWNER_FREE)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("already declared by 'owner'"),
+        "unexpected error: {err}"
+    );
+    load(&host, "owner", RENDER_OWNER_FREE);
+}
+
+/// Fire time reads what the last load granted the plugin, so narrowing a
+/// layer's reach costs a reload rather than a restart.
+#[test]
+fn narrowing_a_layers_grant_drops_it_from_the_next_call() {
+    let (reg, host) = host();
+    load(&host, "caller", SLOT_CALLER);
+    load(&host, "owner", RENDER_OWNER);
+    load_granted(
+        &host,
+        "wrapper",
+        &render_layer("wrap"),
+        PluginPermissions::trusted(),
+    );
+    assert_eq!(exec_tool(&reg, "call_slot"), "ok:world+wrap");
+
+    load_granted(&host, "wrapper", &render_layer("wrap"), all_but_run());
+    assert_eq!(
+        exec_tool(&reg, "call_slot"),
+        "ok:world",
+        "almost all is not all, and the next call is where it shows"
+    );
+}
+
+/// Registration says nothing about entitlement, for host slots and plugin
+/// slots alike: what the plugin holds is read when the chain fires.
+#[test]
+fn a_denied_plugin_registers_a_host_slot_layer() {
+    let (_reg, host) = host();
+    load_granted(
+        &host,
+        "denied_host_layer",
+        &format!(
+            r#"
+{}
+local fillers = maki.api.get_slots()["tool.bash.input"].fillers
+assert(#fillers == 1 and fillers[1] == "denied_host_layer", tostring(fillers[1]))
+"#,
+            layer("bash", HookStage::Input, "return prev(value, ctx)")
+        ),
+        PluginPermissions::denied(),
+    );
+}
+
+/// Registration order stops mattering: by the time the chain fires, the plugin
+/// that filled the orphan owns it, and an owner steers its own chain for free.
+#[test]
+fn a_denied_plugin_wraps_the_slot_it_declares_afterwards() {
+    let (reg, host) = host();
+    load(&host, "caller", SLOT_CALLER);
+    load_granted(
+        &host,
+        "owner",
+        RENDER_SELF_LAYER_FIRST,
+        PluginPermissions::denied(),
+    );
+    assert_eq!(exec_tool(&reg, "call_slot"), "ok:world+self");
 }
 
 const SLOT_CALLER: &str = r#"

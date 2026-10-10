@@ -23,6 +23,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const NO_MATCHES: &str = "No matches";
 const MIN_WIDTH_PERCENT: u16 = 65;
+/// Fits a long model id next to its tier and price columns.
+const MIN_WIDTH_COLS: u16 = 72;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 const SEARCH_ROW: u16 = 1;
 const DETAIL_RIGHT_PAD: u16 = 1;
@@ -77,6 +79,7 @@ struct State<T> {
     inner_area: Rect,
     enabled: Option<Vec<bool>>,
     matcher: Matcher,
+    notice: Option<&'static str>,
 }
 
 impl<T: PickerItem> State<T> {
@@ -92,6 +95,7 @@ impl<T: PickerItem> State<T> {
             inner_area: Rect::default(),
             enabled: None,
             matcher: Matcher::new(Config::DEFAULT),
+            notice: None,
         }
     }
 
@@ -288,6 +292,13 @@ impl<T: PickerItem> ListPicker<T> {
 
     pub fn set_error_text(&mut self, text: Option<String>) {
         self.error_text = text;
+    }
+
+    /// A dim line under the list, for state that is not an item.
+    pub fn set_notice(&mut self, notice: Option<&'static str>) {
+        if let Some(s) = self.state.as_mut() {
+            s.notice = notice;
+        }
     }
 
     pub fn replace_items(&mut self, items: Vec<T>) {
@@ -506,6 +517,7 @@ fn render_ready<T: PickerItem>(
     footer: Option<fn() -> Line<'static>>,
     error_text: Option<&str>,
 ) -> Rect {
+    let notice = s.notice;
     let footer_rows = if footer.is_some() { 1u16 } else { 0 };
     let content_rows = if s.filtered.is_empty() {
         1
@@ -517,28 +529,33 @@ fn render_ready<T: PickerItem>(
         }
     };
     let error_rows = error_text.is_some() as u16;
+    let notice_rows = notice.is_some() as u16;
     let modal = Modal {
         title,
-        width_percent: MIN_WIDTH_PERCENT,
+        width_percent: width_percent(area.width),
         max_height_percent: MAX_HEIGHT_PERCENT,
     };
     let (popup, inner) = modal.render(
         frame,
         area,
-        content_rows + SEARCH_ROW + footer_rows + error_rows,
+        content_rows + SEARCH_ROW + footer_rows + error_rows + notice_rows,
     );
     let viewport_h = inner
         .height
-        .saturating_sub(error_rows + SEARCH_ROW + footer_rows);
+        .saturating_sub(error_rows + notice_rows + SEARCH_ROW + footer_rows);
     s.viewport_height = viewport_h as usize;
     s.ensure_visible();
 
-    let mut constraints: Vec<Constraint> =
-        Vec::with_capacity(3 + footer.is_some() as usize + error_text.is_some() as usize);
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(
+        3 + footer.is_some() as usize + error_text.is_some() as usize + notice.is_some() as usize,
+    );
     if error_text.is_some() {
         constraints.push(Constraint::Length(1)); // error line
     }
     constraints.push(Constraint::Min(1)); // list
+    if notice.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
     constraints.push(Constraint::Length(1)); // search
     if footer.is_some() {
         constraints.push(Constraint::Length(1));
@@ -558,6 +575,15 @@ fn render_ready<T: PickerItem>(
 
     let list_area = areas[area_idx];
     area_idx += 1;
+
+    if let Some(notice) = notice {
+        let line = Line::from(Span::styled(
+            format!("  {notice}"),
+            theme::current().tool_dim,
+        ));
+        frame.render_widget(Paragraph::new(vec![line]), areas[area_idx]);
+        area_idx += 1;
+    }
 
     let search_area = areas[area_idx];
     area_idx += 1;
@@ -639,6 +665,14 @@ fn find_scroll_offset_for_bottom<T: PickerItem>(
         return 0;
     }
     find_scroll_offset_for(filtered, items, len - 1, viewport_height)
+}
+
+/// On a narrow screen the percentage alone leaves the label a sliver next to
+/// its detail, so the picker takes more of the screen before it truncates.
+fn width_percent(screen_width: u16) -> u16 {
+    (MIN_WIDTH_COLS * 100)
+        .div_ceil(screen_width.max(1))
+        .clamp(MIN_WIDTH_PERCENT, 100)
 }
 
 fn truncate_label(label: &str, max_width: usize) -> String {
@@ -987,6 +1021,13 @@ mod tests {
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(matches!(action, PickerAction::Select(ref e) if e.label == "B"));
         assert!(!p.is_open());
+    }
+
+    #[test_case(200, MIN_WIDTH_PERCENT ; "wide_screen_keeps_the_default")]
+    #[test_case(80,  90                ; "narrow_screen_grows_to_fit")]
+    #[test_case(60,  100               ; "tiny_screen_takes_it_all")]
+    fn picker_width_percent(screen_width: u16, expected: u16) {
+        assert_eq!(width_percent(screen_width), expected);
     }
 
     #[test_case(key(KeyCode::Esc) ; "esc_returns_close")]

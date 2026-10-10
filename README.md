@@ -2,6 +2,12 @@
 
 An AI coding agent optimized for minimal use of context tokens, while providing a great user experience.
 
+## Benchmarks
+
+<img src="./site/bench.svg" alt="Maki 0.5.5 at 70% pass rate and $2.06 per pass, against the FrontierHarness Eval baselines">
+
+[FrontierHarness Eval](https://frontierharness.org/) benchmark result, [click here to download report.zip](https://github.com/tontinton/maki/releases/download/v0.5.5/frontierharness-report-2026-09-21.zip)
+
 ## Features
 
 ### Context efficiency
@@ -56,7 +62,9 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * OpenCode Go - `OPENCODE_API_KEY`. Models from the models.dev catalog.
 * Aperture - `APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.
 
-**Dynamic providers** - drop an executable script into `~/.config/maki/providers/` to add custom providers or proxies. See [docs](https://maki.sh/docs/providers/#dynamic-providers) for details.
+**Plugin providers** - a Lua plugin can register a provider with `maki.provider.register`, and its models behave like any built-in provider's. See [docs](https://maki.sh/docs/providers/#plugin-providers) for details.
+
+> Providers as Lua plugins WIP!
 
 ## Installation
 
@@ -142,7 +150,7 @@ More info at the [official docs](https://maki.sh/docs).
 
 ## Community
 
-[![Discord](https://img.shields.io/discord/1543246528876126218?logo=discord&logoColor=white&label=discord&color=5865F2)](https://discord.gg/dEBhANTbX)
+[![Discord](https://img.shields.io/discord/1543246528876126218?logo=discord&logoColor=white&label=discord&color=5865F2)](https://discord.gg/8VKuA4naC3)
 
 ## Example config
 

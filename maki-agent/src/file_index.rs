@@ -52,7 +52,7 @@ const MAX_ROOTS: usize = 4;
 /// Paths one root may retain. The corpus outlives the walk that built it in a
 /// process-wide registry, so without a ceiling a walk of a huge tree would pin
 /// a list of every path in it for the rest of the session.
-const MAX_ENTRIES: usize = 200_000;
+pub const MAX_ENTRIES: usize = 200_000;
 /// Entries ranked between two looks at the cancel flag.
 const CANCEL_EVERY: usize = 2048;
 /// Walks running at once across the process. One is a thread plus a pool of
@@ -400,7 +400,7 @@ struct WalkPermit;
 impl WalkPermit {
     fn take() -> Option<Self> {
         WALKS
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |walking| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |walking| {
                 (walking < MAX_WALKS).then_some(walking + 1)
             })
             .ok()
@@ -556,6 +556,24 @@ impl FileIndex {
             return;
         }
         abandon(&self.shared);
+    }
+
+    /// Ends the walk the way one stopped at `MAX_ENTRIES` ends it, over the
+    /// list published so far. Pairs with `detached`.
+    pub fn cap(&self) {
+        if !self.hand_published() {
+            return;
+        }
+        let _walk = lock(&self.shared.walk);
+        let current = self.shared.corpus.load();
+        self.shared.corpus.store(Arc::new(Corpus {
+            batches: current.batches.clone(),
+            len: current.len,
+            generation: current.generation,
+            complete: true,
+            crashed: false,
+            truncated: true,
+        }));
     }
 
     /// Replaces everything the index knows, the way a finished re-walk does:
@@ -1309,7 +1327,7 @@ mod tests {
     const GONE_FILE: &str = "gone.rs";
     /// Not valid UTF-8, so it has no name the picker could draw or the editor
     /// could open.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     const NON_UTF8_NAME: &[u8] = b"bad\xff.rs";
     const HAND_PUBLISHED: &str = "made_up.rs";
 
@@ -2063,7 +2081,8 @@ mod tests {
     /// A lossy name is a name nothing else in maki can use: the picker draws
     /// it, Enter inserts it, and the editor is asked to open a path the
     /// filesystem does not have.
-    #[cfg(unix)]
+    // APFS rejects non-UTF-8 names.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_path_that_is_not_utf8_never_reaches_the_corpus() {
         use std::ffi::OsStr;

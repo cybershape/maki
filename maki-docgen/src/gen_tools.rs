@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use maki_lua::{OptionType, PluginHost};
 
+use crate::lua_util::in_registration_window;
+
 const DATE_PLACEHOLDER: &str = "YYYY-MM-DD";
 
 const SECTIONS: &[(&str, &[&str])] = &[
@@ -169,10 +171,9 @@ fn redact_path(input: &str, target: &str, placeholder: &str) -> String {
     }
 }
 
-/// Plugins bake env-specific values into their `description` at registration:
-/// `bash` interpolates `maki.uv.cwd()` and `websearch` interpolates
-/// `os.date("%Y-%m-%d")`. Scrub both so `gen-docs-check` is stable across
-/// machines and days. CWD is replaced before HOME so a cwd nested under ~
+/// A plugin may bake env-specific values (the cwd, today's date) into its
+/// `description` at registration. Scrub both so `gen-docs-check` is stable
+/// across machines and days. CWD is replaced before HOME so a cwd nested under ~
 /// doesn't get partially mangled.
 fn redact_env_and_dates(input: &str) -> String {
     let cwd = std::env::current_dir()
@@ -227,17 +228,19 @@ fn collect_tool_info(
 /// opt-in tools too. "Opt-in" means the plugin declares the tool as a boolean
 /// option defaulting to false, so the badge cannot drift from the defaults.
 fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
-    let registry = Arc::new(ToolRegistry::new());
-    let mut host = PluginHost::new(Arc::clone(&registry)).expect("plugin host");
-
-    let mut plugins = HashMap::new();
     let mut edit = PluginFileConfig::default();
     for &sub in maki_config::EDIT_SUB_TOOLS {
         edit.opts.insert(sub.to_owned(), Value::Bool(true));
     }
-    plugins.insert("edit".to_owned(), edit);
-    host.load_builtins(&PluginsConfig::from_plugins(plugins))
-        .expect("loading builtin plugins");
+    let config = PluginsConfig::from_plugins(HashMap::from([("edit".to_owned(), edit)]));
+
+    let registry = Arc::new(ToolRegistry::new());
+    let host = in_registration_window(|| {
+        let mut host = PluginHost::new(Arc::clone(&registry)).expect("plugin host");
+        host.load_builtins(&config)
+            .expect("loading builtin plugins");
+        host
+    });
 
     let opt_in = host
         .plugin_options()

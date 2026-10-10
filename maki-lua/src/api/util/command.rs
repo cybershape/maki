@@ -5,15 +5,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
-use crossterm::event::{KeyCode, KeyModifiers};
 use maki_agent::SharedBuf;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
 
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, try_pair};
+use crate::key::Key;
 
-pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
+pub const NO_UI_ERR: &str = "no interactive UI attached";
 pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
 
 const ROW_REFINE: &str = "refine";
@@ -329,7 +329,7 @@ pub struct FloatConfig {
     /// focused window is handed every key and declares none. Open time only,
     /// so no patch field: the list the user sees in the footer is the list
     /// the window opened with, and it dies with the window.
-    pub keys: Vec<(KeyCode, KeyModifiers)>,
+    pub keys: Vec<Key>,
 }
 
 impl Default for FloatConfig {
@@ -412,7 +412,7 @@ pub struct FloatConfigPatch {
 }
 
 pub enum WinEvent {
-    Key { key: String },
+    Key { key: Key },
     Resize { width: u16, height: u16 },
     Paste { text: String },
     Close,
@@ -678,8 +678,9 @@ pub enum UiAction {
 pub struct UiAttachment(Arc<AtomicBool>);
 
 impl Default for UiAttachment {
-    /// Attached until a loop says otherwise. Headless runs and ACP hand Lua no
-    /// sender at all, so the bit only ever describes a loop that went away.
+    /// Starts attached, so what a TUI host sends before its loop is up gets
+    /// answered once it is. A headless host has no sender at all, so this bit
+    /// only ever tells of a loop that went away.
     fn default() -> Self {
         Self(Arc::new(AtomicBool::new(true)))
     }

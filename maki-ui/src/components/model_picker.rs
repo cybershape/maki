@@ -1,15 +1,16 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 
+use maki_providers::Model;
 use maki_providers::ModelTier;
-use maki_providers::dynamic;
 use maki_providers::model_registry;
-use maki_providers::spec::ProviderRegistry;
+use maki_providers::models_cache::ModelList;
+use maki_providers::spec::{Build, ProviderRegistry};
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -20,6 +21,9 @@ const TITLE: &str = " Models ";
 const RECENT_SECTION: &str = "Recent";
 const FREE_LABEL: &str = "Free";
 const FREE_PREFIX: &str = "Free · ";
+const PRICE_SEPARATOR: &str = " · ";
+const PRICE_WIDTH: usize = 7;
+const LOADING_NOTICE: &str = "loading models...";
 
 fn footer_line() -> Line<'static> {
     let t = theme::current();
@@ -38,14 +42,13 @@ fn footer_line() -> Line<'static> {
 }
 
 fn tier_for_shortcut(key: KeyEvent) -> Option<ModelTier> {
-    let digit = match (key.code, key.modifiers.contains(KeyModifiers::SHIFT)) {
-        // Kitty protocol: Shift+digit reported with base key + SHIFT modifier
-        (KeyCode::Char(c @ '1'..='4'), true) => c,
-        // Legacy terminals: Shift+digit reported as the resulting character
-        (KeyCode::Char('!' | '¡'), false) => '1', // US, ES
-        (KeyCode::Char('@' | '"' | '™'), false) => '2', // US, UK/DE
-        (KeyCode::Char('#' | '§' | '£'), false) => '3', // US, DE, UK
-        (KeyCode::Char('$' | '€' | '¤'), false) => '4', // US, EU, Nordic
+    // Shift+digit arrives as the character it types, with the SHIFT bit
+    // already folded into it by key normalization.
+    let digit = match key.code {
+        KeyCode::Char('!' | '¡') => '1',       // US, ES
+        KeyCode::Char('@' | '"' | '™') => '2', // US, UK/DE
+        KeyCode::Char('#' | '§' | '£') => '3', // US, DE, UK
+        KeyCode::Char('$' | '€' | '¤') => '4', // US, EU, Nordic
         _ => return None,
     };
     match digit {
@@ -70,7 +73,7 @@ struct ModelEntry {
     id: String,
     provider_display: String,
     suffix: Option<String>,
-    tier: String,
+    detail: String,
     override_tiers: Vec<ModelTier>,
     free: bool,
 }
@@ -85,7 +88,7 @@ impl PickerItem for ModelEntry {
     }
 
     fn detail(&self) -> Option<&str> {
-        Some(&self.tier)
+        Some(&self.detail)
     }
 
     fn section(&self) -> Option<&str> {
@@ -99,8 +102,8 @@ impl PickerItem for ModelEntry {
 
 pub struct ModelPicker {
     picker: ListPicker<ModelEntry>,
-    models: Arc<ArcSwapOption<Vec<String>>>,
-    available: Watch<Vec<String>>,
+    models: Arc<ArcSwapOption<ModelList>>,
+    available: Watch<ModelList>,
     recents: Vec<String>,
     current_spec: String,
     needs_rebuild: bool,
@@ -109,7 +112,7 @@ pub struct ModelPicker {
 }
 
 impl ModelPicker {
-    pub fn new(models: Arc<ArcSwapOption<Vec<String>>>) -> Self {
+    pub fn new(models: Arc<ArcSwapOption<ModelList>>) -> Self {
         Self {
             picker: ListPicker::new().with_footer_builder(footer_line),
             models,
@@ -133,6 +136,7 @@ impl ModelPicker {
         let _ = self.available.poll(self.models.load_full());
         let entries = self.load_entries();
         self.picker.open(entries, TITLE);
+        self.show_loading();
         self.preselect_current_model();
     }
 
@@ -151,6 +155,7 @@ impl ModelPicker {
         self.needs_rebuild = false;
         let entries = self.load_entries();
         self.picker.replace_items(entries);
+        self.show_loading();
         if let Some((was_recent, spec)) = &self.anchor {
             self.picker
                 .select_item_by(|e| e.spec == *spec && e.suffix().is_some() == *was_recent);
@@ -160,8 +165,14 @@ impl ModelPicker {
         Dirty::YES
     }
 
+    /// A slow provider leaves a short list that looks final without this.
+    fn show_loading(&mut self) {
+        let loading = self.available.get().is_some_and(|list| list.loading);
+        self.picker.set_notice(loading.then_some(LOADING_NOTICE));
+    }
+
     fn load_entries(&self) -> Vec<ModelEntry> {
-        let specs = self.available.get();
+        let specs = self.available.get().map(|list| &list.specs);
         let mut entries = Vec::new();
         for spec in &self.recents {
             if let Some(mut e) = parse_model_entry(spec) {
@@ -270,30 +281,39 @@ impl Overlay for ModelPicker {
     }
 }
 
+fn format_pricing(model: &Model) -> Option<String> {
+    let pricing = &model.pricing;
+    (model.subsidised_by.is_none() && !pricing.is_zero()).then(|| {
+        format!(
+            "{:>PRICE_WIDTH$}/{:<PRICE_WIDTH$}",
+            format!("${:.2}", pricing.input),
+            format!("${:.2}", pricing.output),
+        )
+    })
+}
+
 fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
     let (provider_str, model_id) = spec.split_once('/')?;
 
-    // `opencode-go` has a spec row but was never a `ProviderKind`, so the
-    // catalog named it and still should. That is what `is_native` filters for.
-    let provider_display =
-        if let Some(spec) = ProviderRegistry::get(provider_str).filter(|s| s.is_native()) {
-            spec.display_name.to_string()
-        } else if let Some(name) = dynamic::display_name(provider_str) {
-            name.to_string()
-        } else if let Some(info) = maki_providers::catalog_provider_if_available(provider_str) {
-            info.display_name.clone()
-        } else if let Some(builtin) = maki_config::providers::builtin_provider(provider_str) {
-            builtin.display_name.to_string()
-        } else {
-            let config = maki_config::providers::ProvidersConfig::load();
-            config.get(provider_str)?;
-            maki_config::providers::resolve_display_name(provider_str, config.get(provider_str))
-        };
+    // A catalog-backed row like `opencode-go` takes the name models.dev gives it.
+    let provider_display = if let Some(spec) =
+        ProviderRegistry::get(provider_str).filter(|s| !matches!(s.build, Build::Catalog))
+    {
+        spec.display_name.to_string()
+    } else if let Some(info) = maki_providers::catalog_provider_if_available(provider_str) {
+        info.display_name.clone()
+    } else if let Some(builtin) = maki_config::providers::builtin_provider(provider_str) {
+        builtin.display_name.to_string()
+    } else {
+        let config = maki_config::providers::ProvidersConfig::load();
+        config.get(provider_str)?;
+        maki_config::providers::resolve_display_name(provider_str, config.get(provider_str))
+    };
 
     let override_tiers = model_registry::override_tiers(spec);
-    let (tier, free) = match maki_providers::Model::from_spec(spec) {
-        Ok(m) => (m.tier.to_string(), m.is_free()),
-        Err(_) => (String::new(), false),
+    let (tier, free, price) = match Model::from_spec(spec) {
+        Ok(m) => (m.tier.to_string(), m.is_free(), format_pricing(&m)),
+        Err(_) => (String::new(), false, None),
     };
     let tier = if override_tiers.is_empty() {
         tier
@@ -309,13 +329,18 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         (true, false) => format!("{FREE_PREFIX}{tier}"),
         (false, _) => tier,
     };
+    let detail = match price {
+        Some(price) if !tier.is_empty() => format!("{tier}{PRICE_SEPARATOR}{price}"),
+        Some(price) => price,
+        None => tier,
+    };
     let id = model_id.to_string();
     Some(ModelEntry {
         spec: spec.to_string(),
         id,
         provider_display,
         suffix: None,
-        tier,
+        detail,
         override_tiers,
         free,
     })
@@ -324,11 +349,13 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::key;
     use crate::components::keybindings::key as kb;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crate::components::{buffer_text, key};
+    use crossterm::event::{KeyCode, KeyEvent};
     use maki_providers::ModelInfo;
     use maki_providers::ModelPricing;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use test_case::test_case;
 
     const SAME_SIZED_LIST: &str = "a republished list of the same length is still a new list";
@@ -340,14 +367,14 @@ mod tests {
     #[test]
     fn a_same_sized_model_list_owes_a_frame() {
         let models = Arc::new(ArcSwapOption::empty());
-        models.store(Some(Arc::new(vec![
+        models.store(Some(loaded(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
         ])));
         let mut p = ModelPicker::new(Arc::clone(&models));
         p.open("");
         assert_eq!(p.refresh(), Dirty::NO);
 
-        models.store(Some(Arc::new(vec![SWAPPED_SPEC.into()])));
+        models.store(Some(loaded(vec![SWAPPED_SPEC.into()])));
         assert_eq!(p.refresh(), Dirty::YES, "{SAME_SIZED_LIST}");
         assert_eq!(
             p.picker.selected_item().map(|e| e.spec.as_str()),
@@ -356,9 +383,39 @@ mod tests {
         );
     }
 
-    fn test_models() -> Arc<ArcSwapOption<Vec<String>>> {
+    fn loaded(specs: Vec<String>) -> Arc<ModelList> {
+        Arc::new(ModelList {
+            specs,
+            loading: false,
+        })
+    }
+
+    fn rendered(p: &mut ModelPicker) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| _ = p.view(f, f.area())).unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    /// A slow provider must not look like a finished, short list.
+    #[test]
+    fn loading_row_shows_until_discovery_finishes() {
         let models = Arc::new(ArcSwapOption::empty());
-        models.store(Some(Arc::new(vec![
+        models.store(Some(Arc::new(ModelList {
+            specs: vec![SWAPPED_SPEC.into()],
+            loading: true,
+        })));
+        let mut p = ModelPicker::new(Arc::clone(&models));
+        p.open("");
+        assert!(rendered(&mut p).contains(LOADING_NOTICE));
+
+        models.store(Some(loaded(vec![SWAPPED_SPEC.into()])));
+        assert_eq!(p.refresh(), Dirty::YES);
+        assert!(!rendered(&mut p).contains(LOADING_NOTICE));
+    }
+
+    fn test_models() -> Arc<ArcSwapOption<ModelList>> {
+        let models = Arc::new(ArcSwapOption::empty());
+        models.store(Some(loaded(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
             "anthropic/claude-opus-4-6-20260101".into(),
             "zai/glm-5".into(),
@@ -379,7 +436,7 @@ mod tests {
     #[test]
     fn refresh_updates_items_and_preserves_search() {
         let models = Arc::new(ArcSwapOption::empty());
-        models.store(Some(Arc::new(vec![
+        models.store(Some(loaded(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
         ])));
         let mut p = ModelPicker::new(models.clone());
@@ -388,7 +445,7 @@ mod tests {
         p.handle_key(key(KeyCode::Char('o')));
         p.handle_key(key(KeyCode::Char('p')));
 
-        models.store(Some(Arc::new(vec![
+        models.store(Some(loaded(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
             "anthropic/claude-opus-4-6-20260101".into(),
         ])));
@@ -416,14 +473,14 @@ mod tests {
         let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514").unwrap();
         assert_eq!(entry.id, "claude-sonnet-4-20250514");
         assert_eq!(entry.provider_display, "Anthropic");
-        assert!(!entry.tier.is_empty());
+        assert!(!entry.detail.is_empty());
     }
 
     #[test]
     fn parse_model_entry_paid_model_not_marked_free() {
         let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514").unwrap();
         assert!(
-            !entry.tier.starts_with(FREE_PREFIX),
+            !entry.detail.starts_with(FREE_PREFIX),
             "paid anthropic model must not be marked free"
         );
     }
@@ -436,8 +493,6 @@ mod tests {
     #[test_case(key(KeyCode::Char('!')),           ModelTier::Strong     ; "legacy_bang_strong")]
     #[test_case(key(KeyCode::Char('$')),           ModelTier::Compaction ; "legacy_dollar_compaction")]
     #[test_case(key(KeyCode::Char('€')),           ModelTier::Compaction ; "legacy_euro_compaction")]
-    #[test_case(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::SHIFT), ModelTier::Strong     ; "kitty_shift_1_strong")]
-    #[test_case(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::SHIFT), ModelTier::Compaction ; "kitty_shift_4_compaction")]
     fn tier_shortcut_assigns_and_keeps_picker_open(k: KeyEvent, want: ModelTier) {
         let mut p = ModelPicker::new(test_models());
         p.open("anthropic/claude-sonnet-4-20250514");
@@ -456,7 +511,7 @@ mod tests {
         let mut p = ModelPicker::new(models.clone());
         p.open("anthropic/claude-opus-4-6-20260101");
 
-        models.store(Some(Arc::new(vec![
+        models.store(Some(loaded(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
             "anthropic/claude-opus-4-6-20260101".into(),
             "zai/glm-5".into(),
@@ -565,7 +620,7 @@ mod tests {
         assert_eq!(entry.spec, "anthropic/claude-sonnet-4-20250514");
         assert_eq!(entry.section(), Some("Recent"));
 
-        models.store(Some(Arc::new(vec![
+        models.store(Some(loaded(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
             "anthropic/claude-opus-4-6-20260101".into(),
             "zai/glm-5".into(),
@@ -594,7 +649,7 @@ mod tests {
         let _ = p.refresh();
         p.handle_key(key(KeyCode::Down));
 
-        models.store(Some(Arc::new(vec![
+        models.store(Some(loaded(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
             "anthropic/claude-opus-4-6-20260101".into(),
             "zai/glm-5".into(),
@@ -625,7 +680,7 @@ mod tests {
 
         models.store(None);
         let _ = p.refresh();
-        models.store(Some(Arc::new(vec![
+        models.store(Some(loaded(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
             "anthropic/claude-opus-4-6-20260101".into(),
             "zai/glm-5".into(),
@@ -644,13 +699,14 @@ mod tests {
         }
     }
 
-    const OX_SPEC: &str = "openrouter/stealth/ox-alpha";
+    const OX_SPEC: &str = "ollama/stealth/ox-alpha";
     const PAID_ID: &str = "vendor/paid-model";
     const PAID_PRICING: ModelPricing = ModelPricing::per_million(3.0, 15.0, 0.0, 0.0);
+    const PAID_PRICE_LABEL: &str = "  $3.00/$15.00 ";
 
-    fn register_openrouter_models() {
+    fn register_discovered_models() {
         model_registry::set_known_models(
-            "openrouter",
+            "ollama",
             vec![
                 discovered("stealth/ox-alpha", ModelPricing::ZERO),
                 discovered(PAID_ID, PAID_PRICING),
@@ -660,30 +716,36 @@ mod tests {
 
     #[test]
     fn zero_priced_discovery_marks_entry_free() {
-        register_openrouter_models();
+        register_discovered_models();
         let entry = parse_model_entry(OX_SPEC).unwrap();
         assert!(
-            entry.tier.starts_with(FREE_PREFIX),
+            entry.detail.starts_with(FREE_PREFIX),
             "zero-priced discovery must mark the entry free"
         );
     }
 
     #[test]
     fn paid_discovery_not_marked_free() {
-        register_openrouter_models();
-        let entry = parse_model_entry(&format!("openrouter/{PAID_ID}")).unwrap();
+        register_discovered_models();
+        let entry = parse_model_entry(&format!("ollama/{PAID_ID}")).unwrap();
         assert!(
-            !entry.tier.starts_with(FREE_PREFIX),
+            !entry.detail.starts_with(FREE_PREFIX),
             "paid discovery must not mark the entry free"
+        );
+        assert!(
+            entry
+                .detail
+                .ends_with(&format!("{PRICE_SEPARATOR}{PAID_PRICE_LABEL}")),
+            "paid discovery must show its price"
         );
     }
 
     #[test]
     fn free_models_sort_before_paid_within_a_provider() {
-        register_openrouter_models();
+        register_discovered_models();
         let models = Arc::new(ArcSwapOption::empty());
-        models.store(Some(Arc::new(vec![
-            format!("openrouter/{PAID_ID}"),
+        models.store(Some(loaded(vec![
+            format!("ollama/{PAID_ID}"),
             OX_SPEC.into(),
         ])));
         let mut p = ModelPicker::new(models);

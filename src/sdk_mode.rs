@@ -24,8 +24,8 @@ use maki_agent::prompt::ResolvedSlots;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, PermissionsConfig,
-    SessionEndReason, SessionEvents,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, InputSource,
+    PermissionsConfig, SessionEndReason, SessionEvents, SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
@@ -33,6 +33,7 @@ use maki_providers::model::Model;
 use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
+use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
 use tracing::warn;
@@ -446,6 +447,9 @@ pub struct SdkParams {
     /// Which session this run continues and writes under, and where. Resolved
     /// by the caller from the same flags every other entry point reads.
     pub resumed: Resumed,
+    /// The right to write [`Self::resumed`]'s session, taken when it was
+    /// resolved and held for the whole run.
+    pub claim: SessionClaim,
     pub storage: StateDir,
     pub model: Model,
     pub config: AgentConfig,
@@ -538,6 +542,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let SdkParams {
         cli,
         resumed,
+        claim,
         storage,
         model,
         mut config,
@@ -576,6 +581,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         mcp_handle,
         initial_wd: cwd.clone(),
         resumed,
+        claim,
         storage,
         yolo: permission_mode == PermissionMode::BypassPermissions,
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
@@ -685,8 +691,13 @@ pub fn run(params: SdkParams) -> Result<()> {
                     shared.turn_start = Instant::now();
                     shared.permission_mode
                 };
-                let input =
-                    AgentInput::from_defaults(prompt, mode.agent_mode(&cwd), images, defaults);
+                let input = AgentInput::from_defaults(
+                    prompt,
+                    mode.agent_mode(&cwd),
+                    images,
+                    defaults,
+                    InputSource::Headless,
+                );
                 if handle.input_tx.send(input).is_err() {
                     break;
                 }
@@ -1051,8 +1062,16 @@ impl EventPump {
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
+            | AgentEvent::Notice { .. }
             | AgentEvent::PromptProgress { .. }
             | AgentEvent::StreamClosed => {}
+            // A later kept message overwrites this with its own answer, so the
+            // reason is the result only when every message was dropped.
+            AgentEvent::Steered {
+                kind: SteerKind::MessageDropped,
+                text,
+            } if parent_tool_use_id.is_none() => self.result_text.clone_from(text),
+            AgentEvent::Steered { .. } => {}
             AgentEvent::Retry {
                 attempt,
                 message,
@@ -1145,12 +1164,19 @@ impl EventPump {
                 reason,
                 ..
             } => {
-                // An interrupted run leaves a partial answer, so it is not a success.
-                let is_error = *reason == DoneReason::Cancelled;
+                // An interrupted run leaves a partial answer and a dropped one
+                // never ran, so neither is a success.
+                let is_error = match reason {
+                    DoneReason::Cancelled | DoneReason::Dropped => true,
+                    DoneReason::EndTurn
+                    | DoneReason::MaxTokens
+                    | DoneReason::MaxTurns
+                    | DoneReason::Compact => false,
+                };
                 let result = mem::take(&mut self.result_text);
                 self.emit_turn_result(is_error, result, *num_turns, *usage)?;
             }
-            AgentEvent::Error { message } => {
+            AgentEvent::Error { message, .. } => {
                 self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;
             }
         }
@@ -1624,6 +1650,7 @@ mod tests {
                 id: TEST_TOOL_USE_ID.to_owned(),
                 tool: ToolKey::parse(TEST_TOOL).unwrap(),
                 scopes: Vec::new(),
+                reason: None,
             },
             subagent: None,
             run_id: 0,
@@ -1643,6 +1670,7 @@ mod tests {
         retained
             .send(AgentEvent::Error {
                 message: PUMP_ERROR.into(),
+                auth: false,
             })
             .unwrap();
         drop(guard);
@@ -1767,5 +1795,41 @@ mod tests {
 
         assert_eq!(answer_rx.try_recv(), Ok(tagged(PermissionAnswer::Deny)));
         assert!(out_rx.is_empty(), "{NO_CONTROL_REQUEST}");
+    }
+
+    fn top_level(event: AgentEvent) -> Envelope {
+        Envelope {
+            event,
+            subagent: None,
+            run_id: 0,
+        }
+    }
+
+    /// Nothing reached the model, so a client reading `is_error` must not take
+    /// the empty turn for an answer.
+    #[test]
+    fn a_dropped_prompt_is_an_error_with_its_reason() {
+        const DROP_REASON: &str = "blocked by a plugin";
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+
+        pump.handle(top_level(AgentEvent::Steered {
+            kind: SteerKind::MessageDropped,
+            text: DROP_REASON.into(),
+        }))
+        .unwrap();
+        pump.handle(top_level(AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
+            num_turns: 0,
+            reason: DoneReason::Dropped,
+        }))
+        .unwrap();
+
+        let wire: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(wire["is_error"], true);
+        assert_eq!(wire["result"], DROP_REASON);
     }
 }

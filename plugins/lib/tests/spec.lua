@@ -3,6 +3,10 @@ local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 local th = require("maki.test_helpers")
 
+-- Splitting a line is a method, not a key, so the random walk names it apart
+-- from the keys it presses.
+local SPLIT_LINE = "split_line"
+
 local case = th.case
 local eq = th.eq
 
@@ -31,19 +35,21 @@ case("truncate_exceeds_line_limit", function()
   assert(result:find("%[truncated %d+ bytes%]"), "should have truncation marker")
 end)
 
-case("truncate_exceeds_byte_limit", function()
-  local text = string.rep("x", 200)
-  local result = truncate(text, 1000, 50)
-  assert(#result < #text, "should be shorter")
-  assert(result:find("%[truncated"), "should have truncation marker")
+local function truncated(kept, dropped_bytes)
+  return kept .. "\n\n[truncated " .. dropped_bytes .. " bytes]"
+end
+
+case("truncate_single_oversized_line_keeps_prefix", function()
+  eq(truncate(string.rep("x", 200), 1000, 50), truncated(string.rep("x", 50), 150))
 end)
 
-case("truncate_byte_limit_mid_line", function()
-  local text = "short\n" .. string.rep("x", 100)
-  local result = truncate(text, 1000, 20)
-  assert(result:find("short"), "should keep first line")
-  assert(not result:find(string.rep("x", 100)), "should drop long line")
-  assert(result:find("%[truncated"), "should have truncation marker")
+case("truncate_oversized_line_after_kept_lines_is_dropped", function()
+  local text = "short\n" .. string.rep("x", 100) .. "\nlast"
+  eq(truncate(text, 1000, 20), truncated("short", 106))
+end)
+
+case("truncate_oversized_line_cuts_on_utf8_boundary", function()
+  eq(truncate(string.rep("é", 10), 1000, 5), truncated("éé", 16))
 end)
 
 case("truncate_trailing_newlines_counted", function()
@@ -377,7 +383,7 @@ end)
 
 case("text_input_backspace_at_start_noop", function()
   local input = TextInput.new()
-  input:handle_key("backspace")
+  input:handle_key("<BS>")
   eq(input:value(), "")
   eq(input.col, 0)
 end)
@@ -387,7 +393,7 @@ case("text_input_backspace_deletes", function()
   input:handle_key("a")
   input:handle_key("b")
   input:handle_key("c")
-  input:handle_key("backspace")
+  input:handle_key("<BS>")
   eq(input:value(), "ab")
   eq(input.col, 2)
 end)
@@ -396,7 +402,7 @@ case("text_input_shift_backspace_deletes", function()
   local input = TextInput.new()
   input:handle_key("a")
   input:handle_key("b")
-  input:handle_key("shift+backspace")
+  input:handle_key("<S-BS>")
   eq(input:value(), "a")
   eq(input.col, 1)
 end)
@@ -406,19 +412,19 @@ case("text_input_cursor_movement", function()
   input:handle_key("a")
   input:handle_key("b")
   input:handle_key("c")
-  input:handle_key("left")
+  input:handle_key("<Left>")
   eq(input.col, 2)
-  input:handle_key("left")
+  input:handle_key("<Left>")
   eq(input.col, 1)
-  input:handle_key("left")
+  input:handle_key("<Left>")
   eq(input.col, 0)
-  input:handle_key("left")
+  input:handle_key("<Left>")
   eq(input.col, 0)
-  input:handle_key("right")
+  input:handle_key("<Right>")
   eq(input.col, 1)
-  input:handle_key("end")
+  input:handle_key("<End>")
   eq(input.col, 3)
-  input:handle_key("home")
+  input:handle_key("<Home>")
   eq(input.col, 0)
 end)
 
@@ -428,9 +434,9 @@ case("text_input_delete_word", function()
     input:handle_key(c)
   end
   eq(input:value(), "hello world")
-  input:handle_key("ctrl+w")
+  input:handle_key("<C-w>")
   eq(input:value(), "hello ", "ctrl+w eats the last word in one press")
-  input:handle_key("ctrl+w")
+  input:handle_key("<C-w>")
   eq(input:value(), "", "second ctrl+w eats remaining trailing space and word")
 end)
 
@@ -438,8 +444,8 @@ local R = TextInput.Result
 
 case("text_input_unknown_key_returns_ignored", function()
   local input = TextInput.new()
-  eq(input:handle_key("ctrl+z"), R.IGNORED)
-  eq(input:handle_key("f1"), R.IGNORED)
+  eq(input:handle_key("<C-z>"), R.IGNORED)
+  eq(input:handle_key("<F1>"), R.IGNORED)
 end)
 
 case("text_input_multibyte_key_inserts_single_codepoint", function()
@@ -448,7 +454,7 @@ case("text_input_multibyte_key_inserts_single_codepoint", function()
   eq(input:value(), "你")
   input:handle_key("好")
   eq(input:value(), "你好")
-  input:handle_key("left")
+  input:handle_key("<Left>")
   eq(input:char_before_cursor(), "你")
 end)
 
@@ -456,7 +462,7 @@ case("text_input_render_format", function()
   local input = TextInput.new()
   input:handle_key("a")
   input:handle_key("b")
-  input:handle_key("left")
+  input:handle_key("<Left>")
   local r = input:render("> ")
   eq(#r.lines, 1)
   eq(r.cursor_row, 1)
@@ -488,17 +494,17 @@ case("text_input_utf8_insert_navigate_delete_render", function()
   input = TextInput.new()
   input:insert_text("aé")
   eq(input.col, 3, "cursor at end of 'aé' (1 + 2 bytes)")
-  input:handle_key("left")
+  input:handle_key("<Left>")
   eq(input.col, 1, "left jumps over whole codepoint")
   eq(input:char_before_cursor(), "a")
-  input:handle_key("right")
+  input:handle_key("<Right>")
   eq(input.col, 3, "right jumps over whole codepoint")
-  input:handle_key("backspace")
+  input:handle_key("<BS>")
   eq(input:value(), "a", "backspace removes whole codepoint")
 
   input = TextInput.new()
   input:insert_text("aé")
-  input:handle_key("left")
+  input:handle_key("<Left>")
   local spans = input:render("> ").lines[1]
   eq(spans[2][1], "a", "text before cursor")
   eq(spans[3][1], "é", "cursor span is whole codepoint")
@@ -525,9 +531,9 @@ end)
 
 case("text_input_newline_table_driven", function()
   local cases = {
-    { { "left", "left" }, "hel\nlo" },
-    { { "home" }, "\nhello" },
-    { { "end" }, "hello\n" },
+    { { "<Left>", "<Left>" }, "hel\nlo" },
+    { { "<Home>" }, "\nhello" },
+    { { "<End>" }, "hello\n" },
   }
   for i, c in ipairs(cases) do
     local input = TextInput.new()
@@ -535,7 +541,7 @@ case("text_input_newline_table_driven", function()
     for _, k in ipairs(c[1]) do
       input:handle_key(k)
     end
-    input:handle_key("newline")
+    input:split_line()
     eq(input:value(), c[2], "case " .. i)
     eq(input:line_count(), 2, "case " .. i .. ": two lines")
     eq(input.line, 2, "case " .. i .. ": cursor on new line")
@@ -548,33 +554,33 @@ case("text_input_up_down_navigation_clamps_and_no_ops", function()
   input:insert_text("abc\nlonger_line")
   eq(input.line, 2)
   eq(input.col, 11, "cursor at end of longer line")
-  input:handle_key("up")
+  input:handle_key("<Up>")
   eq(input.line, 1)
   eq(input.col, 3, "col clamps to short line length")
-  input:handle_key("up")
+  input:handle_key("<Up>")
   eq(input.line, 1, "up at line 1 is a no-op")
-  input:handle_key("down")
-  input:handle_key("down")
+  input:handle_key("<Down>")
+  input:handle_key("<Down>")
   eq(input.line, 2, "down at last line is a no-op")
 end)
 
 case("text_input_cursor_wraps_across_line_boundaries", function()
   local input = TextInput.new()
   input:insert_text("abc\nxy")
-  input:handle_key("home")
-  input:handle_key("left")
+  input:handle_key("<Home>")
+  input:handle_key("<Left>")
   eq(input.line, 1)
   eq(input.col, 3, "left at col 0 lands at end of previous line")
-  input:handle_key("right")
+  input:handle_key("<Right>")
   eq(input.line, 2)
   eq(input.col, 0, "right at end of non-last line goes to start of next")
 end)
 
 case("text_input_backspace_joins_lines_table_driven", function()
   local cases = {
-    { "foo\nbar", { "home" }, "foobar", 1, 3 },
-    { "\nabc", { "home" }, "abc", 1, 0 },
-    { "a\nb", { "end", "backspace" }, "a", 1, 1 },
+    { "foo\nbar", { "<Home>" }, "foobar", 1, 3 },
+    { "\nabc", { "<Home>" }, "abc", 1, 0 },
+    { "a\nb", { "<End>", "<BS>" }, "a", 1, 1 },
   }
   for i, c in ipairs(cases) do
     local input = TextInput.new()
@@ -582,7 +588,7 @@ case("text_input_backspace_joins_lines_table_driven", function()
     for _, k in ipairs(c[2]) do
       input:handle_key(k)
     end
-    input:handle_key("backspace")
+    input:handle_key("<BS>")
     eq(input:value(), c[3], "case " .. i .. ": value")
     eq(input.line, c[4], "case " .. i .. ": line")
     eq(input.col, c[5], "case " .. i .. ": col")
@@ -592,7 +598,7 @@ end)
 
 case("text_input_empty_input_movement_is_noop_and_char_before_cursor_is_nil", function()
   local input = TextInput.new()
-  for _, k in ipairs({ "left", "right", "up", "down", "backspace" }) do
+  for _, k in ipairs({ "<Left>", "<Right>", "<Up>", "<Down>", "<BS>" }) do
     input:handle_key(k)
   end
   eq(input:value(), "")
@@ -603,16 +609,16 @@ case("text_input_empty_input_movement_is_noop_and_char_before_cursor_is_nil", fu
 
   input = TextInput.new()
   input:insert_text("abc\ndef")
-  input:handle_key("home")
+  input:handle_key("<Home>")
   eq(input:char_before_cursor(), nil, "no char before cursor at col 0 on non-first line")
 end)
 
 case("text_input_ctrl_w_consumes_trailing_spaces_then_word", function()
   local input = TextInput.new()
   input:insert_text("hello world  ")
-  input:handle_key("ctrl+w")
+  input:handle_key("<C-w>")
   eq(input:value(), "hello ", "single ctrl+w eats trailing spaces AND the word")
-  input:handle_key("ctrl+w")
+  input:handle_key("<C-w>")
   eq(input:value(), "", "second ctrl+w eats what is left")
 end)
 
@@ -664,7 +670,7 @@ case("text_input_render_wrap_cursor_mid_line", function()
   local input = TextInput.new()
   input:insert_text("abcdefghij")
   for _ = 1, 5 do
-    input:handle_key("left")
+    input:handle_key("<Left>")
   end
   local r = input:render("> ", 2, 8)
   eq(#r.lines, 2, "still 2 visual rows")
@@ -711,7 +717,7 @@ case("text_input_render_wrap_cursor_at_exact_chunk_boundary", function()
   local input = TextInput.new()
   input:insert_text("abcdef")
   for _ = 1, 3 do
-    input:handle_key("left")
+    input:handle_key("<Left>")
   end
   local r = input:render("", 0, 3)
   eq(#r.lines, 2, "6 chars at usable=3 -> 2 rows")
@@ -738,7 +744,7 @@ end)
 case("text_input_render_cursor_at_start_with_wrapping", function()
   local input = TextInput.new()
   input:insert_text("abcdef")
-  input:handle_key("home")
+  input:handle_key("<Home>")
   local r = input:render("", 0, 3)
   eq(r.cursor_row, 1, "cursor at col=0 is in the first chunk")
   eq(find_cursor_char(r.lines[1]), "a", "cursor on first char 'a'")
@@ -764,30 +770,32 @@ case("text_input_invariants_hold_under_random_sequence", function()
     "c",
     "x",
     "é",
-    "space",
-    "newline",
-    "left",
-    "right",
-    "up",
-    "down",
-    "home",
-    "end",
-    "backspace",
-    "delete",
-    "ctrl+w",
-    "ctrl+left",
-    "ctrl+right",
-    "ctrl+a",
-    "ctrl+k",
-    "alt+d",
-    "alt+b",
-    "alt+f",
+    "<Space>",
+    SPLIT_LINE,
+    "<Left>",
+    "<Right>",
+    "<Up>",
+    "<Down>",
+    "<Home>",
+    "<End>",
+    "<BS>",
+    "<Del>",
+    "<C-w>",
+    "<C-Left>",
+    "<C-Right>",
+    "<C-a>",
+    "<C-k>",
+    "<M-d>",
+    "<M-b>",
+    "<M-f>",
   }
   math.randomseed(0xC0FFEE)
   for _ = 1, 2000 do
     local k = keys[math.random(#keys)]
     if k == "é" then
       input:insert_text("é")
+    elseif k == SPLIT_LINE then
+      input:split_line()
     else
       input:handle_key(k)
     end
@@ -813,7 +821,7 @@ local TRACE_CASES = {
     name = "backspace_deletes_char",
     initial = "abc",
     cur = { 1, 3 },
-    keys = { "backspace" },
+    keys = { "<BS>" },
     final_value = "ab",
     final_cur = { 1, 2 },
   },
@@ -821,7 +829,7 @@ local TRACE_CASES = {
     name = "delete_at_end_joins_lines",
     initial = "ab\ncd",
     cur = { 1, 2 },
-    keys = { "delete" },
+    keys = { "<Del>" },
     final_value = "abcd",
     final_cur = { 1, 2 },
   },
@@ -829,7 +837,7 @@ local TRACE_CASES = {
     name = "backspace_at_line_start_joins",
     initial = "ab\ncd",
     cur = { 2, 0 },
-    keys = { "backspace" },
+    keys = { "<BS>" },
     final_value = "abcd",
     final_cur = { 1, 2 },
   },
@@ -837,7 +845,7 @@ local TRACE_CASES = {
     name = "left_then_right_round_trips",
     initial = "abc",
     cur = { 1, 2 },
-    keys = { "left", "right" },
+    keys = { "<Left>", "<Right>" },
     final_value = "abc",
     final_cur = { 1, 2 },
   },
@@ -845,7 +853,7 @@ local TRACE_CASES = {
     name = "right_wraps_to_next_line",
     initial = "ab\ncd",
     cur = { 1, 2 },
-    keys = { "right" },
+    keys = { "<Right>" },
     final_value = "ab\ncd",
     final_cur = { 2, 0 },
   },
@@ -853,7 +861,7 @@ local TRACE_CASES = {
     name = "left_wraps_to_prev_line",
     initial = "ab\ncd",
     cur = { 2, 0 },
-    keys = { "left" },
+    keys = { "<Left>" },
     final_value = "ab\ncd",
     final_cur = { 1, 2 },
   },
@@ -861,7 +869,7 @@ local TRACE_CASES = {
     name = "home_jumps_to_col_zero",
     initial = "hello",
     cur = { 1, 5 },
-    keys = { "home" },
+    keys = { "<Home>" },
     final_value = "hello",
     final_cur = { 1, 0 },
   },
@@ -869,7 +877,7 @@ local TRACE_CASES = {
     name = "end_jumps_to_line_length",
     initial = "hello",
     cur = { 1, 0 },
-    keys = { "end" },
+    keys = { "<End>" },
     final_value = "hello",
     final_cur = { 1, 5 },
   },
@@ -877,7 +885,7 @@ local TRACE_CASES = {
     name = "up_clamps_to_short_line",
     initial = "abc\nlonger_line",
     cur = { 2, 11 },
-    keys = { "up" },
+    keys = { "<Up>" },
     final_value = "abc\nlonger_line",
     final_cur = { 1, 3 },
   },
@@ -885,7 +893,7 @@ local TRACE_CASES = {
     name = "down_moves_to_next_line",
     initial = "ab\ncd",
     cur = { 1, 0 },
-    keys = { "down" },
+    keys = { "<Down>" },
     final_value = "ab\ncd",
     final_cur = { 2, 0 },
   },
@@ -893,7 +901,7 @@ local TRACE_CASES = {
     name = "ctrl_left_jumps_word",
     initial = "hello world",
     cur = { 1, 11 },
-    keys = { "ctrl+left" },
+    keys = { "<C-Left>" },
     final_value = "hello world",
     final_cur = { 1, 6 },
   },
@@ -901,7 +909,7 @@ local TRACE_CASES = {
     name = "ctrl_left_twice_lands_at_zero",
     initial = "hello world",
     cur = { 1, 11 },
-    keys = { "ctrl+left", "ctrl+left" },
+    keys = { "<C-Left>", "<C-Left>" },
     final_value = "hello world",
     final_cur = { 1, 0 },
   },
@@ -909,7 +917,7 @@ local TRACE_CASES = {
     name = "ctrl_right_jumps_word",
     initial = "hello world",
     cur = { 1, 0 },
-    keys = { "ctrl+right" },
+    keys = { "<C-Right>" },
     final_value = "hello world",
     final_cur = { 1, 5 },
   },
@@ -917,7 +925,7 @@ local TRACE_CASES = {
     name = "ctrl_right_eats_leading_spaces_then_word",
     initial = "hello  ",
     cur = { 1, 0 },
-    keys = { "ctrl+right" },
+    keys = { "<C-Right>" },
     final_value = "hello  ",
     final_cur = { 1, 5 },
   },
@@ -925,7 +933,7 @@ local TRACE_CASES = {
     name = "ctrl_left_eats_leading_spaces_then_word",
     initial = "  hello",
     cur = { 1, 7 },
-    keys = { "ctrl+left" },
+    keys = { "<C-Left>" },
     final_value = "  hello",
     final_cur = { 1, 2 },
   },
@@ -933,7 +941,7 @@ local TRACE_CASES = {
     name = "ctrl_w_eats_trailing_spaces_and_word",
     initial = "hello world  ",
     cur = { 1, 13 },
-    keys = { "ctrl+w" },
+    keys = { "<C-w>" },
     final_value = "hello ",
     final_cur = { 1, 6 },
   },
@@ -941,7 +949,7 @@ local TRACE_CASES = {
     name = "ctrl_w_twice_clears_input",
     initial = "hello world",
     cur = { 1, 11 },
-    keys = { "ctrl+w", "ctrl+w" },
+    keys = { "<C-w>", "<C-w>" },
     final_value = "",
     final_cur = { 1, 0 },
   },
@@ -949,7 +957,7 @@ local TRACE_CASES = {
     name = "ctrl_w_at_line_start_joins",
     initial = "ab\ncd",
     cur = { 2, 0 },
-    keys = { "ctrl+w" },
+    keys = { "<C-w>" },
     final_value = "abcd",
     final_cur = { 1, 2 },
   },
@@ -957,7 +965,7 @@ local TRACE_CASES = {
     name = "ctrl_delete_eats_word_after",
     initial = "hello world",
     cur = { 1, 0 },
-    keys = { "ctrl+delete" },
+    keys = { "<C-Del>" },
     final_value = " world",
     final_cur = { 1, 0 },
   },
@@ -965,7 +973,7 @@ local TRACE_CASES = {
     name = "alt_d_eats_word_after_space",
     initial = "hello world",
     cur = { 1, 6 },
-    keys = { "alt+d" },
+    keys = { "<M-d>" },
     final_value = "hello ",
     final_cur = { 1, 6 },
   },
@@ -973,7 +981,7 @@ local TRACE_CASES = {
     name = "ctrl_delete_at_line_end_joins",
     initial = "ab\ncd",
     cur = { 1, 2 },
-    keys = { "ctrl+delete" },
+    keys = { "<C-Del>" },
     final_value = "abcd",
     final_cur = { 1, 2 },
   },
@@ -981,7 +989,7 @@ local TRACE_CASES = {
     name = "ctrl_k_truncates_line",
     initial = "hello world",
     cur = { 1, 5 },
-    keys = { "ctrl+k" },
+    keys = { "<C-k>" },
     final_value = "hello",
     final_cur = { 1, 5 },
   },
@@ -989,7 +997,7 @@ local TRACE_CASES = {
     name = "ctrl_k_at_line_end_joins",
     initial = "ab\ncd",
     cur = { 1, 2 },
-    keys = { "ctrl+k" },
+    keys = { "<C-k>" },
     final_value = "ab\ncd",
     final_cur = { 1, 2 },
   },
@@ -997,7 +1005,7 @@ local TRACE_CASES = {
     name = "ctrl_a_moves_home",
     initial = "hello",
     cur = { 1, 5 },
-    keys = { "ctrl+a" },
+    keys = { "<C-a>" },
     final_value = "hello",
     final_cur = { 1, 0 },
   },
@@ -1005,7 +1013,7 @@ local TRACE_CASES = {
     name = "alt_b_aliases_ctrl_left",
     initial = "hello world",
     cur = { 1, 11 },
-    keys = { "alt+b" },
+    keys = { "<M-b>" },
     final_value = "hello world",
     final_cur = { 1, 6 },
   },
@@ -1013,23 +1021,15 @@ local TRACE_CASES = {
     name = "alt_f_aliases_ctrl_right",
     initial = "hello world",
     cur = { 1, 0 },
-    keys = { "alt+f" },
+    keys = { "<M-f>" },
     final_value = "hello world",
     final_cur = { 1, 5 },
-  },
-  {
-    name = "newline_splits_line",
-    initial = "abcd",
-    cur = { 1, 2 },
-    keys = { "newline" },
-    final_value = "ab\ncd",
-    final_cur = { 2, 0 },
   },
   {
     name = "space_inserts_a_space",
     initial = "abcd",
     cur = { 1, 2 },
-    keys = { "space" },
+    keys = { "<Space>" },
     final_value = "ab cd",
     final_cur = { 1, 3 },
   },
@@ -1037,7 +1037,7 @@ local TRACE_CASES = {
     name = "utf8_left_over_multibyte",
     initial = "aé",
     cur = { 1, 3 },
-    keys = { "left" },
+    keys = { "<Left>" },
     final_value = "aé",
     final_cur = { 1, 1 },
   },
@@ -1045,7 +1045,7 @@ local TRACE_CASES = {
     name = "utf8_backspace_removes_codepoint",
     initial = "aé",
     cur = { 1, 3 },
-    keys = { "backspace" },
+    keys = { "<BS>" },
     final_value = "a",
     final_cur = { 1, 1 },
   },
@@ -1053,7 +1053,7 @@ local TRACE_CASES = {
     name = "utf8_ctrl_w_eats_multibyte_word",
     initial = "hello wörld",
     cur = { 1, 12 },
-    keys = { "ctrl+w" },
+    keys = { "<C-w>" },
     final_value = "hello ",
     final_cur = { 1, 6 },
   },
@@ -1061,7 +1061,7 @@ local TRACE_CASES = {
     name = "tab_is_whitespace_for_ctrl_w",
     initial = "hello\tworld",
     cur = { 1, 11 },
-    keys = { "ctrl+w" },
+    keys = { "<C-w>" },
     final_value = "hello\t",
     final_cur = { 1, 6 },
   },
@@ -1069,7 +1069,7 @@ local TRACE_CASES = {
     name = "ignored_backspace_at_buffer_start",
     initial = "",
     cur = { 1, 0 },
-    keys = { "backspace" },
+    keys = { "<BS>" },
     final_value = "",
     final_cur = { 1, 0 },
     results = { R.IGNORED },
@@ -1078,7 +1078,7 @@ local TRACE_CASES = {
     name = "ignored_left_at_buffer_start",
     initial = "abc",
     cur = { 1, 0 },
-    keys = { "left" },
+    keys = { "<Left>" },
     final_value = "abc",
     final_cur = { 1, 0 },
     results = { R.IGNORED },
@@ -1087,7 +1087,7 @@ local TRACE_CASES = {
     name = "ignored_right_at_buffer_end",
     initial = "abc",
     cur = { 1, 3 },
-    keys = { "right" },
+    keys = { "<Right>" },
     final_value = "abc",
     final_cur = { 1, 3 },
     results = { R.IGNORED },
@@ -1096,7 +1096,7 @@ local TRACE_CASES = {
     name = "ignored_up_on_first_line",
     initial = "abc",
     cur = { 1, 1 },
-    keys = { "up" },
+    keys = { "<Up>" },
     final_value = "abc",
     final_cur = { 1, 1 },
     results = { R.IGNORED },
@@ -1105,7 +1105,7 @@ local TRACE_CASES = {
     name = "ignored_down_on_last_line",
     initial = "abc",
     cur = { 1, 1 },
-    keys = { "down" },
+    keys = { "<Down>" },
     final_value = "abc",
     final_cur = { 1, 1 },
     results = { R.IGNORED },
@@ -1114,7 +1114,7 @@ local TRACE_CASES = {
     name = "ignored_ctrl_w_at_buffer_start",
     initial = "abc",
     cur = { 1, 0 },
-    keys = { "ctrl+w" },
+    keys = { "<C-w>" },
     final_value = "abc",
     final_cur = { 1, 0 },
     results = { R.IGNORED },
@@ -1123,7 +1123,7 @@ local TRACE_CASES = {
     name = "ignored_delete_at_buffer_end",
     initial = "abc",
     cur = { 1, 3 },
-    keys = { "delete" },
+    keys = { "<Del>" },
     final_value = "abc",
     final_cur = { 1, 3 },
     results = { R.IGNORED },
@@ -1676,6 +1676,88 @@ case("render_header_pins_the_height_it_actually_drew", function()
   eq(ListPicker.render_header(win, lines, input, "> ", 40), 2, "clearing the query shrinks the header back")
   eq(win.reserved_top, 2)
   eq(#lines, 2)
+end)
+
+-- Picker keys come from a caller the host never parses, so they are
+-- normalized on the way in: a spelling maki accepts is a spelling that
+-- matches.
+case("picker_keys_are_normalized_and_bad_ones_are_dropped", function()
+  local set = ListPicker._key_set({ "<Enter>", "R", "<nope>" })
+  eq(set["<CR>"], true, "<Enter> matches a <CR> press")
+  eq(set["R"], true, "a plain char is itself")
+  eq(set["<nope>"], nil, "a key maki cannot name is dropped, not stored to never match")
+end)
+
+local parse = require("maki.provider_parse")
+
+local NUMBERS_JSON = [[{
+  "int": 8192, "whole_float": 8192.0, "exp": 1e3, "frac": 1.5, "neg": -1,
+  "null": null, "str": "8192", "bool": true,
+  "u32_max": 4294967295, "past_u32": 4294967296, "past_u64": 1e20
+}]]
+
+case("provider_parse_as_u64_takes_whole_non_negative_numbers", function()
+  local doc = assert(maki.json.decode(NUMBERS_JSON))
+  for key, expected in pairs({
+    int = 8192,
+    whole_float = 8192,
+    exp = 1000,
+    frac = false,
+    neg = false,
+    null = false,
+    str = false,
+    bool = false,
+    missing = false,
+    past_u32 = 4294967296,
+    past_u64 = false,
+  }) do
+    eq(parse.as_u64(doc[key]), expected or nil, key)
+  end
+end)
+
+case("provider_parse_as_u32_rejects_past_u32_max", function()
+  local doc = assert(maki.json.decode(NUMBERS_JSON))
+  eq(parse.as_u32(doc.u32_max), 4294967295)
+  eq(parse.as_u32(doc.past_u32), nil)
+  eq(parse.as_u32(doc.whole_float), 8192)
+  eq(parse.as_u32(doc.neg), nil)
+end)
+
+case("provider_parse_as_f64_and_as_bool_take_only_their_type", function()
+  local doc = assert(maki.json.decode(NUMBERS_JSON))
+  eq(parse.as_f64(doc.frac), 1.5)
+  eq(parse.as_f64(doc.neg), -1)
+  eq(parse.as_f64(doc.str), nil)
+  eq(parse.as_bool(doc.bool), true)
+  eq(parse.as_bool(false), false, "false is a boolean, not a missing one")
+  eq(parse.as_bool(doc.str), nil)
+end)
+
+case("provider_parse_pricing_needs_both_sides", function()
+  eq(parse.pricing(1e-6, nil), nil, "no output price")
+  eq(parse.pricing(nil, 2e-6), nil, "no input price")
+  local pricing = assert(parse.pricing(1e-6, 2e-6, nil, 5e-7))
+  eq(pricing.input, 1)
+  eq(pricing.output, 2)
+  eq(pricing.cache_write, 0, "a missing cache price")
+  eq(pricing.cache_read, 0.5)
+end)
+
+case("provider_parse_models_keeps_the_first_row_per_id_sorted", function()
+  local body = assert(maki.json.decode([[{"data": [
+    {"id": "b", "n": 1}, {"id": "a"}, {"id": "b", "n": 2}, {"n": 3}, "stray"
+  ]}]]))
+  local rows = parse.models(body, function(raw)
+    if type(raw) == "table" and raw.id then
+      return { id = raw.id, n = raw.n }
+    end
+    return nil
+  end)
+  eq(#rows, 2)
+  eq(rows[1].id, "a")
+  eq(rows[2].id, "b")
+  eq(rows[2].n, 1, "the first b wins")
+  eq(#parse.models({}, function() end), 0, "a body without data")
 end)
 
 th.report()

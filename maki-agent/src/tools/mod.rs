@@ -343,7 +343,10 @@ pub struct ToolContext {
     /// otel), so this is what tells their chats apart.
     pub task_id: Option<Arc<str>>,
     pub tool_use_id: Option<String>,
-    pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    pub user_response_rx: Option<Arc<smol::lock::Mutex<flume::Receiver<String>>>>,
+    /// See [`crate::Agent::with_reauth`]. Carried here so a subagent session
+    /// offers a re-login only where its parent does.
+    pub reauth: bool,
     /// Session-wide: a file the model has already seen is never injected again.
     pub loaded_instructions: LoadedInstructions,
     /// Per model call, shared with its nested calls.
@@ -518,12 +521,15 @@ pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> Stri
 }
 
 pub fn is_builtin_tool(name: &str) -> bool {
-    maki_config::DEFAULT_BUILTINS.contains(&name) || maki_config::EDIT_SUB_TOOLS.contains(&name)
+    let bundled_tool = maki_config::DEFAULT_BUILTINS.contains(&name)
+        && !maki_config::PROVIDER_BUILTINS.contains(&name);
+    bundled_tool || maki_config::EDIT_SUB_TOOLS.contains(&name)
 }
 
 pub fn all_builtin_tool_names() -> Vec<&'static str> {
     maki_config::DEFAULT_BUILTINS
         .iter()
+        .filter(|name| !maki_config::PROVIDER_BUILTINS.contains(name))
         .chain(maki_config::EDIT_SUB_TOOLS.iter())
         .copied()
         .collect()
@@ -560,7 +566,7 @@ pub fn interpreter_ctx(
     cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     file_access: Arc<FileAccess>,
-    user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    user_response_rx: Option<Arc<smol::lock::Mutex<flume::Receiver<String>>>>,
     registry: Arc<ToolRegistry>,
 ) -> ToolContext {
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
@@ -575,6 +581,7 @@ pub fn interpreter_ctx(
         task_id: None,
         tool_use_id: None,
         user_response_rx,
+        reauth: false,
         loaded_instructions: LoadedInstructions::new(),
         call_instructions: CallInstructions::default(),
         cancel,
@@ -1050,9 +1057,12 @@ mod tests {
 
         let root_str = root.to_string_lossy();
         let collect = |patterns: &[&str]| -> Vec<String> {
-            walk_builder(&root_str, patterns)
-                .unwrap()
-                .build()
+            // A developer's global gitignore decides for itself whether a
+            // dotfile like `.env` is ignored, and this test is about our
+            // filters, not theirs.
+            let mut wb = walk_builder(&root_str, patterns).unwrap();
+            wb.git_global(false);
+            wb.build()
                 .flatten()
                 .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
                 .map(|e| {
@@ -1199,6 +1209,15 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for name in &names {
             assert!(seen.insert(name), "duplicate builtin tool name: {name}");
+        }
+    }
+
+    #[test]
+    fn provider_plugins_are_not_tools() {
+        for &name in maki_config::PROVIDER_BUILTINS {
+            assert!(maki_config::DEFAULT_BUILTINS.contains(&name), "{name}");
+            assert!(!is_builtin_tool(name), "{name}");
+            assert!(!all_builtin_tool_names().contains(&name), "{name}");
         }
     }
 }

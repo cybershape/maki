@@ -15,6 +15,7 @@ pub(crate) mod net;
 pub(crate) mod options;
 pub(crate) mod pack;
 pub(crate) mod plan;
+pub(crate) mod provider;
 pub(crate) mod session;
 pub(crate) mod slot;
 pub(crate) mod split;
@@ -35,17 +36,31 @@ use mlua::{Lua, Result as LuaResult, Table, Value};
 use crate::api::options::PluginOpts;
 use crate::api::tool::{PendingRules, PendingTools};
 use crate::api::util::command::UiAction;
-use crate::plugin_permissions::{Permission, PluginPermissions};
+use crate::plugin_permissions::{NetEgress, Permission, PluginPermissions, warn_invalid_net_hosts};
+use maki_providers::plugin::DeclAuthority;
+
+/// Who a `maki` global belongs to: the name everything it registers is filed
+/// under, and whether that code shipped inside the binary. One value, so a
+/// call site cannot hand over the name and forget the authority behind it.
+#[derive(Clone)]
+pub(crate) struct Owner {
+    pub name: Arc<str>,
+    pub authority: DeclAuthority,
+}
 
 pub(crate) fn create_maki_global(
     lua: &Lua,
     pending: PendingTools,
     pending_rules: PendingRules,
-    plugin: Arc<str>,
+    owner: Owner,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     permissions: &PluginPermissions,
     opts: PluginOpts,
 ) -> LuaResult<Table> {
+    let Owner {
+        name: plugin,
+        authority,
+    } = owner;
     let maki = lua.create_table()?;
 
     let api = tool::create_api_table(
@@ -58,7 +73,7 @@ pub(crate) fn create_maki_global(
         ui_action_tx.clone(),
     )?;
     autocmd::add_autocmd_methods(&api, lua, Arc::clone(&plugin))?;
-    slot::add_slot_methods(&api, lua, Arc::clone(&plugin))?;
+    slot::add_slot_methods(&api, lua, Arc::clone(&plugin), permissions.clone())?;
     maki.set("api", api)?;
     maki.set("env", env::create_env_table(lua, permissions)?)?;
     maki.set(
@@ -72,8 +87,27 @@ pub(crate) fn create_maki_global(
     maki.set("image", image::create_image_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
-    maki.set("net", net::create_net_table(lua, permissions)?)?;
+    let net_hosts = permissions.net_hosts();
+    warn_invalid_net_hosts(&plugin, &net_hosts);
+    // One egress value shared by the two namespaces that can open a socket, so
+    // a provider registered through `maki.provider` is reachable from
+    // `maki.net` without the manifest naming an origin only maki resolves.
+    let egress = NetEgress::new(net_hosts);
+    maki.set(
+        "net",
+        net::create_net_table(lua, permissions, egress.clone(), Arc::clone(&plugin))?,
+    )?;
     maki.set("plan", plan::create_plan_table(lua, ui_action_tx.clone())?)?;
+    maki.set(
+        "provider",
+        provider::create_provider_namespace(
+            lua,
+            permissions,
+            Arc::clone(&plugin),
+            egress,
+            authority,
+        )?,
+    )?;
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set(
         "session",
@@ -100,7 +134,10 @@ pub(crate) fn create_maki_global(
     )?;
     split::split__register(&maki, lua)?;
     top::add_top_methods(&maki, lua, Arc::clone(&plugin))?;
-    maki.set("async", r#async::create_async_table(lua)?)?;
+    maki.set(
+        "async",
+        r#async::create_async_table(lua, Arc::clone(&plugin))?,
+    )?;
     maki.set(
         "interpreter",
         interpreter::create_interpreter_table(lua, permissions)?,

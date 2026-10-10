@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::app::tasks::{TaskOutcome, TaskStatus};
+use crate::components::input::Submission;
 use crate::components::messages::{MessagesPanel, PromptProgress, ScrollPos};
 use crate::components::tool_display::append_annotation;
 use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
@@ -13,7 +14,9 @@ use crate::markdown::truncate_output;
 
 use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
-use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use maki_agent::{
+    AgentEvent, BufferSnapshot, SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput, ToolStartEvent,
+};
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::WinView;
 use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
@@ -30,6 +33,11 @@ pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
 /// One notice per streak: a wedged model can spend twenty nudges, and twenty
 /// identical bubbles bury the conversation they are about.
 const NUDGE_TEXT: &str = "Model stalled after tool calls, nudging...";
+const REWRITTEN_PREFIX: &str = "A plugin rewrote this message. The model got:";
+const DROPPED_PREFIX: &str = "A plugin kept this message from the model:";
+const CONTINUED_PREFIX: &str = "A plugin kept the agent going:";
+pub(crate) const INBOX_DROPPED_SUFFIX: &str =
+    " queued message(s) dropped: the subagent finished first";
 
 pub enum ChatEventResult {
     Continue,
@@ -43,6 +51,7 @@ pub enum ChatEventResult {
         id: String,
         tool: ToolKey,
         scopes: Vec<String>,
+        reason: Option<String>,
     },
     AuthRequired,
 }
@@ -58,6 +67,11 @@ pub struct Chat {
     /// A subagent's own settings; `None` on the main chat, which reads the
     /// session's.
     pub opts: Option<RequestOptions>,
+    /// A running subagent's inbox for messages typed in its chat. Taken when
+    /// the chat finishes, since nothing would drain it after that.
+    pub(crate) inbox: Option<Arc<SubagentInbox>>,
+    /// Parked while another chat is in front, see `App::set_active_chat`.
+    pub(crate) draft: Submission,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     /// The ending and the index of the bubble announcing it, so a later, better
@@ -85,6 +99,8 @@ impl Chat {
             context_size: 0,
             model_id: None,
             opts: None,
+            inbox: None,
+            draft: Submission::default(),
             pending_turn_usage: None,
             messages_panel,
             finish: None,
@@ -182,12 +198,34 @@ impl Chat {
                 self.messages_panel.flush();
                 return ChatEventResult::Done;
             }
-            AgentEvent::Error { message } => {
+            AgentEvent::Error { message, .. } => {
                 self.messages_panel.flush();
                 return ChatEventResult::Error(message);
             }
-            AgentEvent::PermissionRequest { id, tool, scopes } => {
-                return ChatEventResult::PermissionRequest { id, tool, scopes };
+            AgentEvent::PermissionRequest {
+                id,
+                tool,
+                scopes,
+                reason,
+            } => {
+                return ChatEventResult::PermissionRequest {
+                    id,
+                    tool,
+                    scopes,
+                    reason,
+                };
+            }
+            AgentEvent::Steered { kind, text } => {
+                let prefix = match kind {
+                    SteerKind::MessageRewritten => REWRITTEN_PREFIX,
+                    SteerKind::MessageDropped => DROPPED_PREFIX,
+                    SteerKind::Continued => CONTINUED_PREFIX,
+                };
+                self.messages_panel.flush();
+                self.messages_panel.push(DisplayMessage::new(
+                    DisplayRole::Assistant,
+                    format!("{prefix}\n\n{text}"),
+                ));
             }
             AgentEvent::AuthRequired => {
                 return ChatEventResult::AuthRequired;
@@ -215,6 +253,11 @@ impl Chat {
                         NUDGE_TEXT.into(),
                     ));
                 }
+            }
+            AgentEvent::Notice { text } => {
+                self.messages_panel.flush();
+                self.messages_panel
+                    .push(DisplayMessage::new(DisplayRole::Notice, text));
             }
             AgentEvent::SubagentHistory { .. } | AgentEvent::StreamClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
@@ -385,6 +428,13 @@ impl Chat {
             return;
         }
         self.messages_panel.flush();
+        let undelivered = self.inbox.take().map_or(0, |inbox| inbox.len());
+        if undelivered > 0 {
+            self.messages_panel.push(DisplayMessage::new(
+                DisplayRole::Error,
+                format!("{undelivered}{INBOX_DROPPED_SUFFIX}"),
+            ));
+        }
         let bubble = self
             .messages_panel
             .push(DisplayMessage::new(outcome.role(), text.into()));
@@ -486,6 +536,10 @@ impl Chat {
     }
 }
 
+fn is_shown_prompt(msg: &Message) -> bool {
+    matches!(msg.role, Role::User) && !msg.is_from_host() && msg.user_text().is_some()
+}
+
 pub fn history_to_display(
     messages: &[Message],
     tool_outputs: &HashMap<String, Arc<ToolOutput>>,
@@ -494,7 +548,22 @@ pub fn history_to_display(
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
     let mut restore_items: Vec<maki_lua::RestoreItem> = Vec::new();
-    for msg in messages {
+    // An update sent with a prompt sits before it in history, but live the
+    // prompt shows on submit and the update after. Restored, it keeps that
+    // order.
+    let mut told_with_prompt = None;
+    for (i, msg) in messages.iter().enumerate() {
+        if msg.is_context_update() {
+            if let Some(summary) = &msg.display_text {
+                let notice = DisplayMessage::new(DisplayRole::Notice, summary.clone());
+                if messages.get(i + 1).is_some_and(is_shown_prompt) {
+                    told_with_prompt = Some(notice);
+                } else {
+                    display.push(notice);
+                }
+            }
+            continue;
+        }
         if msg.is_observation() {
             continue;
         }
@@ -514,6 +583,7 @@ pub fn history_to_display(
                         images,
                     ));
                 }
+                display.extend(told_with_prompt.take());
             }
             Role::Assistant => {
                 for block in &msg.content {
@@ -716,7 +786,7 @@ fn user_images(msg: &Message) -> Vec<ImageSource> {
 fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
     let mut map = HashMap::new();
     for msg in messages {
-        if !matches!(msg.role, Role::User) || msg.is_observation() {
+        if !matches!(msg.role, Role::User) || msg.is_from_host() {
             continue;
         }
         for block in &msg.content {
@@ -724,6 +794,7 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } = block
             {
                 map.insert(tool_use_id.as_str(), (*is_error, content.as_str()));
@@ -761,11 +832,7 @@ mod tests {
         let tool_result = Message {
             role: Role::User,
             content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: TASK_ID.into(),
-                    content: USER_TEXT.into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result(TASK_ID, USER_TEXT, false),
                 ContentBlock::Image { source: image() },
             ],
             ..Default::default()
@@ -879,6 +946,7 @@ mod tests {
         written_path: Option<String>,
     ) -> AgentEvent {
         AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            call: None,
             id: id.into(),
             tool: tool.into(),
             output: Arc::new(output),
@@ -1044,6 +1112,33 @@ mod tests {
         assert_eq!(display[0].text, "I will fix it");
     }
 
+    const UPDATE_SUMMARY: &str = "Told the model: date";
+    const PROMPT: &str = "fix the test";
+
+    fn update() -> Message {
+        Message::context_update(
+            "<context-update>Date is now tomorrow.</context-update>".into(),
+            UPDATE_SUMMARY.into(),
+            Default::default(),
+        )
+    }
+
+    /// Live, the prompt shows on submit and the update it carried after it,
+    /// so a restored transcript keeps that order.
+    #[test_case(vec![update()], &[(DisplayRole::Notice, UPDATE_SUMMARY)] ; "alone")]
+    #[test_case(vec![update(), Message::user(PROMPT.into())], &[(DisplayRole::User, PROMPT), (DisplayRole::Notice, UPDATE_SUMMARY)] ; "sent_with_a_prompt")]
+    fn history_shows_context_updates_as_their_summary(
+        msgs: Vec<Message>,
+        expected: &[(DisplayRole, &str)],
+    ) {
+        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let shown: Vec<(DisplayRole, &str)> = display
+            .iter()
+            .map(|d| (d.role.clone(), d.text.as_str()))
+            .collect();
+        assert_eq!(shown, expected);
+    }
+
     fn tool_use_pair(
         tool: &str,
         input: serde_json::Value,
@@ -1058,11 +1153,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: result.into(),
-                    is_error,
-                }],
+                content: vec![ContentBlock::tool_result("t1", result, is_error)],
                 ..Default::default()
             },
         ]
@@ -1098,11 +1189,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "hi".into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("t1", "hi", false)],
                 ..Default::default()
             },
             Message {
@@ -1343,6 +1430,7 @@ mod tests {
                 context_size_before: 0,
                 context_size_after: 0,
                 context_window: 0,
+                summary: String::new(),
             },
             None,
         );
@@ -1471,5 +1559,49 @@ mod tests {
         assert!(sub.is_finished());
         assert_eq!(sub.task_status(), TaskStatus::Error);
         assert_eq!(sub.task_id().map(|id| &**id), Some(TASK_ID));
+    }
+
+    const STEER_TEXT: &str = "keep going";
+    const ASK_REASON: &str = "plugin wants a human to look";
+    const EXPECTED_PERMISSION_REQUEST: &str = "a permission request must reach the caller";
+
+    #[test_case(SteerKind::MessageRewritten, REWRITTEN_PREFIX ; "message_rewritten")]
+    #[test_case(SteerKind::MessageDropped, DROPPED_PREFIX ; "message_dropped")]
+    #[test_case(SteerKind::Continued, CONTINUED_PREFIX ; "continued")]
+    fn steered_shows_one_prefixed_assistant_message(kind: SteerKind, prefix: &str) {
+        let mut chat = chat();
+        chat.handle_event(
+            AgentEvent::Steered {
+                kind,
+                text: STEER_TEXT.into(),
+            },
+            None,
+        );
+        assert_eq!(chat.message_count(), 1);
+        let text = chat.last_message_text();
+        assert!(
+            text.starts_with(prefix) && text.ends_with(STEER_TEXT),
+            "{text}"
+        );
+        assert_eq!(chat.last_message_role(), Some(&DisplayRole::Assistant));
+    }
+
+    #[test]
+    fn permission_request_carries_reason() {
+        let mut chat = chat();
+        let result = chat.handle_event(
+            AgentEvent::PermissionRequest {
+                id: TASK_ID.into(),
+                tool: ToolKey::native("bash"),
+                scopes: Vec::new(),
+                reason: Some(ASK_REASON.into()),
+            },
+            None,
+        );
+        let ChatEventResult::PermissionRequest { id, reason, .. } = result else {
+            panic!("{EXPECTED_PERMISSION_REQUEST}");
+        };
+        assert_eq!(id, TASK_ID);
+        assert_eq!(reason.as_deref(), Some(ASK_REASON));
     }
 }

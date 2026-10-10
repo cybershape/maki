@@ -1,4 +1,6 @@
--- `@` file completion for the chat input, in Lua.
+-- Mention completion for the chat input, in Lua: files after `@`, and
+-- whatever other plugins offer through the `completion.sources` slot (see
+-- `sources.lua`).
 --
 -- Nothing here is special-cased in the host. The popup is an ordinary
 -- unfocused float on the input caret anchor, the navigation keys are the
@@ -14,6 +16,9 @@
 
 local Events = require("events")
 local Menu = require("menu")
+local Sources = require("sources")
+
+Sources.declare()
 
 maki.api.create_autocmd("InputChanged", {
   callback = function(ev)
@@ -29,8 +34,8 @@ maki.api.create_autocmd("SessionReset", {
 
 -- Cycling to a subagent tab stays within the session, so nothing else here
 -- fires. The popup's keys are routed to it before the chat's own, so one left
--- open over a subagent takes `<Tab>` away from the mode toggle and lets `<CR>`
--- write a path into a tab the user is not looking at.
+-- open over a subagent takes `<Up>` away from the input history and lets
+-- `<CR>` write a path into a tab the user is not looking at.
 maki.api.create_autocmd("TaskFocusChanged", {
   callback = Menu.close,
 })

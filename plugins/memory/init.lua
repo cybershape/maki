@@ -234,12 +234,12 @@ maki.api.register_tool({
     if type(input.tags) == "string" then
       input.tags = { input.tags }
     end
-    local verr = helpers.validate_input(input)
+    local cmd = input.command
+    local dir, dir_err = resolve_dir(cmd ~= "write" and cmd ~= "delete")
+    local verr = helpers.validate_input(input, dir)
     if verr then
       return { llm_output = "error: " .. verr, is_error = true }
     end
-    local cmd = input.command
-    local dir, dir_err = resolve_dir(cmd == "list" or cmd == "read")
     if not dir then
       return { llm_output = "error: " .. dir_err, is_error = true }
     end
@@ -365,9 +365,9 @@ maki.api.register_command({
         key = function(item)
           return item.label
         end,
-        submit_keys = { "ctrl+o" },
+        submit_keys = { "<C-o>" },
         live_keys = {
-          tab = function()
+          ["<Tab>"] = function()
             view = view % #VIEWS + 1
             save_view(view)
             return build()

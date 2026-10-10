@@ -7,9 +7,10 @@ use color_eyre::eyre::Context;
 use maki_agent::tools::ToolRegistry;
 use maki_config::load_env_files;
 use maki_config::project::{self, TrustMode};
-use maki_lua::{InitFiles, PluginHost};
+use maki_lua::{InitFiles, Interaction, PluginHost};
 use maki_storage::StateDir;
 
+use crate::provider_scripts;
 use crate::setup;
 
 pub fn run(
@@ -26,14 +27,18 @@ pub fn run(
     let trust = project::resolve(&storage, &cwd, trust_mode);
     load_env_files(&trust.project_config);
 
-    let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
-        .context("initialize lua plugin host")?;
+    let mut plugin_host = PluginHost::start(
+        Arc::clone(ToolRegistry::global_arc()),
+        Interaction::None,
+        !no_jit,
+    )
+    .context("initialize lua plugin host")?;
 
-    let (config, warnings) = super::load_plugins(
+    let (mut config, mut warnings) = super::load_plugins(
         &mut plugin_host,
         no_plugins,
         super::BuiltinFailure::Fatal,
-        maki_lua::Interaction::None,
+        Interaction::None,
         |host, names, warnings| {
             warnings.extend(trust.warning.clone());
             let config = host
@@ -49,11 +54,14 @@ pub fn run(
             Ok(config)
         },
     )?;
+    warnings.extend(provider_scripts::startup_warning());
     super::report_warnings(warnings);
 
     let timeouts = maki_providers::Timeouts::from(&config.provider);
 
-    let model = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
+    let (model, warning) = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
+    super::report_warnings(Vec::from_iter(warning));
+    setup::remember_thinking(&mut config.session_defaults, &storage);
 
     setup::init_logging(&config.storage);
     setup::init_telemetry(&config.telemetry);

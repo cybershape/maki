@@ -23,6 +23,20 @@ skill names + descriptions           MCP tool defs   tool_search
 
 The left column is the fixed overhead of every single request, so Maki keeps it small on purpose: a skill contributes one description line, memories one list of tags, a big MCP server one search tool. The bodies stay on disk until the agent asks.
 
+## One prompt per session
+
+Maki builds the system prompt and tool definitions once per session and sends the same bytes on every request. Providers cache by prefix, so an edit near the front makes the next request pay for the whole conversation again. On Claude models it also drops earlier thinking.
+
+When something changes mid-session (the date, the model, plan mode, the directory after `/cd`, a new memory tag), Maki appends a short update before your next message. The transcript shows it as one dim line, such as `Told the model: date, plan mode`.
+
+A fresh prompt is built only on compaction, or for a change an update cannot carry: different tools (`/reload`, `/workflow`, a model with other capabilities) or a different system prompt passed in [headless](../headless/) mode. Such a change starts the cache over, and Maki tells you when it happens.
+
+Claude binds each thinking block to the prompt it was written under. Accounts that enforce this reject a request whose prompt moved under earlier thinking. When that happens Maki drops all earlier thinking once, tells you, and the session goes on. Later thinking is bound to the new prompt.
+
+A resumed session keeps its prompt across Maki upgrades, as long as the upgrade left the tools alone. Run `/compact` to pick up the new default.
+
+A request carries at most 100 images. Past that, Maki replaces the oldest 25 with a note at once, so the cache breaks once per 25 images rather than on every one.
+
 ## Instruction files
 
 At session start Maki walks from the project git root down to the working directory (no `.git` root, only the cwd). In each directory it loads **one** project instruction file, first match wins:
@@ -69,42 +83,40 @@ Rule of thumb: when `AGENTS.md` grows past a screen, the new material probably w
 
 ## Pointing at a file with `@`
 
-Naming the file you mean saves the agent a search, and a search costs a tool call and a few hundred tokens before it has read anything. Typing `@` in the chat input opens a completion popup over your message, ranked with the same matcher as the `Ctrl+S` file picker:
+Naming the file saves the agent a search, which costs a tool call and a few hundred tokens. Type `@` in the chat input to open a completion popup, ranked like the `Ctrl+S` file picker:
 
 ```
 > explain @maki-ui/src/app/mo
-                ╭────────────────────────────────╮
-                │ maki-ui/src/app/mod.rs         │
-                │ maki-ui/src/app/model.rs       │
-                ╰─ Tab next · Enter insert · Esc ╯
+                ╭─────────────────────────────────╮
+                │ maki-ui/src/app/mod.rs          │
+                │ maki-ui/src/app/model.rs        │
+                ╰ ↑/↓ move Enter insert Esc close ╯
 ```
 
-| Key | What it does |
-|-----|--------------|
-| `Tab`, `Ctrl+N` | next row |
-| `Ctrl+P` | previous row |
-| `Enter` | insert the highlighted path |
-| `Esc` | close the popup |
+| Key | Action |
+|-----|--------|
+| `↓`, `Ctrl+N` | Next row |
+| `↑`, `Ctrl+P` | Previous row |
+| `Enter` | Insert the highlighted path |
+| `Esc` | Close the popup |
 
-The popup owns those keys only while it is on screen, so `Ctrl+P` still opens `/sessions` the rest of the time and every other key still types into your message. Keep typing to narrow the list. A space ends the mention, so `@` in an email address opens nothing. Moving the caret out of the mention with an arrow key closes the popup and gives the keys back, without changing a character of what you typed. With no match to insert, Enter closes the popup and sends nothing, and the next Enter sends your message as usual.
+The popup takes these keys only while it is open. Otherwise `↑` and `↓` still walk the input history and `Ctrl+P` still opens `/sessions`. The characters your query matched are highlighted the way the file picker highlights them. Keep typing to narrow the list. A space ends the mention, so an email address does not open the popup. Moving the caret out of the mention closes it. With no match, `Enter` closes the popup without sending. While the agent is working, the first `Esc` only closes the popup, and after that `Esc` stops the turn as usual.
 
-Esc closes the popup while the agent is working too, and the press after that stops the turn, the way it does with nothing on screen.
+The inserted path is plain text in your message. Nothing is attached or read until the agent calls `read`.
 
-The rows are ranked for the text as it stood when you asked for them. Press Enter on a row faster than the list can catch up with your typing and maki refuses the insert and says so, rather than writing a path over the wrong part of your line.
-
-Inserting a path writes text into your message. The file is not attached and nothing is read yet: the agent reads it when it decides to, with the same `read` tool it would have used anyway.
-
-The plugin ships switched off while its file index proves itself on large repositories. Turn it on in `init.lua`:
+The plugin is off by default while its file index is tested on large repositories. Turn it on in `init.lua`:
 
 ```lua
 maki.setup({
   plugins = {
-    completion = { enabled = true, max_items = 10 },
+    completion = { enabled = true },
   },
 })
 ```
 
-`max_items` is how many rows the popup shows at once. The first walk of a large tree takes a moment. Until it lands the popup says `scanning…`, then fills in on its own when the walk finishes, so you do not have to press a key to wake it. Enter while it is still scanning waits for the rows instead of closing the popup a moment before they arrive. That wait is bounded: when a walk never reports back the popup gives up after a few seconds, the rows read `no matches`, and Enter closes the popup from there.
+On a large repository the first index walk takes a moment. The popup shows `scanning…` and fills in when the walk finishes. If the walk has not reported back after a few seconds, it shows `no matches`. Other options are under `plugins.completion` in [configuration](/docs/configuration/).
+
+Plugins can add their own entries to the popup, such as issues after `#` or people after `@`. See [completion sources](/docs/hooks/#completion-sources).
 
 ## When the window fills
 
@@ -118,7 +130,7 @@ An archive is a complete session file, so `jq` or an editor reads it as it is. T
 cd ~/.local/state/maki/sessions
 mv <session-id>.jsonl <session-id>.jsonl.bak
 cp archive/<session-id>/<n>.jsonl <session-id>.jsonl
-maki -s <session-id>
+maki -r <session-id>
 ```
 
 `MAKI_DISABLE_AUTOCOMPACT=1` turns off the automatic compaction. A manual `/compact` still compacts.

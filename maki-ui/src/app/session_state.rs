@@ -4,15 +4,19 @@ use std::sync::Arc;
 use maki_config::Effect;
 use maki_providers::{Model, RequestOptions, ThinkingConfig, TokenUsage, settle_session};
 use maki_storage::StateDir;
-use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule};
+use maki_storage::sessions::{SessionClaim, StoredEffect, StoredMode, StoredRule};
 
-use crate::AppSession;
+use crate::{AppSession, OpenSession};
 
 use super::mode::{Mode, PlanState};
 
 pub(crate) struct SessionState {
     /// Shared with the writer thread, so a checkpoint is just a refcount bump.
     pub session: Arc<AppSession>,
+    /// The right to write [`Self::session`]. Every queued snapshot carries a
+    /// clone, so swapping this out frees the old session once its last
+    /// snapshot lands.
+    pub claim: SessionClaim,
     pub model: Model,
     pub token_usage: TokenUsage,
     /// What the session has billed so far: the restored total plus every turn
@@ -29,6 +33,7 @@ pub(crate) struct SessionState {
     pub plan: PlanState,
     pub warnings: Vec<String>,
     pub thinking: ThinkingConfig,
+    pub pending_thinking: Option<ThinkingConfig>,
     /// What we actually bill and send.
     pub fast: bool,
     /// A wish parked until discovery answers, so a `/fast` typed while the
@@ -43,9 +48,18 @@ const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started 
 /// them can advertise a mode this model lacks, or miss one it demands. Fast
 /// comes back split into "on now" and "still waiting", which is the only place
 /// those two bits are derived.
-fn clamp(thinking: ThinkingConfig, fast: bool, model: &Model) -> (ThinkingConfig, bool, bool) {
+fn clamp(
+    thinking: ThinkingConfig,
+    fast: bool,
+    model: &Model,
+) -> (ThinkingConfig, Option<ThinkingConfig>, bool, bool) {
     let opts = RequestOptions { thinking, fast }.clamped(model);
-    (opts.thinking, opts.fast, fast && model.fast_pending())
+    (
+        opts.thinking,
+        (thinking.is_enabled() && !model.supports_thinking()).then_some(thinking),
+        opts.fast,
+        fast && model.fast_pending(),
+    )
 }
 
 impl SessionState {
@@ -53,7 +67,8 @@ impl SessionState {
     /// provider. Deciding again here is exactly how the app and the agent used
     /// to drift apart, so this adopts what it is handed and stays the only
     /// writer of `session.model`. Drawn, sent and stored then agree for free.
-    pub fn from_session(mut session: AppSession, model: &Model, storage: &StateDir) -> Self {
+    pub fn from_session(open: OpenSession, model: &Model, storage: &StateDir) -> Self {
+        let OpenSession { mut session, claim } = open;
         session.set_model(model.spec());
         let model = model.clone();
 
@@ -85,7 +100,7 @@ impl SessionState {
 
         // Saved model may differ from the live one (updated, removed, etc), so
         // reconcile before anyone reads the toggles or prices history with them.
-        let (thinking, fast, pending_fast) =
+        let (thinking, pending_thinking, fast, pending_fast) =
             clamp(session.meta.thinking.into(), session.meta.fast, &model);
         let token_usage = session.token_usage;
         let cost = settle_session(&token_usage, session.usage_by_model_mut(), &model, fast);
@@ -102,10 +117,12 @@ impl SessionState {
 
         Self {
             thinking,
+            pending_thinking,
             fast,
             pending_fast,
             workflow: session.meta.workflow,
             session: Arc::new(session),
+            claim,
             model,
             token_usage,
             cost,
@@ -127,13 +144,26 @@ impl SessionState {
         self.fast || self.pending_fast
     }
 
+    pub fn thinking_intent(&self) -> ThinkingConfig {
+        self.pending_thinking.unwrap_or(self.thinking)
+    }
+
     pub fn set_fast(&mut self, fast: bool) {
-        (self.thinking, self.fast, self.pending_fast) = clamp(self.thinking, fast, &self.model);
+        (
+            self.thinking,
+            self.pending_thinking,
+            self.fast,
+            self.pending_fast,
+        ) = clamp(self.thinking_intent(), fast, &self.model);
     }
 
     pub fn update_model(&mut self, model: &Model) {
-        (self.thinking, self.fast, self.pending_fast) =
-            clamp(self.thinking, self.fast_intent(), model);
+        (
+            self.thinking,
+            self.pending_thinking,
+            self.fast,
+            self.pending_fast,
+        ) = clamp(self.thinking_intent(), self.fast_intent(), model);
         self.session_mut().set_model(model.spec());
         self.model = model.clone();
     }
@@ -225,7 +255,7 @@ mod tests {
     use crate::components::{test_model, test_pricing};
     use maki_providers::model::FastSupport;
     use maki_providers::{FastPricing, ModelPricing, ThinkingSupport};
-    use maki_storage::sessions::{Effort, SessionError, SessionLog, StoredThinking};
+    use maki_storage::sessions::{Effort, SessionClaim, SessionError, SessionLog, StoredThinking};
     use test_case::test_case;
 
     const RECORDED_COST: f64 = 0.42;
@@ -257,7 +287,7 @@ mod tests {
     fn resumed(session: AppSession, model: &Model) -> SessionState {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        SessionState::from_session(session, model, &storage)
+        SessionState::from_session(OpenSession::claimed(session, &storage), model, &storage)
     }
 
     /// An old session: counters, no per-model breakdown.
@@ -385,7 +415,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let session = make_plan_session(Some(StoredMode::Plan), None);
-        let state = SessionState::from_session(session, &test_model(), &storage);
+        let state = SessionState::from_session(
+            OpenSession::claimed(session, &storage),
+            &test_model(),
+            &storage,
+        );
         assert_eq!(state.mode, Mode::Plan);
         assert!(state.plan.path().is_some(), "plan path should be allocated");
     }
@@ -396,7 +430,11 @@ mod tests {
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let session =
             make_plan_session(Some(StoredMode::Plan), Some("/nonexistent/plan.md".into()));
-        let state = SessionState::from_session(session, &test_model(), &storage);
+        let state = SessionState::from_session(
+            OpenSession::claimed(session, &storage),
+            &test_model(),
+            &storage,
+        );
         assert_eq!(state.mode, Mode::Plan);
         let path = state.plan.path().expect("plan path should be allocated");
         assert_ne!(path, Path::new("/nonexistent/plan.md"));
@@ -414,7 +452,11 @@ mod tests {
             Some(StoredMode::Plan),
             Some(plan_file.to_string_lossy().into_owned()),
         );
-        let state = SessionState::from_session(session, &test_model(), &storage);
+        let state = SessionState::from_session(
+            OpenSession::claimed(session, &storage),
+            &test_model(),
+            &storage,
+        );
         assert_eq!(state.mode, Mode::Plan);
         assert_eq!(state.plan.path(), Some(plan_file.as_path()));
     }
@@ -427,7 +469,11 @@ mod tests {
         let mut session = make_plan_session(Some(StoredMode::Build), None);
         session.model = "openai/gpt-5".into();
 
-        let state = SessionState::from_session(session, &resolved, &storage);
+        let state = SessionState::from_session(
+            OpenSession::claimed(session, &storage),
+            &resolved,
+            &storage,
+        );
 
         assert_eq!(state.model.spec(), resolved.spec());
         assert_eq!(state.session.model, resolved.spec());
@@ -438,7 +484,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let session = make_plan_session(Some(StoredMode::Build), None);
-        let state = SessionState::from_session(session, &test_model(), &storage);
+        let state = SessionState::from_session(
+            OpenSession::claimed(session, &storage),
+            &test_model(),
+            &storage,
+        );
         assert_eq!(state.mode, Mode::Build);
         assert!(state.plan.path().is_none());
     }
@@ -480,6 +530,25 @@ mod tests {
         resumed(session, &model).thinking
     }
 
+    #[test_case(StoredThinking::Off)]
+    #[test_case(StoredThinking::Adaptive)]
+    #[test_case(StoredThinking::Effort { level: Effort::High })]
+    #[test_case(StoredThinking::Budget { tokens: 8192 })]
+    fn discovery_restores_thinking_after_startup_clamps_it(stored: StoredThinking) {
+        let mut session = AppSession::new("test-model", "/tmp");
+        session.meta.thinking = Some(stored);
+        let mut model = test_model();
+        model.thinking_override = Some(ThinkingSupport::No);
+        let mut state = resumed(session, &model);
+        assert_eq!(state.thinking, ThinkingConfig::Off);
+
+        state.set_fast(false);
+        model.thinking_override = Some(ThinkingSupport::Yes);
+        state.update_model(&model);
+
+        assert_eq!(state.thinking, ThinkingConfig::from(stored));
+    }
+
     /// Adoption overwrites `session.model`, so the per-model breakdown is the
     /// only record left of who earned what. Resuming onto a different model
     /// leaves that history where it stands instead of re-keying it.
@@ -511,14 +580,22 @@ mod tests {
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let mut model = test_model();
         let session = AppSession::new(&model.spec(), "/tmp");
-        let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let claim = SessionClaim::acquire_in(session.id, tmp.path()).unwrap();
+        let mut log = SessionLog::rewrite(tmp.path(), &claim, &session).unwrap();
         if adopt_other {
             model.id = UNRESOLVABLE_MODEL.into();
         }
 
-        let state = SessionState::from_session(session, &model, &storage);
+        let state = SessionState::from_session(
+            OpenSession {
+                session,
+                claim: claim.clone(),
+            },
+            &model,
+            &storage,
+        );
 
-        match log.append(&state.session) {
+        match log.append(&claim, &state.session) {
             Ok(()) => assert!(!adopt_other, "{OLD_SPEC_STAYS_ON_DISK}"),
             Err(SessionError::LogDiverged { .. }) => {
                 assert!(adopt_other, "{CURSOR_VOIDED_FOR_NOTHING}")

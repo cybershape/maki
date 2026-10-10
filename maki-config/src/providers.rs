@@ -1,8 +1,10 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::process;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -30,12 +32,21 @@ type FileStamp = (PathBuf, Option<SystemTime>, u64);
 /// those costs a read plus a full TOML parse.
 static PARSED: Mutex<Option<(FileStamp, ProvidersConfig)>> = Mutex::new(None);
 
-/// Coarse capability classification used by maki-providers to dispatch tiered
-/// requests. Mirrors `maki_providers::ModelTier` shape but lives here so the
-/// config layer can validate inputs without depending on maki-providers.
+/// Valid `top_p` is in the open interval exclusive of 0, up to 1 inclusive.
+const TOP_P_MIN: f64 = 0.0;
+const TOP_P_MAX: f64 = 1.0;
+
+/// The role a model plays, which is what tiered requests dispatch on. Lives
+/// here rather than in maki-providers so `providers.toml` can name it.
+///
+/// Ordering is a cost guarantee (a subagent may never run on a pricier tier
+/// than its parent), so the strength is written down in [`ModelTier::strength`]
+/// instead of being inherited from declaration order, where inserting or moving
+/// a variant would silently redefine "stronger". `Ord` stays because the tier is
+/// also a `BTreeMap` key in `model_registry`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Tier {
+pub enum ModelTier {
     Weak,
     #[default]
     Medium,
@@ -43,11 +54,78 @@ pub enum Tier {
     Compaction,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("invalid model tier '{0}' (expected: strong, medium, weak)")]
+pub struct InvalidTier(String);
+
+impl ModelTier {
+    /// `Compaction` is not a capability tier: it is a user-assigned slot for the
+    /// cheap model that rewrites history. It therefore ranks below every agent
+    /// tier, which makes it the tightest ceiling a parent can impose - a session
+    /// on a compaction model hands its children that same model rather than
+    /// letting them escalate to a capability tier.
+    const fn strength(self) -> u8 {
+        match self {
+            Self::Compaction => 0,
+            Self::Weak => 1,
+            Self::Medium => 2,
+            Self::Strong => 3,
+        }
+    }
+
+    /// The single named way to cap a requested tier, so no call site re-derives
+    /// the cost rule with an ad-hoc comparison.
+    pub fn capped_at(self, ceiling: Self) -> Self {
+        if self.strength() <= ceiling.strength() {
+            self
+        } else {
+            ceiling
+        }
+    }
+}
+
+impl Ord for ModelTier {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.strength().cmp(&other.strength())
+    }
+}
+
+impl PartialOrd for ModelTier {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl fmt::Display for ModelTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Weak => "weak",
+            Self::Medium => "medium",
+            Self::Strong => "strong",
+            Self::Compaction => "compaction",
+        })
+    }
+}
+
+impl FromStr for ModelTier {
+    type Err = InvalidTier;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "weak" => Ok(Self::Weak),
+            "medium" => Ok(Self::Medium),
+            "strong" => Ok(Self::Strong),
+            "compaction" => Ok(Self::Compaction),
+            other => Err(InvalidTier(other.to_string())),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDef {
     pub id: String,
     #[serde(default)]
-    pub tier: Tier,
+    pub tier: ModelTier,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,7 +236,7 @@ pub struct BuiltInProvider {
     pub protocol: Protocol,
     pub default_base_url: &'static str,
     pub default_api_key_env: &'static str,
-    pub default_model: &'static str,
+    pub default_model: Option<&'static str>,
     pub plans: Option<&'static [(&'static str, ProviderPlan)]>,
     pub login_url: Option<&'static str>,
     /// Whether the login flow should prompt for a base URL (e.g. local inference servers).
@@ -166,6 +244,10 @@ pub struct BuiltInProvider {
 }
 
 inventory::collect!(BuiltInProvider);
+
+/// Login rows of Lua plugin providers. They show up at runtime, too late for
+/// `inventory`, so they live here and every lookup checks both.
+static REGISTERED: RwLock<Vec<&'static BuiltInProvider>> = RwLock::new(Vec::new());
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OverrideFields {
@@ -213,6 +295,15 @@ pub struct ProviderDef {
     pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Nucleus sampling threshold sent as `top_p` in the request body to this
+    /// provider. When unset, no `top_p` is sent (the provider's own default
+    /// applies). Must be in `(0, 1]`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_top_p"
+    )]
+    pub top_p: Option<f64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub discover_models: bool,
     /// Extra HTTP headers sent with every request to this provider. Values
@@ -240,6 +331,12 @@ pub struct ProviderDef {
     /// price as a reference; see [`maki_providers::Model::subsidised_by`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subsidised_by: Option<String>,
+    /// Whether the endpoint expands `tool_reference` blocks into
+    /// `defer_loading` definitions, so a deferred MCP tool loads without
+    /// rewriting the cached tools prefix. Unset falls back to the built-in
+    /// row at its own URL, `false` for a custom slug or another `base_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_deferred_tools: Option<bool>,
     /// Opencode-only: when `Some(false)`, free catalog models are hidden
     /// entirely. Defaults to `false` when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -347,14 +444,25 @@ fn providers_file_path() -> PathBuf {
     })
 }
 
+pub fn set_registered_providers(rows: Vec<&'static BuiltInProvider>) {
+    *REGISTERED.write().unwrap_or_else(|e| e.into_inner()) = rows;
+}
+
 pub fn builtin_provider(slug: &str) -> Option<&'static BuiltInProvider> {
     inventory::iter::<BuiltInProvider>()
         .into_iter()
         .find(|p| p.slug == slug)
+        .or_else(|| {
+            let registered = REGISTERED.read().unwrap_or_else(|e| e.into_inner());
+            registered.iter().copied().find(|p| p.slug == slug)
+        })
 }
 
 pub fn all_builtins() -> Vec<&'static BuiltInProvider> {
-    inventory::iter::<BuiltInProvider>().collect()
+    let registered = REGISTERED.read().unwrap_or_else(|e| e.into_inner());
+    inventory::iter::<BuiltInProvider>()
+        .chain(registered.iter().copied())
+        .collect()
 }
 
 pub fn resolve_api_key_env(slug: &str, def: Option<&ProviderDef>) -> String {
@@ -386,14 +494,13 @@ pub fn base_url_override(slug: &str) -> Option<String> {
 /// that already carry a default (the openai-compat layer, whose static default
 /// can be more specific than the inventory one) use this.
 pub fn configured_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String> {
-    if let Some(url) = base_url_override(slug) {
-        return Some(url);
-    }
-    let def = def?;
-    if let Some(url) = &def.base_url {
-        return Some(url.clone());
-    }
-    let plan_name = def.plan.as_ref()?;
+    base_url_override(slug)
+        .or_else(|| def?.base_url.clone())
+        .or_else(|| plan_base_url(slug, def))
+}
+
+pub fn plan_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String> {
+    let plan_name = def?.plan.as_ref()?;
     builtin_provider(slug)?
         .plans?
         .iter()
@@ -428,7 +535,7 @@ pub fn overlays_local_thinking(slug: &str) -> bool {
 fn ignored_local_model_fields(models: &[ModelDef]) -> Vec<&'static str> {
     let any = |is_set: fn(&ModelDef) -> bool| models.iter().any(is_set);
     let mut ignored = Vec::new();
-    if any(|m| m.tier != Tier::default()) {
+    if any(|m| m.tier != ModelTier::default()) {
         ignored.push("models.tier");
     }
     if any(|m| m.context_window.is_some()) {
@@ -518,7 +625,7 @@ pub fn resolve_default_model(slug: &str, def: Option<&ProviderDef>) -> Option<St
             }
         }
     }
-    builtin_provider(slug).map(|b| b.default_model.to_string())
+    builtin_provider(slug)?.default_model.map(str::to_owned)
 }
 
 pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {
@@ -535,6 +642,30 @@ pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {
         }
     }
     builtin_provider(slug).and_then(|b| b.login_url.map(|u| u.to_string()))
+}
+
+/// The `top_p` configured for `slug`. Read with `load_or_default` so a
+/// mid-session typo in `providers.toml` degrades to the default instead of
+/// taking the process down.
+pub fn top_p_for(slug: &str) -> Option<f64> {
+    ProvidersConfig::load_or_default()
+        .get(slug)
+        .and_then(|def| def.top_p)
+}
+
+fn de_top_p<'de, D>(de: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(de)?;
+    if let Some(v) = value
+        && (v.is_nan() || v <= TOP_P_MIN || v > TOP_P_MAX)
+    {
+        return Err(serde::de::Error::custom(format!(
+            "top_p must be in ({TOP_P_MIN}, {TOP_P_MAX}], got {v}"
+        )));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -610,14 +741,14 @@ tier = "mediums"
     #[test]
     fn model_def_tier_defaults_to_medium() {
         let m: ModelDef = toml::from_str(r#"id = "x""#).unwrap();
-        assert_eq!(m.tier, Tier::Medium);
+        assert_eq!(m.tier, ModelTier::Medium);
     }
 
-    #[test_case("weak", Tier::Weak ; "weak")]
-    #[test_case("medium", Tier::Medium ; "medium")]
-    #[test_case("strong", Tier::Strong ; "strong")]
-    #[test_case("compaction", Tier::Compaction ; "compaction")]
-    fn model_def_tier_roundtrip(input: &str, expected: Tier) {
+    #[test_case("weak", ModelTier::Weak ; "weak")]
+    #[test_case("medium", ModelTier::Medium ; "medium")]
+    #[test_case("strong", ModelTier::Strong ; "strong")]
+    #[test_case("compaction", ModelTier::Compaction ; "compaction")]
+    fn model_def_tier_roundtrip(input: &str, expected: ModelTier) {
         let toml = format!(
             r#"id = "x"
 tier = "{input}"
@@ -625,6 +756,69 @@ tier = "{input}"
         );
         let m: ModelDef = toml::from_str(&toml).unwrap();
         assert_eq!(m.tier, expected);
+    }
+
+    const TIERS: [ModelTier; 4] = [
+        ModelTier::Weak,
+        ModelTier::Medium,
+        ModelTier::Strong,
+        ModelTier::Compaction,
+    ];
+
+    /// Declaration index of `Compaction`, which a derived `Ord` would read as
+    /// the strongest tier.
+    const COMPACTION_DECLARED_LAST: u8 = 3;
+
+    #[test_case(ModelTier::Strong, ModelTier::Weak, ModelTier::Weak ; "strong_child_capped_to_weak_parent")]
+    #[test_case(ModelTier::Weak, ModelTier::Strong, ModelTier::Weak ; "weak_child_stays_weak_under_strong_parent")]
+    #[test_case(ModelTier::Medium, ModelTier::Medium, ModelTier::Medium ; "equal_tiers_pass_through")]
+    #[test_case(ModelTier::Strong, ModelTier::Compaction, ModelTier::Compaction ; "strong_child_capped_to_compaction_parent")]
+    #[test_case(ModelTier::Medium, ModelTier::Compaction, ModelTier::Compaction ; "medium_child_capped_to_compaction_parent")]
+    #[test_case(ModelTier::Compaction, ModelTier::Strong, ModelTier::Compaction ; "compaction_child_is_not_escalated")]
+    fn capped_at_never_exceeds_ceiling(
+        requested: ModelTier,
+        ceiling: ModelTier,
+        expected: ModelTier,
+    ) {
+        assert_eq!(requested.capped_at(ceiling), expected);
+        assert!(requested.capped_at(ceiling) <= ceiling);
+    }
+
+    #[test]
+    fn every_tier_under_a_compaction_ceiling_stays_at_compaction() {
+        for tier in TIERS {
+            assert_eq!(tier.capped_at(ModelTier::Compaction), ModelTier::Compaction);
+        }
+    }
+
+    /// Fails if the variants get reordered (the hand-written strength table
+    /// would no longer be the thing that disagrees with declaration order) or if
+    /// the explicit `Ord` is ever replaced by a derive, which would rank
+    /// `Compaction` above `Strong` and turn the subagent cap into a no-op.
+    #[test]
+    fn tier_order_is_explicit_not_declaration_order() {
+        assert_eq!(ModelTier::Compaction as u8, COMPACTION_DECLARED_LAST);
+        assert!(ModelTier::Compaction < ModelTier::Weak);
+
+        let mut tiers = TIERS;
+        tiers.sort();
+        assert_eq!(
+            tiers,
+            [
+                ModelTier::Compaction,
+                ModelTier::Weak,
+                ModelTier::Medium,
+                ModelTier::Strong
+            ]
+        );
+    }
+
+    #[test]
+    fn tier_display_roundtrip() {
+        for tier in TIERS {
+            assert_eq!(tier.to_string().parse::<ModelTier>().unwrap(), tier);
+        }
+        assert!("turbo".parse::<ModelTier>().is_err());
     }
 
     #[test_case("anthropic", None => "ANTHROPIC_API_KEY".to_string(); "builtin_default")]
@@ -747,7 +941,7 @@ tier = "{input}"
     fn every_model_def_field_is_read_or_reported() {
         let every_field_set = ModelDef {
             id: "qwen".to_string(),
-            tier: Tier::Strong,
+            tier: ModelTier::Strong,
             context_window: Some(131_072),
             max_output_tokens: Some(8192),
             supports_tool_examples: Some(true),
@@ -782,6 +976,30 @@ tier = "{input}"
     fn thinking_level_keys_are_checked_at_parse(fields: &str, parses: bool) {
         let entry = format!(r#"models = [{{ id = "m", thinking_fields = {fields} }}]"#);
         assert_eq!(toml::from_str::<ProviderDef>(&entry).is_ok(), parses);
+    }
+
+    #[test_case(0.0; "zero")]
+    #[test_case(-0.1; "negative")]
+    #[test_case(1.5; "above_one")]
+    fn top_p_out_of_range_rejected(value: f64) {
+        let res = toml::from_str::<ProviderDef>(&format!("top_p = {value}"));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn top_p_nan_rejected() {
+        let err = toml::from_str::<ProviderDef>("top_p = nan")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("top_p must be in"), "{err}");
+    }
+
+    #[test]
+    fn top_p_boundaries_accepted() {
+        let def: ProviderDef = toml::from_str("top_p = 1.0").unwrap();
+        assert_eq!(def.top_p, Some(1.0));
+        let def2: ProviderDef = toml::from_str(&format!("top_p = {}", f64::MIN_POSITIVE)).unwrap();
+        assert!(def2.top_p.unwrap() > 0.0);
     }
 
     #[test_case("MyProvider", "myprovider"; "mixed_case")]

@@ -1,16 +1,21 @@
-//! Queue for messages typed while the agent is busy.
+//! Queue for messages typed while the agent is busy, and the subagent
+//! inbox a message typed in a subagent's chat goes to instead.
 
-use maki_agent::{AgentInput, ImageSource};
+use std::borrow::Cow;
+
+use maki_agent::{AgentInput, AgentMode, ImageSource, InputSource};
 
 use super::{Action, App, Status};
 
 use crate::agent::shared_queue::{Compaction, QueueItem, QueueSender, QueuedInput};
 use crate::components::queue_panel::QueueEntry;
+use crate::theme;
 
 pub(crate) use crate::agent::shared_queue::QueuedMessage;
 
 pub(crate) const EMPTY_PROMPT_ERR: &str = "prompt is empty";
 pub(crate) const NO_QUEUE_ERR: &str = "session cannot queue messages";
+pub(crate) const NO_INBOX_ERR: &str = "subagent is not taking messages";
 
 pub(crate) enum SubmitOutcome {
     Started(Vec<Action>),
@@ -148,6 +153,74 @@ impl App {
         }
     }
 
+    /// A message typed in a subagent's chat is for that subagent: it waits in
+    /// the subagent's inbox until its loop reaches a turn boundary, and the
+    /// `QueueItemConsumed` relayed from there draws it in this chat. The
+    /// subagent runs its own settings, so the input carries them.
+    pub(super) fn queue_for_subagent(&mut self, msg: QueuedMessage) -> Vec<Action> {
+        let chat = &self.chats[self.active_chat];
+        let Some(inbox) = chat.inbox.as_ref() else {
+            self.flash(NO_INBOX_ERR.into());
+            return vec![];
+        };
+        let (thinking, fast) = chat
+            .opts
+            .map_or((self.state.thinking, self.state.fast), |o| {
+                (o.thinking, o.fast)
+            });
+        inbox.push(AgentInput {
+            message: msg.text,
+            mode: AgentMode::Build,
+            images: msg.images,
+            preamble: Vec::new(),
+            earlier: Vec::new(),
+            thinking,
+            fast,
+            workflow: false,
+            prompt: None,
+            source: InputSource::Tui,
+        });
+        vec![]
+    }
+
+    /// The panel above the input shows the queue of the chat in front: the
+    /// session's for the main chat, the subagent's inbox otherwise.
+    pub(super) fn active_queue_len(&self) -> usize {
+        if self.is_main_chat() {
+            return self.queue.panel_len();
+        }
+        self.chats[self.active_chat]
+            .inbox
+            .as_ref()
+            .map_or(0, |inbox| inbox.len())
+    }
+
+    pub(super) fn active_queue_entries(&self) -> Vec<QueueEntry<'static>> {
+        if self.is_main_chat() {
+            return self.queue.panel_entries();
+        }
+        let color = theme::current().foreground;
+        self.chats[self.active_chat]
+            .inbox
+            .as_ref()
+            .map_or_else(Vec::new, |inbox| inbox.texts())
+            .into_iter()
+            .map(|text| QueueEntry {
+                text: Cow::Owned(text),
+                color,
+            })
+            .collect()
+    }
+
+    pub(super) fn pop_active_queue(&mut self) {
+        if self.is_main_chat() {
+            return self.queue.remove(0);
+        }
+        if let Some(ref inbox) = self.chats[self.active_chat].inbox {
+            inbox.remove(0);
+        }
+    }
+
     /// Deferred path: the agent is busy, so park the message and let
     /// `QueueItemConsumed` draw it once the agent picks it up. Returns
     /// false when there is no shared queue, meaning the message was dropped.
@@ -189,6 +262,7 @@ impl App {
         shared.push(QueueItem::Compact(Compaction {
             run_id: self.run_id,
             instructions,
+            workflow: self.state.workflow,
         }));
     }
 
@@ -229,7 +303,7 @@ impl App {
         // New work supersedes text held for recovery after an agent error.
         self.recoverable_queue.clear();
         self.status = Status::Streaming;
-        self.fire_session_autocmd("TurnStart", serde_json::json!({}));
+        self.fire_session_autocmd("TurnStart", serde_json::json!({ "text": display }));
         if !display.is_empty() || !input.images.is_empty() {
             self.main_chat()
                 .show_user_message(display, input.images.clone());

@@ -1,13 +1,25 @@
 local Events = require("events")
 local Menu = require("menu")
+local Sources = require("sources")
 local Trigger = require("trigger")
 local th = require("maki.test_helpers")
 
 local case = th.case
 local eq = th.eq
 
+-- Layered once, the way another plugin would, so every case goes through the
+-- real chain. The harness empties `offered` after each case.
+local offered = {}
+Sources.declare()
+maki.api.set_slot(Sources.SLOT, function(prev, list)
+  for _, source in ipairs(offered) do
+    table.insert(list, source)
+  end
+  return prev(list)
+end)
+
 local function find(text, cursor)
-  local start, query = Trigger.find(text, cursor or #text)
+  local start, query = Trigger.find(text, cursor or #text, Trigger.FILES)
   return start, query
 end
 
@@ -210,9 +222,15 @@ local function harness(body)
   maki.ui.flash = function(msg)
     table.insert(h.flashes, msg)
   end
-  maki.fs.fuzzy_files = function()
+  -- Once asked, the host reports highlights for every item, so a fixture
+  -- without them matched nothing.
+  maki.fs.fuzzy_files = function(rank_opts)
+    h.rank_opts = rank_opts
     if h.before_rank then
       h.before_rank()
+    end
+    for _, item in ipairs(h.found.items) do
+      item.highlights = item.highlights or {}
     end
     return h.found
   end
@@ -259,6 +277,9 @@ local function harness(body)
   maki.api.create_autocmd, maki.api.del_autocmd = saved.create_autocmd, saved.del_autocmd
   maki.defer_fn = saved.defer_fn
   maki.log.warn = saved.warn
+  for i = #offered, 1, -1 do
+    offered[i] = nil
+  end
   if not ok then
     error(err)
   end
@@ -267,7 +288,23 @@ end
 
 -- The text of the row the popup painted at {i}, border padding included.
 local function row(h, i)
-  return h.rows[i] and h.rows[i][1][1]
+  if not h.rows[i] then
+    return nil
+  end
+  local text = {}
+  for _, span in ipairs(h.rows[i]) do
+    text[#text + 1] = span[1]
+  end
+  return table.concat(text)
+end
+
+-- Row {i} as `[text:style]` per span, to compare the styling in one string.
+local function styled(h, i)
+  local out = {}
+  for _, span in ipairs(h.rows[i]) do
+    out[#out + 1] = "[" .. span[1] .. ":" .. span[2] .. "]"
+  end
+  return table.concat(out)
 end
 
 -- A walk landing, as the host delivers it: the tree it covered and nothing
@@ -370,7 +407,7 @@ case("the_popup_keeps_its_keys_while_a_refresh_is_in_flight", function()
 
     Events.input_changed(NEWER)
     eq(Menu.session_id(), SESSION, "the popup is still up")
-    Menu.handle_key("enter")
+    Menu.handle_key("<CR>")
 
     eq(#hh.edits, 1, "and it answered the key its footer advertises")
     eq(hh.edits[1].version, INPUT.version, "with the snapshot its rows were ranked for")
@@ -399,7 +436,7 @@ case("enter_with_nothing_to_insert_closes_the_popup_and_writes_nothing", functio
   local h = harness(function(hh)
     hh.found = { complete = true, items = {} }
     Menu.refresh(hh.input)
-    Menu.handle_key("enter")
+    Menu.handle_key("<CR>")
     eq(Menu.session_id(), nil, "the popup went")
   end)
   eq(#h.edits, 0, "and nothing was inserted")
@@ -416,7 +453,7 @@ case("enter_while_the_walk_is_still_running_holds_the_popup_open", function()
     Menu.refresh(hh.input)
     eq(row(hh, 1), " " .. SCANNING)
 
-    Menu.handle_key("enter")
+    Menu.handle_key("<CR>")
     eq(Menu.session_id(), SESSION, "the popup is still up for the rows on their way")
   end)
   eq(#h.edits, 0, "and nothing was inserted")
@@ -438,7 +475,7 @@ end)
 
 -- Moving the caret out of the mention changes no text at all. Until the host
 -- reported cursor-only moves the popup stayed up over a mention the user had
--- left, holding `<Tab>`, `<C-p>`, `<Esc>` and `<CR>` with it.
+-- left, holding `<Up>`, `<C-p>`, `<Esc>` and `<CR>` with it.
 
 case("the_popup_closes_when_the_caret_leaves_the_mention", function()
   harness(function(h)
@@ -473,7 +510,7 @@ case("a_key_for_a_popup_that_closed_does_nothing", function()
   local h = harness(function(hh)
     Menu.refresh(hh.input)
     Menu.close()
-    Menu.handle_key("enter")
+    Menu.handle_key("<CR>")
   end)
   eq(#h.edits, 0)
   eq(Menu.session_id(), nil)
@@ -490,11 +527,9 @@ local function selected(h)
   return nil
 end
 
--- A key is claimed as `<C-n>` and delivered as `ctrl+n`, and nothing in the
--- language holds the two lists to each other: a key added to one and not the
--- other is claimed, taken from the user, and dropped. Every claim has to be
--- answered under the name the press arrives by.
-case("every_claimed_key_is_answered_under_the_name_it_is_delivered_by", function()
+-- A claim the popup never answers is a key taken from the user and dropped,
+-- so this presses every binding and checks the window claimed it too.
+case("every_claimed_key_is_answered", function()
   for _, binding in ipairs(Menu.BINDINGS) do
     harness(function(hh)
       hh.found = {
@@ -506,26 +541,51 @@ case("every_claimed_key_is_answered_under_the_name_it_is_delivered_by", function
       th.has(table.concat(hh.claimed, " "), binding.claim, "the window claims " .. binding.claim)
 
       local before = selected(hh)
-      Menu.handle_key(binding.event)
+      Menu.handle_key(binding.claim)
       local answered = Menu.session_id() == nil or selected(hh) ~= before
-      eq(answered, true, binding.event .. " reached a handler")
+      eq(answered, true, binding.claim .. " reached a handler")
     end)
   end
 end)
 
--- Navigation is the other half of what the claimed keys are for.
+-- Navigation is the other half of what the claimed keys are for. Up from the
+-- first row wraps to the last, which is where a list shown above the input
+-- keeps its nearest rows.
 case("the_navigation_keys_move_the_highlight", function()
+  for _, press in ipairs({ { "<Down>" }, { "<C-n>" }, { "<Up>" }, { "<C-p>" }, { "<Down>", "<Down>", "<Up>" } }) do
+    local h = harness(function(hh)
+      hh.found = {
+        complete = true,
+        root = ROOT,
+        items = { { path = MATCH }, { path = OTHER_MATCH } },
+      }
+      Menu.refresh(hh.input)
+      for _, key in ipairs(press) do
+        Menu.handle_key(key)
+      end
+      Menu.handle_key("<CR>")
+    end)
+    eq(h.edits[1].text, OTHER_MATCH .. " ", table.concat(press, " ") .. " landed on the second row")
+  end
+end)
+
+-- Matches are marked the way the `Ctrl+S` picker marks them, on the selected
+-- row and off it.
+case("the_matched_characters_are_highlighted", function()
   local h = harness(function(hh)
     hh.found = {
       complete = true,
       root = ROOT,
-      items = { { path = MATCH }, { path = OTHER_MATCH } },
+      items = {
+        { path = MATCH, highlights = { { 1, 3 }, { 5, 6 } } },
+        { path = OTHER_MATCH, highlights = { { 5, 5 } } },
+      },
     }
     Menu.refresh(hh.input)
-    Menu.handle_key("tab")
-    Menu.handle_key("enter")
   end)
-  eq(h.edits[1].text, OTHER_MATCH .. " ", "Tab moved the highlight down a row")
+  eq(h.rank_opts.highlights, true, "the ranking was asked where it matched")
+  eq(styled(h, 1), "[ :selected][src:match_selected][/:selected][ma:match_selected][in.rs:selected]")
+  eq(styled(h, 2), "[ :item][src/:item][m:match][enu.rs:item]")
 end)
 
 -- Esc is the key the popup shares with the host: while the agent streams the
@@ -533,7 +593,7 @@ end)
 case("esc_closes_the_popup", function()
   local h = harness(function(hh)
     Menu.refresh(hh.input)
-    Menu.handle_key("esc")
+    Menu.handle_key("<Esc>")
     eq(Menu.session_id(), nil)
   end)
   eq(h.closes, 1)
@@ -598,6 +658,55 @@ case("a_walk_of_another_tree_leaves_the_rows_waiting", function()
   eq(h.on_index_ready, nil)
 end)
 
+-- One keystroke past `INPUT`.
+local TYPED = { text = INPUT.text .. "i", cursor = INPUT.cursor + 1, version = INPUT.version + 1, session_id = SESSION }
+local ANSWERS_THE_LAST_KEYSTROKE = "the rows answer the text the user typed last"
+
+-- The two ways a scan asks for another look. Each used to rank the snapshot it
+-- started from, which cancelled the ranking of the newer keystroke and left old
+-- rows up, with a version every accept was then refused for.
+
+case("a_walk_landing_mid_keystroke_ranks_the_newest_input", function()
+  local h = harness(function(hh)
+    hh.found = { complete = false, root = ROOT, items = {} }
+    Menu.refresh(hh.input)
+    hh.found = { complete = true, root = ROOT, items = { { path = MATCH } } }
+    hh.defer = true
+    hh.before_rank = function()
+      hh.before_rank = nil
+      walk_landed(hh)
+    end
+    Menu.refresh(TYPED)
+    hh.flush()
+    Menu.handle_key("<CR>")
+  end)
+  eq(h.edits[1].version, TYPED.version, ANSWERS_THE_LAST_KEYSTROKE)
+end)
+
+case("a_look_queued_behind_a_newer_keystroke_ranks_the_newest_input", function()
+  local h = harness(function(hh)
+    hh.found = { complete = false, root = ROOT, items = {} }
+    hh.defer = true
+    Menu.refresh(hh.input)
+    hh.found = { complete = true, root = ROOT, items = { { path = MATCH } } }
+    Menu.refresh(TYPED)
+    hh.flush()
+    Menu.handle_key("<CR>")
+  end)
+  eq(h.edits[1].version, TYPED.version, ANSWERS_THE_LAST_KEYSTROKE)
+end)
+
+case("esc_during_a_scan_is_not_undone_by_a_queued_look", function()
+  local h = harness(function(hh)
+    hh.found = { complete = false, root = ROOT, items = {} }
+    hh.defer = true
+    Menu.refresh(hh.input)
+    Menu.handle_key("<Esc>")
+    hh.flush()
+  end)
+  eq(h.opens, 1, "the popup stayed closed")
+end)
+
 -- The walk can land between the ranking and the subscription, and that event
 -- has no subscriber. Without one more look the rows then say `scanning…` until
 -- the user presses a key, which is the opposite of what the docs promise.
@@ -610,7 +719,7 @@ case("a_walk_that_landed_before_the_subscription_still_fills_the_rows", function
       if looks == 1 then
         return { complete = false, root = ROOT, items = {} }
       end
-      return { complete = true, root = ROOT, items = { { path = MATCH } } }
+      return { complete = true, root = ROOT, items = { { path = MATCH, highlights = {} } } }
     end
     Menu.refresh(hh.input)
     eq(row(hh, 1), " " .. MATCH, "the look after subscribing found the walk already in")
@@ -635,7 +744,7 @@ case("a_walk_that_never_lands_stops_holding_enter", function()
     eq(row(hh, 1), " " .. NO_MATCHES, "the popup stops saying rows are on their way")
     eq(hh.on_index_ready, nil, "and stops listening for a walk that is not coming")
 
-    Menu.handle_key("enter")
+    Menu.handle_key("<CR>")
     eq(Menu.session_id(), nil, "Enter closes the popup, the way it does on an empty list")
   end)
   eq(#h.edits, 0, "and nothing was inserted")
@@ -747,6 +856,203 @@ case("events_close_a_popup_when_the_input_goes_off_screen", function()
 
     Events.session_status_changed({ focused = true, status = "needs_input" })
     eq(Menu.session_id(), nil)
+  end)
+end)
+
+-- ------------------------------------------------------------ sources
+
+local ISSUE_TRIGGER = "#"
+local ISSUE_INPUT = { text = "fix #cr", cursor = 7, version = 5, session_id = SESSION }
+local ISSUE = "#12"
+local ISSUE_LABEL = "#12 crash on start"
+
+-- A source that answers {items} and records every call it got.
+local function source(name, trigger, items)
+  local s = { name = name, trigger = trigger, calls = {} }
+  s.complete = function(query, ctx)
+    table.insert(s.calls, { query = query, ctx = ctx })
+    return items
+  end
+  table.insert(offered, s)
+  return s
+end
+
+case("trigger_opens_on_any_listed_character", function()
+  local start, query, trigger = Trigger.find("see #12", 7, "@#")
+  eq(start, 4)
+  eq(query, "12")
+  eq(trigger, "#")
+  eq(Trigger.find("see #12", 7, "@"), nil, "a character no source listens for opens nothing")
+  eq(Trigger.may_open("see (x", 6), true)
+  eq(Trigger.may_open("see x", 5), false)
+end)
+
+case("a_source_answers_the_trigger_it_listens_on", function()
+  local issues
+  local h = harness(function(hh)
+    issues = source("issues", ISSUE_TRIGGER, { { text = ISSUE, label = ISSUE_LABEL } })
+    Menu.refresh(ISSUE_INPUT)
+    eq(row(hh, 1), " " .. ISSUE_LABEL, "the label is what the row shows")
+    Menu.accept()
+  end)
+  eq(issues.calls[1].query, "cr")
+  eq(issues.calls[1].ctx.trigger, ISSUE_TRIGGER)
+  eq(issues.calls[1].ctx.session_id, SESSION)
+  eq(h.rank_opts, nil, "files are the `@` trigger's, not every trigger's")
+  eq(h.edits[1].text, ISSUE .. " ", "the text is what the accept inserts")
+  eq(h.edits[1].start, 4, "over the mention, trigger included")
+end)
+
+case("source_rows_merge_with_the_files_by_score", function()
+  harness(function(hh)
+    source("people", Trigger.FILES, {
+      { text = "@low", score = -1 },
+      { text = "@tie" },
+      { text = "@high", score = 2 },
+    })
+    Menu.refresh(hh.input)
+    eq(row(hh, 1), " @high")
+    eq(row(hh, 2), " " .. MATCH)
+    eq(row(hh, 3), " @tie")
+    eq(row(hh, 4), " @low")
+  end)
+end)
+
+case("a_broken_source_costs_only_its_own_rows", function()
+  local h = harness(function(hh)
+    local raising = source("raising", ISSUE_TRIGGER, nil)
+    raising.complete = function()
+      error("boom")
+    end
+    source("textless", ISSUE_TRIGGER, { { label = "no text" } })
+    source("fine", ISSUE_TRIGGER, { { text = ISSUE } })
+    Menu.refresh(ISSUE_INPUT)
+    eq(row(hh, 1), " " .. ISSUE)
+    eq(row(hh, 2), nil, "an item with nothing to insert is not a row")
+  end)
+  th.has(table.concat(h.warnings, "\n"), "raising", "the failure is logged under the source's name")
+end)
+
+case("a_malformed_source_is_skipped_and_logged_once", function()
+  local h = harness(function(hh)
+    source("two_chars", "##", { { text = ISSUE } })
+    source("dup", ISSUE_TRIGGER, { { text = "first" } })
+    source("dup", ISSUE_TRIGGER, { { text = "second" } })
+    Menu.refresh(ISSUE_INPUT)
+    Menu.refresh(ISSUE_INPUT)
+    eq(row(hh, 1), " first", "the first source under a name keeps it")
+    eq(row(hh, 2), nil)
+  end)
+  eq(#h.warnings, 2, "one line per problem, not one per keystroke")
+end)
+
+case("a_silent_source_is_given_up_on_at_the_deadline", function()
+  harness(function(hh)
+    local silent = source("silent", ISSUE_TRIGGER, { { text = ISSUE } })
+    hh.defer = true
+    Menu.refresh(ISSUE_INPUT)
+    eq(Menu.session_id(), nil, "nothing to show yet, so nothing is shown")
+
+    hh.fire_timers()
+    eq(row(hh, 1), " " .. NO_MATCHES, "past the deadline the answer is that nothing matched")
+
+    hh.flush()
+    eq(silent.calls[1].ctx.cancelled(), true, "the source can tell it is no longer awaited")
+    eq(row(hh, 1), " " .. NO_MATCHES, "and its late answer paints nothing")
+  end)
+end)
+
+case("a_newer_keystroke_supersedes_the_answer_in_flight", function()
+  local NEWER = { text = "fix #cra", cursor = 8, version = 6, session_id = SESSION }
+  harness(function(hh)
+    local issues = source("issues", ISSUE_TRIGGER, { { text = ISSUE } })
+    hh.defer = true
+    Menu.refresh(ISSUE_INPUT)
+    Menu.refresh(NEWER)
+    hh.flush()
+    eq(issues.calls[1].ctx.cancelled(), true, "the first ask answers a keystroke nobody is on")
+    eq(issues.calls[2].query, "cra")
+    Menu.accept()
+    eq(hh.edits[1].version, NEWER.version, "the rows on screen are the newest keystroke's")
+  end)
+end)
+
+case("rows_carry_over_within_a_mention_and_not_across_one", function()
+  local SAME = { text = "fix #cra", cursor = 8, version = 6, session_id = SESSION }
+  local OTHER = { text = "fix #cra and #b", cursor = 15, version = 7, session_id = SESSION }
+  harness(function(hh)
+    source("issues", ISSUE_TRIGGER, { { text = ISSUE } })
+    Menu.refresh(ISSUE_INPUT)
+    hh.defer = true
+
+    Menu.refresh(SAME)
+    eq(row(hh, 1), " " .. ISSUE, "the popup narrows instead of blinking empty")
+
+    Menu.refresh(OTHER)
+    eq(row(hh, 1), " " .. SCANNING)
+    Menu.handle_key("<CR>")
+    eq(#hh.edits, 0, "Enter waits for this mention's rows")
+    eq(Menu.session_id(), SESSION, "and holds the popup open meanwhile")
+  end)
+end)
+
+-- A source answering before the files are ranked paints the files carried
+-- from the keystroke before, and those still answer that keystroke's text.
+case("a_carried_file_row_is_weighed_against_the_snapshot_it_was_ranked_for", function()
+  local h = harness(function(hh)
+    source("people", Trigger.FILES, { { text = "@ann" } })
+    Menu.refresh(hh.input)
+    -- The source answered first, so the highlight followed its row down.
+    Menu.handle_key("<Up>")
+    hh.defer = true
+    hh.before_rank = function()
+      hh.before_rank = nil
+      hh.flush()
+      eq(row(hh, 1), " " .. MATCH)
+      Menu.accept()
+    end
+    Menu.refresh(TYPED)
+  end)
+  eq(h.edits[1].version, INPUT.version, "the version the row was ranked against")
+  eq(h.edits[1].stop, INPUT.cursor, "and the range it was ranked for")
+end)
+
+case("an_empty_list_while_the_files_rank_is_not_no_matches", function()
+  harness(function(hh)
+    source("people", Trigger.FILES, { { text = "@ann" } })
+    hh.defer = true
+    hh.before_rank = function()
+      hh.before_rank = nil
+      hh.fire_timers()
+      eq(row(hh, 1), " " .. SCANNING, "past the source deadline, the files are still coming")
+      Menu.handle_key("<CR>")
+      eq(Menu.session_id(), SESSION, "so Enter waits for them")
+    end
+    Menu.refresh(hh.input)
+    eq(row(hh, 1), " " .. MATCH)
+  end)
+end)
+
+-- This one bit once. An issue mention left the file mention's wait
+-- subscribed, so the next file mention found it there and armed no deadline.
+-- A walk that never landed then held `scanning…` and Enter until Esc.
+case("leaving_a_file_mention_ends_its_wait_on_the_walk", function()
+  local ISSUE_AFTER = { text = INPUT.text .. " #cr", cursor = #INPUT.text + 4, version = 4, session_id = SESSION }
+  local BACK = { text = ISSUE_AFTER.text .. " @x", cursor = #ISSUE_AFTER.text + 3, version = 5, session_id = SESSION }
+  harness(function(hh)
+    source("issues", ISSUE_TRIGGER, { { text = ISSUE } })
+    hh.found = { complete = false, root = ROOT, items = {} }
+    Menu.refresh(hh.input)
+    eq(type(hh.on_index_ready), "function")
+
+    Menu.refresh(ISSUE_AFTER)
+    eq(hh.on_index_ready, nil, "an issue mention waits on no walk")
+
+    hh.fire_timers()
+    Menu.refresh(BACK)
+    eq(hh.subscriptions, 2, "the next file mention starts its own wait")
+    hh.fire_timers()
+    eq(row(hh, 1), " " .. NO_MATCHES, "and gives up on a walk that never lands")
   end)
 end)
 

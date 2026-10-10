@@ -1,15 +1,16 @@
 use std::mem;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
+use maki_agent::file_index::MAX_ENTRIES;
 use maki_agent::{FILE_MATCH_CONFIG, FileReader, file_haystack_owned, file_index};
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Matcher, Nucleo};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tracing::warn;
@@ -43,6 +44,9 @@ const MAX_MATERIALIZED: u32 = 640;
 /// allocation and a haystack per path in the whole corpus.
 const INJECT_BATCH: usize = 2048;
 
+static TITLE_CAPPED: LazyLock<String> =
+    LazyLock::new(|| format!(" Files (showing the first {MAX_ENTRIES} entries) "));
+
 /// An empty directory, a fully ignored one and one that could not be opened
 /// all look identical from the injector's side, so how the walk ended is what
 /// tells them apart.
@@ -50,6 +54,9 @@ const INJECT_BATCH: usize = 2048;
 enum Walk {
     Running,
     Listed,
+    /// The walk stopped at `MAX_ENTRIES`, so the list is a prefix of the tree
+    /// and which prefix differs from one walk to the next.
+    Capped,
     Unreadable,
     Crashed,
 }
@@ -60,9 +67,17 @@ impl Walk {
     fn nothing_found_msg(self) -> Option<&'static str> {
         match self {
             Self::Running => None,
-            Self::Listed => Some(NOTHING_TO_PICK_MSG),
+            Self::Listed | Self::Capped => Some(NOTHING_TO_PICK_MSG),
             Self::Unreadable => Some(UNREADABLE_DIR_MSG),
             Self::Crashed => Some(WALKER_CRASHED_MSG),
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Running => TITLE_WALKING,
+            Self::Capped => &TITLE_CAPPED,
+            Self::Listed | Self::Unreadable | Self::Crashed => TITLE,
         }
     }
 }
@@ -292,11 +307,6 @@ impl FilePickerModal {
         };
 
         let match_count = s.matches.len() as u16;
-        let title = if s.walk == Walk::Running {
-            TITLE_WALKING
-        } else {
-            TITLE
-        };
 
         let has_query_without_matches = s.matches.is_empty() && !s.search.value().is_empty();
         let max_visible = area.height.saturating_sub(SEARCH_ROW + 2);
@@ -307,7 +317,7 @@ impl FilePickerModal {
         };
 
         let modal = Modal {
-            title,
+            title: s.walk.title(),
             width_percent: WIDTH_PERCENT,
             max_height_percent: MAX_HEIGHT_PERCENT,
         };
@@ -442,6 +452,8 @@ fn pull(s: &mut Session) -> bool {
     // hands over the last batch is the tick the title settles on.
     let walk = match (owed || s.injected < corpus.len(), corpus.crashed) {
         (true, _) => Walk::Running,
+        // Ahead of a crash: a dead re-walk keeps the capped list it had.
+        (false, _) if corpus.truncated => Walk::Capped,
         (false, true) => Walk::Crashed,
         (false, false) if s.readable => Walk::Listed,
         (false, false) => Walk::Unreadable,
@@ -618,10 +630,10 @@ fn build_highlighted_line<'a>(
     selected: bool,
     t: &'a theme::Theme,
 ) -> Line<'a> {
-    let base = if selected { t.item_selected } else { t.item };
-    let highlight = base
-        .fg(t.accent.fg.unwrap_or_default())
-        .add_modifier(Modifier::BOLD);
+    let (base, highlight) = match selected {
+        true => (t.item_selected, t.item_match_selected),
+        false => (t.item, t.item_match),
+    };
 
     let mut spans = vec![Span::styled(LABEL_INDENT, base)];
     let mut in_match = false;
@@ -663,6 +675,8 @@ mod tests {
     use crate::repaint::expect::{OWED, QUIET};
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
     use maki_agent::{FileIndex, FileQuery, Ranked, file_pattern};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -729,6 +743,9 @@ mod tests {
     /// Enough that a walk of them is still going when the picker is reopened,
     /// and few enough that the reopened one finishes well inside the timeout.
     const REOPENED_FILES: usize = 64;
+    /// Wide enough that the modal's share of it fits the capped title whole.
+    const TERMINAL_WIDTH: u16 = 120;
+    const TERMINAL_HEIGHT: u16 = 30;
     static NEVER: AtomicBool = AtomicBool::new(false);
 
     /// Ticks until `ready` holds, collecting the frames owed on the way, or
@@ -1239,6 +1256,40 @@ mod tests {
             Walk::Listed,
             "and the tick that hands over the last of it settles the title"
         );
+    }
+
+    /// A walk stopped at `MAX_ENTRIES` is over like any other, and its list
+    /// used to be drawn exactly like the whole tree, with the missing files
+    /// different on every walk.
+    #[test_case(true  => (Walk::Capped, true)  ; "capped_walk_says_so")]
+    #[test_case(false => (Walk::Listed, false) ; "complete_walk_does_not")]
+    fn a_capped_walk_says_the_list_is_short(capped: bool) -> (Walk, bool) {
+        let (mut picker, index) = pending_picker();
+        walked(&index, &[A, B]);
+        if capped {
+            index.cap();
+        }
+        let _ = tick_until(&mut picker, |s| s.visible && s.walk != Walk::Running)
+            .expect(NEVER_CONVERGED);
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(TERMINAL_WIDTH, TERMINAL_HEIGHT)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        (
+            picker.session.as_ref().unwrap().walk,
+            screen.contains(TITLE_CAPPED.trim()),
+        )
     }
 
     /// Opening the picker closes it first, so `Ctrl+S` on an open picker is a

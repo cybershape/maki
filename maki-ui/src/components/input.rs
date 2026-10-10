@@ -44,6 +44,7 @@ const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
     "remove dead code",
 ];
 const QUEUE_PLACEHOLDER: &str = "Queue another prompt...";
+const SUBAGENT_QUEUE_PLACEHOLDER: &str = "Queue a message for this subagent...";
 const ASK_PREFIX: &str = "Ask maki to ";
 const ASK_SUFFIX: &str = "...";
 const BLANK_PLACEHOLDER: &str = " ";
@@ -53,6 +54,7 @@ pub enum Placeholder {
     Suggestion,
     Blank,
     Queue,
+    SubagentQueue,
 }
 
 pub enum InputAction {
@@ -63,19 +65,13 @@ pub enum InputAction {
     None,
 }
 
+#[derive(Default)]
 pub struct Submission {
     pub text: String,
     pub images: Vec<ImageSource>,
 }
 
 impl Submission {
-    pub fn empty() -> Self {
-        Self {
-            text: String::new(),
-            images: Vec::new(),
-        }
-    }
-
     pub fn is_empty(&self) -> bool {
         self.text.is_empty() && self.images.is_empty()
     }
@@ -120,7 +116,7 @@ impl InputBox {
             KeyCode::Enter => {
                 return match self.submit() {
                     Some(sub) => InputAction::Submit(sub),
-                    None => InputAction::Submit(Submission::empty()),
+                    None => InputAction::Submit(Submission::default()),
                 };
             }
             _ => {}
@@ -150,8 +146,8 @@ impl InputBox {
         let is_word_boundary =
             |c: char| -> bool { c.is_alphanumeric() || c == '_' || ")]}>".contains(c) };
 
-        let needs_leading = char_before.is_some_and(&is_word_boundary) && !text.starts_with(' ');
-        let needs_trailing = char_after.is_some_and(&is_word_boundary) && !text.ends_with(' ');
+        let needs_leading = char_before.is_some_and(is_word_boundary) && !text.starts_with(' ');
+        let needs_trailing = char_after.is_some_and(is_word_boundary) && !text.ends_with(' ');
 
         if !needs_leading && !needs_trailing {
             return self.handle_paste(text);
@@ -272,6 +268,31 @@ impl InputBox {
 
     pub fn is_empty(&self) -> bool {
         self.buffer.value().trim().is_empty() && self.pending_images.is_empty()
+    }
+
+    /// The text the user is composing. Under an untouched history recall that
+    /// is the draft it covers, since the recall is still in history. An edited
+    /// recall is new work and wins over the draft, as it does on submit.
+    pub fn draft_text(&self) -> String {
+        let text = self.buffer.value();
+        let untouched_recall = self
+            .history_index
+            .and_then(|i| self.history.get(i))
+            .is_some_and(|entry| entry == text);
+        if untouched_recall {
+            self.draft.clone()
+        } else {
+            text
+        }
+    }
+
+    pub fn swap_draft(&mut self, draft: Submission) -> Submission {
+        let text = self.draft_text();
+        let images = mem::take(&mut self.pending_images);
+        self.discard();
+        self.set_input(draft.text);
+        self.pending_images = draft.images;
+        Submission { text, images }
     }
 
     pub fn attach_image(&mut self, source: ImageSource) {
@@ -401,6 +422,7 @@ impl InputBox {
                     ],
                 ),
                 Placeholder::Queue => (QUEUE_PLACEHOLDER, Vec::new()),
+                Placeholder::SubagentQueue => (SUBAGENT_QUEUE_PLACEHOLDER, Vec::new()),
                 Placeholder::Blank => (BLANK_PLACEHOLDER, Vec::new()),
             };
             let mut spans = vec![super::chevron_span()];
@@ -488,6 +510,11 @@ impl InputBox {
 
     pub fn history(&self) -> &InputHistory {
         &self.history
+    }
+
+    pub fn set_history(&mut self, history: InputHistory) {
+        self.history = history;
+        self.history_index = None;
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -757,7 +784,13 @@ fn overlay_cursor(
     cursor_char_pos: usize,
     reversed: bool,
 ) -> (Vec<Span<'static>>, u16) {
-    let cursor_style = |style: Style| if reversed { style.reversed() } else { style };
+    let cursor_style = |style: Style| {
+        if reversed {
+            style.patch(theme::cursor_style())
+        } else {
+            style
+        }
+    };
     let mut result = Vec::new();
     let mut pos = 0;
     let mut cursor_col = None;
@@ -812,6 +845,7 @@ mod tests {
     use crate::components::scrollbar::SCROLLBAR_THUMB;
     use crate::selection::{ContentRegion, ScreenSelection, extract_selected_text};
     use ratatui::layout::{Position, Rect};
+    use ratatui::style::Color;
     use test_case::test_case;
 
     fn type_text(input: &mut InputBox, text: &str) {
@@ -958,6 +992,31 @@ mod tests {
 
         input.history_down();
         assert_eq!(input.buffer.value(), "");
+    }
+
+    const DRAFT: &str = "draft";
+    const RECALLED: &str = "recalled";
+    const EDITED_RECALL: &str = "edited";
+
+    #[test_case(None, DRAFT ; "untouched_recall_keeps_the_draft")]
+    #[test_case(Some(EDITED_RECALL), EDITED_RECALL ; "edited_recall_keeps_the_edit")]
+    fn draft_while_browsing_history(edit: Option<&str>, parked: &str) {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, RECALLED);
+        type_text(&mut input, DRAFT);
+        input.history_up();
+        if let Some(edit) = edit {
+            input.buffer.clear();
+            type_text(&mut input, edit);
+        }
+        assert_eq!(input.draft_text(), parked);
+
+        let swapped = input.swap_draft(Submission {
+            text: String::new(),
+            images: Vec::new(),
+        });
+
+        assert_eq!(swapped.text, parked);
     }
 
     #[test]
@@ -1171,6 +1230,7 @@ mod tests {
 
     #[test_case(Placeholder::Blank, "" ; "blank_shows_only_the_chevron")]
     #[test_case(Placeholder::Queue, QUEUE_PLACEHOLDER ; "queue_asks_for_another_prompt")]
+    #[test_case(Placeholder::SubagentQueue, SUBAGENT_QUEUE_PLACEHOLDER ; "subagent_queue_names_the_subagent")]
     fn placeholder_row(placeholder: Placeholder, expected: &str) {
         let mut input = InputBox::new(InputHistory::default(), 20);
         let terminal = render_input_with(&mut input, 40, 4, placeholder);
@@ -1375,17 +1435,22 @@ mod tests {
     const CURSOR_STAYS_HIDDEN: &str = "the hardware cursor must never be shown";
     const NO_BLOCK_CURSOR_UNFOCUSED: &str =
         "an overlay owns the keyboard, so nothing may be reversed";
+    const CARET_FG: Color = Color::Rgb(0x12, 0x34, 0x56);
+    const CARET_BG: Color = Color::Rgb(0x65, 0x43, 0x21);
+    const CARET_UNFOCUSED_FG: Color = Color::Rgb(0x0f, 0x0f, 0x0f);
+    const CARET_THEME_WITH_CURSOR: &str = r##"
+[ui]
+"cursor" = { fg = "#123456", bg = "#654321" }
+"cursor_unfocused" = { fg = "#0f0f0f" }
+"##;
+    const CARET_THEME_WITHOUT_CURSOR: &str = "";
 
-    fn reversed_cells(
-        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
-    ) -> Vec<Position> {
+    /// Finds the cells painted as the caret, whatever the loaded theme is.
+    fn caret_cells(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<Position> {
         let buf = terminal.backend().buffer();
         buf.area
             .positions()
-            .filter(|&p| {
-                buf.cell(p)
-                    .is_some_and(|c| c.modifier.contains(Modifier::REVERSED))
-            })
+            .filter(|&p| buf.cell(p).is_some_and(theme::is_caret_cell))
             .collect()
     }
 
@@ -1400,7 +1465,7 @@ mod tests {
     fn assert_cursor_at(rendered: &Rendered, expected: Option<Position>) {
         assert!(!rendered.terminal.backend().cursor_visible());
         assert_eq!(rendered.cursor, expected);
-        assert_eq!(reversed_cells(&rendered.terminal), Vec::from_iter(expected));
+        assert_eq!(caret_cells(&rendered.terminal), Vec::from_iter(expected));
     }
 
     fn render_cursor(input: &mut InputBox, width: u16, height: u16) -> Rendered {
@@ -1413,6 +1478,37 @@ mod tests {
             input.buffer.move_left();
         }
         render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT)
+    }
+
+    /// The caret carries whatever paint the theme gives it: the explicit
+    /// `[ui] cursor` colors when set, the reversed fallback when not.
+    fn painted_caret() -> ratatui::buffer::Cell {
+        render_with_cursor_left("abc", 1)
+            .terminal
+            .backend()
+            .buffer()
+            .cell(Position::new(4, 1))
+            .expect("caret cell must be on screen")
+            .clone()
+    }
+
+    /// The caret carries whatever paint the theme gives it: the explicit
+    /// `[ui] cursor` colors when set, the reversed fallback when not, and
+    /// `[ui] cursor_unfocused` once the terminal reports lost focus.
+    #[test]
+    fn caret_honors_the_theme_cursor_styles() {
+        theme::set(theme::Theme::from_toml(CARET_THEME_WITHOUT_CURSOR).unwrap());
+        assert!(painted_caret().modifier.contains(Modifier::REVERSED));
+
+        theme::set(theme::Theme::from_toml(CARET_THEME_WITH_CURSOR).unwrap());
+        let cell = painted_caret();
+        assert_eq!(cell.fg, CARET_FG);
+        assert_eq!(cell.bg, CARET_BG);
+
+        theme::set_cursor_focused(false);
+        assert_eq!(painted_caret().fg, CARET_UNFOCUSED_FG);
+        theme::set_cursor_focused(true);
+        theme::set(theme::load_by_name("dracula").unwrap());
     }
 
     #[test_case("hello", 0, Position::new(7, 1) ; "ascii_at_end_of_line")]
@@ -1521,7 +1617,7 @@ mod tests {
             "{CURSOR_STAYS_HIDDEN}"
         );
         assert_eq!(
-            reversed_cells(&unfocused.terminal),
+            caret_cells(&unfocused.terminal),
             Vec::new(),
             "{NO_BLOCK_CURSOR_UNFOCUSED}"
         );

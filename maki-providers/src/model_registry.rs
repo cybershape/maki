@@ -270,7 +270,7 @@ fn static_prefixes(provider: &str, tier: ModelTier) -> impl Iterator<Item = &'st
         .into_iter()
         .flat_map(|spec| spec.models())
         .filter(move |entry| entry.default && entry.tier == tier)
-        .flat_map(|entry| entry.prefixes.iter().copied())
+        .flat_map(|entry| entry.prefixes.iter().map(String::as_str))
 }
 
 fn tier_for_position(pos: usize) -> ModelTier {
@@ -355,20 +355,20 @@ mod tests {
     fn curated_provider_ignores_discovered_tiers() {
         let mut reg = ModelRegistry::default();
         reg.set_known_models(
-            "synthetic",
+            "zai",
             vec![ModelInfo {
                 tier: Some(ModelTier::Strong),
-                ..ModelInfo::id_only("syn:large:vision".into())
+                ..ModelInfo::id_only("glm-large-vision".into())
             }],
         );
 
         assert_ne!(
-            reg.tier_for("synthetic/syn:large:vision", "synthetic", None),
+            reg.tier_for("zai/glm-large-vision", "zai", None),
             ModelTier::Strong
         );
         assert_ne!(
-            reg.spec_for_tier("synthetic", ModelTier::Strong),
-            Some("synthetic/syn:large:vision".into())
+            reg.spec_for_tier("zai", ModelTier::Strong),
+            Some("zai/glm-large-vision".into())
         );
     }
 

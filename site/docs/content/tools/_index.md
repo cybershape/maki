@@ -14,7 +14,7 @@ Maki ships with 21 built-in tools in this reference (20 on by default, 1 opt-in 
 ### `bash` {#bash}
 
 Execute a bash command.
-Commands run in <cwd> by default.
+Commands run in the session's working directory (see Environment) by default.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -48,6 +48,7 @@ Write content to a file, replacing existing content.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `append` | boolean | no | Add content to the end of the file instead of replacing it |
 | `content` | string | yes | The complete file content to write |
 | `path` | string | yes | Absolute path to the file |
 

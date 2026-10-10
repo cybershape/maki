@@ -10,6 +10,7 @@ use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
+use maki_providers::plugin::DeclAuthority;
 
 use crate::api::keymap::{KeybindTicket, KeymapReader};
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
@@ -18,7 +19,7 @@ use crate::api::util::command::{
     HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
 };
 use crate::error::PluginError;
-use crate::pack::DiscoveredPackage;
+use crate::pack::{DiscoveredPackage, Interaction};
 use crate::plugin_permissions::{
     MANIFEST_FILE, PluginPermissions, Requested, check_plugin_compatibility,
     load_plugin_permissions,
@@ -163,6 +164,37 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         name: "list",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
     },
+    // The rest register no tool. They declare a provider maki ships, on
+    // the same surface a third-party plugin declares one with, which is what
+    // keeps that surface honest.
+    BundledPlugin {
+        name: "synthetic",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/synthetic"),
+    },
+    BundledPlugin {
+        name: "deepseek",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/deepseek"),
+    },
+    BundledPlugin {
+        name: "mistral",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/mistral"),
+    },
+    BundledPlugin {
+        name: "tensorx",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/tensorx"),
+    },
+    BundledPlugin {
+        name: "regolo",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/regolo"),
+    },
+    BundledPlugin {
+        name: "requesty",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/requesty"),
+    },
+    BundledPlugin {
+        name: "openrouter",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/openrouter"),
+    },
 ];
 
 /// Every bundled name, not just the default-enabled ones. An external package
@@ -279,18 +311,24 @@ impl Drop for PluginHost {
 }
 
 impl PluginHost {
+    /// A TUI host with JIT on, so tests get the whole `maki.ui` surface.
     pub fn new(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
-        Self::with_jit(registry, true)
+        Self::start(registry, Interaction::Tty, true)
     }
 
     /// `jit: false` (the `--no-jit` flag) runs plugin Lua on the O1
     /// interpreter with full debug info. Applied at VM creation, so
     /// every chunk gets it, init.lua files included.
-    pub fn with_jit(registry: Arc<ToolRegistry>, jit: bool) -> Result<Self, PluginError> {
+    pub fn start(
+        registry: Arc<ToolRegistry>,
+        interaction: Interaction,
+        jit: bool,
+    ) -> Result<Self, PluginError> {
         let plugin_rules = Arc::new(PluginRuleStore::default());
         let lua = runtime::spawn(
             Arc::clone(&registry),
             *BUNDLED_DIRS,
+            interaction,
             jit,
             Arc::clone(&plugin_rules),
         )?;
@@ -299,6 +337,12 @@ impl PluginHost {
             plugin_rules,
             registry,
         })
+    }
+
+    /// One status bar line summing up the wrong key spellings found since the
+    /// last take. Each finding is in the log already.
+    pub fn take_key_warning(&self) -> Option<String> {
+        self.inner.key_lint.take_summary()
     }
 
     /// The store that `maki.api.register_permission_rule` writes into. Hand
@@ -493,9 +537,12 @@ impl PluginHost {
                 .unwrap_or_default();
             self.send_load(
                 Arc::clone(&name),
-                vec![LoadChunk::new(name.as_ref(), init)],
+                vec![LoadChunk::bundled(name.as_ref(), init)],
                 LoadContext {
                     opts,
+                    // The one load that ships inside the binary, and so the
+                    // one that may declare a provider under a built-in slug.
+                    authority: DeclAuthority::Bundled,
                     ..LoadContext::plain(None, permissions)
                 },
             )?;
@@ -677,6 +724,7 @@ impl PluginHost {
                     opts,
                     revision_guard: package.revision_guard.clone(),
                     package: true,
+                    authority: DeclAuthority::ThirdParty,
                 },
                 reply: reply_tx,
             })
@@ -753,6 +801,7 @@ impl PluginHost {
                 opts,
                 revision_guard,
                 package: true,
+                authority: DeclAuthority::ThirdParty,
             },
         )
     }
@@ -967,6 +1016,11 @@ impl PluginHost {
 
     pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
         self.inner.ui_action_rx.clone()
+    }
+
+    /// Rings when a plugin changes a window or what one shows.
+    pub fn ui_wake_rx(&self) -> flume::Receiver<()> {
+        self.inner.ui_wake_rx.clone()
     }
 
     /// The bit every `maki.ui` and `maki.fn` roundtrip consults. The event
@@ -1270,8 +1324,9 @@ impl EventHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::keymap::TAKEN_ERR;
     use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
-    use crossterm::event::{KeyCode, KeyEvent};
+    use crossterm::event::KeyCode;
     use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
     use maki_agent::tools::ToolRegistry;
     use std::time::Instant;
@@ -1305,9 +1360,9 @@ mod tests {
     /// (`tests/plugin_host.rs` boots hosts via `new`); only the O1
     /// interpreter path needs its own coverage.
     #[test]
-    fn with_jit_off_loads_builtins_and_registers_tools() {
+    fn jit_off_loads_builtins_and_registers_tools() {
         let reg = Arc::new(ToolRegistry::new());
-        let mut host = PluginHost::with_jit(Arc::clone(&reg), false).unwrap();
+        let mut host = PluginHost::start(Arc::clone(&reg), Interaction::Tty, false).unwrap();
         host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
             .unwrap();
         assert!(reg.has("glob"));
@@ -1546,7 +1601,7 @@ mod tests {
             assert_eq!(snap.entries.len(), 1, "override published to snapshot");
             let entry = &snap.entries[0];
             assert_eq!(entry.desc, "test override");
-            KeyEvent::new(entry.key, entry.modifiers)
+            entry.key
         };
         assert!(
             host.command_reader().load().commands.is_empty(),
@@ -1571,6 +1626,44 @@ mod tests {
             .expect_err("Ctrl+C is the host's");
         assert!(err.to_string().contains("reserved"), "got: {err}");
         assert!(host.keymap_reader().load().entries.is_empty());
+    }
+
+    /// `unique` is a plugin saying the key is no good to it shared, so the
+    /// call has to fail where the author reads it and name who to go look at.
+    #[test]
+    fn a_unique_bind_fails_on_a_key_another_plugin_holds() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("first", r#"maki.keymap.set("n", "<C-g>", function() end)"#)
+            .unwrap();
+
+        let err = host
+            .load_source(
+                "second",
+                r#"maki.keymap.set("n", "<C-g>", function() end, { unique = true })"#,
+            )
+            .expect_err("the key is taken");
+        let err = err.to_string();
+        assert!(
+            err.contains(&format!("{TAKEN_ERR} first")),
+            "the error has to name the owner, got: {err}"
+        );
+        assert_eq!(
+            host.keymap_reader().load().entries.len(),
+            1,
+            "the refused bind stored nothing"
+        );
+    }
+
+    #[test]
+    fn del_from_another_plugin_leaves_the_key_alone() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("first", r#"maki.keymap.set("n", "<C-g>", function() end)"#)
+            .unwrap();
+
+        host.load_source("second", r#"maki.keymap.del("n", "<C-g>")"#)
+            .unwrap();
+
+        assert_eq!(host.keymap_reader().load().entries.len(), 1);
     }
 
     /// A handler that raises is logged and its key is spent: handing the key
@@ -1603,9 +1696,9 @@ mod tests {
             let entry = snap
                 .entries
                 .iter()
-                .find(|e| e.key == KeyCode::Char(code))
+                .find(|e| e.key.code() == KeyCode::Char(code))
                 .expect("both keys published");
-            KeyEvent::new(entry.key, entry.modifiers)
+            entry.key
         };
 
         assert!(reader.dispatch(key_of('g'), |t| handle.run_keybind_callback(t)));
@@ -2151,6 +2244,8 @@ mod bundled_manifests {
     const TEST_DIR: &str = "tests";
     const LUA_EXT: &str = "lua";
     const REQUIRE_CALL: &str = "require(";
+    const PROVIDER_REGISTER: &str = "maki.provider.register";
+    const API_KEY_ENV_FIELD: &str = "api_key_env";
 
     /// Every guarded `maki.*` function under the dotted name lua calls it by.
     fn guarded_calls() -> Vec<(String, Permission)> {
@@ -2254,6 +2349,25 @@ mod bundled_manifests {
         })
     }
 
+    /// `PROVIDER_BUILTINS` is what keeps a provider plugin's name from reading
+    /// as a tool, so a bundled plugin that starts registering one must join it.
+    #[test]
+    fn provider_builtins_are_the_bundled_plugins_that_register_a_provider() {
+        let mut registering: Vec<&str> = BUNDLED_PLUGINS
+            .iter()
+            .filter(|p| {
+                runtime_sources(&p.dir)
+                    .iter()
+                    .any(|s| calls(s, PROVIDER_REGISTER))
+            })
+            .map(|p| p.name)
+            .collect();
+        let mut expected = maki_config::PROVIDER_BUILTINS.to_vec();
+        registering.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(registering, expected);
+    }
+
     #[test]
     fn bundled_manifests_match_the_permissions_their_plugin_uses() {
         let tools = tool_permissions();
@@ -2279,6 +2393,13 @@ mod bundled_manifests {
                         needed.entry(*permission).or_insert_with(|| name.clone());
                     }
                 }
+                // `api_key_env` is a field, not a call, so the scan above
+                // misses it. Registration still refuses it without `env`.
+                if calls(source, PROVIDER_REGISTER) && calls(source, API_KEY_ENV_FIELD) {
+                    needed
+                        .entry(Permission::Env)
+                        .or_insert_with(|| format!("{PROVIDER_REGISTER} with {API_KEY_ENV_FIELD}"));
+                }
             }
 
             let manifest = format!("plugins/{}/plugin.toml", plugin.name);
@@ -2295,5 +2416,44 @@ mod bundled_manifests {
             }
         }
         assert!(drift.is_empty(), "plugin.toml drift:\n{}", drift.join("\n"));
+    }
+
+    fn collect_lua_files(dir: &'static Dir<'static>, out: &mut Vec<&'static File<'static>>) {
+        for entry in dir.entries() {
+            match entry {
+                DirEntry::Dir(sub) => collect_lua_files(sub, out),
+                DirEntry::File(file) if file.path().extension() == Some(LUA_EXT.as_ref()) => {
+                    out.push(file);
+                }
+                DirEntry::File(_) => {}
+            }
+        }
+    }
+
+    /// Bundled Lua ships in the binary, so it is linted here instead of at
+    /// every start. Every file counts, specs and modules too, because key
+    /// handling rarely lives in `init.lua`.
+    #[test]
+    fn bundled_lua_has_no_wrong_key_spellings() {
+        let mut linted = 0;
+        let mut findings = Vec::new();
+        for plugin in BUNDLED_PLUGINS {
+            let mut files = Vec::new();
+            collect_lua_files(&plugin.dir, &mut files);
+            for file in files {
+                let Some(source) = file.contents_utf8() else {
+                    continue;
+                };
+                let name = format!("{}/{}", plugin.name, file.path().display());
+                findings.extend(crate::key_lint::lint(&name, source));
+                linted += 1;
+            }
+        }
+
+        assert!(
+            linted > BUNDLED_PLUGINS.len(),
+            "the walk reached past init.lua"
+        );
+        assert!(findings.is_empty(), "{findings:#?}");
     }
 }

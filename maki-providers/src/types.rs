@@ -10,25 +10,21 @@ use std::borrow::Cow;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
+use jiff::Timestamp;
+use maki_storage::frame::FactsUpdate;
 use maki_storage::intern;
 pub use maki_storage::sessions::Effort;
-use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, TitleSource};
-use serde::{Deserialize, Serialize};
+use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, THINKING_ADAPTIVE, TitleSource};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 use strum::{Display, IntoStaticStr};
 use tracing::warn;
 
 use crate::TokenUsage;
-use crate::image::{Fix, MAX_IMAGES, fix_for_wire};
+use crate::image::{Fix, IMAGE_EVICTION_STEP, MAX_IMAGES, fix_for_wire};
 use crate::model::Model;
 
 const LOCAL_BUDGET_FIELD: &str = "thinking_budget_tokens";
-
-/// The two thinking modes that are neither an effort level nor a token count.
-/// `Display` and [`Model::thinking_options`] both spell them from here, so the
-/// picker offers exactly the strings the parser accepts.
-pub(crate) const THINKING_OFF: &str = "off";
-pub(crate) const THINKING_ADAPTIVE: &str = "adaptive";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageMediaType {
@@ -144,6 +140,13 @@ pub const IMAGE_EVICTED_NOTE: &str = "[image omitted: too many images in this co
 pub const IMAGE_PLACEHOLDER: &str = "[image]";
 /// See [`Message::empty_marker`].
 pub const EMPTY_RESPONSE_MARKER: &str = "(empty)";
+/// Marks a definition the API keeps out of the model's context until a
+/// `tool_reference` loads it (see [`crate::Model::supports_deferred_tools`]).
+pub const DEFER_LOADING_KEY: &str = "defer_loading";
+
+pub fn is_deferred_tool(tool: &Value) -> bool {
+    tool[DEFER_LOADING_KEY].as_bool() == Some(true)
+}
 
 /// The last stop before the wire for every image in a request, whatever put
 /// it there. For models without vision, image blocks become a text note
@@ -178,22 +181,18 @@ pub async fn adapt_images_for_model<'a>(
         .collect();
     let note = |text: &str| ContentBlock::Text { text: text.into() };
     let vision = model.supports_vision();
+    let kept = images_kept(images.len());
     let mut edits: Vec<(usize, usize, ContentBlock)> = Vec::new();
-    // Counts survivors, not blocks, or an image nobody can read would cost a
-    // good one its place. Nothing past the cap is decoded at all.
-    let mut kept = 0;
-    for (m, b, source) in images {
+    // Nothing past the cap is decoded at all.
+    for (newest_first, (m, b, source)) in images.into_iter().enumerate() {
         if !vision {
             edits.push((m, b, note(IMAGE_OMITTED_NOTE)));
-        } else if kept == MAX_IMAGES {
+        } else if newest_first >= kept {
             edits.push((m, b, note(IMAGE_EVICTED_NOTE)));
         } else {
             match fix_for_wire(&source).await {
-                Fix::Keep => kept += 1,
-                Fix::Replace(source) => {
-                    kept += 1;
-                    edits.push((m, b, ContentBlock::Image { source }));
-                }
+                Fix::Keep => {}
+                Fix::Replace(source) => edits.push((m, b, ContentBlock::Image { source })),
                 Fix::Drop => edits.push((m, b, note(IMAGE_UNUSABLE_NOTE))),
             }
         }
@@ -227,10 +226,20 @@ pub async fn adapt_images_for_model<'a>(
             role: message.role.clone(),
             content,
             display_text: message.display_text.clone(),
-            kind: message.kind,
+            kind: message.kind.clone(),
         });
     }
     Cow::Owned(adapted)
+}
+
+/// How many of the newest `total` images a request keeps. Past the cap a
+/// whole [`IMAGE_EVICTION_STEP`] of the oldest goes at once, and new images
+/// fill the gap one by one. It depends on the count alone, never on which
+/// images decode, so which ones are evicted only moves once per step. An
+/// unreadable image therefore holds its slot until it ages out.
+fn images_kept(total: usize) -> usize {
+    let over = total.saturating_sub(MAX_IMAGES);
+    total - over.div_ceil(IMAGE_EVICTION_STEP) * IMAGE_EVICTION_STEP
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -273,6 +282,12 @@ pub enum ContentBlock {
         content: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+        /// Wire names of deferred tools this result loaded. A provider with
+        /// API-side deferral replays them as `tool_reference` blocks, so the
+        /// definitions expand here instead of rewriting the cached tools
+        /// prefix; everyone else ignores them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        loaded_tools: Vec<String>,
     },
     Image {
         source: ImageSource,
@@ -290,8 +305,9 @@ impl ContentBlock {
 /// travel as a user message, and without this there is no way to tell it
 /// apart from the user actually typing. A prefix in the text would not do:
 /// a log line can print one.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum MessageKind {
     /// Someone said this, the user or the model.
     #[default]
@@ -299,6 +315,14 @@ pub enum MessageKind {
     /// The host noticed it and passed it to the model. It stays in session
     /// history for conversation order but is hidden from user-facing views.
     Observation,
+    /// Something the system prompt said has changed (date, model, plan
+    /// mode...). Editing the prompt would void the cache and every thinking
+    /// block bound to it, so we append this instead. Views only show its
+    /// `display_text` summary.
+    ///
+    /// It carries the facts it told, so what the model holds true can be read
+    /// off the transcript, even after a resume or a rewind.
+    ContextUpdate(Arc<FactsUpdate>),
 }
 
 impl MessageKind {
@@ -314,6 +338,19 @@ impl ContentBlock {
             name: name.into(),
             input,
             thought_signature: None,
+        }
+    }
+
+    pub fn tool_result(
+        tool_use_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
+        Self::ToolResult {
+            tool_use_id: tool_use_id.into(),
+            content: content.into(),
+            is_error,
+            loaded_tools: Vec::new(),
         }
     }
 }
@@ -357,6 +394,30 @@ impl Message {
 
     pub fn is_observation(&self) -> bool {
         self.kind == MessageKind::Observation
+    }
+
+    pub fn context_update(text: String, summary: String, update: FactsUpdate) -> Self {
+        Self {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text }],
+            display_text: Some(summary),
+            kind: MessageKind::ContextUpdate(Arc::new(update)),
+        }
+    }
+
+    pub fn is_context_update(&self) -> bool {
+        self.facts_update().is_some()
+    }
+
+    pub fn facts_update(&self) -> Option<&FactsUpdate> {
+        match &self.kind {
+            MessageKind::ContextUpdate(update) => Some(update),
+            _ => None,
+        }
+    }
+
+    pub fn is_from_host(&self) -> bool {
+        !self.kind.is_turn()
     }
 
     pub fn user(text: String) -> Self {
@@ -433,14 +494,14 @@ impl Message {
 
 impl TitleSource for Message {
     fn first_user_text(&self) -> Option<&str> {
-        if !self.role.is_user() || self.is_observation() {
+        if !self.role.is_user() || self.is_from_host() {
             return None;
         }
         self.user_text()
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ProviderEvent {
     TextDelta {
         text: String,
@@ -528,6 +589,13 @@ fn claude_version(model_id: &str) -> Option<(&str, (u32, u32))> {
     Some((family, (major, minor)))
 }
 
+/// The releases that made thinking adaptive-only also reject any sampling
+/// parameter (`top_p`, `temperature`) with a 400, even with thinking off.
+/// Reads the id, not the provider, so a gateway serving Claude is covered too.
+pub(crate) fn rejects_sampling(model_id: &str) -> bool {
+    ThinkingConfig::requires_adaptive(model_id)
+}
+
 /// How a provider's effort knob speaks: which levels its API accepts, what
 /// `adaptive` means there, and whether "off" needs an explicit string.
 /// New providers add a const in [`dialect`]; providers with dynamic model
@@ -592,7 +660,7 @@ fn declared_fragment(
         .map(|f| (f, false))
 }
 
-fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
+pub(crate) fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
     for (key, value) in fragment {
         match (body.get_mut(key), value.as_object()) {
             (Some(Value::Object(target)), Some(source)) => merge_body(target, source),
@@ -603,6 +671,55 @@ fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
     }
 }
 
+/// One table, and every view of it is read off that table: the consts, the
+/// wire names, and the lookup in both directions. Kept by hand they drift, and
+/// a dialect missing from `by_name` is a declaration that stops loading.
+macro_rules! dialects {
+    ($(
+        $(#[$attr:meta])+
+        $konst:ident $name:literal {
+            supported: [$($level:ident),+ $(,)?],
+            adaptive: $adaptive:expr,
+            off: $off:expr $(,)?
+        }
+    ),+ $(,)?) => {
+        $(
+            $(#[$attr])+
+            pub const $konst: EffortDialect = EffortDialect {
+                supported: &[$($level),+],
+                adaptive: $adaptive,
+                off: $off,
+            };
+        )+
+
+        /// Every dialect name, in declaration order.
+        pub const NAMES: &[&str] = &[$($name),+];
+
+        /// Resolve a dialect by its wire name, as listed in [`NAMES`].
+        pub fn by_name(name: &str) -> Option<&'static EffortDialect<'static>> {
+            match name {
+                $($name => Some(&$konst),)+
+                _ => None,
+            }
+        }
+
+        /// The name [`by_name`] answers this dialect to, so a declaration can
+        /// serialise the dialect it holds instead of keeping the name twice.
+        /// Written as the inverse of `by_name` so the two cannot drift.
+        ///
+        /// Matched by value, not by address: a `const` is inlined at each use
+        /// site, so two `&STANDARD` need not be the same pointer. `None` for a
+        /// dialect built at runtime out of a model's declared levels (see
+        /// OpenRouter), which no declaration can name.
+        pub fn name_of(dialect: &EffortDialect) -> Option<&'static str> {
+            NAMES
+                .iter()
+                .copied()
+                .find(|name| by_name(name).is_some_and(|known| known == dialect))
+        }
+    };
+}
+
 pub mod dialect {
     use super::EffortDialect;
     use maki_storage::sessions::Effort::{High, Low, Max, Medium, Minimal, XHigh};
@@ -611,102 +728,104 @@ pub mod dialect {
     /// opt-out.
     pub const OFF: &str = "none";
 
-    /// OpenAI platform, synthetic.
-    pub const STANDARD: EffortDialect = EffortDialect {
-        supported: &[Minimal, Low, Medium, High],
-        adaptive: Some(Medium),
-        off: None,
-    };
-    /// OpenAI Responses API models whose highest effort is `xhigh`.
-    pub const CODEX: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High, XHigh],
-        adaptive: Some(Medium),
-        off: None,
-    };
-    /// OpenAI GPT-5.1 Codex Responses API models.
-    pub const CODEX_5_1: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(Medium),
-        off: None,
-    };
-    /// OpenAI Coding Plan models that aren't Codex. They keep `minimal`, and
-    /// the Responses API opts out of reasoning with an explicit "none".
-    pub const CODING_PLAN: EffortDialect = EffortDialect {
-        supported: &[Minimal, Low, Medium, High, XHigh],
-        adaptive: Some(Medium),
-        off: Some(OFF),
-    };
-    /// OpenAI GPT-5.6 Coding Plan models (Luna, Terra, Sol), which also take
-    /// `max`.
-    pub const GPT_5_6: EffortDialect = EffortDialect {
-        supported: &[Minimal, Low, Medium, High, XHigh, Max],
-        adaptive: Some(Medium),
-        off: Some(OFF),
-    };
-    /// OpenAI GPT-6 (Astra): `low` through `max`, no `minimal` and no
-    /// explicit opt-out, so Off omits the reasoning field.
-    pub const GPT_6: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High, XHigh, Max],
-        adaptive: Some(Medium),
-        off: None,
-    };
-    /// opencode chat-completions, openrouter (static fallback).
-    pub const PREFER_HIGH: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(High),
-        off: None,
-    };
-    /// Mistral.
-    pub const HIGH_ONLY: EffortDialect = EffortDialect {
-        supported: &[High],
-        adaptive: Some(High),
-        off: None,
-    };
-    /// Z.AI. GLM reasons by default, so Off sends "none" explicitly.
-    /// Only use behind `Model::supports_thinking`.
-    pub const GLM: EffortDialect = EffortDialect {
-        supported: &[High, XHigh],
-        adaptive: Some(High),
-        off: Some(OFF),
-    };
-    /// DeepSeek accepts only "max"; Adaptive keeps the model's own default
-    /// reasoning depth by sending no effort at all.
-    pub const DEEPSEEK: EffortDialect = EffortDialect {
-        supported: &[Max],
-        adaptive: None,
-        off: None,
-    };
-    /// `output_config.effort` on Anthropic adaptive-thinking models. The API
-    /// has native adaptive mode, so Adaptive sends no effort.
-    pub const ANTHROPIC_ADAPTIVE: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: None,
-        off: None,
-    };
-    /// TensorX routes models that may reason by default, so Off sends "none"
-    /// explicitly and Adaptive asks for full depth.
-    pub const TENSORX: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(High),
-        off: Some(OFF),
-    };
-    /// xAI Grok 4.5/4.6. Adaptive defaults to high; Off sends nothing so the
-    /// model keeps its own default. `xhigh` is advertised on Grok 4.6.
-    pub const GROK: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High, XHigh],
-        adaptive: Some(High),
-        off: None,
-    };
-    /// Ollama's OpenAI-compat endpoint documents low, medium and high, and
-    /// rejects the rest, so anything higher snaps down. A model with its own
-    /// words for it says so through `thinking_fields` instead. Leaving effort
-    /// out lets a capable model start reasoning on its own, so Off has to say
-    /// "none" out loud. Only use behind `Model::supports_thinking`.
-    pub const OLLAMA: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(Medium),
-        off: Some(OFF),
-    };
+    dialects! {
+        /// OpenAI platform, synthetic.
+        STANDARD "standard" {
+            supported: [Minimal, Low, Medium, High],
+            adaptive: Some(Medium),
+            off: None
+        },
+        /// OpenAI Responses API models whose highest effort is `xhigh`.
+        CODEX "codex" {
+            supported: [Low, Medium, High, XHigh],
+            adaptive: Some(Medium),
+            off: None
+        },
+        /// OpenAI GPT-5.1 Codex Responses API models.
+        CODEX_5_1 "codex-5-1" {
+            supported: [Low, Medium, High],
+            adaptive: Some(Medium),
+            off: None
+        },
+        /// OpenAI Coding Plan models that aren't Codex. They keep `minimal`, and
+        /// the Responses API opts out of reasoning with an explicit "none".
+        CODING_PLAN "coding-plan" {
+            supported: [Minimal, Low, Medium, High, XHigh],
+            adaptive: Some(Medium),
+            off: Some(OFF)
+        },
+        /// OpenAI GPT-5.6 Coding Plan models (Luna, Terra, Sol), which also take
+        /// `max`.
+        GPT_5_6 "gpt-5-6" {
+            supported: [Minimal, Low, Medium, High, XHigh, Max],
+            adaptive: Some(Medium),
+            off: Some(OFF)
+        },
+        /// OpenAI GPT-6 (Astra): `low` through `max`, no `minimal` and no
+        /// explicit opt-out, so Off omits the reasoning field.
+        GPT_6 "gpt-6" {
+            supported: [Low, Medium, High, XHigh, Max],
+            adaptive: Some(Medium),
+            off: None
+        },
+        /// opencode chat-completions, openrouter (static fallback).
+        PREFER_HIGH "prefer-high" {
+            supported: [Low, Medium, High],
+            adaptive: Some(High),
+            off: None
+        },
+        /// Mistral.
+        HIGH_ONLY "high-only" {
+            supported: [High],
+            adaptive: Some(High),
+            off: None
+        },
+        /// Z.AI. GLM reasons by default, so Off sends "none" explicitly.
+        /// Only use behind `Model::supports_thinking`.
+        GLM "glm" {
+            supported: [High, XHigh],
+            adaptive: Some(High),
+            off: Some(OFF)
+        },
+        /// DeepSeek accepts only "max"; Adaptive keeps the model's own default
+        /// reasoning depth by sending no effort at all.
+        DEEPSEEK "deepseek" {
+            supported: [Max],
+            adaptive: None,
+            off: None
+        },
+        /// `output_config.effort` on Anthropic adaptive-thinking models. The API
+        /// has native adaptive mode, so Adaptive sends no effort.
+        ANTHROPIC_ADAPTIVE "anthropic-adaptive" {
+            supported: [Low, Medium, High],
+            adaptive: None,
+            off: None
+        },
+        /// TensorX routes models that may reason by default, so Off sends "none"
+        /// explicitly and Adaptive asks for full depth.
+        TENSORX "tensorx" {
+            supported: [Low, Medium, High],
+            adaptive: Some(High),
+            off: Some(OFF)
+        },
+        /// xAI Grok 4.5/4.6. Adaptive defaults to high; Off sends nothing so the
+        /// model keeps its own default. `xhigh` is advertised on Grok 4.6.
+        GROK "grok" {
+            supported: [Low, Medium, High, XHigh],
+            adaptive: Some(High),
+            off: None
+        },
+        /// Ollama's OpenAI-compat endpoint documents low, medium and high, and
+        /// rejects the rest, so anything higher snaps down. A model with its own
+        /// words for it says so through `thinking_fields` instead. Leaving effort
+        /// out lets a capable model start reasoning on its own, so Off has to say
+        /// "none" out loud. Only use behind `Model::supports_thinking`.
+        OLLAMA "ollama" {
+            supported: [Low, Medium, High],
+            adaptive: Some(Medium),
+            off: Some(OFF)
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -850,18 +969,9 @@ impl ThinkingConfig {
     /// What the model says about itself wins, and `fallback` covers the modes
     /// it left unsaid.
     pub fn apply_thinking(self, body: &mut Value, model: &Model, fallback: ThinkingFallback) {
-        let max = model.max_thinking_budget();
         if let Some(fields) = &model.thinking_fields
-            && let Some((fragment, keep_budget)) = declared_fragment(fields, self, max)
-            && let Some(object) = body.as_object_mut()
+            && self.apply_fields(body, model, fields, fallback)
         {
-            merge_body(object, fragment);
-            if keep_budget
-                && matches!(fallback, ThinkingFallback::BudgetField)
-                && let Budgeted::Tokens(budget) = self.request_budget(model, max)
-            {
-                body[LOCAL_BUDGET_FIELD] = json!(budget);
-            }
             return;
         }
         match fallback {
@@ -874,7 +984,7 @@ impl ThinkingConfig {
             // The model has no way to spell this mode, so the budget field
             // takes over: a request must never end up saying nothing.
             ThinkingFallback::BudgetField => {
-                let budget = match self.request_budget(model, max) {
+                let budget = match self.request_budget(model, model.max_thinking_budget()) {
                     Budgeted::Off => 0,
                     Budgeted::Adaptive => -1,
                     Budgeted::Tokens(n) => i64::from(n),
@@ -882,6 +992,32 @@ impl ThinkingConfig {
                 body[LOCAL_BUDGET_FIELD] = json!(budget);
             }
         }
+    }
+
+    /// Merges the fragment `fields` spell for this mode, and says whether they
+    /// spell it at all.
+    pub(crate) fn apply_fields(
+        self,
+        body: &mut Value,
+        model: &Model,
+        fields: &ThinkingFields,
+        fallback: ThinkingFallback,
+    ) -> bool {
+        let max = model.max_thinking_budget();
+        let Some((fragment, keep_budget)) = declared_fragment(fields, self, max) else {
+            return false;
+        };
+        let Some(object) = body.as_object_mut() else {
+            return false;
+        };
+        merge_body(object, fragment);
+        if keep_budget
+            && matches!(fallback, ThinkingFallback::BudgetField)
+            && let Budgeted::Tokens(budget) = self.request_budget(model, max)
+        {
+            body[LOCAL_BUDGET_FIELD] = json!(budget);
+        }
+        true
     }
 
     /// `max` is Google's own documented ceiling on thinking, which is a
@@ -963,12 +1099,7 @@ impl ThinkingConfig {
 
 impl std::fmt::Display for ThinkingConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Off => f.write_str(THINKING_OFF),
-            Self::Adaptive => f.write_str(THINKING_ADAPTIVE),
-            Self::Effort(e) => f.write_str(e.as_str()),
-            Self::Budget(n) => write!(f, "{n}"),
-        }
+        write!(f, "{}", StoredThinking::from(*self))
     }
 }
 
@@ -1022,11 +1153,25 @@ impl RequestOptions {
     }
 }
 
-#[derive(Debug)]
+/// A change the API made to the request before the model read it, such as a
+/// thinking block dropped because the prefix it was bound to changed. Kinds
+/// and reasons stay strings, because the API keeps adding new ones.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InputTransformation {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Default)]
 pub struct StreamResponse {
     pub message: Message,
     pub usage: TokenUsage,
     pub stop_reason: Option<StopReason>,
+    pub input_transformations: Vec<InputTransformation>,
 }
 
 /// Provider-reported usage quota, independent of local token accounting. Not every
@@ -1067,18 +1212,55 @@ pub struct UsageLimit {
     /// Usage percentage within the window, 0-100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub percentage: Option<u32>,
-    /// When the window resets, as epoch milliseconds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// When the window resets, as epoch milliseconds. Also read from an RFC
+    /// 3339 timestamp, see [`deserialize_reset_at`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_reset_at"
+    )]
     pub reset_at: Option<u64>,
     /// Extra provider-supplied context, e.g. "$2.33 spent" for usage credits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
+/// Epoch milliseconds of an RFC 3339 timestamp, clamped at the epoch. `None`
+/// for a string that is no timestamp.
+pub(crate) fn rfc3339_millis(at: &str) -> Option<u64> {
+    at.parse::<Timestamp>()
+        .ok()
+        .map(|at| at.as_millisecond().max(0) as u64)
+}
+
+/// A usage hook may hand back the timestamp it read off the wire as is, so a
+/// plugin needs no date parser that could drift from this one. A string that
+/// is no timestamp reads as no reset, the way maki's own providers read one,
+/// rather than failing the whole report over one field.
+fn deserialize_reset_at<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ResetAt {
+        Millis(u64),
+        Timestamp(String),
+    }
+    Ok(match Option::<ResetAt>::deserialize(deserializer)? {
+        Some(ResetAt::Millis(millis)) => Some(millis),
+        Some(ResetAt::Timestamp(at)) => rfc3339_millis(&at),
+        None => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
 
+    use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    use maki_storage::frame::PlanChange;
+    use maki_storage::sessions::generate_title;
 
     use super::*;
     use crate::model::ThinkingSupport as Support;
@@ -1086,6 +1268,8 @@ mod tests {
 
     /// Ollama is the one path that pairs a dialect with per-model fields.
     const DIALECT: ThinkingFallback = ThinkingFallback::Dialect(&dialect::OLLAMA);
+
+    const UNKNOWN_DIALECT: &str = "name in NAMES must resolve";
 
     const INTERNED_DATA: &str = "aW50ZXJuZWQtcGF5bG9hZA==";
     /// Valid ASCII, but no image ever started with these bytes.
@@ -1095,6 +1279,15 @@ mod tests {
     const SMALL_BUDGET: u32 = 2048;
     /// Between `Medium` and `High` against [`FALLBACK_MAX_THINKING_BUDGET`].
     const LARGE_BUDGET: u32 = 16_384;
+
+    const PROMPT: &str = "fix the flaky login test";
+    const UPDATE_TEXT: &str = "<context-update>plan mode is on</context-update>";
+    const UPDATE_SUMMARY: &str = "Plan mode on";
+    const UPDATE_DATE: &str = "2026-10-02";
+    const UPDATE_PLAN: &str = "/project/.maki/plan.md";
+    const UPDATE_HINT_SLOT: &str = "memory/tags";
+    const GONE_HINT_SLOT: &str = "todo/after_instructions";
+    const UPDATE_HINT: &str = "rust, cache";
 
     #[test_case("end_turn", StopReason::EndTurn   ; "end_turn")]
     #[test_case("tool_use", StopReason::ToolUse   ; "tool_use")]
@@ -1145,6 +1338,67 @@ mod tests {
         assert_eq!(observation.first_user_text(), None);
         let observation = serde_json::to_value(observation).unwrap();
         assert_eq!(observation["kind"], "observation");
+        let loaded: Message = serde_json::from_value(observation).unwrap();
+        assert_eq!(loaded.kind, MessageKind::Observation);
+    }
+
+    fn plan_mode_facts() -> FactsUpdate {
+        FactsUpdate {
+            date: Some(UPDATE_DATE.into()),
+            plan: Some(PlanChange::Entered(UPDATE_PLAN.into())),
+            hints: BTreeMap::from([
+                (UPDATE_HINT_SLOT.into(), Some(UPDATE_HINT.into())),
+                (GONE_HINT_SLOT.into(), None),
+            ]),
+            ..FactsUpdate::default()
+        }
+    }
+
+    /// A resume reads what the model holds true from the stored updates, so
+    /// the format is pinned. If it drifts, a resumed session forgets plan mode
+    /// or the hints.
+    #[test]
+    fn context_update_keeps_its_stored_format() {
+        let stored = json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": UPDATE_TEXT }],
+            "display_text": UPDATE_SUMMARY,
+            "kind": { "context_update": {
+                "date": UPDATE_DATE,
+                "plan": { "entered": UPDATE_PLAN },
+                "hints": { UPDATE_HINT_SLOT: UPDATE_HINT, GONE_HINT_SLOT: null }
+            } }
+        });
+        let update =
+            Message::context_update(UPDATE_TEXT.into(), UPDATE_SUMMARY.into(), plan_mode_facts());
+        assert_eq!(serde_json::to_value(&update).unwrap(), stored);
+
+        let loaded: Message = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.facts_update(), Some(&plan_mode_facts()));
+        assert_eq!(loaded.display_text.as_deref(), Some(UPDATE_SUMMARY));
+    }
+
+    /// A first run in plan mode tells the model before the user's prompt, and
+    /// the session must still be named after what the user typed.
+    #[test_case(Message::context_update(UPDATE_TEXT.into(), UPDATE_SUMMARY.into(), plan_mode_facts()) ; "context_update")]
+    #[test_case(Message::observation(UPDATE_TEXT.into())                                               ; "observation")]
+    fn title_skips_what_the_host_wrote(host: Message) {
+        assert_eq!(
+            generate_title(&[host, Message::user(PROMPT.into())]),
+            PROMPT
+        );
+    }
+
+    /// A result that loaded nothing must serialize to the same bytes as
+    /// before, or every provider's cached transcript breaks on upgrade.
+    #[test]
+    fn tool_result_loaded_tools_is_backward_compatible() {
+        let stored = json!({ "type": "tool_result", "tool_use_id": "t1", "content": "ok" });
+        let old: ContentBlock = serde_json::from_value(stored.clone()).unwrap();
+        assert!(
+            matches!(&old, ContentBlock::ToolResult { loaded_tools, .. } if loaded_tools.is_empty())
+        );
+        assert_eq!(serde_json::to_value(&old).unwrap(), stored);
     }
 
     #[test_case(ImageMediaType::Png,  "image/png"  ; "png")]
@@ -1299,40 +1553,74 @@ mod tests {
         );
     }
 
+    /// Evicting edits early messages, which voids the cache and the thinking
+    /// bound to them. So each new image must leave the request an append of
+    /// the one before, except at most once per step when the oldest images
+    /// make way, and the API cap is never crossed.
     #[test]
-    fn adapt_images_evicts_the_oldest_past_the_request_cap() {
-        const EXTRA: usize = 3;
+    fn adapt_images_moves_the_prefix_once_per_step() {
+        const LAST_TOTAL: usize = MAX_IMAGES + 2 * IMAGE_EVICTION_STEP + 1;
         let model = clamp_test_model(anthropic_spec());
-        let blocks = adapt(&model, (1..=MAX_IMAGES + EXTRA).map(png_block).collect());
-        assert_eq!(image_count(&blocks), MAX_IMAGES);
-        assert!(
-            matches!(&blocks[EXTRA - 1], ContentBlock::Text { text } if text == IMAGE_EVICTED_NOTE),
-            "the oldest images are the ones that make way"
-        );
-        assert!(matches!(&blocks[EXTRA], ContentBlock::Image { .. }));
+        let images: Vec<ContentBlock> = (1..=LAST_TOTAL).map(png_block).collect();
+        let wire = |blocks: &[ContentBlock]| serde_json::to_value(blocks).unwrap();
+        let mut before = adapt(&model, images[..MAX_IMAGES].to_vec());
+        let mut last_move: Option<usize> = None;
+        for total in MAX_IMAGES + 1..=LAST_TOTAL {
+            let after = adapt(&model, images[..total].to_vec());
+            let kept = image_count(&after);
+            assert!(kept <= MAX_IMAGES, "{kept} images sent");
+            assert!(
+                kept > MAX_IMAGES - IMAGE_EVICTION_STEP,
+                "{kept} of {total} images kept"
+            );
+            assert!(
+                after[..total - kept].iter().all(
+                    |b| matches!(b, ContentBlock::Text { text } if text == IMAGE_EVICTED_NOTE)
+                ),
+                "the oldest images are the ones that make way"
+            );
+            if wire(&after[..total - 1]) != wire(&before) {
+                assert!(
+                    last_move.is_none_or(|at| total - at >= IMAGE_EVICTION_STEP),
+                    "prefix moved at image {total}, last moved at {last_move:?}"
+                );
+                last_move = Some(total);
+            }
+            before = after;
+        }
     }
 
-    /// An image no provider could read frees no room, so the cap is spent on
-    /// survivors: counting blocks instead would evict a good one in its place.
+    /// Readability must not decide what is evicted: an unreadable image that
+    /// freed its slot would pull an evicted one back in, editing an early
+    /// message outside the step schedule.
     #[test]
-    fn adapt_images_drops_what_it_cannot_read_without_spending_the_cap() {
+    fn adapt_images_evicts_the_same_images_whatever_decodes() {
         let model = clamp_test_model(anthropic_spec());
-        let mut content = vec![png_block(1), unreadable_block()];
-        content.extend((2..=MAX_IMAGES).map(png_block));
+        let readable: Vec<ContentBlock> = (1..=MAX_IMAGES + 1).map(png_block).collect();
+        let mut content = readable.clone();
+        content[MAX_IMAGES] = unreadable_block();
+        let evicted = |blocks: &[ContentBlock]| -> Vec<usize> {
+            blocks
+                .iter()
+                .enumerate()
+                .filter(
+                    |(_, b)| matches!(b, ContentBlock::Text { text } if text == IMAGE_EVICTED_NOTE),
+                )
+                .map(|(i, _)| i)
+                .collect()
+        };
         let blocks = adapt(&model, content);
-        assert_eq!(image_count(&blocks), MAX_IMAGES);
-        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == IMAGE_UNUSABLE_NOTE));
+        assert_eq!(evicted(&blocks), evicted(&adapt(&model, readable)));
+        assert!(
+            matches!(&blocks[MAX_IMAGES], ContentBlock::Text { text } if text == IMAGE_UNUSABLE_NOTE)
+        );
     }
 
     #[test]
     fn adapt_images_replaces_blocks_for_text_only_model() {
         let mut model = clamp_test_model(anthropic_spec());
         model.supports_vision_override = Some(false);
-        let tool_result = ContentBlock::ToolResult {
-            tool_use_id: "t1".into(),
-            content: "[image: pic.png 1KB]".into(),
-            is_error: false,
-        };
+        let tool_result = ContentBlock::tool_result("t1", "[image: pic.png 1KB]", false);
         let blocks = adapt(&model, vec![tool_result, unreadable_block()]);
         assert_eq!(blocks.len(), 2);
         assert!(matches!(&blocks[0], ContentBlock::ToolResult { .. }));
@@ -1399,31 +1687,22 @@ mod tests {
         )
     }
 
+    /// `Effort::snap` walks `supported` expecting it sorted, and `name_of`
+    /// matches on field values, so two dialects with identical fields would
+    /// hand a declaration back the wrong name.
     #[test]
-    fn dialects_have_non_empty_ascending_supported() {
-        let all = [
-            &dialect::STANDARD,
-            &dialect::CODEX,
-            &dialect::CODEX_5_1,
-            &dialect::CODING_PLAN,
-            &dialect::GPT_5_6,
-            &dialect::PREFER_HIGH,
-            &dialect::HIGH_ONLY,
-            &dialect::GLM,
-            &dialect::DEEPSEEK,
-            &dialect::ANTHROPIC_ADAPTIVE,
-            &dialect::TENSORX,
-            &dialect::GROK,
-            &dialect::OLLAMA,
-        ];
-        for d in all {
-            assert!(!d.supported.is_empty());
+    fn every_dialect_is_well_formed_and_uniquely_named() {
+        for name in dialect::NAMES {
+            let d = dialect::by_name(name).expect(UNKNOWN_DIALECT);
+            assert!(!d.supported.is_empty(), "{name} supports nothing");
             for pair in d.supported.windows(2) {
-                assert!(pair[0] < pair[1], "supported must be strictly ascending");
+                assert!(pair[0] < pair[1], "{name} is not strictly ascending");
             }
             if let Some(adaptive) = d.adaptive {
-                assert!(d.supported.contains(&adaptive));
+                let supported = d.supported.contains(&adaptive);
+                assert!(supported, "{name} adaptive is not a supported level");
             }
+            assert_eq!(dialect::name_of(d), Some(*name));
         }
     }
 
@@ -1814,5 +2093,25 @@ mod tests {
         };
         let json = serde_json::to_value(&block).unwrap();
         assert!(json.get("signature").is_none());
+    }
+
+    const USAGE_LABEL: &str = "Spend";
+    const RESET_MILLIS: u64 = 1_790_812_800_250;
+
+    #[test_case(json!(RESET_MILLIS), Some(RESET_MILLIS) ; "epoch_millis")]
+    #[test_case(json!("2026-10-01T02:00:00.25+02:00"), Some(RESET_MILLIS) ; "rfc3339_with_offset_and_fraction")]
+    #[test_case(json!("1969-12-31T23:59:59Z"), Some(0) ; "before_the_epoch_clamps")]
+    #[test_case(json!("next month"), None ; "not_a_timestamp")]
+    #[test_case(Value::Null, None ; "null")]
+    fn usage_limit_reset_at_reads_millis_or_rfc3339(reset_at: Value, expected: Option<u64>) {
+        let limit: UsageLimit =
+            serde_json::from_value(json!({ "label": USAGE_LABEL, "reset_at": reset_at })).unwrap();
+        assert_eq!(limit.reset_at, expected);
+    }
+
+    #[test]
+    fn usage_limit_without_reset_at_has_none() {
+        let limit: UsageLimit = serde_json::from_value(json!({ "label": USAGE_LABEL })).unwrap();
+        assert_eq!(limit.reset_at, None);
     }
 }

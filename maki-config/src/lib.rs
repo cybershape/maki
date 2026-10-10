@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -89,23 +90,42 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
     "batch",
     "code_execution",
+    "deepseek",
     "edit",
     "glob",
     "grep",
     "index",
     "list",
     "memory",
+    "mistral",
+    "openrouter",
     "question",
     "read",
+    "regolo",
+    "requesty",
     "sessions",
     "skill",
+    "synthetic",
     "task",
+    "tensorx",
     "thinking",
     "todo_write",
     "view_image",
     "webfetch",
     "websearch",
     "write",
+];
+
+/// The [`DEFAULT_BUILTINS`] that declare a provider and register no tool, so
+/// their names stay free for MCP servers and are not valid tool names.
+pub const PROVIDER_BUILTINS: &[&str] = &[
+    "deepseek",
+    "mistral",
+    "openrouter",
+    "regolo",
+    "requesty",
+    "synthetic",
+    "tensorx",
 ];
 
 /// Bundled plugins that ship switched off. They load only when a config says
@@ -122,6 +142,11 @@ pub const OPTIONAL_BUILTINS: &[&str] = &["completion"];
 pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
 
 pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines", "insert_lines"];
+
+const WILDCARD_LABEL: &str = "*.";
+const LABEL_SEPARATOR: char = '.';
+const WILDCARD: char = '*';
+const PORT_SEPARATOR: char = ':';
 
 /// A capability a lua plugin can hold. Declared in `plugin.toml`, recorded in
 /// the package approval store, and named on every guarded `maki.*` function.
@@ -190,6 +215,90 @@ impl std::fmt::Display for Permission {
     }
 }
 
+/// Matches a host and port against a plugin manifest's `net_hosts`. It lives
+/// next to [`Permission`] because the network sandbox and the provider
+/// registry both read the same list, and they must never disagree about it.
+///
+/// A pattern is an exact host, or a leading `*.` meaning "any subdomain of".
+/// The wildcard never covers the bare domain or half a label, so
+/// `*.example.com` takes `api.example.com` but not `example.com` or
+/// `evilexample.com`. A pattern may end in `:port` to allow only that port.
+/// Without one it allows every port, which is what lists written before ports
+/// existed meant.
+///
+/// Both sides are canonicalised first, so `evil.test.` and `evil.test` are
+/// the same host no matter which side spells it with the trailing dot.
+pub fn host_allowed(host: &str, port: u16, patterns: &[String]) -> bool {
+    let host = canonical_host(host);
+    patterns
+        .iter()
+        .filter_map(|pattern| host_pattern(pattern))
+        .any(|(pattern, allowed_port)| {
+            allowed_port.is_none_or(|allowed| allowed == port)
+                && match pattern.strip_prefix(WILDCARD_LABEL) {
+                    Some(domain) => is_subdomain_of(host, domain),
+                    None => host == pattern,
+                }
+        })
+}
+
+pub fn is_valid_host_pattern(pattern: &str) -> bool {
+    host_pattern(pattern).is_some()
+}
+
+/// `None` means the pattern grants nothing. A bare `*.` would read as
+/// "anywhere" and a `*` inside a name can never match a real host. Both look
+/// like typos, and a list is a grant, so a typo must not open anything.
+fn host_pattern(pattern: &str) -> Option<(&str, Option<u16>)> {
+    let (host, port) = split_host_port(pattern)?;
+    let host = canonical_host(host);
+    let domain = host.strip_prefix(WILDCARD_LABEL).unwrap_or(host);
+    (!domain.is_empty() && !domain.contains(WILDCARD)).then_some((host, port))
+}
+
+/// Reads `host`, `host:port` or `[v6]:port`, the one grammar both `net_hosts`
+/// and `net.allowed_private_hosts` use. A bare `::1` has too many colons to
+/// carry a port, so it is all host.
+///
+/// A broken port (`x`, `0`, empty) fails the whole entry. Dropping just the
+/// port would quietly turn a typo into "every port".
+pub fn split_host_port(entry: &str) -> Option<(&str, Option<u16>)> {
+    let (host, port) = match entry.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']')? {
+            (host, "") => (host, None),
+            (host, tail) => (host, Some(tail.strip_prefix(PORT_SEPARATOR)?)),
+        },
+        None => match entry.rsplit_once(PORT_SEPARATOR) {
+            Some((host, port)) if !host.contains(PORT_SEPARATOR) => (host, Some(port)),
+            _ => (entry, None),
+        },
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = match port {
+        Some(port) => Some(port.parse::<NonZeroU16>().ok()?.get()),
+        None => None,
+    };
+    Some((host, port))
+}
+
+/// `url::Url` already lowercases and punycodes hosts, so only two spellings
+/// are left to fold: the trailing root dot, and the brackets a URL puts
+/// around an IPv6 address.
+fn canonical_host(host: &str) -> &str {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.strip_suffix(LABEL_SEPARATOR).unwrap_or(host)
+}
+
+fn is_subdomain_of(host: &str, domain: &str) -> bool {
+    host.strip_suffix(domain)
+        .is_some_and(|label| label.len() > 1 && label.ends_with(LABEL_SEPARATOR))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigValue {
     Bool(bool),
@@ -245,10 +354,10 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
     ConfigField {
         name: "always_thinking",
         ty: "bool | string",
-        default: ConfigValue::Bool(false),
+        default: ConfigValue::Str("none"),
         min: None,
         env: None,
-        description: "Start every session with extended thinking (true/\"adaptive\", \"off\", an effort level (\"minimal\" to \"max\"), or a token budget)",
+        description: "Pin the thinking level of every new session: true/\"adaptive\", false/\"off\", \"minimal\" to \"max\", or a token budget. Unset, new sessions start at the last `/thinking` level",
     },
 ];
 
@@ -280,6 +389,14 @@ pub fn expand_env(value: &str) -> Result<String, String> {
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// The variable names [`expand_env`] would look up in `value`.
+pub fn env_var_refs(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split("${")
+        .skip(1)
+        .filter_map(|part| part.split_once('}').map(|(var, _)| var))
 }
 
 #[derive(Debug, Error)]
@@ -2625,6 +2742,57 @@ mod tests {
     const BLANKET_GLOB: &str = "**";
     const ABSOLUTE_PATH: &str = "/workspace";
     const BROKEN_GLOB: &str = "[";
+    const EXAMPLE_HOST: &str = "example.com";
+    const PINNED_PORT: u16 = 7777;
+    const OTHER_PORT: u16 = 8443;
+
+    #[test_case(EXAMPLE_HOST, EXAMPLE_HOST, true ; "exact")]
+    #[test_case("api.example.com", EXAMPLE_HOST, false ; "exact_rejects_subdomain")]
+    #[test_case("api.example.com", "*.example.com", true ; "wildcard_subdomain")]
+    #[test_case("a.b.example.com", "*.example.com", true ; "wildcard_nested_subdomain")]
+    #[test_case(EXAMPLE_HOST, "*.example.com", false ; "wildcard_excludes_the_bare_domain")]
+    #[test_case("evilexample.com", "*.example.com", false ; "wildcard_needs_a_label_boundary")]
+    #[test_case("evilexample.com", EXAMPLE_HOST, false ; "near_miss")]
+    // A `*.` with nothing after it used to strip an empty suffix off every
+    // host, leaving "does it end in a dot" -- which any name written as an
+    // fqdn does, and dns resolves the same either way.
+    #[test_case("evil.test.", "*.", false ; "the_empty_wildcard_grants_nothing")]
+    #[test_case(EXAMPLE_HOST, "*.", false ; "and_grants_nothing_to_a_bare_name_either")]
+    #[test_case("example.com.", EXAMPLE_HOST, true ; "the_root_label_is_the_same_name")]
+    #[test_case("api.example.com.", "*.example.com", true ; "including_under_a_wildcard")]
+    #[test_case(EXAMPLE_HOST, "example.com.", true ; "however_the_pattern_spells_it")]
+    fn host_allowed_patterns(host: &str, pattern: &str, expected: bool) {
+        assert_eq!(
+            host_allowed(host, PINNED_PORT, &[pattern.to_string()]),
+            expected
+        );
+    }
+
+    #[test_case(EXAMPLE_HOST, OTHER_PORT, EXAMPLE_HOST, true ; "no_port_takes_any_port")]
+    #[test_case(EXAMPLE_HOST, PINNED_PORT, "example.com:7777", true ; "a_port_takes_that_port")]
+    #[test_case(EXAMPLE_HOST, OTHER_PORT, "example.com:7777", false ; "and_no_other")]
+    #[test_case("api.example.com", PINNED_PORT, "*.example.com:7777", true ; "wildcard_with_a_port")]
+    #[test_case("::1", PINNED_PORT, "[::1]:7777", true ; "bracketed_ipv6_with_a_port")]
+    #[test_case("[::1]", PINNED_PORT, "[::1]:7777", true ; "a_url_spelled_ipv6_host")]
+    #[test_case("::1", OTHER_PORT, "::1", true ; "bare_ipv6_takes_any_port")]
+    #[test_case("::1", OTHER_PORT, "[::1]", true ; "bracketed_ipv6_without_a_port_takes_any_port")]
+    #[test_case(EXAMPLE_HOST, PINNED_PORT, "example.com:", false ; "an_empty_port_grants_nothing")]
+    fn host_allowed_ports(host: &str, port: u16, pattern: &str, expected: bool) {
+        assert_eq!(host_allowed(host, port, &[pattern.to_string()]), expected);
+    }
+
+    #[test_case(EXAMPLE_HOST, true ; "a_host")]
+    #[test_case("*.example.com:7777", true ; "a_wildcard_with_a_port")]
+    #[test_case("example.com:x", false ; "a_port_that_is_not_a_number")]
+    #[test_case("example.com:0", false ; "port_zero")]
+    #[test_case(":7777", false ; "a_port_without_a_host")]
+    #[test_case("[::1]7777", false ; "junk_after_brackets")]
+    #[test_case("*", false ; "a_bare_star")]
+    #[test_case("*.", false ; "an_empty_wildcard")]
+    #[test_case("api.*.com", false ; "a_star_inside_the_name")]
+    fn host_pattern_validity(pattern: &str, expected: bool) {
+        assert_eq!(is_valid_host_pattern(pattern), expected);
+    }
 
     /// The temp directory a test builds its project in, with its parent
     /// standing in for the home directory. Plain discovery would read the real
@@ -4464,6 +4632,13 @@ mod tests {
             expand_env("x ${NOT_CLOSED").as_deref(),
             Ok("x ${NOT_CLOSED")
         );
+    }
+
+    #[test_case("plain value", &[] ; "no_refs")]
+    #[test_case("Bearer ${A}-${B}!", &["A", "B"] ; "every_ref")]
+    #[test_case("${A} ${NOT_CLOSED", &["A"] ; "unterminated_skipped")]
+    fn env_var_refs_names(value: &str, expected: &[&str]) {
+        assert_eq!(env_var_refs(value).collect::<Vec<_>>(), expected);
     }
 
     #[test]

@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use async_lock::Mutex;
+use smol::lock::Mutex;
 
 use futures_lite::io::BufReader;
 use futures_lite::{AsyncBufReadExt, AsyncWriteExt};
+use maki_providers::strip_provider_keys;
 use serde_json::Value;
 use smol::channel;
 use tracing::{debug, info, warn};
@@ -25,7 +26,7 @@ use crate::ChildGuard;
 
 pub struct StdioTransport {
     name: Arc<str>,
-    stdin: Mutex<async_process::ChildStdin>,
+    stdin: Mutex<smol::process::ChildStdin>,
     pending: Arc<Mutex<PendingMap>>,
     next_id: AtomicU64,
     timeout: Duration,
@@ -44,7 +45,9 @@ impl StdioTransport {
         timeout: Duration,
     ) -> Result<Self, McpError> {
         let mut std_cmd = std::process::Command::new(program);
-        std_cmd.args(args).envs(environment);
+        strip_provider_keys(&mut std_cmd)
+            .args(args)
+            .envs(environment);
 
         #[cfg(unix)]
         unsafe {
@@ -54,10 +57,10 @@ impl StdioTransport {
             });
         }
 
-        let mut cmd: async_process::Command = std_cmd.into();
-        cmd.stdin(async_process::Stdio::piped())
-            .stdout(async_process::Stdio::piped())
-            .stderr(async_process::Stdio::piped());
+        let mut cmd: smol::process::Command = std_cmd.into();
+        cmd.stdin(smol::process::Stdio::piped())
+            .stdout(smol::process::Stdio::piped())
+            .stderr(smol::process::Stdio::piped());
         let mut child = cmd.spawn().map_err(|e| McpError::StartFailed {
             server: name.into(),
             reason: e.to_string(),
@@ -248,7 +251,7 @@ impl McpTransport for StdioTransport {
             let result = futures_lite::future::race(
                 async { rx.recv().await.unwrap_or(Err(self.server_died())) },
                 async {
-                    async_io::Timer::after(self.timeout).await;
+                    smol::Timer::after(self.timeout).await;
                     Err(McpError::Timeout {
                         server: self.server(),
                         timeout_ms: self.timeout.as_millis() as u64,

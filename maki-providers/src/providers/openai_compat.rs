@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -11,8 +12,11 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use super::ResolvedAuth;
+use crate::model::ModelFamily;
+use crate::types::rejects_sampling;
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
+    ThinkingConfig, TokenUsage,
 };
 
 const STREAM_DONE: &str = "[DONE]";
@@ -27,6 +31,9 @@ const PROCESS_TAG_LEN: usize = 8;
 /// The listing every OpenAI compatible API serves, relative to the base URL.
 /// Providers with a second catalog pass their own path instead.
 pub(crate) const MODELS_PATH: &str = "/models";
+/// What a plain openai endpoint takes, and what a declaration that says
+/// nothing about it gets.
+pub(crate) const DEFAULT_MAX_TOKENS_FIELD: &str = "max_tokens";
 static NEXT_UNNAMED_TOOL_ID: AtomicU64 = AtomicU64::new(0);
 /// Minted once per process: the counter alone restarts at 0 on every run, so a
 /// session resumed with `--continue` would mint ids that already exist in its
@@ -36,18 +43,33 @@ static PROCESS_TAG: LazyLock<String> = LazyLock::new(|| {
     id[id.len() - PROCESS_TAG_LEN..].to_owned()
 });
 
+#[derive(Clone)]
 pub(crate) struct OpenAiCompatConfig {
-    pub slug: &'static str,
-    pub api_key_env: &'static str,
-    pub base_url: &'static str,
-    pub max_tokens_field: &'static str,
+    pub slug: Cow<'static, str>,
+    pub api_key_env: Cow<'static, str>,
+    pub base_url: Cow<'static, str>,
+    pub max_tokens_field: Cow<'static, str>,
     pub include_stream_usage: bool,
-    pub provider_name: &'static str,
+    pub provider_name: Cow<'static, str>,
+}
+
+impl From<&'static OpenAiCompatConfig> for Cow<'static, OpenAiCompatConfig> {
+    fn from(config: &'static OpenAiCompatConfig) -> Self {
+        Cow::Borrowed(config)
+    }
+}
+
+/// For a config assembled at runtime from a provider declaration, which has no
+/// `static` to borrow. `std` has no blanket `From<T> for Cow<'_, T>`.
+impl From<OpenAiCompatConfig> for Cow<'static, OpenAiCompatConfig> {
+    fn from(config: OpenAiCompatConfig) -> Self {
+        Cow::Owned(config)
+    }
 }
 
 pub(crate) struct OpenAiCompatProvider {
     client: HttpClient,
-    config: &'static OpenAiCompatConfig,
+    config: Cow<'static, OpenAiCompatConfig>,
     stream_timeout: Duration,
     /// Env / `providers.toml` override, resolved once at construction. The
     /// static compat default stays the last resort because it can be more
@@ -58,12 +80,16 @@ pub(crate) struct OpenAiCompatProvider {
 }
 
 impl OpenAiCompatProvider {
-    pub fn new(config: &'static OpenAiCompatConfig, timeouts: super::Timeouts) -> Self {
+    pub fn new(
+        config: impl Into<Cow<'static, OpenAiCompatConfig>>,
+        timeouts: super::Timeouts,
+    ) -> Self {
+        let config = config.into();
         let resolved_base_url = if config.slug.is_empty() {
             None
         } else {
             let providers = maki_config::providers::ProvidersConfig::load();
-            maki_config::providers::configured_base_url(config.slug, providers.get(config.slug))
+            maki_config::providers::configured_base_url(&config.slug, providers.get(&config.slug))
         };
         Self {
             client: super::http_client(timeouts),
@@ -77,8 +103,8 @@ impl OpenAiCompatProvider {
         &self.client
     }
 
-    pub(crate) fn config(&self) -> &'static OpenAiCompatConfig {
-        self.config
+    pub(crate) fn config(&self) -> &OpenAiCompatConfig {
+        &self.config
     }
 
     pub(crate) fn stream_timeout(&self) -> Duration {
@@ -135,6 +161,8 @@ impl OpenAiCompatProvider {
         messages: &[Message],
         system: &str,
         tools: &Value,
+        thinking: ThinkingConfig,
+        top_p: Option<f64>,
     ) -> Value {
         let wire_messages = convert_messages(messages, system);
         let wire_tools = convert_tools(tools);
@@ -144,8 +172,18 @@ impl OpenAiCompatProvider {
             "messages": wire_messages,
             "stream": true,
         });
+        // OpenAI's reasoning models reject `top_p` whenever reasoning effort
+        // is set. Everyone else (deepseek, glm, grok, llama.cpp) takes it
+        // alongside thinking, so only the GPT family is gated. A gateway
+        // serving recent Claude passes the 400 through.
+        if let Some(top_p) = top_p
+            && !(thinking.is_enabled() && model.family == ModelFamily::Gpt)
+            && !rejects_sampling(&model.id)
+        {
+            body["top_p"] = json!(top_p);
+        }
         if let Some(max_output) = model.output_tokens() {
-            body[self.config.max_tokens_field] = json!(max_output);
+            body[&*self.config.max_tokens_field] = json!(max_output);
         }
         if self.config.include_stream_usage {
             body["stream_options"] = json!({"include_usage": true});
@@ -183,6 +221,10 @@ impl OpenAiCompatProvider {
         )
     }
 
+    /// Where a provider's own headers meet the credentials. A header already on
+    /// the request wins: no denylist could say which headers carry a
+    /// credential (`x-api-key`, `api-key`, `x-goog-api-key`, ...), so whatever
+    /// the auth layer wrote stays, key rotation included.
     pub async fn do_stream(
         &self,
         model: &crate::model::Model,
@@ -196,6 +238,13 @@ impl OpenAiCompatProvider {
             .build_request("POST", "/chat/completions", auth)
             .header("content-type", "application/json");
         for &(key, value) in extra_headers {
+            if request
+                .headers_ref()
+                .is_some_and(|set| set.contains_key(key))
+            {
+                debug!(header = key, "kept the header already on the request");
+                continue;
+            }
             request = request.header(key, value);
         }
 
@@ -203,7 +252,7 @@ impl OpenAiCompatProvider {
 
         debug!(
             model = %model.id,
-            provider = self.config.provider_name,
+            provider = &*self.config.provider_name,
             "sending API request"
         );
 
@@ -282,6 +331,8 @@ impl OpenAiCompatProvider {
             supports_vision,
             tier: None,
             provider_info: None,
+            extra: None,
+            effort: None,
         })
     }
 
@@ -766,6 +817,7 @@ pub async fn parse_sse(
         },
         usage,
         stop_reason,
+        ..Default::default()
     })
 }
 
@@ -773,7 +825,10 @@ pub async fn parse_sse(
 mod tests {
     use super::*;
     use futures_lite::io::Cursor;
+    use std::sync::Arc;
     use test_case::test_case;
+
+    use crate::model::{Model, ModelPricing, ModelTier};
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const COUNTS_SURVIVE_A_BAD_COST: &str =
@@ -986,11 +1041,7 @@ data: [DONE]\n";
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "tc_1".to_string(),
-                    content: "file.txt".to_string(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("tc_1", "file.txt", false)],
                 ..Default::default()
             },
         ];
@@ -1280,11 +1331,7 @@ data: [DONE]\n";
         let msgs = vec![Message {
             role: Role::User,
             content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "[image: pic.png 1KB]".into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result("t1", "[image: pic.png 1KB]", false),
                 ContentBlock::Image {
                     source: ImageSource::new(ImageMediaType::Png, Arc::from("abc123")),
                 },
@@ -1398,5 +1445,82 @@ data: [DONE]\n";
             assert_eq!(text_deltas, vec!["Hello"]);
             assert_eq!(thinking_deltas, vec!["Let me think", "..."]);
         })
+    }
+
+    static TEST_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+        slug: Cow::Borrowed("top-p-test"),
+        api_key_env: Cow::Borrowed(""),
+        base_url: Cow::Borrowed("https://example.test/v1"),
+        max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
+        include_stream_usage: true,
+        provider_name: Cow::Borrowed("test"),
+    };
+
+    fn test_model(family: ModelFamily) -> Model {
+        Model {
+            id: "test-model".into(),
+            provider: Arc::<str>::from("test"),
+            tier: ModelTier::Medium,
+            family,
+            supports_tool_examples_override: None,
+            thinking_override: None,
+            supports_vision_override: None,
+            supports_fast_override: None,
+            pricing: ModelPricing::default(),
+            subsidised_by: None,
+            discovered_free: false,
+            max_output_tokens: Some(8192),
+            turn_output_tokens: None,
+            context_window: 131_072,
+            thinking_fields: None,
+        }
+    }
+
+    fn test_provider() -> OpenAiCompatProvider {
+        OpenAiCompatProvider {
+            client: super::super::http_client(super::super::Timeouts::default()),
+            config: Cow::Borrowed(&TEST_CONFIG),
+            stream_timeout: TEST_STREAM_TIMEOUT,
+            resolved_base_url: None,
+        }
+    }
+
+    #[test_case("test-model", ModelFamily::Gpt, ThinkingConfig::Off, true ; "gpt_off_sends")]
+    #[test_case("test-model", ModelFamily::Gpt, ThinkingConfig::Adaptive, false ; "gpt_thinking_omits")]
+    #[test_case("test-model", ModelFamily::Generic, ThinkingConfig::Adaptive, true ; "generic_thinking_sends")]
+    #[test_case("test-model", ModelFamily::Glm, ThinkingConfig::Effort(crate::Effort::High), true ; "glm_effort_sends")]
+    #[test_case("anthropic/claude-opus-4-7", ModelFamily::Generic, ThinkingConfig::Off, false ; "gateway_adaptive_only_claude_omits")]
+    fn build_body_top_p_gated(
+        model_id: &str,
+        family: ModelFamily,
+        thinking: ThinkingConfig,
+        sent: bool,
+    ) {
+        let model = Model {
+            id: model_id.into(),
+            ..test_model(family)
+        };
+        let body = test_provider().build_body(
+            &model,
+            &[Message::user("hi".into())],
+            "",
+            &json!([]),
+            thinking,
+            Some(0.8),
+        );
+        assert_eq!(body.get("top_p") == Some(&json!(0.8)), sent);
+    }
+
+    #[test]
+    fn build_body_omits_top_p_when_unset() {
+        let body = test_provider().build_body(
+            &test_model(ModelFamily::Generic),
+            &[Message::user("hi".into())],
+            "",
+            &json!([]),
+            ThinkingConfig::Off,
+            None,
+        );
+        assert!(body.get("top_p").is_none());
     }
 }

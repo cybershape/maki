@@ -2,7 +2,8 @@ use std::any::Any;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use flume::{Receiver, Sender};
 use maki_config::ToolKey;
@@ -146,6 +147,10 @@ pub struct TextOutput {
     /// has to re-parse its own llm output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<serde_json::Value>,
+    /// Deferred MCP tools this call loaded, by wire name; copied into the
+    /// [`ContentBlock::ToolResult`] for providers to expand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaded_tools: Vec<String>,
 }
 
 impl From<String> for TextOutput {
@@ -154,17 +159,14 @@ impl From<String> for TextOutput {
             text,
             instructions: None,
             state: None,
+            loaded_tools: Vec::new(),
         }
     }
 }
 
 impl From<&str> for TextOutput {
     fn from(text: &str) -> Self {
-        Self {
-            text: text.to_owned(),
-            instructions: None,
-            state: None,
-        }
+        text.to_owned().into()
     }
 }
 
@@ -180,6 +182,8 @@ impl<'de> Deserialize<'de> for TextOutput {
                 instructions: Option<Vec<InstructionBlock>>,
                 #[serde(default)]
                 state: Option<serde_json::Value>,
+                #[serde(default)]
+                loaded_tools: Vec<String>,
             },
         }
         match Raw::deserialize(deserializer)? {
@@ -188,10 +192,12 @@ impl<'de> Deserialize<'de> for TextOutput {
                 text,
                 instructions,
                 state,
+                loaded_tools,
             } => Ok(Self {
                 text,
                 instructions,
                 state,
+                loaded_tools,
             }),
         }
     }
@@ -305,6 +311,13 @@ impl ToolOutput {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.instructions.as_deref(),
             Self::ReadCode { instructions, .. } => instructions.as_deref(),
             _ => None,
+        }
+    }
+
+    pub fn loaded_tools(&self) -> &[String] {
+        match self {
+            Self::Plain(t) | Self::Markdown(t) => &t.loaded_tools,
+            _ => &[],
         }
     }
 
@@ -489,6 +502,17 @@ pub struct ToolDoneEvent {
     pub is_error: bool,
     pub annotation: Option<String>,
     pub written_path: Option<String>,
+    /// Only dispatch fills this, so an event made up anywhere else (a
+    /// doom-loop refusal, a restored transcript) has none.
+    #[serde(skip)]
+    pub call: Option<Box<CallRecord>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallRecord {
+    /// After every input hook had its say.
+    pub input: serde_json::Value,
+    pub duration: Duration,
 }
 
 const UNKNOWN_TOOL: &str = "unknown";
@@ -503,6 +527,7 @@ impl ToolDoneEvent {
             is_error: true,
             annotation: None,
             written_path: None,
+            call: None,
         }
     }
 
@@ -529,6 +554,7 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
             tool_use_id: r.id,
             content: r.output.as_text(),
             is_error: r.is_error,
+            loaded_tools: r.output.loaded_tools().to_vec(),
         });
         if let ToolOutput::Image { source, .. } = r.output.as_ref() {
             images.push(ContentBlock::Image {
@@ -559,6 +585,9 @@ pub enum DoneReason {
     /// A manual `/compact` ended the run, but no user turn ended with it, so
     /// a goal loop should not treat this as a turn boundary.
     Compact,
+    /// An `agent.user_message` layer dropped the message before the model saw
+    /// it.
+    Dropped,
 }
 
 impl From<Option<StopReason>> for DoneReason {
@@ -570,6 +599,15 @@ impl From<Option<StopReason>> for DoneReason {
             Some(StopReason::EndTurn | StopReason::ToolUse) | None => Self::EndTurn,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SteerKind {
+    MessageRewritten,
+    MessageDropped,
+    /// `agent.stop` kept the run going after the model ended its turn.
+    Continued,
 }
 
 /// Why a session ended, as `SessionEnd` handlers see it in `data.reason`.
@@ -647,6 +685,8 @@ pub enum AgentEvent {
         context_size_before: u32,
         context_size_after: u32,
         context_window: u32,
+        /// So a plugin can check the summary kept what matters.
+        summary: String,
     },
     Retry {
         attempt: u32,
@@ -655,14 +695,32 @@ pub enum AgentEvent {
     },
     Error {
         message: String,
+        /// The provider rejected the credentials, so a re-login is what fixes it.
+        auth: bool,
     },
     PermissionRequest {
         id: String,
         tool: ToolKey,
         scopes: Vec<String>,
+        /// Why a plugin escalated this call to the user, if one did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     AuthRequired,
     Nudge,
+    /// One line for the user about something the host did that the transcript
+    /// won't show, like telling the model the date changed or rebuilding the
+    /// prompt.
+    Notice {
+        text: String,
+    },
+    /// A plugin changed the run in a way the transcript alone would not show.
+    /// `text` is the message as sent, the reason for a drop, or the message
+    /// that kept the run going.
+    Steered {
+        kind: SteerKind,
+        text: String,
+    },
     SubagentHistory {
         tool_use_id: String,
         messages: Vec<Message>,
@@ -695,11 +753,41 @@ pub enum AgentEvent {
     StreamClosed,
 }
 
+impl AgentEvent {
+    pub fn error(error: &AgentError) -> Self {
+        Self::Error {
+            message: error.user_message(),
+            auth: error.is_auth_error(),
+        }
+    }
+}
+
+/// Wakes the UI loop so a change made on another thread is painted now, not on
+/// the loop's next timed poll. Wakes pile up into one until the loop looks, so
+/// a plugin writing in a tight loop costs one frame, not one per write.
+#[derive(Clone)]
+pub struct UiWaker(Sender<()>);
+
+impl UiWaker {
+    pub fn new() -> (Self, Receiver<()>) {
+        let (tx, rx) = flume::bounded(1);
+        (Self(tx), rx)
+    }
+
+    pub fn wake(&self) {
+        let _ = self.0.try_send(());
+    }
+}
+
 /// Append-only buffer for streaming tool output to the UI. Writers append
 /// under a Mutex, readers get a cheap Arc clone via `read_if_dirty()`.
 pub struct SharedBuf {
     committed: Mutex<Arc<Vec<SnapshotLine>>>,
     dirty: AtomicBool,
+    /// Only a buffer shown in a plugin window gets one, since the UI reads
+    /// those on a tick. A tool body is repainted by the agent events that
+    /// carry it.
+    waker: OnceLock<UiWaker>,
     on_change: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Opaque click handler owned by the Lua layer. It lives on the buffer
     /// itself, not on any one handle, so every handle wrapping this buf,
@@ -713,6 +801,7 @@ impl SharedBuf {
         Self {
             committed: Mutex::new(Arc::new(Vec::new())),
             dirty: AtomicBool::new(false),
+            waker: OnceLock::new(),
             on_change: Mutex::new(None),
             click: Mutex::new(None),
             notifying: AtomicBool::new(false),
@@ -745,7 +834,16 @@ impl SharedBuf {
         *self.on_change.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
+    /// There is one waker per process, so the first window to show the buffer
+    /// sets it for good.
+    pub fn wake_on_change(&self, waker: &UiWaker) {
+        let _ = self.waker.set(waker.clone());
+    }
+
     fn notify_change(&self) {
+        if let Some(waker) = self.waker.get() {
+            waker.wake();
+        }
         if self.notifying.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -1023,6 +1121,10 @@ pub struct SubagentInfo {
     pub opts: Option<RequestOptions>,
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
+    /// Where a host queues messages for this subagent. Its loop drains the
+    /// queue between turns, so a message lands as a user interrupt.
+    #[serde(skip)]
+    pub inbox: Option<Arc<crate::SubagentInbox>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1178,6 +1280,7 @@ mod tests {
             text: FILTERABLE_TEXT.into(),
             instructions: None,
             state: Some(serde_json::json!({ "text": FILTERABLE_TEXT })),
+            loaded_tools: Vec::new(),
         }
     }
 
@@ -1326,6 +1429,7 @@ mod tests {
     fn tool_results_builds_message_with_tool_result_blocks() {
         let msg = tool_results(vec![
             ToolDoneEvent {
+                call: None,
                 id: "t1".into(),
                 tool: Arc::from("bash"),
                 output: Arc::new(ToolOutput::Plain("ok".into())),
@@ -1334,6 +1438,7 @@ mod tests {
                 written_path: None,
             },
             ToolDoneEvent {
+                call: None,
                 id: "t2".into(),
                 tool: Arc::from("read"),
                 output: Arc::new(ToolOutput::Plain("fail".into())),
@@ -1362,6 +1467,7 @@ mod tests {
             text: "[image: pic.png 1KB]".into(),
         };
         let done = |id: &str, output: ToolOutput| ToolDoneEvent {
+            call: None,
             id: id.into(),
             tool: Arc::from("t"),
             output: Arc::new(output),
@@ -1444,6 +1550,7 @@ mod tests {
     #[test]
     fn wrote_to_checks_path_and_error_flag() {
         let ok_event = ToolDoneEvent {
+            call: None,
             id: "id".into(),
             tool: Arc::from("write"),
             output: Arc::new(ToolOutput::Plain("wrote 10 bytes".into())),
@@ -1454,6 +1561,7 @@ mod tests {
         assert!(!ok_event.wrote_to(Path::new("/plans/other.md")));
 
         let err_event = ToolDoneEvent {
+            call: None,
             is_error: true,
             ..ok_event
         };
@@ -1666,6 +1774,7 @@ mod tests {
             text: "file contents".into(),
             instructions: Some(blocks),
             state: None,
+            loaded_tools: Vec::new(),
         });
         let json = serde_json::to_string(&output).unwrap();
         let parsed: ToolOutput = serde_json::from_str(&json).unwrap();
@@ -1702,6 +1811,7 @@ mod tests {
         expected: Option<&str>,
     ) {
         let event = ToolDoneEvent {
+            call: None,
             id: "id".into(),
             tool: Arc::from("tool"),
             output: Arc::new(output),
@@ -1723,6 +1833,7 @@ mod tests {
                 content: "do stuff".into(),
             }]),
             state: None,
+            loaded_tools: Vec::new(),
         });
         let text = output.as_text();
         assert!(text.contains("fn main()"), "{INCLUDES_MSG}");

@@ -46,25 +46,45 @@ Add `--verbose` to include full turn-by-turn messages in the output.
 ## Sessions
 
 A `--print` run stores its session, so `maki session list` shows it and the next
-run picks it up with `-c` or `-s <id>`. Default `text` output does not print the
-id, `json` and `stream-json` return it as `session_id`. The write happens at the
-end of each turn, so a run that dies before its first turn stores nothing.
+run can resume it with `-c` or `-r <id>`. `text` output prints `session: <id>`
+on stderr to keep stdout clean for pipes. `json` and `stream-json` return it as
+`session_id`.
+
+Maki saves at the end of each turn, so a run that dies before its first turn
+stores nothing. If a save fails, for example on a full disk, Maki prints
+`maki: failed to save session <id>` on stderr. The exit code ignores save
+failures, so check stderr before a script resumes with `-c`.
 
 `--session-id <ID>` picks the id up front. It fails if a session already exists
-under that id, because a run replaces the transcript it writes to. To build on
-a session that exists:
+under that id. To build on a session that exists:
 
 | Goal | Flags |
 |------|-------|
-| Continue it in place | `-s <id>` |
-| Copy its history under a generated id | `-s <id> --fork-session` |
-| Copy its history under an id you choose | `-s <old> --session-id <new>` |
+| Continue it in place | `-r <id>` |
+| Copy its history under a generated id | `-r <id> --fork-session` |
+| Copy its history under an id you choose | `-r <old> --session-id <new>` |
 
-A copy belongs to the directory you run it in and starts with no recorded cost,
-so `maki -c` there continues the copy rather than the session it came from.
+A copy belongs to the directory you run it in, so `maki -c` there continues the
+copy rather than the session it came from.
 
 The `session_id` in output messages is the id string you passed, so a hex uuid
 comes back as that hex uuid rather than the base58 form Maki generates.
+
+### One process per session
+
+Only one Maki process can have a session open, so two runs cannot overwrite
+each other's turns. A second process that resumes a busy session with `-c` or
+`-r` exits before it sends any request:
+
+```
+session <id> is open in another maki process
+  --fork-session  work on a copy of it
+  or drop -c/-r to start a new session here
+```
+
+The lock is released when the process exits, even after a crash. On a filesystem
+without file locks, such as some NFS mounts, Maki logs a warning and runs
+unlocked.
 
 ## Claude Code Compatibility
 
