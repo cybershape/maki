@@ -1125,7 +1125,7 @@ impl<'t> EventLoop<'t> {
             selected = select_notification(selected, candidate);
         }
         if let Some(notification) = selected.filter(|n| self.focus.allows(n))
-            && let Err(error) = notifier.notify(&notification.message())
+            && let Err(error) = notifier.notify(&notification.message(), notification.reason())
         {
             warn!(notifier = ?notifier.notifier(), %error, "terminal notifications disabled after write failure");
             self.notifier = None;
@@ -1393,6 +1393,7 @@ impl<'t> EventLoop<'t> {
         match req {
             TaskRequest::List => Ok(json!(self.focused_app().tasks())),
             TaskRequest::Focus { id } => self.focused_app().focus_task(&id).map(|()| json!(true)),
+            TaskRequest::Remove { id } => self.focused_app().remove_task(&id).map(|()| json!(true)),
         }
     }
 

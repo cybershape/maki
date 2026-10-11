@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use humantime::format_duration;
 use ignore::WalkBuilder;
+use jiff::fmt::friendly::{Designator, Spacing, SpanPrinter};
 use maki_config::ProjectConfig;
 use serde_json::Value;
 
@@ -44,6 +44,9 @@ use maki_providers::provider::Provider;
 use maki_storage::id::SessionRef;
 
 pub(crate) const TOOL_NAME_FIELD: &str = "name";
+const COMPACT_DURATION: SpanPrinter = SpanPrinter::new()
+    .designator(Designator::Compact)
+    .spacing(Spacing::None);
 /// What `maki.task` calls the session's own chat.
 pub const MAIN_TASK_ID: &str = "main";
 
@@ -68,6 +71,31 @@ impl CallOrigin {
         match self {
             Self::Model => "model",
             Self::Nested => "nested",
+        }
+    }
+}
+
+/// Result presentation, independent of tool visibility and history ownership.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolOutputMode {
+    #[default]
+    Full,
+    Compact,
+}
+
+impl ToolOutputMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Compact => "compact",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "full" => Some(Self::Full),
+            "compact" => Some(Self::Compact),
+            _ => None,
         }
     }
 }
@@ -291,14 +319,13 @@ impl Deadline {
     }
 }
 
+/// Whole seconds as `1h1m1s`. Hours are the largest unit, so a day reads `24h`.
+pub fn compact_duration(secs: u64) -> String {
+    COMPACT_DURATION.unsigned_duration_to_string(&Duration::from_secs(secs))
+}
+
 pub fn timeout_annotation(secs: u64) -> String {
-    let d = Duration::from_secs(secs);
-    let formatted: String = format_duration(d)
-        .to_string()
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    format!("{formatted} timeout")
+    format!("{} timeout", compact_duration(secs))
 }
 
 pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
@@ -357,6 +384,7 @@ pub struct ToolContext {
     pub config: AgentConfig,
     pub tool_filter: Arc<ToolFilter>,
     pub tool_output_lines: ToolOutputLines,
+    pub output_mode: ToolOutputMode,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: maki_providers::Timeouts,
     pub file_access: Arc<FileAccess>,
@@ -590,6 +618,7 @@ pub fn interpreter_ctx(
         config: AgentConfig::default(),
         tool_filter: Arc::default(),
         tool_output_lines: ToolOutputLines::default(),
+        output_mode: ToolOutputMode::Full,
         permissions,
         timeouts: maki_providers::Timeouts::default(),
         file_access,
@@ -775,6 +804,7 @@ pub mod test_support {
             Arc::new(ToolRegistry::new()),
         );
         ctx.tool_use_id = tool_use_id.map(String::from);
+        ctx.output_mode = ToolOutputMode::Compact;
         ctx
     }
 
@@ -799,6 +829,7 @@ pub mod test_support {
             Arc::new(ToolRegistry::new()),
         );
         ctx.tool_use_id = None;
+        ctx.output_mode = ToolOutputMode::Compact;
         ctx
     }
 }
@@ -851,6 +882,13 @@ mod tests {
     #[test_case(90,  "1m30s timeout" ; "mixed")]
     fn timeout_annotation_cases(secs: u64, expected: &str) {
         assert_eq!(timeout_annotation(secs), expected);
+    }
+
+    #[test_case(0,     "0s"     ; "zero")]
+    #[test_case(3661,  "1h1m1s" ; "all_units")]
+    #[test_case(90000, "25h"    ; "days_stay_in_hours")]
+    fn compact_duration_cases(secs: u64, expected: &str) {
+        assert_eq!(compact_duration(secs), expected);
     }
 
     #[test_case(Deadline::None,                          120, 120 ; "none_passes_through")]

@@ -407,6 +407,8 @@ Your {spec} table must include a name, a description (the model reads it
 to decide when to use the tool), a JSON Schema for the input, and a handler
 function. The handler receives `(input, ctx)` and returns either a plain
 string or a table with richer output fields.
+`ctx:output_mode()` is "full" or "compact". Apply presentation limits
+only in compact mode so Python and other code callers get complete text.
 
 **Parameters:**
 
@@ -416,7 +418,7 @@ string or a table with richer output fields.
   - `schema` (`table`) Required. JSON Schema object describing the tool's input parameters.
   - `handler` (`function`) Required. Called with `(input, ctx)` when the tool is invoked.
     Must return a string or a table with any of these fields:
-    - `llm_output` (`string`) Text sent to the model.
+    - `llm_output` (`string`) Text returned to the caller, including the model.
     - `is_error` (`boolean`) When true, the result is treated as an error.
     - `content` (`string`) Alias for llm_output (legacy).
     - `body` (`BufHandle`) Rich rendered body shown in the UI.
@@ -1377,6 +1379,10 @@ through optional callbacks while the tool runs.
 - `{input}` (`table|any`) Tool input (JSON-serializable). Must match the tool's `input_schema`.
 - `{opts?}` (`table?`) Optional fields:
   - `timeout` (`integer?`) deadline in seconds.
+  - `output_mode` (`string?`) "full" (default) returns complete text.
+    "compact" applies model output limits and automatic RTK rewriting.
+    Hooks receive the mode in both cases so presentation filters can skip
+    full results. Permissions and redaction still apply in both modes.
   - `on_live_buf` (`function?`) called with a `BufHandle` for each live buffer
     the tool publishes. Must not yield.
   - `on_annotation` (`function?`) called with an annotation string for each
@@ -2057,9 +2063,11 @@ local id = maki.fn.jobstart("git status", {
 maki.fn.jobstart({cmd}, {opts?})
 ```
 
-Run a command in the background. A string runs through `bash -c` on Unix
-or `cmd /C` on Windows; a table is spawned as argv, with no shell in
-between (nothing in it can be read as a redirect, a pipe, or `$(...)`).
+Run a command in the background. A string runs through `bash -c` on Unix.
+On Windows it follows `agent.shell`: Git Bash by default, `cmd.exe /C`
+when set to `cmd`, or any program you name. A table is spawned as argv,
+with no shell in between (nothing in it can be read as a redirect, a pipe,
+or `$(...)`).
 You get back a job id that you can pass to `jobstop` or `jobwait` to
 control the process.
 
@@ -2944,7 +2952,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{pattern}` (`string`) Regular expression to search for.
-- `{opts?}` (`table?`) `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): skip lines longer than this.
+- `{opts?}` (`table?`) `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
 
 **Returns:** (`table?`, `string?`) Array of `{path, groups}` tables, or nil plus an error message.
 
@@ -4718,6 +4726,32 @@ another session returns an error instead of landing on the wrong task.
 
 ```lua
 local _, err = maki.task.focus("main")
+```
+
+---
+
+### `maki.task.remove()` {#maki-task-remove}
+
+```lua
+maki.task.remove({id})
+```
+
+Deletes a finished task and its transcript, so a reload cannot bring it
+back. The main chat and still-running tasks are refused.
+
+Deleting the focused task moves focus to the chat before it. Call
+`maki.task.focus()` afterwards to land somewhere else.
+
+**Parameters:**
+
+- `{id}` (`string`) Task id, as returned by `list()`.
+
+**Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
+
+**Example:**
+
+```lua
+local _, err = maki.task.remove("toolu_01")
 ```
 
 
@@ -7223,8 +7257,11 @@ ListPicker.range_spans = range_spans
 M.DEFAULT_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
 function M.extend(spec)
 
---- Returns max_lines, max_bytes: tool override when set, agent-wide otherwise.
+--- Model presentation limits, or nil, nil for full results.
 function M.resolve(opts, ctx)
+
+--- Zero disables the line-byte presentation limit for full results.
+function M.line_bytes(opts, ctx)
 
 --- Last {n} lines of {text}, or all of it when it has fewer. Newlines separate
 --- lines here rather than terminate them, so a trailing one is an empty last
@@ -7473,46 +7510,7 @@ function ToolView.restore_markdown(output, is_error, opts)
 ### `require("maki.truncate")`
 
 ```lua
-local function truncate(text, max_lines, max_bytes)
-  if #text <= max_bytes then
-    local n = 0
-    for _ in text:gmatch("\n") do
-      n = n + 1
-    end
-    if n + 1 <= max_lines then
-      return text
-    end
-  end
-  local out = {}
-  local bytes = 0
-  local lines = 0
-  for line in text:gmatch("([^\n]*)\n?") do
-    lines = lines + 1
-    if lines > max_lines then
-      break
-    end
-    local new_bytes = bytes + #line + 1
-    if new_bytes > max_bytes then
-      if #out == 0 then
-        -- Back off UTF-8 continuation bytes so no character is split in half.
-        local cut = max_bytes
-        while cut > 0 and line:find("^[\128-\191]", cut + 1) do
-          cut = cut - 1
-        end
-        out[1] = line:sub(1, cut)
-      end
-      break
-    end
-    out[#out + 1] = line
-    bytes = new_bytes
-  end
-  local result = table.concat(out, "\n")
-  if #result < #text then
-    result = result .. "\n\n[truncated " .. (#text - #result) .. " bytes]"
-  end
-  return result
-end
-
-return truncate
+--- require("maki.truncate")(text, max_lines, max_bytes)
+--- Bounds model text. With both limits nil, returns the complete text unchanged.
 ```
 

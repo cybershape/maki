@@ -5,13 +5,15 @@ use std::io::{BufRead, BufReader};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
+use maki_config::ShellPreference;
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_providers::strip_provider_keys;
+use maki_providers::{shell_command, strip_provider_keys};
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use shell_words::join as shell_join;
@@ -39,8 +41,14 @@ const JOB_WAIT_TIMEOUT_ERR: &str = "jobwait: timed out";
 const BLANK_NAME_ERR: &str = "jobstart: name must be non-blank";
 const EMPTY_ARGV_ERR: &str = "jobstart: argv table must not be empty";
 const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv table";
-#[cfg(windows)]
-const GIT_BASH_PATH: &str = r"C:\Program Files\Git\bin\bash.exe";
+
+/// `agent.shell`, set once from config at startup. Jobs get built far away
+/// from any config, on whatever Lua thread runs the plugin, so they read it here.
+static SHELL: LazyLock<ArcSwap<ShellPreference>> = LazyLock::new(ArcSwap::default);
+
+pub fn set_shell_preference(shell: ShellPreference) {
+    SHELL.store(Arc::new(shell));
+}
 
 #[derive(Clone)]
 pub(crate) enum JobEvent {
@@ -77,7 +85,7 @@ impl From<&str> for JobCommand {
 impl JobCommand {
     fn build(&self) -> Command {
         match self {
-            Self::Shell(cmd) => shell_command(cmd),
+            Self::Shell(cmd) => shell_command(cmd, &SHELL.load()),
             Self::Argv(argv) => {
                 let mut command = Command::new(&argv[0]);
                 command.args(&argv[1..]);
@@ -776,32 +784,6 @@ fn drop_callbacks(lua: &Lua, job: &mut JobMeta) {
     }
 }
 
-fn shell_command(cmd: &str) -> Command {
-    #[cfg(unix)]
-    {
-        let mut c = Command::new("bash");
-        c.arg("-c").arg(cmd);
-        c
-    }
-    #[cfg(windows)]
-    {
-        windows_shell_command(cmd, Path::new(GIT_BASH_PATH))
-    }
-}
-
-#[cfg(any(windows, test))]
-fn windows_shell_command(cmd: &str, git_bash: &Path) -> Command {
-    if git_bash.is_file() {
-        let mut c = Command::new(git_bash);
-        c.arg("-c").arg(cmd);
-        c
-    } else {
-        let mut c = Command::new("cmd.exe");
-        c.arg("/C").arg(cmd);
-        c
-    }
-}
-
 /// Signalling a reaped pid would hit whoever the kernel handed it to next, so
 /// skip the jobs the wait thread already reaped. Until then the child is a
 /// zombie, and a zombie group leader keeps its pid and pgid off the free list,
@@ -831,9 +813,11 @@ fn kill_job(job: &JobMeta) {
     }
 }
 
-/// Run a command in the background. A string runs through `bash -c` on Unix
-/// or `cmd /C` on Windows; a table is spawned as argv, with no shell in
-/// between (nothing in it can be read as a redirect, a pipe, or `$(...)`).
+/// Run a command in the background. A string runs through `bash -c` on Unix.
+/// On Windows it follows `agent.shell`: Git Bash by default, `cmd.exe /C`
+/// when set to `cmd`, or any program you name. A table is spawned as argv,
+/// with no shell in between (nothing in it can be read as a redirect, a pipe,
+/// or `$(...)`).
 /// You get back a job id that you can pass to `jobstop` or `jobwait` to
 /// control the process.
 ///
@@ -2057,29 +2041,6 @@ mod tests {
             ARGV,
             "the row a user reads must quote what the shell would have eaten"
         );
-    }
-
-    #[test]
-    fn windows_shell_command_prefers_git_bash_when_present() {
-        const CMD: &str = "echo hello";
-        let dir = tempfile::tempdir().unwrap();
-        let bash_path = dir.path().join("bash.exe");
-        std::fs::write(&bash_path, []).unwrap();
-
-        let cmd = windows_shell_command(CMD, &bash_path);
-        assert_eq!(cmd.get_program(), bash_path.as_os_str());
-        let args: Vec<_> = cmd.get_args().collect();
-        assert_eq!(args, ["-c", CMD]);
-    }
-
-    #[test]
-    fn windows_shell_command_falls_back_to_cmd_exe_when_git_bash_missing() {
-        const CMD: &str = "echo hello";
-        let missing = Path::new("nonexistent_bash.exe");
-        let cmd = windows_shell_command(CMD, missing);
-        assert_eq!(cmd.get_program(), "cmd.exe");
-        let args: Vec<_> = cmd.get_args().collect();
-        assert_eq!(args, ["/C", CMD]);
     }
 
     #[cfg(unix)]
