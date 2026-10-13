@@ -1,10 +1,11 @@
-//! Shared plumbing for tools. The registry itself lives in `registry.rs`; this file
-//! holds the helpers every tool leans on: `ToolFilter` to enable/disable per caller,
-//! `Deadline` so a parent tool can cap a child's timeout, the walker that skips `.git`,
+//! Shared plumbing for tools. The registry itself lives in `registry.rs` and the
+//! call deadline in `deadline.rs`; this file holds the helpers every tool leans on:
+//! `ToolFilter` to enable/disable per caller, the walker that skips `.git`,
 //! and `sanitize_tool_input` which patches up small JSON mistakes models make (stray
 //! quotes, camelCase keys, extra wrappers). Plan mode rejects writes to
 //! anything but the plan file before they reach the tool.
 
+mod deadline;
 mod file_access;
 pub mod grep;
 pub mod hook;
@@ -12,6 +13,7 @@ pub mod interpreter_bridge;
 pub mod registry;
 pub mod schema;
 
+pub use deadline::Deadline;
 pub use file_access::{FileAccess, FileKey};
 pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 pub use registry::{
@@ -25,7 +27,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use ignore::WalkBuilder;
 use jiff::fmt::friendly::{Designator, Spacing, SpanPrinter};
@@ -41,7 +43,7 @@ use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
 
 pub(crate) const TOOL_NAME_FIELD: &str = "name";
 const COMPACT_DURATION: SpanPrinter = SpanPrinter::new()
@@ -280,45 +282,6 @@ pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
 pub const WRITE_TOOL_NAME: &str = "write";
 
 pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
-pub(crate) const DEADLINE_EXCEEDED: &str = "timeout exceeded";
-
-#[derive(Clone, Copy, Debug, Default)]
-pub enum Deadline {
-    #[default]
-    None,
-    At(Instant),
-}
-
-impl Deadline {
-    pub fn after(duration: Duration) -> Self {
-        Self::At(Instant::now() + duration)
-    }
-
-    pub fn check(self) -> Result<(), String> {
-        match self {
-            Self::None => Ok(()),
-            Self::At(instant) if instant.saturating_duration_since(Instant::now()).is_zero() => {
-                Err(DEADLINE_EXCEEDED.into())
-            }
-            Self::At(_) => Ok(()),
-        }
-    }
-
-    pub fn cap_timeout(self, timeout_secs: u64) -> Result<u64, String> {
-        match self {
-            Self::None => Ok(timeout_secs),
-            Self::At(instant) => {
-                let remaining = instant.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    Err(DEADLINE_EXCEEDED.into())
-                } else {
-                    Ok(timeout_secs.min(remaining.as_secs().max(1)))
-                }
-            }
-        }
-    }
-}
-
 /// Whole seconds as `1h1m1s`. Hours are the largest unit, so a day reads `24h`.
 pub fn compact_duration(secs: u64) -> String {
     COMPACT_DURATION.unsigned_duration_to_string(&Duration::from_secs(secs))
@@ -364,6 +327,9 @@ pub struct ToolContext {
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `maki index` one-shot.
     pub session_id: Option<SessionRef>,
+    /// See [`crate::AgentParams::background_for`]. Every nested call clones
+    /// this context, so batch and code_execution children carry it too.
+    pub background_for: Option<MakiId>,
     /// `None` in the agent that owns the session ([`MAIN_TASK_ID`]), the
     /// spawning call's `tool_use_id` in a subagent. A subagent shares
     /// `session_id` with its parent on purpose (provider affinity, hooks,
@@ -606,6 +572,7 @@ pub fn interpreter_ctx(
         event_tx: event_tx.clone(),
         mode: mode.clone(),
         session_id: None,
+        background_for: None,
         task_id: None,
         tool_use_id: None,
         user_response_rx,
@@ -614,7 +581,7 @@ pub fn interpreter_ctx(
         call_instructions: CallInstructions::default(),
         cancel,
         mcp: None,
-        deadline: Deadline::None,
+        deadline: Deadline::default(),
         config: AgentConfig::default(),
         tool_filter: Arc::default(),
         tool_output_lines: ToolOutputLines::default(),
@@ -664,7 +631,12 @@ pub fn cli_tool_ctx() -> ToolContext {
 pub mod test_support {
     use std::borrow::Cow;
 
-    use crate::{Envelope, EventSender, ToolOutput};
+    use arc_swap::ArcSwap;
+    use maki_providers::Timeouts;
+    use maki_storage::id::MakiId;
+
+    use crate::live_session::AgentSeed;
+    use crate::{Envelope, EventSender, ModelSlot, ToolOutput};
 
     use super::*;
 
@@ -812,6 +784,24 @@ pub mod test_support {
         stub_ctx_with(mode, None, None)
     }
 
+    pub fn stub_seed(id: MakiId) -> AgentSeed {
+        let ctx = stub_ctx(&AgentMode::Build);
+        let slot = ModelSlot {
+            model: (*ctx.model).clone(),
+            provider: ctx.provider,
+        };
+        AgentSeed::new(
+            SessionRef::from(id),
+            Arc::new(ArcSwap::from_pointee(slot)),
+            AgentConfig::default(),
+            ToolOutputLines::default(),
+            ctx.permissions,
+            None,
+            Timeouts::default(),
+            Arc::default(),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn stub_ctx_with_permissions(
         mode: &AgentMode,
@@ -831,6 +821,19 @@ pub mod test_support {
         ctx.tool_use_id = None;
         ctx.output_mode = ToolOutputMode::Compact;
         ctx
+    }
+
+    /// Plays someone else's edit. It pushes the mtime ahead instead of writing
+    /// again, because two writes close together can share one mtime on
+    /// filesystems with coarse timestamps.
+    #[cfg(test)]
+    pub(crate) fn future_mtime(path: &Path) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(10))
+            .unwrap();
     }
 }
 
@@ -889,26 +892,6 @@ mod tests {
     #[test_case(90000, "25h"    ; "days_stay_in_hours")]
     fn compact_duration_cases(secs: u64, expected: &str) {
         assert_eq!(compact_duration(secs), expected);
-    }
-
-    #[test_case(Deadline::None,                          120, 120 ; "none_passes_through")]
-    #[test_case(Deadline::after(Duration::from_secs(60)), 10,  10  ; "requested_under_remaining")]
-    fn cap_timeout_ok(deadline: Deadline, requested: u64, expected: u64) {
-        assert_eq!(deadline.cap_timeout(requested).unwrap(), expected);
-    }
-
-    #[test]
-    fn cap_timeout_clamps_to_remaining() {
-        let clamped = Deadline::after(Duration::from_secs(3600))
-            .cap_timeout(7200)
-            .unwrap();
-        assert!(clamped <= 3600, "expected <= 3600, got {clamped}");
-    }
-
-    #[test]
-    fn cap_timeout_expired() {
-        let expired = Deadline::At(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
-        assert_eq!(expired.cap_timeout(120).unwrap_err(), DEADLINE_EXCEEDED);
     }
 
     #[test_case("short",                            "short"                             ; "short_passthrough")]

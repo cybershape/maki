@@ -15,11 +15,12 @@ use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
 use crate::tools::registry::{InstalledHook, RegisteredTool, Tool, ToolInvocation};
 use crate::tools::{
-    CallOrigin, Deadline, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience,
-    ToolContext, truncate_bytes,
+    CallOrigin, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience, ToolContext,
+    truncate_bytes,
 };
 use crate::{
-    AgentError, AgentEvent, CallRecord, TextOutput, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentError, AgentEvent, AgentSeed, CallRecord, TextOutput, ToolDoneEvent, ToolOutput,
+    ToolStartEvent,
 };
 use maki_config::ToolKey;
 use maki_storage::id::SessionRef;
@@ -42,6 +43,14 @@ const BASH_TOOL: &str = "bash";
 const BASH_COMMAND_FIELD: &str = "command";
 const GIT_COMMIT: &str = "git commit";
 const GH_PR_CREATE: &str = "gh pr create";
+const LIST_TOOL: &str = "list";
+const LIST_DIR_ALIAS: &str = "list_dir";
+const PYTHON_KEYWORDS: &[&str] = &[
+    "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue",
+    "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import",
+    "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while",
+    "with", "yield",
+];
 
 const ERROR_CANCELLED: &str = "cancelled";
 const ERROR_TIMEOUT: &str = "timeout";
@@ -339,10 +348,7 @@ impl<'a> Hook<'a> {
     /// answer would inherit a window the call already used up.
     fn window(&self) -> Instant {
         let cap = Instant::now() + HOOK_CHAIN_MAX;
-        match self.ctx.deadline {
-            Deadline::At(at) => at.min(cap),
-            Deadline::None => cap,
-        }
+        self.ctx.deadline.at().map_or(cap, |at| at.min(cap))
     }
 }
 
@@ -525,12 +531,18 @@ fn assign_aliases(tools: &mut [Callable]) {
     }
 }
 
-fn identifier_alias(name: &str) -> Option<String> {
+pub fn identifier_alias(name: &str) -> Option<String> {
     let is_body = |c: char| c.is_ascii_alphanumeric() || c == '_';
     // A leading digit is not something substitution can fix without inventing a
     // character the model never saw.
     if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
         return None;
+    }
+    if name == LIST_TOOL {
+        return Some(LIST_DIR_ALIAS.to_owned());
+    }
+    if PYTHON_KEYWORDS.contains(&name) {
+        return Some(format!("{name}_"));
     }
     name.chars().any(|c| !is_body(c)).then(|| {
         name.chars()
@@ -633,6 +645,18 @@ async fn run_native_tool(
     let mutated = invocation.mutable_path().map(FileKey::new);
 
     if let Some(key) = &mutated {
+        if let Some(chat) = ctx.background_for
+            && let Some(reason) = AgentSeed::background_write_block(chat)
+        {
+            warn!(
+                tool = %name,
+                %chat,
+                target = %key.as_path().display(),
+                reason = %reason,
+                "blocked background write"
+            );
+            return done_error(reason);
+        }
         let is_plan_target = ctx
             .mode
             .plan_path()
@@ -847,6 +871,9 @@ async fn enforce_permission(
     }
 }
 
+/// Every permission check passes through here, so this is where the clock
+/// stops while the user decides. Someone who answers a minute later should
+/// not find the call already timed out before it even started.
 async fn gate(
     ctx: &ToolContext,
     tool: &ToolKey,
@@ -854,17 +881,19 @@ async fn gate(
     id: &str,
     ask: Option<&str>,
 ) -> Result<(), String> {
-    ctx.permissions
-        .enforce(
-            tool,
-            scopes,
-            &ctx.event_tx,
-            ctx.user_response_rx.as_deref(),
-            id,
-            &ctx.cancel,
-            ctx.mode.plan_path(),
-            ask,
-        )
+    let decision = ctx.permissions.enforce(
+        tool,
+        scopes,
+        ctx.session_id.as_ref(),
+        &ctx.event_tx,
+        ctx.user_response_rx.as_deref(),
+        id,
+        &ctx.cancel,
+        ctx.mode.plan_path(),
+        ask,
+    );
+    ctx.deadline
+        .paused_while(decision)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1091,11 +1120,13 @@ mod tests {
     use maki_config::{
         Effect, Permission, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
     };
+    use maki_storage::id::MakiId;
     use smol::lock::Mutex as AsyncMutex;
     use test_case::test_case;
 
     use super::*;
     use crate::cancel::CancelToken;
+    use crate::live_session::{BACKGROUND_PLAN_WRITE_DENIED, SessionMailbox};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::{ToolDeferral, tool_names};
     use crate::permissions::{
@@ -1106,12 +1137,12 @@ mod tests {
     use crate::tools::schema::{JsonPath, ToolInputErrorKind};
     use crate::tools::test_support::{
         GUARDED_TOOL_NAME, GuardedMock, mock_tool, mock_tool_with_schema, stub_ctx,
-        stub_ctx_with_permissions,
+        stub_ctx_with_permissions, stub_seed,
     };
     use crate::tools::{
-        BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-        PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience, ToolExecResult,
-        ToolHook, local_tool,
+        BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
+        ParseError, PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience,
+        ToolExecResult, ToolHook, local_tool,
     };
     use crate::{AgentMode, Envelope, EventSender, InstructionBlock};
 
@@ -1157,6 +1188,7 @@ mod tests {
     const SCOPELESS_TOOL_NAME: &str = "scopeless";
     const SEARCH_QUERY_FIELD: &str = "query";
     const SEARCH_QUERY: &str = "probe";
+    const PROMPT_THINK_TIME: Duration = Duration::from_millis(20);
 
     fn recent_calls(entries: &[(&str, Value)]) -> RecentCalls {
         let mut rc = RecentCalls::new();
@@ -1667,9 +1699,9 @@ mod tests {
     #[test]
     fn a_firing_carries_the_calls_cancellation_and_deadline() {
         smol::block_on(async {
-            let at = Instant::now() + HOOK_CALL_DEADLINE;
             let mut ctx = build_ctx();
-            ctx.deadline = Deadline::At(at);
+            ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);
+            let at = ctx.deadline.at();
             ctx.cancel = cancelled_token();
             let (ctx, hook) = hooked_ctx(ctx);
 
@@ -1677,7 +1709,11 @@ mod tests {
 
             let firing = hook.at(HookStage::Input).expect("the input stage fired");
             assert!(firing.cancelled, "the call's own token, not a fresh one");
-            assert_eq!(firing.deadline, at, "and no later than the call itself");
+            assert_eq!(
+                Some(firing.deadline),
+                at,
+                "and no later than the call itself"
+            );
         });
     }
 
@@ -1805,6 +1841,45 @@ mod tests {
             let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
             let (ctx, _hook) = hooked_with(stub_ctx(&plan), None, hook);
             let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(PLAN_PATH)).await;
+
+            assert_eq!(done.output.as_text(), expected);
+        });
+    }
+
+    fn planning() -> AgentMode {
+        AgentMode::Plan(PathBuf::from(PLAN_PATH))
+    }
+
+    /// Background work runs in build mode, so this gate is the only place the
+    /// chat's plan mode reaches it. Even the plan file gets no pass, because
+    /// nobody asked a monitor to write the user's plan. A write from inside
+    /// batch or code_execution must not slip past it either.
+    #[test_case(planning(),       PLAN_PATH,         CallOrigin::Model,  BACKGROUND_PLAN_WRITE_DENIED.to_owned() ; "plan_file_while_the_chat_plans")]
+    #[test_case(planning(),       HOOK_ESCAPED_PATH, CallOrigin::Nested, BACKGROUND_PLAN_WRITE_DENIED.to_owned() ; "nested_write_while_the_chat_plans")]
+    #[test_case(AgentMode::Build, PLAN_PATH,         CallOrigin::Model,  ran(PLAN_PATH)                          ; "building_chat_follows_the_rules")]
+    fn background_write_follows_the_chat_mode(
+        chat_mode: AgentMode,
+        target: &str,
+        origin: CallOrigin,
+        expected: String,
+    ) {
+        smol::block_on(async {
+            let chat = MakiId::generate();
+            let mailbox = SessionMailbox::register(chat);
+            let seed = mailbox.publish_seed(stub_seed(chat));
+            seed.set_chat_settings(Default::default(), &chat_mode);
+            let mut ctx = build_ctx();
+            ctx.registry = registered(Arc::new(HookMock(None)));
+            ctx.background_for = Some(chat);
+
+            let done = run(
+                TEST_ID.into(),
+                HOOK_TOOL_NAME,
+                &call_input(target),
+                &ctx,
+                origin,
+            )
+            .await;
 
             assert_eq!(done.output.as_text(), expected);
         });
@@ -2467,6 +2542,38 @@ mod tests {
         assert!(callable(&ctx).iter().all(|c| c.alias.is_none()));
     }
 
+    #[test]
+    fn list_registry_tool_aliases_to_list_dir() {
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.registry = registered(mock_tool(LIST_TOOL, ToolAudience::all()));
+        let entry = callable(&ctx)
+            .into_iter()
+            .find(|c| c.name == LIST_TOOL)
+            .expect("the published tool is callable");
+        assert_eq!(entry.alias.as_deref(), Some(LIST_DIR_ALIAS));
+    }
+
+    #[test]
+    fn python_keyword_aliases_with_trailing_underscore() {
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.registry = registered(mock_tool("def", ToolAudience::all()));
+        let entry = callable(&ctx)
+            .into_iter()
+            .find(|c| c.name == "def")
+            .expect("the published tool is callable");
+        assert_eq!(entry.alias.as_deref(), Some("def_"));
+    }
+
+    #[test]
+    fn colliding_list_dir_tool_drops_alias() {
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        let registry = ToolRegistry::new();
+        register(&registry, mock_tool(LIST_TOOL, ToolAudience::all()));
+        register(&registry, mock_tool(LIST_DIR_ALIAS, ToolAudience::all()));
+        ctx.registry = Arc::new(registry);
+        assert!(callable(&ctx).iter().all(|c| c.alias.is_none()));
+    }
+
     /// The model only fixes names it recognizes, so it hears back what it sent.
     #[test_case(None, "nonexistent.tool", false ; "without_mcp")]
     #[test_case(Some(PROBE_QUALIFIED), OTHER_WIRE, true ; "unpublished_wire_name")]
@@ -2588,6 +2695,48 @@ mod tests {
                 done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
                 "error should be the permission-denied message, got: {}",
                 done.output.as_text()
+            );
+        });
+    }
+
+    /// We measure the pause on the output hook's window instead of racing the
+    /// tool against a tiny budget, so a slow machine can't fail this. The tool
+    /// shares that same deadline, so it gets the time back too.
+    #[test]
+    fn time_on_a_permission_prompt_does_not_spend_the_deadline() {
+        smol::block_on(async {
+            let mut ctx = rules_ctx(&AgentMode::Build, Vec::new());
+            ctx.registry = registered(Arc::new(GuardedMock));
+            let hook = RecordingHook::default();
+            ctx.registry.set_hook(hook.clone());
+            let (event_tx, events) = flume::unbounded();
+            let (answer_tx, answer_rx) = flume::unbounded();
+            ctx.event_tx = EventSender::new(event_tx, 0);
+            ctx.user_response_rx = Some(Arc::new(AsyncMutex::new(answer_rx)));
+            ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);
+
+            let user = async {
+                while !matches!(
+                    events.recv_async().await.unwrap().event,
+                    AgentEvent::PermissionRequest { .. }
+                ) {}
+                smol::Timer::after(PROMPT_THINK_TIME).await;
+                answer_tx
+                    .send(TaggedAnswer::new(TEST_ID, PermissionAnswer::AllowOnce).encode())
+                    .unwrap();
+            };
+            let (done, ()) = futures_lite::future::zip(
+                dispatch(&ctx, GUARDED_TOOL_NAME, &serde_json::json!({})),
+                user,
+            )
+            .await;
+
+            assert!(!done.is_error, "got: {}", done.output.as_text());
+            let input = hook.at(HookStage::Input).expect("the input stage fired");
+            let output = hook.at(HookStage::Output).expect("the output stage fired");
+            assert!(
+                output.deadline - input.deadline >= PROMPT_THINK_TIME,
+                "the prompt ate into the call's budget"
             );
         });
     }
