@@ -57,6 +57,37 @@ pub fn build_body(model: &Model, messages: &[Message], system: &str, tools: &Val
     body
 }
 
+pub fn plan_dialect(model_id: &str) -> &'static EffortDialect<'static> {
+    if !model_id.contains("-codex") {
+        return if model_id.starts_with("gpt-6-") || model_id.starts_with("gpt-6.") {
+            &dialect::GPT_6
+        } else if model_id.starts_with("gpt-5.6-") {
+            &dialect::GPT_5_6
+        } else if model_id.starts_with("gpt-5.5") {
+            &dialect::CODING_PLAN
+        } else {
+            &dialect::GPT_5_6
+        };
+    }
+    if model_id.starts_with("gpt-5.1-codex") && !model_id.starts_with("gpt-5.1-codex-max") {
+        &dialect::CODEX_5_1
+    } else {
+        &dialect::CODEX
+    }
+}
+
+pub fn responses_dialect<'a>(
+    model_id: &str,
+    discovered: Option<&'a ModelInfo>,
+) -> EffortDialect<'a> {
+    let base = plan_dialect(model_id);
+    if let Some(effort) = discovered.and_then(|d| d.effort.as_ref()) {
+        effort.refine(base)
+    } else {
+        base.clone()
+    }
+}
+
 pub(crate) fn apply_responses_reasoning(
     body: &mut Value,
     thinking: ThinkingConfig,
@@ -285,6 +316,138 @@ pub struct ResponsesProvider {
     body_hook: Option<Arc<dyn super::codec::BodyHook>>,
 }
 
+fn parse_price_value(val: &Value) -> Option<f64> {
+    if let Some(n) = val.as_f64() {
+        Some(n)
+    } else if let Some(s) = val.as_str() {
+        s.parse::<f64>().ok()
+    } else {
+        None
+    }
+}
+
+fn normalize_price(val: Option<f64>) -> f64 {
+    let p = val.unwrap_or(0.0);
+    if p > 0.0 && p < 0.01 {
+        let scaled = p * 1_000_000.0;
+        (scaled * 1_000_000.0).round() / 1_000_000.0
+    } else {
+        p
+    }
+}
+
+fn parse_pricing(pricing_val: &Value) -> Option<crate::model::ModelPricing> {
+    if !pricing_val.is_object() {
+        return None;
+    }
+    let input = normalize_price(
+        pricing_val
+            .get("prompt")
+            .or_else(|| pricing_val.get("input"))
+            .and_then(parse_price_value),
+    );
+    let output = normalize_price(
+        pricing_val
+            .get("completion")
+            .or_else(|| pricing_val.get("output"))
+            .and_then(parse_price_value),
+    );
+    let cache_read = normalize_price(
+        pricing_val
+            .get("input_cache_read")
+            .or_else(|| pricing_val.get("cache_read"))
+            .and_then(parse_price_value),
+    );
+    let cache_write = normalize_price(
+        pricing_val
+            .get("input_cache_write")
+            .or_else(|| pricing_val.get("cache_write"))
+            .and_then(parse_price_value),
+    );
+    Some(crate::model::ModelPricing {
+        input,
+        output,
+        cache_write,
+        cache_read,
+        fast: None,
+    })
+}
+
+fn parse_model_info(m: &Value) -> Option<ModelInfo> {
+    let id = m["id"].as_str().or_else(|| m["slug"].as_str())?;
+    let context_window = m["context_window"]
+        .as_u64()
+        .or_else(|| m["context_length"].as_u64())
+        .or_else(|| m["max_model_len"].as_u64())
+        .or_else(|| m["max_input_tokens"].as_u64())
+        .and_then(|v| u32::try_from(v).ok());
+    let max_output_tokens = m["max_output_tokens"]
+        .as_u64()
+        .or_else(|| m["max_tokens"].as_u64())
+        .and_then(|v| u32::try_from(v).ok());
+
+    let supports_vision = m
+        .get("modalities")
+        .and_then(|mod_val| mod_val.get("input"))
+        .or_else(|| m.get("input_modalities"))
+        .and_then(Value::as_array)
+        .map(|modalities| modalities.iter().any(|modality| modality == "image"));
+
+    let pricing = m.get("pricing").and_then(parse_pricing);
+    let reasoning_flag = m.get("reasoning").and_then(Value::as_bool);
+
+    let mut efforts = Vec::new();
+    let mut has_none = false;
+    let levels_array = m
+        .get("supported_reasoning_levels")
+        .and_then(Value::as_array)
+        .or_else(|| m.get("reasoning_levels").and_then(Value::as_array));
+
+    if let Some(levels) = levels_array {
+        for lvl in levels {
+            let effort_str = lvl.as_str().or_else(|| lvl["effort"].as_str());
+            if let Some(s) = effort_str {
+                if s == dialect::OFF {
+                    has_none = true;
+                } else if let Ok(e) = s.parse::<crate::Effort>() {
+                    efforts.push(e);
+                }
+            }
+        }
+        efforts.sort_unstable();
+        efforts.dedup();
+    }
+
+    let (effort, supports_thinking) = if reasoning_flag == Some(false) {
+        (None, Some(false))
+    } else if !efforts.is_empty() || has_none {
+        (
+            Some(crate::model::ModelEffort {
+                supported: efforts.clone(),
+                send_off: Some(has_none),
+            }),
+            Some(!efforts.is_empty()),
+        )
+    } else if reasoning_flag == Some(true) {
+        (None, Some(true))
+    } else {
+        (None, None)
+    };
+
+    Some(ModelInfo {
+        id: id.to_string(),
+        context_window,
+        max_output_tokens,
+        pricing,
+        supports_thinking,
+        supports_vision,
+        tier: None,
+        provider_info: None,
+        extra: Some(m.clone()),
+        effort,
+    })
+}
+
 impl ResponsesProvider {
     pub fn new(
         slug: String,
@@ -346,34 +509,16 @@ impl ResponsesProvider {
                 let mut text = String::new();
                 if resp.body_mut().read_to_string(&mut text).await.is_ok()
                     && let Ok(val) = serde_json::from_str::<Value>(&text)
-                    && let Some(data) = val["data"].as_array()
                 {
-                    let mut models: Vec<ModelInfo> = data
-                        .iter()
-                        .filter_map(|m| {
-                            let id = m["id"].as_str()?;
-                            Some(ModelInfo {
-                                id: id.to_string(),
-                                context_window: m["context_length"]
-                                    .as_u64()
-                                    .or_else(|| m["max_model_len"].as_u64())
-                                    .and_then(|v| u32::try_from(v).ok()),
-                                max_output_tokens: m["max_tokens"]
-                                    .as_u64()
-                                    .and_then(|v| u32::try_from(v).ok()),
-                                pricing: None,
-                                supports_thinking: None,
-                                supports_vision: None,
-                                tier: None,
-                                provider_info: None,
-                                extra: None,
-                                effort: None,
-                            })
-                        })
-                        .collect();
-                    models.sort_by(|a, b| a.id.cmp(&b.id));
-                    if !models.is_empty() {
-                        return Ok(models);
+                    let raw_items = val["data"].as_array().or_else(|| val["models"].as_array());
+                    if let Some(data) = raw_items {
+                        let mut models: Vec<ModelInfo> =
+                            data.iter().filter_map(parse_model_info).collect();
+                        models.sort_by(|a, b| a.id.cmp(&b.id));
+                        if !models.is_empty() {
+                            crate::model_registry::set_known_models(&self.slug, models.clone());
+                            return Ok(models);
+                        }
                     }
                 }
             }
@@ -383,17 +528,28 @@ impl ResponsesProvider {
             let models: Vec<ModelInfo> = def
                 .models
                 .iter()
-                .map(|m| ModelInfo {
-                    id: m.id.clone(),
-                    context_window: m.context_window,
-                    max_output_tokens: m.max_output_tokens,
-                    pricing: None,
-                    supports_thinking: m.supports_thinking,
-                    supports_vision: m.supports_vision,
-                    tier: Some(m.tier),
-                    provider_info: None,
-                    extra: None,
-                    effort: None,
+                .map(|m| {
+                    let effort = m.thinking_fields.as_ref().map(|f| {
+                        let supported: Vec<_> = f.levels.keys().copied().collect();
+                        crate::model::ModelEffort {
+                            supported,
+                            send_off: Some(f.off.is_some()),
+                        }
+                    });
+                    ModelInfo {
+                        id: m.id.clone(),
+                        context_window: m.context_window,
+                        max_output_tokens: m.max_output_tokens,
+                        pricing: None,
+                        supports_thinking: m
+                            .supports_thinking
+                            .or_else(|| effort.as_ref().map(|e| !e.supported.is_empty())),
+                        supports_vision: m.supports_vision,
+                        tier: Some(m.tier),
+                        provider_info: None,
+                        extra: None,
+                        effort,
+                    }
                 })
                 .collect();
             return Ok(models);
@@ -427,7 +583,9 @@ impl Provider for ResponsesProvider {
                 opts.thinking
                     .apply_fields(&mut body, model, fields, fallback);
             } else {
-                apply_responses_reasoning(&mut body, opts.thinking, model, &dialect::STANDARD);
+                let discovered = crate::model_registry::discovered(&self.slug, &model.id);
+                let dialect = responses_dialect(&model.id, discovered.as_ref());
+                apply_responses_reasoning(&mut body, opts.thinking, model, &dialect);
             }
             if let Some(hook) = &self.body_hook {
                 let ctx = super::codec::RequestCtx {
@@ -1480,5 +1638,164 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
             assert_eq!(resp.usage.output, 10);
             assert_eq!(resp.usage.cache_read, 40);
         })
+    }
+
+    #[test_case(ThinkingConfig::Adaptive, "gpt-5.3-codex", "medium" ; "adaptive_codex")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Minimal), "gpt-5.3-codex", "low" ; "minimal_snaps_to_low_on_codex")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Low), "gpt-5.3-codex", "low" ; "low_codex")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Medium), "gpt-5.3-codex", "medium" ; "medium_codex")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::High), "gpt-5.3-codex", "high" ; "high_codex")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::XHigh), "gpt-5.3-codex", "xhigh" ; "xhigh_codex")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Max), "gpt-5.3-codex", "xhigh" ; "max_snaps_to_xhigh_on_codex")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::XHigh), "gpt-5.1-codex", "high" ; "xhigh_snaps_to_high_on_5_1")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::XHigh), "gpt-5.1-codex-max", "xhigh" ; "xhigh_passes_through_on_5_1_max")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Minimal), "gpt-5.5", "minimal" ; "minimal_passes_through_on_5_5")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Max), "gpt-5.5", "xhigh" ; "max_snaps_to_xhigh_on_5_5")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Minimal), "gpt-5.6-sol", "minimal" ; "minimal_passes_through_on_5_6_sol")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Max), "gpt-5.6-sol", "max" ; "max_passes_through_on_5_6_sol")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Max), "gpt-5.6-terra", "max" ; "max_passes_through_on_5_6_terra")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Max), "gpt-5.6-luna", "max" ; "max_passes_through_on_5_6_luna")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Max), "gpt-6-sol", "max" ; "max_passes_through_on_6_sol")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Minimal), "gpt-6-sol", "low" ; "minimal_snaps_to_low_on_6_sol")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Max), "gpt-6-luna", "max" ; "max_passes_through_on_6_luna")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Minimal), "gpt-6-luna", "low" ; "minimal_snaps_to_low_on_6_luna")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Max), "gpt-6-astra", "max" ; "max_passes_through_on_6_astra")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Minimal), "gpt-6-astra", "low" ; "minimal_snaps_to_low_on_6_astra")]
+    #[test_case(ThinkingConfig::Adaptive, "gpt-6-astra", "medium" ; "adaptive_on_6_astra")]
+    fn responses_reasoning_uses_responses_effort_object(
+        thinking: ThinkingConfig,
+        model_id: &str,
+        expected: &str,
+    ) {
+        let model = Model::from_spec(&format!("responses/{model_id}")).unwrap();
+        let mut body = json!({});
+        let dialect = responses_dialect(&model.id, None);
+        apply_responses_reasoning(&mut body, thinking, &model, &dialect);
+        assert_eq!(body["reasoning"]["effort"], expected);
+    }
+
+    #[test_case("gpt-5.3-codex")]
+    #[test_case("gpt-6-sol")]
+    #[test_case("gpt-6-luna")]
+    #[test_case("gpt-6-astra")]
+    fn responses_reasoning_omits_effort_when_disabled(model_id: &str) {
+        let model = Model::from_spec(&format!("responses/{model_id}")).unwrap();
+        let mut body = json!({});
+        let dialect = responses_dialect(&model.id, None);
+        apply_responses_reasoning(&mut body, ThinkingConfig::Off, &model, &dialect);
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test_case("gpt-5.5")]
+    #[test_case("gpt-5.6-luna")]
+    #[test_case("gpt-5.6-terra")]
+    #[test_case("gpt-5.6-sol")]
+    fn responses_reasoning_sends_none_when_disabled(model_id: &str) {
+        let model = Model::from_spec(&format!("responses/{model_id}")).unwrap();
+        let mut body = json!({});
+        let dialect = responses_dialect(&model.id, None);
+        apply_responses_reasoning(&mut body, ThinkingConfig::Off, &model, &dialect);
+        assert_eq!(body["reasoning"]["effort"], "none");
+        assert!(body["reasoning"].get("summary").is_none());
+    }
+
+    #[test]
+    fn parse_model_info_extracts_reasoning_levels() {
+        let raw = json!({
+            "id": "custom-thinking-model",
+            "context_length": 128000,
+            "max_tokens": 16000,
+            "supported_reasoning_levels": [
+                {"effort": "low"},
+                {"effort": "high"},
+                {"effort": "none"}
+            ]
+        });
+        let info = parse_model_info(&raw).expect("parses model info");
+        assert_eq!(info.id, "custom-thinking-model");
+        assert_eq!(info.supports_thinking, Some(true));
+        let effort = info.effort.expect("has effort");
+        assert_eq!(
+            effort.supported,
+            vec![crate::Effort::Low, crate::Effort::High]
+        );
+        assert_eq!(effort.send_off, Some(true));
+    }
+
+    #[test]
+    fn parse_model_info_curl_magpie_sample() {
+        let grok = json!({
+            "context_length": 500000,
+            "context_window": 500000,
+            "id": "group/grok-4.7",
+            "max_input_tokens": 500000,
+            "max_output_tokens": 500000,
+            "modalities": {"input": ["text", "image"]},
+            "pricing": {
+                "completion": "0.000006",
+                "input_cache_read": "0.0000005",
+                "prompt": "0.000002"
+            },
+            "reasoning": true,
+            "reasoning_levels": ["low", "medium", "high", "xhigh"],
+            "supported_reasoning_levels": [
+                {"effort": "low"},
+                {"effort": "medium"},
+                {"effort": "high"},
+                {"effort": "xhigh"}
+            ]
+        });
+        let info = parse_model_info(&grok).expect("parses grok-4.7");
+        assert_eq!(info.id, "group/grok-4.7");
+        assert_eq!(info.context_window, Some(500000));
+        assert_eq!(info.max_output_tokens, Some(500000));
+        assert_eq!(info.supports_vision, Some(true));
+        assert_eq!(info.supports_thinking, Some(true));
+        let pricing = info.pricing.expect("has pricing");
+        assert_eq!(pricing.input, 2.0);
+        assert_eq!(pricing.output, 6.0);
+        assert_eq!(pricing.cache_read, 0.5);
+        let effort = info.effort.expect("has effort");
+        assert_eq!(
+            effort.supported,
+            vec![
+                crate::Effort::Low,
+                crate::Effort::Medium,
+                crate::Effort::High,
+                crate::Effort::XHigh
+            ]
+        );
+
+        let composer = json!({
+            "id": "cursor/composer-2.5-fast",
+            "reasoning": false,
+            "reasoning_levels": [],
+            "supported_reasoning_levels": []
+        });
+        let info = parse_model_info(&composer).expect("parses composer");
+        assert_eq!(info.supports_thinking, Some(false));
+        assert!(info.effort.is_none());
+
+        let codex = json!({
+            "id": "codex/gpt-6.1-sol",
+            "context_length": 400000,
+            "max_output_tokens": 128000,
+            "pricing": {
+                "completion": "0.00001",
+                "input_cache_read": "0.0000001",
+                "input_cache_write": "0.0000025",
+                "prompt": "0.000002"
+            },
+            "service_tiers": [
+                {"id": "priority", "name": "Fast"}
+            ]
+        });
+        let info = parse_model_info(&codex).expect("parses codex");
+        let pricing = info.pricing.expect("has pricing");
+        assert_eq!(pricing.input, 2.0);
+        assert_eq!(pricing.output, 10.0);
+        assert_eq!(pricing.cache_read, 0.1);
+        assert_eq!(pricing.cache_write, 2.5);
+        assert!(info.extra.is_some());
     }
 }

@@ -130,12 +130,32 @@ fn model_from_def(
         .or_else(|| discovered.and_then(|d| d.supports_vision))
         .or(Some(true));
 
-    let pricing = row.pricing.take().unwrap_or_default();
+    let pricing = row
+        .pricing
+        .take()
+        .or_else(|| discovered.and_then(|d| d.pricing.clone()))
+        .unwrap_or_default();
     row.pricing = Some(pricing);
-    Model {
-        subsidised_by: subsidy_source.map(Arc::from),
-        ..row.to_model(slug, base, model_id.to_string())
+    let mut model = row.to_model(slug, base, model_id.to_string());
+    model.subsidised_by = subsidy_source.map(Arc::from);
+    if let Some(d) = discovered {
+        if d.pricing.as_ref().is_some_and(ModelPricing::is_zero) {
+            model.discovered_free = true;
+        }
+        if let Some(extra) = &d.extra
+            && extra
+                .get("service_tiers")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|tiers| {
+                    tiers
+                        .iter()
+                        .any(|t| t["id"] == "priority" || t["id"] == "fast")
+                })
+        {
+            model.supports_fast_override = Some(crate::model::FastSupport::Supported);
+        }
     }
+    model
 }
 
 pub fn declared_model_specs() -> Vec<String> {
@@ -211,6 +231,7 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
         if let Ok(provider) = create(slug, timeouts)
             && let Ok(models) = smol::block_on(provider.list_models())
         {
+            crate::model_registry::set_known_models(slug, models.clone());
             for m in models {
                 all_specs.push(format!("{slug}/{}", m.id));
             }
