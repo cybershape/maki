@@ -140,8 +140,8 @@ maki.api.register_tool({{
     handler = function() return "" end,
 }})
 maki.api.register_tool({{
-    name = "list",
-    description = "list fixture",
+    name = "list_dir",
+    description = "list_dir fixture",
     audiences = {{ "main", "interpreter" }},
     schema = {{
         type = "object",
@@ -286,21 +286,17 @@ fn interpreter_calls_advertised_tool_end_to_end() {
 }
 
 #[test]
-fn describe_aliases_list_tool_to_list_dir() {
+fn describe_includes_list_dir_tool() {
     let (reg, _host) = setup();
     let desc = describe(&reg, &ToolFilter::All, ToolAudience::MAIN, false);
     assert!(
         desc.lines().any(|l| l.starts_with("- list_dir(")),
         "expected list_dir in tool signatures: {desc}"
     );
-    assert!(
-        !desc.lines().any(|l| l.starts_with("- list(")),
-        "list tool must be aliased, not exposed directly: {desc}"
-    );
 }
 
 #[test]
-fn aliased_list_tool_is_callable_and_preserves_builtin_list() {
+fn list_dir_tool_is_callable_and_preserves_builtin_list() {
     let out = run_code(
         "res = await list_dir(path='test_path')\nitems = list([1, 2])\nprint(f'{res}')\nprint(f'items: {len(items)}')",
     )

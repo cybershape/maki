@@ -18,7 +18,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
         "File Operations",
         &[
             "bash",
-            "list",
+            "list_dir",
             "read",
             "write",
             "edit",

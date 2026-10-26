@@ -10,11 +10,11 @@ local DESCRIPTION =
 maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = [[
-- Use the **list** tool to see what a directory contains.]],
+- Use the **list_dir** tool to see what a directory contains.]],
 })
 
 maki.api.register_tool({
-  name = "list",
+  name = "list_dir",
   permission = "fs_read",
   kind = "read",
   description = DESCRIPTION,

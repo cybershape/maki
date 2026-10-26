@@ -24,7 +24,7 @@ Commands run in the session's working directory (see Environment) by default.
 | `timeout` | integer | no | 120 | Timeout in seconds |
 | `workdir` | string | no | cwd | Working directory |
 
-### `list` {#list}
+### `list_dir` {#list_dir}
 
 List directory contents. Returns entry names sorted alphabetically, directories first with a trailing /.
 

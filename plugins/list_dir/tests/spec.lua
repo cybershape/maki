@@ -4,7 +4,7 @@ local th = require("maki.test_helpers")
 local case = th.case
 local eq = th.eq
 local mktmpdir = function()
-  return th.mktmpdir("list_spec")
+  return th.mktmpdir("list_dir_spec")
 end
 local rmtree = th.rmtree
 

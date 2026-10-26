@@ -1378,7 +1378,7 @@ fn run_live_batch(child_src: &str, tool: &str) -> Vec<BufferSnapshot> {
 #[test_case::test_case("read", |file, _| json!({ "path": file, "offset": 2, "limit": 0 }) ; "read_inside_block_comment")]
 #[test_case::test_case("index", |file, _| json!({ "path": file }) ; "index_file")]
 #[test_case::test_case("grep", |_, dir| json!({ "pattern": "main", "path": dir }) ; "grep_dir")]
-#[test_case::test_case("list", |_, dir| json!({ "path": dir }) ; "list_dir")]
+#[test_case::test_case("list_dir", |_, dir| json!({ "path": dir }) ; "list_dir")]
 fn batch_child_body_matches_standalone(tool: &str, input: fn(&str, &str) -> Value) {
     let dir = tempfile::TempDir::new().unwrap();
     let file = dir.path().join(PROBE_FILE_NAME);

@@ -99,7 +99,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "glob",
     "grep",
     "index",
-    "list",
+    "list_dir",
     "memory",
     "question",
     "read",

@@ -48,8 +48,6 @@ const BASH_TOOL: &str = "bash";
 const BASH_COMMAND_FIELD: &str = "command";
 const GIT_COMMIT: &str = "git commit";
 const GH_PR_CREATE: &str = "gh pr create";
-const LIST_TOOL: &str = "list";
-const LIST_DIR_ALIAS: &str = "list_dir";
 
 const ERROR_CANCELLED: &str = "cancelled";
 const ERROR_TIMEOUT: &str = "timeout";
@@ -571,9 +569,6 @@ pub fn identifier_alias(name: &str) -> Option<String> {
     // character the model never saw.
     if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
         return None;
-    }
-    if name == LIST_TOOL {
-        return Some(LIST_DIR_ALIAS.to_owned());
     }
     name.chars().any(|c| !is_body(c)).then(|| {
         name.chars()
@@ -2728,27 +2723,6 @@ mod tests {
     #[test]
     fn colliding_aliases_are_dropped() {
         let ctx = mcp_ctx(&stub_mcp(&["srv.get-docs", "srv.get_docs"]));
-        assert!(callable(&ctx).iter().all(|c| c.alias.is_none()));
-    }
-
-    #[test]
-    fn list_registry_tool_aliases_to_list_dir() {
-        let mut ctx = stub_ctx(&AgentMode::Build);
-        ctx.registry = registered(mock_tool(LIST_TOOL, ToolAudience::all()));
-        let entry = callable(&ctx)
-            .into_iter()
-            .find(|c| c.name == LIST_TOOL)
-            .expect("the published tool is callable");
-        assert_eq!(entry.alias.as_deref(), Some(LIST_DIR_ALIAS));
-    }
-
-    #[test]
-    fn colliding_list_dir_tool_drops_alias() {
-        let mut ctx = stub_ctx(&AgentMode::Build);
-        let registry = ToolRegistry::new();
-        register(&registry, mock_tool(LIST_TOOL, ToolAudience::all()));
-        register(&registry, mock_tool(LIST_DIR_ALIAS, ToolAudience::all()));
-        ctx.registry = Arc::new(registry);
         assert!(callable(&ctx).iter().all(|c| c.alias.is_none()));
     }
 
