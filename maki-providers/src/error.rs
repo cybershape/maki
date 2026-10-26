@@ -10,10 +10,13 @@ use std::{io, time::Duration};
 use isahc::{AsyncReadResponseExt, error::ErrorKind as HttpErrorKind};
 use serde_json::Value;
 
-use crate::{
-    providers::opencode::{self, NonLoginError},
-    retry::RetryKind,
-};
+use crate::retry::RetryKind;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct NonLoginError {
+    pub is_quota: bool,
+    pub message: String,
+}
 
 /// Request fields that cap the *output*. A 400 naming one of them is about the
 /// cap we sent, never about the prompt being too big.
@@ -316,13 +319,7 @@ impl AgentError {
     /// OpenCode serves billing and plan failures on the statuses we otherwise
     /// read as a stale token, and only that provider knows its error types.
     fn non_login_error(&self) -> Option<NonLoginError> {
-        let Self::Api {
-            status, message, ..
-        } = self
-        else {
-            return None;
-        };
-        opencode::non_login_error(*status, message)
+        None
     }
 
     /// A plan quota that resets on a weekly or monthly boundary: retrying just
@@ -511,17 +508,12 @@ mod tests {
     use std::{collections::HashSet, mem::discriminant};
 
     use maki_config::DEFAULT_MAX_RETRIES;
-    use serde_json::{Value, json};
+    use serde_json::Value;
     use test_case::test_case;
 
     use super::*;
-    use crate::{
-        providers::opencode::{NON_LOGIN_FALLBACK_MESSAGE, QUOTA_FALLBACK_MESSAGE},
-        retry::{RetryPolicy, RetryState},
-    };
+    use crate::retry::{RetryPolicy, RetryState};
 
-    const QUOTA_MESSAGE: &str = "Weekly usage limit reached. Resets in 3 hours.";
-    const MODEL_MESSAGE: &str = "Your trial has ended.";
     const RATE_LIMITED_RETRY_MESSAGE: &str = "Rate limited";
     /// More rounds than any bounded budget allows, so a budget that survives
     /// all of them is the unbounded one.
@@ -576,10 +568,6 @@ mod tests {
         );
     }
 
-    fn opencode_body(error_type: &str, message: &str) -> String {
-        json!({"error": {"type": error_type, "message": message}}).to_string()
-    }
-
     #[test_case(429, true  ; "rate_limit")]
     #[test_case(500, true  ; "server_error")]
     #[test_case(529, true  ; "overloaded")]
@@ -593,49 +581,6 @@ mod tests {
     #[test_case(403, false ; "forbidden")]
     fn api_auth_error(status: u16, expected: bool) {
         assert_eq!(api(status).is_auth_error(), expected);
-    }
-
-    #[test_case("CreditsError", 401 ; "credits")]
-    #[test_case("MonthlyLimitError", 401 ; "monthly_limit")]
-    #[test_case("UserLimitError", 401 ; "user_limit")]
-    #[test_case("GoUsageLimitError", 401 ; "go_unauthorized")]
-    #[test_case("GoUsageLimitError", 429 ; "go_rate_limit")]
-    #[test_case("BlackUsageLimitError", 429 ; "black_rate_limit")]
-    #[test_case("FreeUsageLimitError", 429 ; "free_rate_limit")]
-    fn opencode_usage_limits_preserve_details(error_type: &str, status: u16) {
-        let err = api_msg(status, &opencode_body(error_type, QUOTA_MESSAGE));
-
-        assert!(!err.is_auth_error());
-        assert_eq!(err.user_message(), QUOTA_MESSAGE);
-        assert_eq!(err.retry_message(), QUOTA_MESSAGE);
-        // A weekly cap outlives any backoff, and every key on the account
-        // shares it.
-        assert!(!err.is_retryable());
-        assert!(!err.should_rotate_key());
-    }
-
-    /// Not a usage cap: "trial ended", "model disabled", "no provider
-    /// available". Logging in fixes none of them, but the normal status rules
-    /// still apply.
-    #[test_case(401, false ; "unauthorized")]
-    #[test_case(429, true  ; "rate_limited")]
-    fn opencode_model_error_is_not_a_login_problem(status: u16, retryable: bool) {
-        let err = api_msg(status, &opencode_body("ModelError", MODEL_MESSAGE));
-
-        assert!(!err.is_auth_error());
-        assert_eq!(err.user_message(), MODEL_MESSAGE);
-        assert_eq!(err.is_retryable(), retryable);
-        assert!(err.should_rotate_key());
-    }
-
-    #[test_case(json!({"type": "GoUsageLimitError"}), QUOTA_FALLBACK_MESSAGE    ; "quota_missing_message")]
-    #[test_case(json!({"type": "GoUsageLimitError", "message": " "}), QUOTA_FALLBACK_MESSAGE ; "quota_empty_message")]
-    #[test_case(json!({"type": "ModelError"}), NON_LOGIN_FALLBACK_MESSAGE       ; "model_missing_message")]
-    fn non_login_error_without_message_does_not_request_login(error: Value, expected: &str) {
-        let err = api_msg(401, &json!({"error": error}).to_string());
-
-        assert!(!err.is_auth_error());
-        assert_eq!(err.user_message(), expected);
     }
 
     #[test_case(r#"{"error":{"type":"AuthError","message":"Invalid API key"}}"# ; "auth_error")]
@@ -860,8 +805,6 @@ mod tests {
     /// Every variant, and for `Api` every wording and status the answers are
     /// known to turn on, crossed with both `Retry-After` shapes.
     fn corpus() -> Vec<AgentError> {
-        let quota = opencode_body("GoUsageLimitError", QUOTA_MESSAGE);
-        let model = opencode_body("ModelError", MODEL_MESSAGE);
         let messages = [
             "",
             PLAIN_MESSAGE,
@@ -869,8 +812,6 @@ mod tests {
             OVERFLOW_ALIAS,
             ANTHROPIC_BUDGET,
             THINKING_UNBOUND_MESSAGE,
-            quota.as_str(),
-            model.as_str(),
         ];
         let mut corpus = Vec::new();
         for status in CORPUS_STATUSES {

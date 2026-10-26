@@ -544,7 +544,7 @@ mod tests {
                 None,
             )
         };
-        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let model = Model::from_spec("responses/default").unwrap();
         let facts = spec.render(&model, false).facts;
         assert_eq!(
             facts.is_some_and(|f| !f.instructions.is_empty() && !f.hints.is_empty()),
@@ -576,7 +576,7 @@ mod tests {
                 None,
             )
         };
-        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let model = Model::from_spec("responses/default").unwrap();
         let context = spec.render(&model, false);
         assert_eq!(context.system, expected);
         assert_eq!(context.facts.is_none(), explicit.is_some());

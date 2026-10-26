@@ -821,12 +821,6 @@ fn requires_adaptive(model_id: &str) -> bool {
     })
 }
 
-/// The releases that made thinking adaptive-only also reject any sampling
-/// parameter (`top_p`, `temperature`) with a 400, even with thinking off.
-pub(crate) fn rejects_sampling(model_id: &str) -> bool {
-    requires_adaptive(model_id)
-}
-
 /// Gemini 3+ and the `-latest` aliases take `thinkingLevel` (`low`, `medium`,
 /// `high`) in place of `thinkingBudget`. Only the 2.x series speaks budgets;
 /// `minimal` is omitted from the dialect because Pro and Gemini 4 reject it
@@ -896,21 +890,6 @@ pub enum ThinkingFallback {
     Dialect(&'static EffortDialect<'static>),
     /// llama.cpp's token budget field.
     BudgetField,
-}
-
-impl ThinkingFallback {
-    /// The level [`ThinkingConfig::apply_thinking`] sends for `Adaptive` on
-    /// `model`. `None` where the model spells the mode itself, or where the
-    /// endpoint is left to decide.
-    pub(crate) fn adaptive_effort(self, model: &Model) -> Option<Effort> {
-        let spelled = model
-            .effective_thinking_fields()
-            .is_some_and(|(fields, _)| fields.adaptive.is_some());
-        match self {
-            Self::Dialect(dialect) if !spelled => dialect.adaptive_effort(),
-            Self::None | Self::Dialect(_) | Self::BudgetField => None,
-        }
-    }
 }
 
 /// The setting the native fragment sends. Budgets survive only where the
@@ -2080,7 +2059,7 @@ mod tests {
 
     fn native_thinking_model(id: &str, fields: Value) -> crate::model::Model {
         let mut model = thinking_model(id);
-        model.provider = Arc::from("llama-cpp");
+        model.provider = Arc::from("responses");
         model.thinking_fields = Some(Box::new(serde_json::from_value(fields).unwrap()));
         model
     }
@@ -2431,10 +2410,9 @@ mod tests {
         assert_eq!(body, expected);
     }
 
-    #[test_case("llama-cpp", None, ThinkingConfig::Budget(LARGE_BUDGET), Some(4096) ; "llama_cpp_sends_a_clamped_count")]
-    #[test_case("llama-cpp", Some(SMALL_BUDGET), ThinkingConfig::Budget(LARGE_BUDGET), Some(1024) ; "llama_cpp_respects_the_turn_cap")]
-    #[test_case("ollama", None, ThinkingConfig::Adaptive, None ; "ollama_sends_only_the_toggle")]
-    #[test_case("openai", None, ThinkingConfig::Adaptive, None ; "openai_chat_sends_only_the_toggle")]
+    #[test_case("responses", None, ThinkingConfig::Budget(LARGE_BUDGET), Some(4096) ; "responses_sends_a_clamped_count")]
+    #[test_case("responses", Some(SMALL_BUDGET), ThinkingConfig::Budget(LARGE_BUDGET), Some(1024) ; "responses_respects_the_turn_cap")]
+    #[test_case("other", None, ThinkingConfig::Adaptive, None ; "other_sends_only_the_toggle")]
     fn toggle_budget_is_shown_only_when_the_adapter_forwards_it(
         provider: &str,
         turn_output_tokens: Option<u32>,
@@ -2516,12 +2494,12 @@ mod tests {
         assert_eq!(body["thinking_budget_tokens"], 16_384);
     }
 
-    fn anthropic_spec() -> &'static crate::spec::ProviderSpec {
-        crate::spec::ProviderRegistry::get("anthropic").unwrap()
+    fn responses_spec() -> &'static crate::spec::ProviderSpec {
+        &crate::spec::RESPONSES_SPEC
     }
 
-    fn google_spec() -> &'static crate::spec::ProviderSpec {
-        crate::spec::ProviderRegistry::get("google").unwrap()
+    fn anthropic_spec() -> &'static crate::spec::ProviderSpec {
+        &crate::spec::RESPONSES_SPEC
     }
 
     fn clamp_test_model(spec: &'static crate::spec::ProviderSpec) -> crate::model::Model {
@@ -2534,6 +2512,7 @@ mod tests {
             thinking_override: None,
             supports_vision_override: Some(spec.family.supports_vision()),
             supports_fast_override: None,
+            supports_deferred_tools_override: None,
             pricing: crate::model::ModelPricing::default(),
             subsidised_by: None,
             discovered_free: false,
@@ -2554,7 +2533,7 @@ mod tests {
         thinking: ThinkingConfig,
         expected: ThinkingConfig,
     ) {
-        let mut model = clamp_test_model(anthropic_spec());
+        let mut model = clamp_test_model(responses_spec());
         model.thinking_override = thinking_override;
         let opts = RequestOptions {
             thinking,
@@ -2563,36 +2542,17 @@ mod tests {
         assert_eq!(opts.clamped(&model).thinking, expected);
     }
 
-    /// The picker and the status bar read the level, but the session keeps
-    /// `Adaptive`: a stored level would cap subagents where `Adaptive` does not.
-    #[test_case(ThinkingConfig::Adaptive,    ThinkingConfig::Effort(High) ; "adaptive_reads_as_the_fixed_level")]
+    #[test_case(ThinkingConfig::Adaptive,    ThinkingConfig::Adaptive     ; "adaptive_stays")]
     #[test_case(ThinkingConfig::Effort(Low), ThinkingConfig::Effort(Low)  ; "a_named_level_stays")]
     #[test_case(ThinkingConfig::Off,         ThinkingConfig::Off          ; "off_stays")]
     fn shown_resolves_adaptive_without_changing_what_is_stored(
         thinking: ThinkingConfig,
         expected: ThinkingConfig,
     ) {
-        let mut model = clamp_test_model(crate::spec::ProviderRegistry::get("xai").unwrap());
+        let mut model = clamp_test_model(responses_spec());
         model.thinking_override = Some(Support::Yes);
 
         assert_eq!(thinking.shown(&model), expected);
-        assert_eq!(thinking.clamped(&model), thinking);
-    }
-
-    /// A model that spells `adaptive` itself keeps the mode, whatever the
-    /// provider's dialect would have sent.
-    #[test_case("llama-cpp", json!({"high": {"reasoning_effort": "xhigh"}}), Some(Effort::Medium) ; "unspelled_takes_the_dialect_level")]
-    #[test_case("llama-cpp", json!({"adaptive": {"reasoning_effort": "auto"}}), None ; "spelled_stays_adaptive")]
-    #[test_case("zai", json!({"adaptive": {"reasoning_effort": "auto"}}), Some(Effort::Medium) ; "inactive_fields_do_not_hide_the_fixed_mode")]
-    fn fallback_adaptive_effort_defers_to_the_models_own_fields(
-        provider: &str,
-        fields: Value,
-        expected: Option<Effort>,
-    ) {
-        let mut model = native_thinking_model("partial", fields);
-        model.provider = Arc::from(provider);
-        assert_eq!(DIALECT.adaptive_effort(&model), expected);
-        assert_eq!(ThinkingFallback::None.adaptive_effort(&model), None);
     }
 
     #[test_case(None,                           ThinkingConfig::Off      ; "absent_means_off")]
@@ -2606,7 +2566,7 @@ mod tests {
 
     #[test]
     fn request_options_clamped_fast_requires_model_support() {
-        let model = clamp_test_model(google_spec());
+        let model = clamp_test_model(responses_spec());
         let opts = RequestOptions {
             thinking: ThinkingConfig::Off,
             fast: true,

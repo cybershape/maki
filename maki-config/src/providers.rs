@@ -200,13 +200,12 @@ pub fn slugify(name: &str) -> String {
         .join("-")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Protocol {
-    Openai,
+    #[default]
+    #[serde(alias = "responses", alias = "openai")]
     OpenaiResponses,
-    Anthropic,
-    Google,
 }
 
 impl FromStr for Protocol {
@@ -214,11 +213,10 @@ impl FromStr for Protocol {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "openai" => Ok(Self::Openai),
-            "openai-responses" => Ok(Self::OpenaiResponses),
-            "anthropic" => Ok(Self::Anthropic),
-            "google" => Ok(Self::Google),
-            _ => Err(format!("unknown protocol: {s}")),
+            "openai" | "openai-responses" | "responses" => Ok(Self::OpenaiResponses),
+            _ => Err(format!(
+                "unknown protocol: {s} (only openai-responses is supported)"
+            )),
         }
     }
 }
@@ -621,7 +619,9 @@ pub fn resolve_protocol(slug: &str, def: Option<&ProviderDef>) -> Option<Protoco
     {
         return Some(*p);
     }
-    builtin_provider(slug).map(|b| b.protocol)
+    builtin_provider(slug)
+        .map(|b| b.protocol)
+        .or(Some(Protocol::OpenaiResponses))
 }
 
 pub fn resolve_display_name(slug: &str, def: Option<&ProviderDef>) -> String {
@@ -738,7 +738,7 @@ mod tests {
         config.upsert(
             "my-provider".into(),
             ProviderDef {
-                protocol: Some(Protocol::Openai),
+                protocol: Some(Protocol::OpenaiResponses),
                 base_url: Some("https://api.example.com/v1".into()),
                 api_key_env: Some("MY_API_KEY".into()),
                 discover_models: true,
@@ -750,7 +750,7 @@ mod tests {
         let parsed: ProvidersConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(
             parsed.get("my-provider").unwrap().protocol,
-            Some(Protocol::Openai)
+            Some(Protocol::OpenaiResponses)
         );
         assert_eq!(
             parsed.get("my-provider").unwrap().base_url,
@@ -796,7 +796,7 @@ mod tests {
         const SLUG: &str = "selected-provider";
         const ERROR: &str = "must select either a plugin or a protocol";
         let config: ProvidersConfig = toml::from_str(&format!(
-            "[{SLUG}]\nplugin = \"provider-package\"\nprotocol = \"openai\"\n"
+            "[{SLUG}]\nplugin = \"provider-package\"\nprotocol = \"openai-responses\"\n"
         ))
         .unwrap();
         let error = config.save().unwrap_err();
@@ -1004,7 +1004,7 @@ tier = "{input}"
     fn ignored_builtin_fields_lists_custom_only_fields() {
         let def = ProviderDef {
             base_url: Some("http://proxy.local/v1".into()),
-            protocol: Some(Protocol::Openai),
+            protocol: Some(Protocol::OpenaiResponses),
             api_key_env: Some("MY_KEY".into()),
             discover_models: true,
             ..Default::default()

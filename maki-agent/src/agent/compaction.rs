@@ -694,7 +694,7 @@ mod tests {
     }
 
     fn default_model() -> Model {
-        Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()
+        Model::from_spec("responses/default").unwrap()
     }
 
     fn small_context_model(context_window: u32) -> Model {

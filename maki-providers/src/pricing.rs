@@ -213,7 +213,6 @@ pub fn model_cost(id: &str, usage: &StoredTokenUsage, current: &Model, fast: boo
 mod tests {
     use super::*;
     use crate::model::{FastPricing, ModelFamily, ModelPricing, ModelTier};
-    use crate::spec::ProviderRegistry;
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -241,8 +240,6 @@ mod tests {
     const FAST_INPUT_RATE: f64 = 12.0;
     /// [`ONE_MILLION`] input tokens at [`FAST_INPUT_RATE`].
     const FAST_LIST_PRICE: f64 = 12.0;
-    /// A real spec, so the bare-id fallback runs against the real tables.
-    const CURATED_SPEC: &str = "anthropic/claude-sonnet-4-5";
 
     fn schedule(windows: &[(u8, u8)], weekdays_only: bool) -> Result<PricingSchedule, String> {
         DeclaredSchedule {
@@ -263,13 +260,14 @@ mod tests {
     fn model(id: &str, input_rate: f64) -> Model {
         Model {
             id: id.into(),
-            provider: Arc::from("anthropic"),
+            provider: Arc::from("responses"),
             tier: ModelTier::Medium,
-            family: ModelFamily::Claude,
+            family: ModelFamily::Gpt,
             supports_tool_examples_override: None,
             thinking_override: None,
             supports_vision_override: None,
             supports_fast_override: None,
+            supports_deferred_tools_override: None,
             pricing: ModelPricing {
                 input: input_rate,
                 ..ModelPricing::ZERO
@@ -440,30 +438,6 @@ mod tests {
         );
     }
 
-    /// The sibling is priced differently on purpose, so passing here cannot be
-    /// `current`'s rates leaking through.
-    #[test]
-    fn bare_ids_resolve_against_the_current_provider() {
-        let current = Model::from_spec(CURATED_SPEC).unwrap();
-        let sibling_id = ProviderRegistry::for_slug(&current.provider)
-            .expect("a builtin provider")
-            .models()
-            .iter()
-            .find_map(|e| {
-                (e.pricing.as_ref()?.input != current.pricing.input)
-                    .then_some(e.prefixes[0].as_str())
-            })
-            .expect("a sibling model the table prices differently");
-        let sibling = Model::from_spec(&format!("{}/{sibling_id}", current.provider)).unwrap();
-        let usage = stored(None);
-
-        let cost = model_cost(sibling_id, &usage, &current, false);
-        assert_eq!(cost, sibling.list_cost(&usage.into(), false));
-        assert_ne!(cost, current.list_cost(&usage.into(), false));
-    }
-
-    /// What was paid is what was paid, even for an id the table prices
-    /// differently, and even for a model that prices to nothing today.
     #[test_case(INPUT_RATE ; "priced_model")]
     #[test_case(UNPRICED   ; "unpriced_model")]
     fn a_recorded_cost_short_circuits_the_price_table(input_rate: f64) {

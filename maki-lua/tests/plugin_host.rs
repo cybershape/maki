@@ -114,7 +114,7 @@ fn builtins_host_with(config: &PluginsConfig) -> (Arc<ToolRegistry>, PluginHost)
 /// A tool can be registered and still stay invisible to the model, so this
 /// goes through the definitions a real request is built from.
 fn tool_description(reg: &ToolRegistry, agent: &maki_config::AgentConfig, name: &str) -> String {
-    let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+    let model = Model::from_spec("responses/claude-opus-4-8").unwrap();
     let filter = ToolFilter::from_config(agent, &model, &[]);
     let ctx = DescriptionContext {
         filter: &filter,
@@ -1070,7 +1070,7 @@ fn resolve_model_spec_takes_precedence_over_tier() {
             handler = function(input, ctx)
                 local m, err = maki.agent.resolve_model(ctx, {{
                     tier = "weak",
-                    spec = "anthropic/claude-opus-4-8",
+                    spec = "responses/claude-opus-4-8",
                 }})
                 if err then return "err:" .. err end
                 return m.spec
@@ -1080,7 +1080,7 @@ fn resolve_model_spec_takes_precedence_over_tier() {
     host.load_source("spec_precedence_probe", &src).unwrap();
     let out = exec_tool(&reg, "spec_precedence_probe", serde_json::json!({})).unwrap();
     assert_eq!(
-        out, "anthropic/claude-opus-4-8",
+        out, "responses/claude-opus-4-8",
         "spec must override tier when both are set"
     );
 }

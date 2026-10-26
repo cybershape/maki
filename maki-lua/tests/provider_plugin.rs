@@ -71,9 +71,9 @@ const FREE_SLUG: &str = "acmefree";
 const STUCK_AFTER: Duration = Duration::from_secs(20);
 const RELOADED_SOURCE: &str = "-- the provider plugin, reloaded without its registration\n";
 
-/// Shipped as a bundled plugin, which this file never loads.
-const BUILTIN_SLUG: &str = "deepseek";
-const BUILTIN_HOST: &str = "api.deepseek.com";
+/// Shipped as a built-in provider.
+const BUILTIN_SLUG: &str = "responses";
+const BUILTIN_HOST: &str = "api.openai.com";
 const RESERVED_SLUG_MESSAGE: &str = "is reserved";
 const CLAIM_ALLOWED: &str = "a third-party plugin took a built-in slug";
 const BUILTIN_TAKEN: &str = "a refused declaration must not be serving the slug";
@@ -109,17 +109,20 @@ const HOST_THREAD_PARKED: &str =
 const ASKED_EFFORT: Effort = Effort::Max;
 const SNAPPED_EFFORT: &str = "high";
 
-const CHAT_TRANSCRIPT: &str = r#"data: {"choices":[{"delta":{"reasoning_content":"weighing the options"}}]}
+const CHAT_TRANSCRIPT: &str = r#"event: response.reasoning_text.delta
+data: {"delta":"weighing the options"}
 
-data: {"choices":[{"delta":{"content":"Hello"}}]}
+event: response.output_text.delta
+data: {"delta":"Hello"}
 
-data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{\"path\":"}}]}}]}
+event: response.output_item.added
+data: {"item":{"type":"function_call","call_id":"call_1","name":"read"}}
 
-data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.txt\"}"}}]}}]}
+event: response.function_call_arguments.delta
+data: {"delta":"{\"path\":\"a.txt\"}"}
 
-data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":5}}
-
-data: [DONE]
+event: response.completed
+data: {"response":{"status":"completed","usage":{"input_tokens":12,"output_tokens":5}}}
 
 "#;
 
@@ -205,6 +208,7 @@ fn plugin_host() -> PluginHost {
 }
 
 fn load_inline(host: &PluginHost, source: &str, net_host: &str) {
+    plugin::begin_load();
     host.load_source_with_permissions(INLINE_PLUGIN, source, permissions_for(net_host))
         .expect(LOAD_FAILED);
 }
@@ -254,6 +258,8 @@ if {fail_load} then error({FAILED_SELECTED_LOAD:?}) end"#
         );
         assert!(provider_for_slug(SLUG, Timeouts::default()).is_err());
     }
+    let clean = ProvidersConfig::default();
+    let _ = clean.save();
 }
 
 /// The fixture plugin, loaded from disk with the grant its `plugin.toml`
@@ -273,8 +279,12 @@ impl Fixture {
 
     fn at(base_url: &str, server: Requests) -> Self {
         let state = isolated_state();
+        if let Ok(dir) = StateDir::resolve() {
+            let _ = maki_storage::auth::delete_plugin_auth(&dir, SLUG);
+        }
         unsafe { std::env::set_var(BASE_URL_ENV, base_url) };
 
+        plugin::begin_load();
         let host = plugin_host();
         host.load_plugin_file(&fixture_path()).expect(LOAD_FAILED);
         plugin::commit_load();
@@ -376,7 +386,7 @@ fn a_recorded_turn_streams_its_events_and_posts_the_body_the_hook_built() {
     assert_eq!(fixture.tokens(), [bearer(ANON_TOKEN)]);
     assert_eq!(sent[0]["model"], json!(MODEL));
     assert_eq!(
-        sent[0]["messages"][0]["content"],
+        sent[0]["instructions"],
         json!(format!("{SYSTEM_PREFIX}\n\n{SYSTEM}"))
     );
     assert_eq!(

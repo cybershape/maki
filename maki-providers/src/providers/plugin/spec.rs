@@ -200,7 +200,7 @@ fn login_row(decl: &ProviderDecl, target: Target, spec: &'static ProviderSpec) -
             Target::Base(spec) => spec
                 .login
                 .as_ref()
-                .map_or(Protocol::Openai, |login| login.protocol),
+                .map_or(Protocol::OpenaiResponses, |login| login.protocol),
         },
         default_base_url,
         default_api_key_env: spec.api_key_env,

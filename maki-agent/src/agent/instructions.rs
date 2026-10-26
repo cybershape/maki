@@ -285,7 +285,7 @@ mod tests {
             &vars,
             &format!("\n{INSTR}"),
             &slots,
-            &Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
+            &Model::from_spec("responses/default").unwrap(),
         );
         assert!(prompt.find(INSTR).unwrap() < prompt.find(EXTRA).unwrap());
     }

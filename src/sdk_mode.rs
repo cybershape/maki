@@ -912,10 +912,7 @@ fn resolve_model_spec(model_id: &str) -> String {
     if model_id.contains('/') {
         return model_id.to_string();
     }
-    if model_id.starts_with("claude-") {
-        return format!("anthropic/{model_id}");
-    }
-    model_id.to_string()
+    format!("responses/{model_id}")
 }
 
 fn decode_permission_response(data: &Value) -> PermissionAnswer {
@@ -1526,9 +1523,9 @@ mod tests {
         assert_eq!(json["request"]["tool_name"], "Read");
     }
 
-    #[test_case("claude-opus-4-6", "anthropic/claude-opus-4-6"; "claude_prefix")]
+    #[test_case("claude-opus-4-6", "responses/claude-opus-4-6"; "claude_prefix")]
     #[test_case("openai/gpt-4", "openai/gpt-4"; "explicit_provider")]
-    #[test_case("gpt-4o", "gpt-4o"; "unknown_passthrough")]
+    #[test_case("gpt-4o", "responses/gpt-4o"; "unknown_passthrough")]
     fn resolve_model_spec_cases(input: &str, expected: &str) {
         assert_eq!(resolve_model_spec(input), expected);
     }
@@ -1557,13 +1554,13 @@ mod tests {
             &serde_json::json!({"behavior": "deny", "message": "not now"}),
         ) {
             PermissionAnswer::DenyWithGuidance(msg) => assert_eq!(msg, "not now"),
-            other => panic!("expected guidance, got {other:?}"),
+            _ => panic!("expected DenyWithGuidance"),
         }
     }
 
     #[test]
     fn resolve_set_model_null_returns_startup() {
-        let startup = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let startup = Model::from_spec("responses/claude-sonnet-4-20250514").unwrap();
         let result = resolve_set_model(
             Some(&Value::Null),
             &startup,
@@ -1575,7 +1572,7 @@ mod tests {
 
     #[test]
     fn resolve_set_model_rejects_disallowed_exact_spec() {
-        let startup = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let startup = Model::from_spec("responses/claude-sonnet-4-20250514").unwrap();
         let raw: maki_config::RawConfig = serde_json::from_value(serde_json::json!({
             "provider": {"allowed_models": [startup.spec()]}
         }))
@@ -1584,7 +1581,7 @@ mod tests {
 
         assert!(
             resolve_set_model(
-                Some(&Value::String("openai/gpt-5".into())),
+                Some(&Value::String("responses/gpt-5".into())),
                 &startup,
                 &policy
             )
@@ -1605,7 +1602,7 @@ mod tests {
         assert_eq!(mapped[2]["name"], "unknown_native");
     }
 
-    const TEST_MODEL_SPEC: &str = "anthropic/claude-test";
+    const TEST_MODEL_SPEC: &str = "responses/claude-test";
     const PUMP_ERROR: &str = "boom";
     const PUMP_FORWARDED: &str = "the pump must forward what was queued before the close";
     const TEST_TOOL: &str = "bash";

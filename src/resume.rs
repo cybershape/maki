@@ -295,7 +295,7 @@ mod tests {
     const UNUSED_SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
     const INVALID_ID_ERROR: &str = "invalid session id";
     const NOT_FOUND_ERROR: &str = "not found";
-    const FRESH_MODEL: &str = "anthropic/claude-fresh";
+    const FRESH_MODEL: &str = "responses/claude-fresh";
     const CONTEXT_SIZE: u32 = 4_242;
     const ID_PLACEHOLDER: &str = "{id}";
     const SURVIVED: &str = "a refused run must leave the session it pointed at alone";

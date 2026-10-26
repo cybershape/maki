@@ -1339,11 +1339,21 @@ mod tests {
     }
 
     fn default_model() -> Model {
-        Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()
+        let mut m = Model::from_spec("responses/default").unwrap();
+        m.pricing = maki_providers::ModelPricing {
+            input: 3.0,
+            output: 15.0,
+            cache_read: 0.3,
+            cache_write: 3.75,
+            fast: None,
+        };
+        m
     }
 
     fn tool_search_model() -> Model {
-        Model::from_spec("anthropic/claude-sonnet-4-5").unwrap()
+        let mut m = Model::from_spec("responses/claude-sonnet-4-5").unwrap();
+        m.supports_deferred_tools_override = Some(true);
+        m
     }
 
     fn text_response(stop_reason: StopReason) -> StreamResponse {
@@ -2041,7 +2051,7 @@ mod tests {
 
     #[test]
     fn mcp_definitions_refresh_per_request() {
-        let (tools, result) = search_turn(Model::from_spec("openai/gpt-5").unwrap());
+        let (tools, result) = search_turn(Model::from_spec("responses/gpt-5").unwrap());
         assert_eq!(tools.len(), 2);
         let first = tool_names(&tools[0]);
         assert!(first.contains(&crate::mcp::TOOL_SEARCH_TOOL_NAME));
@@ -2251,10 +2261,10 @@ mod tests {
     /// request goes out on it under the same frame, and an update tells the
     /// model. Another provider, a thinking change or other tools wait for the
     /// next run (see `sync_model` for why).
-    #[test_case("anthropic", ThinkingSupport::No, true, true ; "same_provider_thinking_and_tools")]
-    #[test_case("anthropic", ThinkingSupport::No, false, false ; "tools_changed")]
-    #[test_case("anthropic", ThinkingSupport::Yes, true, false ; "thinking_support_changed")]
-    #[test_case("openai", ThinkingSupport::No, true, false ; "provider_changed")]
+    #[test_case("responses", ThinkingSupport::No, true, true ; "same_provider_thinking_and_tools")]
+    #[test_case("responses", ThinkingSupport::No, false, false ; "tools_changed")]
+    #[test_case("responses", ThinkingSupport::Yes, true, false ; "thinking_support_changed")]
+    #[test_case("other", ThinkingSupport::No, true, false ; "provider_changed")]
     fn model_switched_between_turns(
         switched_provider: &str,
         switched_thinking: ThinkingSupport,

@@ -9,37 +9,19 @@ use isahc::config::{Configurable, VersionNegotiation};
 use isahc::http::request::Builder;
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::{debug, warn};
-
-use maki_storage::StateDir;
-use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, lock_tokens, save_tokens};
+use tracing::debug;
 
 use crate::AgentError;
 use crate::retry::RetryPolicy;
 
-pub(crate) mod anthropic;
-pub(crate) mod aperture;
-pub(crate) mod catalog;
 pub(crate) mod codec;
-pub(crate) mod copilot;
 pub mod custom;
-pub(crate) mod google;
-pub(crate) mod llama_cpp;
-pub(crate) mod local;
-pub(crate) mod oauth_loopback;
-pub(crate) mod ollama;
-pub(crate) mod openai;
-pub(crate) mod openai_compat;
-pub mod opencode;
 pub mod plugin;
-pub(crate) mod xai;
-pub(crate) mod zai;
+pub mod responses;
 
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;
 const EMPTY_SSE_ERROR_MESSAGE: &str = "provider sent an error frame with no detail";
-pub(crate) const UNAUTHORIZED_STATUS: u16 = 401;
-const BAD_REQUEST_STATUS: u16 = 400;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
 
@@ -97,61 +79,6 @@ impl From<&maki_config::ProviderConfig> for Timeouts {
 /// token means only a real refresh gets us out of the loop, whatever the
 /// expiry clock says, because that clock is wrong exactly when a server
 /// revokes early or the local time drifts.
-///
-/// Only a 400 or 401 from the token endpoint, its answer for a dead refresh
-/// token, deletes the token file. Anything else keeps it (a 429, a 5xx, a
-/// firewall's 403, a proxy's login page, a dropped connection): a token kept
-/// by mistake costs one failed refresh, one deleted by mistake a new login.
-pub(crate) fn refreshed_tokens(
-    dir: &StateDir,
-    provider: &str,
-    rejected: Option<&str>,
-    refresh: impl FnOnce(&OAuthTokens) -> Result<OAuthTokens, AgentError>,
-) -> Result<OAuthTokens, AgentError> {
-    let _lock = lock_tokens(dir, provider);
-    let current = load_tokens(dir, provider).ok_or_else(|| {
-        AgentError::api(
-            UNAUTHORIZED_STATUS,
-            format!("{provider} OAuth tokens not found on disk"),
-        )
-    })?;
-    if rejected.is_none_or(|stale| current.access != stale) && !current.is_expired() {
-        return Ok(current);
-    }
-    let fresh = refresh(&current).inspect_err(|e| {
-        let cleared = matches!(
-            e,
-            AgentError::Api {
-                status: BAD_REQUEST_STATUS | UNAUTHORIZED_STATUS,
-                ..
-            }
-        );
-        warn!(provider, cleared, error = %e, "OAuth refresh failed");
-        if cleared {
-            let _ = delete_tokens(dir, provider);
-        }
-    })?;
-    // Not `?`: every caller reads an error here as "these credentials are
-    // dead" and falls back to other auth, so a full disk would log the user out
-    // over a refresh that actually succeeded. The run keeps the token it just
-    // got and the next start refreshes again.
-    if let Err(e) = save_tokens(dir, provider, &fresh) {
-        warn!(provider, error = %e, "could not persist refreshed OAuth tokens");
-    }
-    Ok(fresh)
-}
-
-/// Whether `held` must give way to the stored tokens: it expired, or a peer
-/// rotated, cleared or logged in. A stored copy older than `held` is a failed
-/// save whose refresh token may be spent, so it waits until `held` expires.
-pub(crate) fn needs_refresh(dir: &StateDir, provider: &str, held: Option<&OAuthTokens>) -> bool {
-    match (load_tokens(dir, provider), held) {
-        (Some(stored), Some(held)) => held.is_expired() || stored.expires > held.expires,
-        (None, None) => false,
-        _ => true,
-    }
-}
-
 #[derive(Clone)]
 pub struct ResolvedAuth {
     pub base_url: Option<String>,
@@ -204,15 +131,6 @@ impl ResolvedAuth {
             self.config_headers.push(name.clone());
         }
         Ok(())
-    }
-
-    /// The access token behind the bearer header, so a 401 retry can say which
-    /// token it was using.
-    pub(crate) fn access_token(&self) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(AUTHORIZATION_HEADER))
-            .and_then(|(_, value)| value.strip_prefix(BEARER_PREFIX))
     }
 
     /// No credentials, not even `[<slug>.headers]`: what an auth cell holds
@@ -282,36 +200,6 @@ impl ResolvedAuth {
             top_p: None,
         }
     }
-}
-
-pub(crate) fn with_prefix<'a>(
-    prefix: &Option<String>,
-    system: &'a str,
-    buf: &'a mut String,
-) -> &'a str {
-    match prefix {
-        Some(p) => {
-            *buf = format!("{p}\n\n{system}");
-            buf
-        }
-        None => system,
-    }
-}
-
-pub(crate) fn urlenc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => {
-                out.push('%');
-                out.push_str(&format!("{b:02X}"));
-            }
-        }
-    }
-    out
 }
 
 #[derive(Deserialize)]
@@ -586,9 +474,6 @@ impl<'a> KeyRotation<'a> {
 
 #[cfg(test)]
 mod tests {
-    use maki_storage::auth::save_tokens;
-    use tempfile::TempDir;
-
     use super::*;
     use futures_lite::io::AsyncBufReadExt;
     use test_case::test_case;
@@ -597,96 +482,6 @@ mod tests {
     const PARSE_FAILED: &str = "SSE error payload should deserialize";
     const UNAVAILABLE_STATUS: u16 = 502;
     const UNAVAILABLE_TAG: &str = "provider_unavailable";
-    const TEST_PROVIDER: &str = "openai";
-    const PROXY_LOGIN_PAGE: &str = "<html><body>Sign in to continue</body></html>";
-    const ON_DISK: &str = "on-disk-access";
-    const FRESH: &str = "fresh-access";
-    const REFRESHED: &str = "refresh should have run";
-    const NOT_REFRESHED: &str = "refresh should not have run";
-    const EXPIRED: u64 = 0;
-    const SOONER: u64 = u64::MAX - 1;
-    const LATER: u64 = u64::MAX;
-
-    fn state_with_tokens(access: &str) -> TempDir {
-        let dir = TempDir::new().expect("temp dir");
-        let state = StateDir::from_path(dir.path().to_path_buf());
-        save_tokens(
-            &state,
-            TEST_PROVIDER,
-            &OAuthTokens {
-                access: access.into(),
-                refresh: "refresh".into(),
-                expires: u64::MAX,
-                account_id: None,
-            },
-        )
-        .expect("save tokens");
-        dir
-    }
-
-    fn fresh_tokens(_: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
-        Ok(OAuthTokens {
-            access: FRESH.into(),
-            refresh: "refresh".into(),
-            expires: u64::MAX,
-            account_id: None,
-        })
-    }
-
-    #[test_case(Some(ON_DISK), FRESH,  REFRESHED     ; "the rejected token is the one on disk")]
-    #[test_case(Some("older"), ON_DISK, NOT_REFRESHED ; "a peer already rotated it")]
-    #[test_case(None,          ON_DISK, NOT_REFRESHED ; "not expired and nothing was rejected")]
-    fn refreshed_tokens_forces_a_refresh_only_for_the_rejected_token(
-        rejected: Option<&str>,
-        expected: &str,
-        reason: &str,
-    ) {
-        let dir = state_with_tokens(ON_DISK);
-        let state = StateDir::from_path(dir.path().to_path_buf());
-        let got = refreshed_tokens(&state, TEST_PROVIDER, rejected, fresh_tokens).expect("refresh");
-        assert_eq!(got.access, expected, "{reason}");
-    }
-
-    #[test_case(AgentError::api(503, ERROR_MESSAGE), true  ; "server_error_keeps_tokens")]
-    #[test_case(AgentError::api(429, ERROR_MESSAGE), true  ; "rate_limit_keeps_tokens")]
-    #[test_case(AgentError::api(403, ERROR_MESSAGE), true  ; "firewall_block_keeps_tokens")]
-    #[test_case(AgentError::from(serde_json::from_str::<Value>(PROXY_LOGIN_PAGE).unwrap_err()), true ; "proxy_login_page_keeps_tokens")]
-    #[test_case(AgentError::api(400, ERROR_MESSAGE), false ; "invalid_grant_clears_tokens")]
-    #[test_case(AgentError::api(401, ERROR_MESSAGE), false ; "unauthorized_clears_tokens")]
-    fn refreshed_tokens_clears_only_a_dead_token(error: AgentError, kept: bool) {
-        let dir = state_with_tokens(ON_DISK);
-        let state = StateDir::from_path(dir.path().to_path_buf());
-        refreshed_tokens(&state, TEST_PROVIDER, Some(ON_DISK), |_| Err(error))
-            .expect_err("refresh should fail");
-        assert_eq!(load_tokens(&state, TEST_PROVIDER).is_some(), kept);
-    }
-
-    #[test_case(Some(EXPIRED), Some(EXPIRED), true  ; "held_expired")]
-    #[test_case(Some(LATER),   Some(SOONER),  true  ; "peer_rotated")]
-    #[test_case(None,          Some(LATER),   true  ; "peer_cleared_the_tokens")]
-    #[test_case(Some(SOONER),  Some(LATER),   false ; "older_copy_after_failed_save")]
-    fn needs_refresh_tracks_peers_but_not_a_failed_save(
-        stored: Option<u64>,
-        held: Option<u64>,
-        expected: bool,
-    ) {
-        let dir = TempDir::new().expect("temp dir");
-        let state = StateDir::from_path(dir.path().to_path_buf());
-        let tokens = |access: &str, expires| OAuthTokens {
-            access: access.into(),
-            refresh: "refresh".into(),
-            expires,
-            account_id: None,
-        };
-        if let Some(expires) = stored {
-            save_tokens(&state, TEST_PROVIDER, &tokens(ON_DISK, expires)).expect("save tokens");
-        }
-        let held = held.map(|expires| tokens(FRESH, expires));
-        assert_eq!(
-            needs_refresh(&state, TEST_PROVIDER, held.as_ref()),
-            expected
-        );
-    }
 
     // Codex only admits the overload in `code`, and anything we cannot place has to stay a plain
     // 400 so a user mistake is not retried forever: https://github.com/tontinton/maki/issues/777
@@ -738,13 +533,6 @@ mod tests {
             format!("API error ({UNAVAILABLE_STATUS}): {expected}")
         );
         assert!(err.is_retryable());
-    }
-
-    #[test_case("a b", "a%20b" ; "space")]
-    #[test_case("a:b", "a%3Ab" ; "colon")]
-    #[test_case("abc", "abc"   ; "passthrough")]
-    fn urlenc_encodes(input: &str, expected: &str) {
-        assert_eq!(urlenc(input), expected);
     }
 
     struct NeverReader;

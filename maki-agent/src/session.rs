@@ -345,7 +345,7 @@ mod tests {
 
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
     const CWD: &str = "/project";
-    const MODEL_SPEC: &str = "anthropic/claude-test";
+    const MODEL_SPEC: &str = "responses/claude-test";
     const OTHER_SPEC: &str = "other/model";
     const CONTEXT_SIZE: u32 = 42_000;
     const PROMPT: &str = "fix the login bug";

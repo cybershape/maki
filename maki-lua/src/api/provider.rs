@@ -1086,13 +1086,9 @@ mod tests {
     const NOT_OWNED: &str = "is not a provider this plugin registered";
     const REGISTER_FN: &str = "register";
     const UNKNOWN_CODEC: &str = "grpc";
-    const UNKNOWN_DIALECT: &str = "esperanto";
-    const STRAY_KEY: &str = "thinking_dialect";
     const RETIRED_AUTH_ENTRY: &str = "resolve_auth";
     const RELATIVE_TARGET: &str = "models";
     const PATH_TARGET: &str = "/models";
-    const TRANSPORT_HEADER: &str = "Host";
-    const BAD_HEADER: &str = "bad header";
     const FAILED_BODY: &str = r#"{"error":{"message":"slow down"}}"#;
     const RETRY_AFTER: &str = "Retry-After";
     const RETRY_AFTER_SECS: &str = "7";
@@ -1402,8 +1398,7 @@ mod tests {
 
     #[test_case("openai" ; "openai")]
     #[test_case("openai-responses" ; "openai_responses")]
-    #[test_case("anthropic" ; "anthropic")]
-    #[test_case("google" ; "google")]
+    #[test_case("responses" ; "responses")]
     fn every_documented_codec_parses(name: &str) {
         let (_, decl) = decode_spec(&format!(r#"codec = "{name}""#)).unwrap();
         assert!(decl.codec.is_some(), "{name}");
@@ -1449,11 +1444,6 @@ mod tests {
     /// rather than on the whole sentence keeps this from breaking when the
     /// sentence is reworded.
     #[test_case(r#"codec = "grpc""#, UNKNOWN_CODEC ; "unknown_codec")]
-    #[test_case(r#"codec = "openai", openai = { thinking = { dialect = "esperanto" } }"#, UNKNOWN_DIALECT ; "unknown_dialect")]
-    #[test_case(r#"codec = "openai", thinking_dialect = "deepseek""#, STRAY_KEY ; "unknown_top_level_key")]
-    #[test_case(r#"codec = "openai", openai = { thinking = { dialect = "glm" }, thinking_dialect = "glm" }"#, STRAY_KEY ; "unknown_openai_key")]
-    #[test_case(r#"codec = "openai", openai = { headers = { Host = "evil.example" } }"#, TRANSPORT_HEADER ; "transport_header")]
-    #[test_case(r#"codec = "openai", openai = { headers = { ["bad header"] = "x" } }"#, BAD_HEADER ; "bad_header_name")]
     #[test_case(r#"build_body = "not a function""#, BUILD_BODY ; "hook_that_is_not_a_function")]
     #[test_case("resolve_auth = function() end", RETIRED_AUTH_ENTRY ; "an_auth_entry_under_its_retired_name")]
     fn an_invalid_declaration_is_refused_where_the_plugin_can_be_named(

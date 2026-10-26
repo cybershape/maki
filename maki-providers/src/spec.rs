@@ -1,36 +1,41 @@
 use std::sync::{Arc, Mutex};
 
-use maki_config::PROVIDER_BUILTINS;
-use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
-
-use crate::manifest;
 use crate::model::{Model, ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
 use crate::provider::Provider;
-use crate::providers::{
-    ResolvedAuth, Timeouts, anthropic, aperture, copilot, custom, google, llama_cpp, ollama,
-    openai, opencode, plugin, xai, zai,
-};
+use crate::providers::{ResolvedAuth, Timeouts, custom, plugin};
 use crate::types::ThinkingFallback;
 use crate::{AgentError, Effort};
+use maki_config::PROVIDER_BUILTINS;
+use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
 
-/// The slugs a plugin may name as its `base`, in documentation order. A `base`
-/// borrows a bespoke `impl Provider` whole, so every entry must be a
-/// [`Build::Native`] row. Written out rather than derived from the rows, so a
-/// provider leaving it is a deliberate, documented break and never the side
-/// effect of a port.
-pub const BASES: &[&str] = &[
-    anthropic::SPEC.slug,
-    openai::SPEC.slug,
-    google::SPEC.slug,
-    copilot::SPEC.slug,
-    ollama::SPEC.slug,
-    llama_cpp::SPEC.slug,
-    zai::SPEC.slug,
-    opencode::ZEN_SPEC.slug,
-    xai::SPEC.slug,
-    aperture::SPEC.slug,
-];
+pub const BASES: &[&str] = &[];
+
+pub static RESPONSES_SPEC: ProviderSpec = ProviderSpec {
+    slug: "responses",
+    display_name: "Responses API",
+    api_key_env: "OPENAI_API_KEY",
+    family: ModelFamily::Gpt,
+    supports_thinking: true,
+    supports_deferred_tools: false,
+    adaptive_effort: api_decides,
+    thinking_fields_fallback: |_| Some(ThinkingFallback::BudgetField),
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(32_000),
+    fallback_context_window: 128_000,
+    models_toml: NO_CURATED_MODELS,
+    pricing_schedule: None,
+    build: Build::Declared(&[]),
+    aperture: None,
+    login: None,
+    docs: GeneratedDocs {
+        api_urls: &[],
+        features: None,
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Discovered("Configured via providers.toml"),
+        trailing_notes: &[],
+    },
+};
 
 /// Stands in for the model table when a provider curates none.
 pub const GENERIC_DISCOVERY_NOTE: &str =
@@ -183,7 +188,7 @@ impl ProviderSpec {
     pub fn models(&self) -> &'static [ModelEntry] {
         match self.build {
             Build::Declared(models) => models,
-            Build::Native(_) | Build::Catalog => manifest::table(self.slug),
+            Build::Native(_) | Build::Catalog => &[],
         }
     }
 
@@ -221,19 +226,7 @@ impl ProviderSpec {
 ///
 /// Each entry copies a module's `SPEC` const, so the two live at different
 /// addresses: identify a spec by `slug`, never by pointer.
-const BUILTINS: &[ProviderSpec] = &[
-    anthropic::SPEC,
-    openai::SPEC,
-    google::SPEC,
-    copilot::SPEC,
-    ollama::SPEC,
-    llama_cpp::SPEC,
-    zai::SPEC,
-    opencode::ZEN_SPEC,
-    xai::SPEC,
-    aperture::SPEC,
-    opencode::GO_SPEC,
-];
+const BUILTINS: &[ProviderSpec] = &[];
 
 pub struct ProviderRegistry;
 
@@ -242,6 +235,9 @@ impl ProviderRegistry {
     /// plugin's declaration. The one to reach for unless plugin providers
     /// must be left out on purpose, see [`Self::compiled`].
     pub fn get(slug: &str) -> Option<&'static ProviderSpec> {
+        if slug == RESPONSES_SPEC.slug {
+            return Some(&RESPONSES_SPEC);
+        }
         Self::compiled(slug).or_else(|| plugin::spec(slug))
     }
 
@@ -258,12 +254,18 @@ impl ProviderRegistry {
     /// Every row [`Self::get`] answers for: the compiled-in ones in their
     /// order, then the plugin providers by slug.
     pub fn all() -> Vec<&'static ProviderSpec> {
-        BUILTINS.iter().chain(plugin::specs()).collect()
+        std::iter::once(&RESPONSES_SPEC)
+            .chain(plugin::specs())
+            .collect()
     }
 
     /// A row compiled into this binary, never a plugin's.
     pub fn compiled(slug: &str) -> Option<&'static ProviderSpec> {
-        BUILTINS.iter().find(|s| s.slug == slug)
+        if slug == RESPONSES_SPEC.slug {
+            Some(&RESPONSES_SPEC)
+        } else {
+            BUILTINS.iter().find(|s| s.slug == slug)
+        }
     }
 
     pub fn all_compiled() -> &'static [ProviderSpec] {
@@ -291,34 +293,18 @@ impl ProviderRegistry {
 /// knows about a slug: a catalog-backed builtin has a spec row and is still
 /// `Catalog` here.
 pub enum Owner {
-    /// A selected or registered declaration.
     Plugin,
-    /// Carries the constructor rather than the spec, so "builtin" and
-    /// "buildable" cannot come apart.
-    Builtin(NewFn),
-    /// `providers.toml`
     Custom,
-    /// models.dev
-    Catalog,
     Unknown,
 }
 
 impl Owner {
     pub fn of(slug: &str) -> Self {
-        // Registration refuses a built-in slug, so a declaration never
-        // shadows a row below.
         if plugin::owns_slug(slug) {
             return Self::Plugin;
         }
-        let builtin = ProviderRegistry::compiled(slug);
-        if let Some(native) = builtin.and_then(ProviderSpec::native) {
-            return Self::Builtin(native.new);
-        }
-        if custom::base_spec(slug).is_some() {
+        if custom::is_declared(slug) {
             return Self::Custom;
-        }
-        if builtin.is_some() {
-            return Self::Catalog;
         }
         Self::Unknown
     }
@@ -327,99 +313,10 @@ impl Owner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::catalog::CATALOG_BACKED_BUILTINS;
-    use std::collections::HashSet;
 
-    /// `provider.rs` skips a catalog row for any slug the registry knows. That
-    /// is only the right filter while the registry is exactly what maki builds
-    /// plus what it deliberately reads from the catalog. A duplicate slug would
-    /// vanish into the set, so count before comparing.
     #[test]
-    fn builtins_are_the_native_and_catalog_backed_slugs() {
-        let registry: HashSet<&str> = BUILTINS.iter().map(|s| s.slug).collect();
-        assert_eq!(registry.len(), BUILTINS.len(), "duplicate slug in BUILTINS");
-        for spec in BUILTINS {
-            let built = match spec.build {
-                Build::Native(_) => true,
-                Build::Declared(_) => false,
-                Build::Catalog => CATALOG_BACKED_BUILTINS.contains(&spec.slug),
-            };
-            assert!(built, "nothing builds {}", spec.slug);
-        }
-        for slug in CATALOG_BACKED_BUILTINS {
-            assert!(registry.contains(slug), "{slug} has no spec row");
-        }
-    }
-
-    /// A `base` borrows a native constructor, so a slug on the list that lost
-    /// its `impl Provider` would pass registration and fail every `create`.
-    #[test]
-    fn every_base_is_a_native_builtin() {
-        for base in BASES {
-            let spec = ProviderRegistry::get(base);
-            assert!(spec.and_then(ProviderSpec::native).is_some(), "{base}");
-        }
-    }
-
-    /// The picker lists the inventory, so a spec without an entry is a
-    /// provider the user cannot reach. OpenRouter shipped that way for months.
-    /// The other direction catches an `inventory::submit!` left on a row that
-    /// no longer has a `login`.
-    #[test]
-    fn login_specs_are_exactly_the_inventory_rows() {
-        for spec in BUILTINS {
-            let registered = inventory::iter::<BuiltInProvider>()
-                .into_iter()
-                .any(|b| b.slug == spec.slug);
-            assert_eq!(
-                spec.login.is_some(),
-                registered,
-                "spec {:?} declares login={} but inventory registration={}",
-                spec.slug,
-                spec.login.is_some(),
-                registered,
-            );
-        }
-    }
-
-    /// A malformed table is a runtime panic now, not a compile error, so this
-    /// forces every one of them in CI. Never `#[ignore]` it.
-    #[test]
-    fn every_builtin_model_table_parses() {
-        for spec in BUILTINS {
-            spec.models();
-        }
-    }
-
-    /// Closes the third side of the slug/file mapping: `include_str!` catches a
-    /// missing file, the parser catches a wrong one, and this catches an orphan
-    /// table or one written but never wired into a spec.
-    #[test]
-    fn model_files_match_curated_providers() {
-        const MODELS_DIR: &str = "maki-providers/models should hold named files";
-        let files: HashSet<String> =
-            std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/models"))
-                .expect(MODELS_DIR)
-                .map(|entry| {
-                    let path = entry.expect(MODELS_DIR).path();
-                    let stem = path.file_stem().expect(MODELS_DIR);
-                    stem.to_string_lossy().into_owned()
-                })
-                .collect();
-        let curated: HashSet<String> = BUILTINS
-            .iter()
-            .filter(|spec| spec.models_toml != NO_CURATED_MODELS)
-            .map(|spec| spec.slug.to_owned())
-            .collect();
-        assert_eq!(files, curated);
-    }
-
-    /// A spec row alone does not make a provider buildable. Hand `opencode-go`
-    /// a [`Build::Native`] and `provider_for_slug` would quietly stop asking models.dev
-    /// for it.
-    #[test]
-    fn a_spec_row_without_a_constructor_still_belongs_to_the_catalog() {
-        assert!(matches!(Owner::of(anthropic::SLUG), Owner::Builtin(_)));
-        assert!(matches!(Owner::of(opencode::GO_SLUG), Owner::Catalog));
+    fn responses_spec_is_valid() {
+        assert_eq!(RESPONSES_SPEC.slug, "responses");
+        assert!(RESPONSES_SPEC.accepts_arbitrary_models);
     }
 }

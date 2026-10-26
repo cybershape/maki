@@ -34,14 +34,13 @@ use maki_lua::{
     PluginPermissions, SessionEndReason, Split, WinCommand, WinEvent,
 };
 use maki_providers::{
-    ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, ThinkingSupport,
-    TokenUsage,
+    ContentBlock, Effort, FastPricing, FastSupport, Message, Model, ModelTier, RequestOptions,
+    Role, THINKING_USAGE, ThinkingSupport, TokenUsage,
 };
 use maki_storage::id::MakiId;
 use maki_storage::model::read_thinking;
 use maki_storage::sessions::{
-    SessionClaim, SessionMeta, StoredMode, StoredThinking, StoredTokenUsage, THINKING_ADAPTIVE,
-    ThinkingParseError,
+    SessionClaim, SessionMeta, StoredMode, StoredThinking, StoredTokenUsage, ThinkingParseError,
 };
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
@@ -66,7 +65,7 @@ const PACK_REVIEW_PROMPT: &str = "Apply these package changes?";
 pub(crate) const RESEARCH_NAME: &str = "research";
 const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
-const LATE_MODEL_SPEC: &str = "zai/glm-5";
+const LATE_MODEL_SPEC: &str = "responses/late-model";
 const PRIMARY_TEXT: &str = "selected text";
 const HINT_PLUGIN: &str = "statusline";
 const HINT_TEXT: &str = "2/4 staged";
@@ -83,12 +82,11 @@ const NOTICE_REPLY: &str = "the build is green";
 const STEERED_TEXT: &str = "rewritten by a plugin";
 const MISSING_DIR: &str = "gone";
 const RESUMED_PROMPT: &str = "carry me over";
-const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-5";
-const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
-const PLAIN_MODEL_SPEC: &str = "ollama/qwen3";
+const SONNET_SPEC: &str = "responses/sonnet";
+const OPUS_SPEC: &str = "responses/opus";
+const PLAIN_MODEL_SPEC: &str = "responses/plain";
 const THINKING_OPTIONS: &str = "thinking_options";
 const THINKING_SHOWN: &str = "thinking_shown";
-const FIXED_ADAPTIVE_PROVIDER: &str = "xai";
 const MODEL_CHANGED_EVENT: &str = "ModelChanged";
 const INPUT_CHANGED_EVENT: &str = "InputChanged";
 const PLAN_READY_EVENT: &str = "PlanReady";
@@ -166,6 +164,27 @@ fn test_permissions(yolo: bool) -> Arc<PermissionManager> {
     ))
 }
 
+fn test_opus_model() -> Model {
+    let mut model = test_model();
+    model.id = "opus".into();
+    model.tier = ModelTier::Strong;
+    model.thinking_override = Some(ThinkingSupport::Yes);
+    model.supports_fast_override = Some(FastSupport::Supported);
+    model.pricing.fast = Some(FastPricing {
+        input: 30.0,
+        output: 150.0,
+    });
+    model
+}
+
+fn test_plain_model() -> Model {
+    let mut model = test_model();
+    model.id = "plain".into();
+    model.thinking_override = Some(ThinkingSupport::No);
+    model.supports_fast_override = Some(FastSupport::Unsupported);
+    model
+}
+
 fn build_app_with_session(
     dir: StateDir,
     writer: Arc<StorageWriter>,
@@ -175,7 +194,13 @@ fn build_app_with_session(
 ) -> App {
     // Mirrors the event loop, where the session's own spec decides and the
     // startup model catches one that will not resolve.
-    let model = Model::from_spec(&tab.session.model).unwrap_or_else(|_| test_model());
+    let model = if tab.session.model == OPUS_SPEC {
+        test_opus_model()
+    } else if tab.session.model == PLAIN_MODEL_SPEC {
+        test_plain_model()
+    } else {
+        Model::from_spec(&tab.session.model).unwrap_or_else(|_| test_model())
+    };
     App::new(
         &model,
         tab,
@@ -6281,7 +6306,7 @@ fn thinking_restored_from_session_meta() {
 }
 
 fn set_opus_model(app: &mut App) {
-    app.state.model = Model::from_spec(OPUS_SPEC).unwrap();
+    app.state.model = test_opus_model();
 }
 
 #[test]
@@ -6343,11 +6368,10 @@ fn subagent_history_finishes_workflow_chat() {
     assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
 }
 
-#[test_case(SONNET_SPEC ; "non_opus_anthropic")]
-#[test_case("openai/gpt-5.5" ; "non_anthropic")]
-fn fast_flashes_error_on_ineligible_model(spec: &str) {
+#[test]
+fn fast_flashes_error_on_ineligible_model() {
     let mut app = test_app();
-    app.state.model = Model::from_spec(spec).unwrap();
+    app.state.model = Model::from_spec(SONNET_SPEC).unwrap();
 
     app.execute_command(cmd("/fast"), 0);
     assert!(!app.state.fast);
@@ -6363,7 +6387,7 @@ fn fast_restored_from_session_meta() {
 
     let state = SessionState::from_session(
         OpenSession::claimed(session, &storage),
-        &Model::from_spec(OPUS_SPEC).unwrap(),
+        &test_opus_model(),
         &storage,
     );
     assert!(state.fast);
@@ -6389,13 +6413,13 @@ fn fast_normalized_off_when_restored_onto_ineligible_model() {
 #[test]
 fn model_state_reports_the_model_and_what_it_supports() {
     let mut app = test_app();
-    app.state.model = Model::from_spec(PLAIN_MODEL_SPEC).unwrap();
+    app.state.model = test_plain_model();
     assert_eq!(
         model_state_scalars(&app),
         serde_json::json!({
             "spec": PLAIN_MODEL_SPEC,
-            "id": "qwen3",
-            "provider": "ollama",
+            "id": "plain",
+            "provider": "responses",
             "thinking": "off",
             "thinking_shown": "off",
             "fast": false,
@@ -6411,8 +6435,8 @@ fn model_state_reports_the_model_and_what_it_supports() {
         model_state_scalars(&app),
         serde_json::json!({
             "spec": OPUS_SPEC,
-            "id": "claude-opus-4-8",
-            "provider": "anthropic",
+            "id": "opus",
+            "provider": "responses",
             "thinking": "high",
             "thinking_shown": "high",
             "fast": true,
@@ -6453,7 +6477,7 @@ fn model_state_carries_the_thinking_ladder() {
         "an effort row carries what it costs: {ladder}"
     );
 
-    app.state.model = Model::from_spec(PLAIN_MODEL_SPEC).unwrap();
+    app.state.model = test_plain_model();
     assert_eq!(app.model_state()[THINKING_OPTIONS], serde_json::json!([]));
 }
 
@@ -6591,8 +6615,7 @@ fn model_change_fires_once_per_real_swap() {
     app.emit_model_change();
     assert_eq!(probe.try_recv_autocmd(), None);
 
-    app.state
-        .update_model(&Model::from_spec(OPUS_SPEC).unwrap());
+    app.state.update_model(&test_opus_model());
     app.emit_model_change();
     app.emit_model_change();
 
@@ -6615,7 +6638,7 @@ fn loading_a_session_on_another_model_announces_the_swap() {
     let (_tmp, _storage, _writer, mut app) = tempdir_app();
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
-    let resolved = Model::from_spec(OPUS_SPEC).unwrap();
+    let resolved = test_opus_model();
 
     app.apply_loaded_session(
         OpenSession::claimed(AppSession::new(OPUS_SPEC, "/tmp/test"), &app.storage),
@@ -6958,23 +6981,6 @@ fn model_state_thinking_round_trips_into_set_thinking(thinking: ThinkingConfig, 
     assert_eq!(reported, expected);
     assert_eq!(app.set_thinking(&reported).unwrap(), thinking);
     assert_eq!(app.set_thinking(&reported).unwrap(), thinking);
-}
-
-/// xAI sends `high` for `adaptive`. The picker and the flash read the level,
-/// while `thinking` keeps what the session holds, so handing it back to
-/// `maki.model.set` changes nothing.
-#[test]
-fn model_state_shows_the_level_a_hidden_adaptive_is_sent_as() {
-    let mut app = test_app();
-    app.state.model.provider = Arc::from(FIXED_ADAPTIVE_PROVIDER);
-    app.state.model.thinking_override = Some(ThinkingSupport::Yes);
-    app.state.thinking = ThinkingConfig::Adaptive;
-
-    let state = app.model_state();
-    assert_eq!(state[THINKING_SHOWN], Effort::High.as_str());
-    assert_eq!(state["thinking"], THINKING_ADAPTIVE);
-    let offered = state[THINKING_OPTIONS].as_array().unwrap();
-    assert!(offered.iter().all(|row| row["name"] != THINKING_ADAPTIVE));
 }
 
 #[test]
@@ -8175,7 +8181,7 @@ fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
     app.checkpoint();
     let (live_id, sent_revision) = (app.state.session.id, app.state.session.revision());
 
-    let resolved = Model::from_spec(OPUS_SPEC).unwrap();
+    let resolved = test_opus_model();
     load_session(&mut app, stored.id, &resolved);
     assert_eq!(app.state.session.id, stored.id);
     assert_eq!(app.state.model.spec(), OPUS_SPEC, "{LOADED_MODEL_IGNORED}");

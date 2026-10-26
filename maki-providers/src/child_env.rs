@@ -3,9 +3,6 @@ use std::process::Command;
 use maki_config::providers::{ProvidersConfig, resolve_api_key_env};
 use maki_config::{PROVIDER_BUILTINS, ShellPreference, env_var_refs};
 
-use crate::providers::anthropic::bedrock;
-use crate::providers::catalog;
-use crate::providers::copilot::auth as copilot_auth;
 use crate::spec::ProviderRegistry;
 
 /// Credentials other CLIs read too (gh, huggingface-cli, doctl, databricks,
@@ -35,7 +32,7 @@ const SHARED_CREDENTIAL_VARS: &[&str] = &[
 /// catalog that warmed up late counts from the next spawn.
 pub fn strip_provider_keys(cmd: &mut Command) -> &mut Command {
     let config = ProvidersConfig::load_or_default();
-    for var in provider_key_vars(&config, catalog::key_vars_if_available()) {
+    for var in provider_key_vars(&config) {
         cmd.env_remove(var);
     }
     cmd
@@ -44,16 +41,12 @@ pub fn strip_provider_keys(cmd: &mut Command) -> &mut Command {
 /// `providers.toml` cannot change the `api_key_env` of a known slug, so that
 /// var is never a key maki reads. Its `headers` are still sent though, so
 /// their `${VAR}`s count.
-fn provider_key_vars(config: &ProvidersConfig, catalog_vars: Vec<String>) -> Vec<String> {
+fn provider_key_vars(config: &ProvidersConfig) -> Vec<String> {
     let known = ProviderRegistry::all()
         .into_iter()
         .map(|spec| spec.api_key_env)
-        .chain(copilot_auth::TOKEN_ENV_VARS.iter().copied())
-        .chain([bedrock::BEARER_TOKEN_ENV])
         .filter(|var| !var.is_empty())
         .map(str::to_owned);
-    // The key stays the user's secret even while its plugin is off or still
-    // loading.
     let bundled = PROVIDER_BUILTINS
         .iter()
         .map(|slug| resolve_api_key_env(slug, None));
@@ -72,7 +65,6 @@ fn provider_key_vars(config: &ProvidersConfig, catalog_vars: Vec<String>) -> Vec
         .chain(bundled)
         .chain(custom)
         .chain(header_refs)
-        .chain(catalog_vars)
         .filter(|var| !SHARED_CREDENTIAL_VARS.contains(&var.as_str()))
         .collect()
 }
@@ -205,7 +197,6 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::providers::anthropic;
 
     const CUSTOM_SLUG: &str = "my-proxy";
     const CUSTOM_KEY_ENV: &str = "MY_PROXY_SECRET";
@@ -216,11 +207,7 @@ mod tests {
     const GATEWAY_SECRET_ENV: &str = "CF_ACCESS_CLIENT_SECRET";
     const SHARED_HEADER: &str = "X-GitHub-Token";
     const SHARED_TOKEN: &str = "GITHUB_TOKEN";
-    const CATALOG_KEY_ENV: &str = "FIREWORKS_API_KEY";
-    const SHARED_CATALOG_KEY_ENV: &str = "HF_TOKEN";
     const UNRELATED_VAR: &str = "MAKI_TEST_UNRELATED";
-    /// Its plugin never loads in this crate's tests.
-    const BUNDLED_KEY_ENV: &str = "MISTRAL_API_KEY";
     #[cfg(unix)]
     const SECRET: &str = "sk-secret";
 
@@ -240,29 +227,19 @@ mod tests {
             providers: HashMap::from([
                 (CUSTOM_SLUG.into(), with_env(CUSTOM_KEY_ENV)),
                 (DEFAULT_SLUG.into(), ProviderDef::default()),
-                (anthropic::SPEC.slug.into(), builtin_with_headers),
+                ("header-custom".into(), builtin_with_headers),
             ]),
         }
     }
 
-    #[test_case(anthropic::SPEC.api_key_env, true ; "builtin_key")]
-    #[test_case(copilot_auth::TOKEN_ENV_VARS[1], true ; "copilot_fallback_token")]
-    #[test_case(bedrock::BEARER_TOKEN_ENV, true ; "bedrock_bearer_token")]
     #[test_case(CUSTOM_KEY_ENV, true ; "custom_api_key_env")]
     #[test_case(DEFAULT_KEY_ENV, true ; "custom_default_slug_key")]
-    #[test_case(IGNORED_KEY_ENV, false ; "builtin_api_key_env_override_ignored")]
     #[test_case(GATEWAY_SECRET_ENV, true ; "header_ref")]
     #[test_case(SHARED_TOKEN, false ; "shared_credential_in_header_kept")]
-    #[test_case(CATALOG_KEY_ENV, true ; "catalog_key")]
-    #[test_case(SHARED_CATALOG_KEY_ENV, false ; "shared_credential_in_catalog_kept")]
     #[test_case(UNRELATED_VAR, false ; "unrelated_var_kept")]
-    #[test_case(BUNDLED_KEY_ENV, true ; "unloaded_bundled_plugin_key")]
     fn provider_key_vars_membership(var: &str, stripped: bool) {
-        let catalog_vars = vec![CATALOG_KEY_ENV.into(), SHARED_CATALOG_KEY_ENV.into()];
         assert_eq!(
-            provider_key_vars(&config(), catalog_vars)
-                .iter()
-                .any(|v| v == var),
+            provider_key_vars(&config()).iter().any(|v| v == var),
             stripped
         );
     }
@@ -270,8 +247,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn child_sees_only_keys_set_after_strip() {
-        let inherited = anthropic::SPEC.api_key_env;
-        let explicit = bedrock::BEARER_TOKEN_ENV;
+        let inherited = crate::spec::RESPONSES_SPEC.api_key_env;
+        let explicit = "EXPLICIT_VAR";
         let mut cmd = Command::new("env");
         cmd.env(inherited, SECRET);
         let output = strip_provider_keys(&mut cmd)

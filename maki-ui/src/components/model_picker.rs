@@ -10,7 +10,7 @@ use maki_providers::Model;
 use maki_providers::ModelTier;
 use maki_providers::model_registry;
 use maki_providers::models_cache::ModelList;
-use maki_providers::spec::{Build, ProviderRegistry};
+use maki_providers::spec::ProviderRegistry;
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -379,17 +379,12 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
     let (provider_str, model_id) = spec.split_once('/')?;
 
     // A catalog-backed row like `opencode-go` takes the name models.dev gives it.
-    let provider_display = if let Some(spec) =
-        ProviderRegistry::get(provider_str).filter(|s| !matches!(s.build, Build::Catalog))
-    {
+    let provider_display = if let Some(spec) = ProviderRegistry::get(provider_str) {
         spec.display_name.to_string()
-    } else if let Some(info) = maki_providers::catalog_provider_if_available(provider_str) {
-        info.display_name.clone()
     } else if let Some(builtin) = maki_config::providers::builtin_provider(provider_str) {
         builtin.display_name.to_string()
     } else {
         let config = maki_config::providers::ProvidersConfig::load();
-        config.get(provider_str)?;
         maki_config::providers::resolve_display_name(provider_str, config.get(provider_str))
     };
 
@@ -627,9 +622,9 @@ mod tests {
 
     #[test]
     fn parse_model_entry_valid() {
-        let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514").unwrap();
-        assert_eq!(entry.id, "claude-sonnet-4-20250514");
-        assert_eq!(entry.provider_display, "Anthropic");
+        let entry = parse_model_entry("responses/my-model").unwrap();
+        assert_eq!(entry.id, "my-model");
+        assert_eq!(entry.provider_display, "Responses API");
         assert!(!entry.detail.is_empty());
     }
 
@@ -733,7 +728,7 @@ mod tests {
         assert_eq!(entry.spec, "zai/glm-5");
         assert_eq!(
             entry.section(),
-            Some("Z.AI"),
+            Some("zai"),
             "selection should land on the provider entry, not the Recent copy",
         );
     }
@@ -756,7 +751,7 @@ mod tests {
         assert_eq!(entry.spec, "zai/glm-5");
         assert_eq!(
             entry.section(),
-            Some("Z.AI"),
+            Some("zai"),
             "selection should stay on the provider entry, not jump to Recent",
         );
     }
@@ -788,7 +783,7 @@ mod tests {
         assert_eq!(entry.spec, "anthropic/claude-sonnet-4-20250514");
         assert_eq!(
             entry.section(),
-            Some("Anthropic"),
+            Some("anthropic"),
             "cursor should migrate to the provider entry once it arrives",
         );
     }
@@ -926,7 +921,7 @@ mod tests {
 
         let entry = p.picker.selected_item().expect("selection after refresh");
         assert_eq!(entry.spec, "zai/glm-5");
-        assert_eq!(entry.section(), Some("Z.AI"));
+        assert_eq!(entry.section(), Some("zai"));
     }
 
     fn discovered(id: &str, pricing: ModelPricing) -> ModelInfo {
@@ -936,14 +931,14 @@ mod tests {
         }
     }
 
-    const OX_SPEC: &str = "ollama/stealth/ox-alpha";
+    const OX_SPEC: &str = "responses/stealth/ox-alpha";
     const PAID_ID: &str = "vendor/paid-model";
     const PAID_PRICING: ModelPricing = ModelPricing::per_million(3.0, 15.0, 0.0, 0.0);
     const PAID_PRICE_LABEL: &str = "  $3.00/$15.00 ";
 
     fn register_discovered_models() {
         model_registry::set_known_models(
-            "ollama",
+            "responses",
             vec![
                 discovered("stealth/ox-alpha", ModelPricing::ZERO),
                 discovered(PAID_ID, PAID_PRICING),
@@ -964,7 +959,7 @@ mod tests {
     #[test]
     fn paid_discovery_not_marked_free() {
         register_discovered_models();
-        let entry = parse_model_entry(&format!("ollama/{PAID_ID}")).unwrap();
+        let entry = parse_model_entry(&format!("responses/{PAID_ID}")).unwrap();
         assert!(
             !entry.detail.starts_with(FREE_PREFIX),
             "paid discovery must not mark the entry free"
@@ -982,7 +977,7 @@ mod tests {
         register_discovered_models();
         let models = Arc::new(ArcSwapOption::empty());
         models.store(Some(loaded(vec![
-            format!("ollama/{PAID_ID}"),
+            format!("responses/{PAID_ID}"),
             OX_SPEC.into(),
         ])));
         let mut p = ModelPicker::new(models);

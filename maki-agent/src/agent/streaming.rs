@@ -406,7 +406,7 @@ mod tests {
     const CROWDING_PROMPT: u32 = WINDOW - CROWDED_ROOM;
 
     fn model_with(max_output_tokens: Option<u32>) -> Model {
-        let mut model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let mut model = Model::from_spec("responses/default").unwrap();
         model.context_window = WINDOW;
         model.max_output_tokens = max_output_tokens;
         model

@@ -167,37 +167,6 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         name: "list",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
     },
-    // The rest register no tool. They declare a provider maki ships, on
-    // the same surface a third-party plugin declares one with, which is what
-    // keeps that surface honest.
-    BundledPlugin {
-        name: "synthetic",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/synthetic"),
-    },
-    BundledPlugin {
-        name: "deepseek",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/deepseek"),
-    },
-    BundledPlugin {
-        name: "mistral",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/mistral"),
-    },
-    BundledPlugin {
-        name: "tensorx",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/tensorx"),
-    },
-    BundledPlugin {
-        name: "regolo",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/regolo"),
-    },
-    BundledPlugin {
-        name: "requesty",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/requesty"),
-    },
-    BundledPlugin {
-        name: "openrouter",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/openrouter"),
-    },
 ];
 
 /// Every bundled name, not just the default-enabled ones. An external package

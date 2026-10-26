@@ -566,8 +566,11 @@ pub fn interpreter_ctx(
     registry: Arc<ToolRegistry>,
 ) -> ToolContext {
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
-    static MODEL: LazyLock<Arc<Model>> =
-        LazyLock::new(|| Arc::new(Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()));
+    static MODEL: LazyLock<Arc<Model>> = LazyLock::new(|| {
+        let mut model = Model::from_spec("responses/default").unwrap();
+        model.pricing = maki_providers::ModelPricing::per_million(3.0, 15.0, 3.75, 0.30);
+        Arc::new(model)
+    });
     ToolContext {
         provider: Arc::clone(&PROVIDER),
         model: Arc::clone(&MODEL),
@@ -849,7 +852,7 @@ mod tests {
     use super::*;
 
     const LINE_LIMIT: usize = 500;
-    const TEST_MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
+    const TEST_MODEL_SPEC: &str = "responses/claude-opus-4-8";
 
     /// The array a host hands in is the whole answer, but only where names can
     /// be read out of it. Something unreadable must not quietly come out as

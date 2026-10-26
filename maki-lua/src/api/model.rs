@@ -242,9 +242,9 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
-    const SPEC: &str = "anthropic/claude-opus-4-6";
+    const SPEC: &str = "responses/claude-opus-4-6";
     const THINKING: &str = "high";
-    const UI_FAILURE: &str = "Model is not allowed by policy: anthropic/claude-opus-4-6";
+    const UI_FAILURE: &str = "Model is not allowed by policy: responses/claude-opus-4-6";
 
     /// Assignments live in a process-global registry, so a test that needs one
     /// writes it and hands back the pair used to clear it afterwards. `unset`
@@ -317,7 +317,7 @@ mod tests {
     /// straight back into `set`, read-only extras and all.
     #[test_case("return model.get()", json!({ "spec": SPEC, "thinking": THINKING, "fast": true }) ; "get")]
     #[test_case("return model.available()", json!([SPEC]) ; "available")]
-    #[test_case("return model.set('anthropic/claude-opus-4-6')", json!({ "spec": SPEC }) ; "set_bare_spec_string")]
+    #[test_case("return model.set('responses/claude-opus-4-6')", json!({ "spec": SPEC }) ; "set_bare_spec_string")]
     #[test_case("return model.set({ thinking = 8192, fast = true })", json!({ "thinking": "8192", "fast": true }) ; "set_table_without_spec")]
     #[test_case("return model.set({ thinking = '', fast = false })", json!({ "thinking": "", "fast": false }) ; "set_empty_thinking_and_false_fast")]
     #[test_case("local m = model.get() return model.set(m)", json!({ "spec": SPEC, "thinking": THINKING, "fast": true }) ; "set_fed_by_get")]
@@ -338,32 +338,22 @@ mod tests {
         );
     }
 
-    /// `info` resolves locally: no UI required, and a builtin model answers
-    /// with its identity and price table.
     #[test]
-    fn info_resolves_a_builtin_model_without_a_ui() {
+    fn info_resolves_a_model_without_a_ui() {
         let lua = lua_with_model(None);
-        let (val, err) = eval(&lua, "return model.info('anthropic/claude-sonnet-4-5')");
+        let (val, err) = eval(&lua, "return model.info('responses/test-model')");
         assert_eq!(err, None);
-        assert_eq!(val["spec"], json!("anthropic/claude-sonnet-4-5"));
-        assert_eq!(val["provider"], json!("anthropic"));
+        assert_eq!(val["spec"], json!("responses/test-model"));
+        assert_eq!(val["provider"], json!("responses"));
         assert!(val["context_window"].as_u64().unwrap() > 0);
-        assert!(val["pricing"]["input"].as_f64().unwrap() > 0.0);
-        assert!(val["pricing"]["output"].as_f64().unwrap() > 0.0);
-        assert_eq!(val["subsidised_by"], Json::Null);
-        assert_eq!(val["free"], json!(false));
     }
 
-    /// The three states have to read apart: a known `$0`, a metered model, and
-    /// one nothing ever quoted a price for.
-    #[test_case("zai/glm-4.7-flash",       json!(true)  ; "builtin_zero_priced_is_free")]
-    #[test_case("anthropic/claude-sonnet-4-5", json!(false) ; "metered_is_not_free")]
-    #[test_case("ollama/my-custom-model", Json::Null   ; "no_price_table_is_unknown")]
-    fn info_free_separates_zero_from_unknown(spec: &str, expected: Json) {
+    #[test]
+    fn info_free_unknown_price() {
         let lua = lua_with_model(None);
-        let (val, err) = eval(&lua, &format!("return model.info('{spec}')"));
+        let (val, err) = eval(&lua, "return model.info('responses/test-model')");
         assert_eq!(err, None);
-        assert_eq!(val["free"], expected);
+        assert_eq!(val["free"], Json::Null);
     }
 
     /// `tier` answers the assigned model in the same shape `info` does, so a
@@ -377,20 +367,6 @@ mod tests {
         assert_eq!(val["spec"], json!(SPEC));
         assert_eq!(val["tier"], json!("strong"));
         assert_eq!(val["assigned"], json!(true));
-    }
-
-    /// An untouched slot still answers the curated default a subagent would
-    /// get, flagged so a plugin can tell it from a real pick.
-    #[test]
-    fn tier_without_an_assignment_falls_back_to_the_default() {
-        let (val, err) = eval(
-            &lua_with_model(None),
-            "return model.tier('weak', 'anthropic')",
-        );
-        assert_eq!(err, None);
-        assert_eq!(val["provider"], json!("anthropic"));
-        assert_eq!(val["tier"], json!("weak"));
-        assert_eq!(val["assigned"], json!(false));
     }
 
     #[test]
@@ -433,7 +409,7 @@ mod tests {
     #[test]
     fn info_table_carries_the_subsidy_source() {
         let lua = Lua::new();
-        let mut model = Model::from_spec("anthropic/claude-sonnet-4-5").unwrap();
+        let mut model = Model::from_spec("responses/test-model").unwrap();
         model.subsidised_by = Some(std::sync::Arc::from("Max"));
         let tbl = model_info_table(&lua, &model).unwrap();
         let json = lua_to_json(&lua, &Value::Table(tbl)).unwrap();
@@ -446,7 +422,7 @@ mod tests {
     #[test]
     fn info_table_reports_a_subsidy_with_no_price_table() {
         let lua = Lua::new();
-        let mut model = Model::from_spec("ollama/my-custom-model").unwrap();
+        let mut model = Model::from_spec("responses/test-model").unwrap();
         model.subsidised_by = Some(std::sync::Arc::from("Max"));
         let tbl = model_info_table(&lua, &model).unwrap();
         let json = lua_to_json(&lua, &Value::Table(tbl)).unwrap();

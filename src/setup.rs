@@ -24,16 +24,6 @@ const LOG_ENV: &str = "MAKI_LOG";
 const LOG_ENV_SHARED: &str = "RUST_LOG";
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::INFO;
 
-const PROVIDER_PRIORITY: &[&str] = &[
-    "anthropic",
-    "openai",
-    "xai",
-    "copilot",
-    "zai",
-    "synthetic",
-    "deepseek",
-    "regolo",
-];
 const STARTUP_TIERS: [ModelTier; 2] = [ModelTier::Strong, ModelTier::Medium];
 
 /// The model to start on, plus a warning when the saved one had to be skipped.
@@ -120,13 +110,7 @@ pub fn remember_thinking(defaults: &mut SessionDefaults, storage: &StateDir) {
 /// yet, so retry once with a warm catalog. `Model::from_spec` itself must stay
 /// non-blocking: the UI draws with it.
 fn from_spec_or_warm_catalog(spec: &str) -> Result<Model> {
-    let result = match Model::from_spec(spec) {
-        Err(ModelError::UnsupportedProvider(_)) => {
-            maki_providers::warm_catalog();
-            Model::from_spec(spec)
-        }
-        result => result,
-    };
+    let result = Model::from_spec(spec);
     if let Err(ModelError::UnsupportedProvider(slug)) = &result
         && let Some(hint) = provider_scripts::unknown_provider_hint(slug)
     {
@@ -136,16 +120,6 @@ fn from_spec_or_warm_catalog(spec: &str) -> Result<Model> {
 }
 
 fn auto_detect_model(policy: &ModelPolicy) -> Option<Model> {
-    for tier in STARTUP_TIERS {
-        for &slug in PROVIDER_PRIORITY {
-            if provider_ready(slug).is_ok()
-                && let Ok(model) = Model::from_tier(slug, tier)
-                && policy.allows(&model.spec())
-            {
-                return Some(model);
-            }
-        }
-    }
     let mut checked = HashSet::new();
     user_provider_models()
         .filter(|model| policy.allows(&model.spec()))

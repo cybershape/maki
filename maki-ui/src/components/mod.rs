@@ -431,13 +431,14 @@ pub(crate) fn test_pricing() -> ModelPricing {
 pub(crate) fn test_model() -> maki_providers::Model {
     maki_providers::Model {
         id: "test-model".into(),
-        provider: std::sync::Arc::<str>::from("anthropic"),
+        provider: std::sync::Arc::<str>::from("responses"),
         tier: maki_providers::ModelTier::Medium,
-        family: maki_providers::ModelFamily::Claude,
+        family: maki_providers::ModelFamily::Gpt,
         supports_tool_examples_override: None,
         thinking_override: None,
         supports_vision_override: Some(true),
         supports_fast_override: None,
+        supports_deferred_tools_override: None,
         pricing: test_pricing(),
         subsidised_by: None,
         discovered_free: false,

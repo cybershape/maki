@@ -312,7 +312,7 @@ mod tests {
 
     const ORIGIN_CWD: &str = "/origin";
     const IMPORT_CWD: &str = "/imported";
-    const MODEL: &str = "anthropic/claude-opus-5";
+    const MODEL: &str = "responses/claude-opus-5";
     const PROMPT: &str = "fix the bug";
     const NEWER_FORMAT_VERSION: u32 = u32::MAX;
     const NOT_JSON: &str = "{ not json";

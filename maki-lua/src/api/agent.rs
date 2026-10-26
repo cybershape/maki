@@ -1756,7 +1756,7 @@ mod tests {
         shown: ThinkingConfig,
         expected_grandchild: ThinkingConfig,
     ) {
-        let mut model = Model::from_spec("llama-cpp/default").unwrap();
+        let mut model = Model::from_spec("responses/default").unwrap();
         model.thinking_override = Some(ThinkingSupport::Yes);
         let mut intermediate = model.clone();
         intermediate.thinking_fields = Some(Box::new(serde_json::from_value(fields).unwrap()));

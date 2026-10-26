@@ -336,7 +336,7 @@ mod tests {
 
     const CWD: &str = "/here";
     const ORIGIN_CWD: &str = "/origin";
-    const MODEL: &str = "anthropic/claude-opus-5";
+    const MODEL: &str = "responses/claude-opus-5";
     const UNKNOWN_MODEL: &str = "nowhere/model-from-2024";
     const TITLE: &str = "moved session";
     const MULTILINE_TITLE: &str = "moved\n  session";

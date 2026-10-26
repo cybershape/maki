@@ -351,27 +351,6 @@ mod tests {
         assert_eq!(t("ollama/unknown", None), ModelTier::Medium);
     }
 
-    #[test]
-    fn curated_provider_ignores_discovered_tiers() {
-        let mut reg = ModelRegistry::default();
-        reg.set_known_models(
-            "zai",
-            vec![ModelInfo {
-                tier: Some(ModelTier::Strong),
-                ..ModelInfo::id_only("glm-large-vision".into())
-            }],
-        );
-
-        assert_ne!(
-            reg.tier_for("zai/glm-large-vision", "zai", None),
-            ModelTier::Strong
-        );
-        assert_ne!(
-            reg.spec_for_tier("zai", ModelTier::Strong),
-            Some("zai/glm-large-vision".into())
-        );
-    }
-
     fn make_tiered(models: &[(&str, ModelTier)]) -> ModelRegistry {
         let mut reg = ModelRegistry::default();
         reg.set_known_models(
@@ -413,8 +392,6 @@ mod tests {
         );
     }
 
-    #[test_case(&[("gpt-5.4", ModelTier::Strong), ("claude-opus-4.7", ModelTier::Strong)], "copilot/claude-opus-4.7"; "curated default beats discovered tier")]
-    #[test_case(&[("claude-opus-4.6", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/claude-opus-4.6"; "later curated prefix when first is unavailable")]
     #[test_case(&[("zeta", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/alpha"; "lowest id when no curated default is entitled")]
     fn spec_for_tier_prefers_entitled_curated_default(
         models: &[(&str, ModelTier)],

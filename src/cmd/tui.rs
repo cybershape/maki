@@ -22,7 +22,7 @@ use crate::provider_scripts;
 use crate::resume::{self, Resolved};
 use crate::setup;
 
-const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
+const FALLBACK_MODEL_SPEC: &str = "responses/default";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
 const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
@@ -589,7 +589,7 @@ mod tests {
     use tempfile::tempdir;
     use test_case::test_case;
 
-    const STARTUP_SPEC: &str = "anthropic/claude-sonnet-4-5";
+    const STARTUP_SPEC: &str = "responses/claude-sonnet-4-5";
     const STORED_SPEC: &str = "zai/glm-4.6";
     const CWD: &str = "/project";
     const STORED_MESSAGE: &str = "the turn the stored session already had";

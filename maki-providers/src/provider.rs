@@ -11,9 +11,6 @@ use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelInfo};
 use crate::model_registry::set_known_models;
-use crate::providers::catalog::{
-    available_if_warm, catalog_providers, catalog_providers_if_available, try_create,
-};
 use crate::providers::{KeyRotation, Timeouts, custom, plugin};
 use crate::spec::{Owner, ProviderRegistry};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
@@ -63,13 +60,10 @@ pub trait Provider: Send + Sync {
 
 pub fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
     match Owner::of(slug) {
-        Owner::Builtin(new) => new(timeouts),
-        Owner::Plugin => plugin::create(slug, timeouts),
         Owner::Custom => custom::create(slug, timeouts),
-        Owner::Catalog | Owner::Unknown => try_create(slug, timeouts).unwrap_or_else(|| {
-            Err(AgentError::Config {
-                message: format!("unknown provider '{slug}'"),
-            })
+        Owner::Plugin => plugin::create(slug, timeouts),
+        _ => Err(AgentError::Config {
+            message: format!("unknown provider '{slug}'"),
         }),
     }
 }
@@ -82,10 +76,7 @@ pub fn provider_available(slug: &str) -> bool {
 /// catalog-backed slugs consult only the already-warm catalog, so a cold cache
 /// reports them unavailable instead of blocking on a network fetch.
 fn provider_available_offline(slug: &str) -> bool {
-    match Owner::of(slug) {
-        Owner::Builtin(_) | Owner::Plugin | Owner::Custom => provider_available(slug),
-        Owner::Catalog | Owner::Unknown => available_if_warm(slug),
-    }
+    provider_available(slug)
 }
 
 pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
@@ -180,26 +171,6 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
             specs.push(spec);
         }
     }
-    if let Some(catalog) = catalog_providers_if_available() {
-        for cat in catalog {
-            // Any slug the registry knows was listed above; see
-            // `spec::tests::builtins_are_the_native_and_catalog_backed_slugs`.
-            if ProviderRegistry::get(&cat.slug).is_some()
-                || matches!(Owner::of(&cat.slug), Owner::Plugin | Owner::Custom)
-            {
-                continue;
-            }
-            if !provider_available(&cat.slug) {
-                continue;
-            }
-            for model_id in cat.models.keys() {
-                let spec = format!("{}/{}", cat.slug, model_id);
-                if !specs.contains(&spec) {
-                    specs.push(spec);
-                }
-            }
-        }
-    }
     specs.retain(|spec| policy.allows(spec));
     specs
 }
@@ -260,32 +231,6 @@ pub async fn fetch_all_models(
         .detach();
     }
 
-    let tx_catalog = tx.clone();
-    smol::spawn(async move {
-        let catalog = smol::unblock(catalog_providers).await;
-        for cat in catalog {
-            // No `Owner::Custom` here, unlike `available_model_specs` above:
-            // a long-standing asymmetry, changing it is a behaviour change.
-            if ProviderRegistry::get(&cat.slug).is_some()
-                || matches!(Owner::of(&cat.slug), Owner::Plugin)
-            {
-                continue;
-            }
-            if !provider_available(&cat.slug) {
-                continue;
-            }
-            let slug = cat.slug;
-            let models: Vec<String> = cat.models.keys().map(|id| format!("{slug}/{id}")).collect();
-            let _ = tx_catalog
-                .send_async(ModelBatch {
-                    models,
-                    warnings: Vec::new(),
-                })
-                .await;
-        }
-    })
-    .detach();
-
     let tx_custom = tx.clone();
     smol::spawn(async move {
         let declared = custom::declared_model_specs();
@@ -340,23 +285,13 @@ mod tests {
 
     #[test]
     fn available_specs_apply_model_policy() {
-        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-model-policy") };
-        let policy = policy(&["openai/*"], &["*/gpt-5.6-terra"]);
-
+        let policy = policy(&["responses/*"], &["*/excluded"]);
         let specs = available_model_specs(&policy);
-        unsafe { std::env::remove_var("OPENAI_API_KEY") };
-
-        assert!(!specs.is_empty());
-        assert!(specs.iter().all(|spec| spec.starts_with("openai/")));
-        assert!(!specs.iter().any(|spec| spec == "openai/gpt-5.6-terra"));
+        assert!(!specs.iter().any(|spec| spec.ends_with("/excluded")));
     }
 
     #[test]
     fn provider_for_slug_unknown_returns_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        crate::providers::catalog::warm_empty_catalog_for_tests(maki_storage::StateDir::from_path(
-            tmp.path().to_path_buf(),
-        ));
         let result = provider_for_slug("nonexistent-provider-xyz", Timeouts::default());
         match result {
             Err(e) => {

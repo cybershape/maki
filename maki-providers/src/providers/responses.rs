@@ -9,25 +9,38 @@ use isahc::{HttpClient, Request};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::model::Model;
-use crate::providers::copilot::copilot_usd;
-use crate::providers::openai_compat::tool_parameters;
-use crate::providers::{ResolvedAuth, sse_error_status};
+use std::sync::Arc;
+
+use crate::model::{Model, ModelInfo};
+use crate::provider::{BoxFuture, Provider};
+use crate::providers::{ResolvedAuth, Timeouts, sse_error_status};
 use crate::types::EffortDialect;
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
-    ThinkingConfig, TokenUsage, dialect,
+    AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
+    StreamResponse, ThinkingConfig, TokenUsage, dialect,
 };
+use futures_lite::AsyncReadExt;
+use maki_config::providers::ProvidersConfig;
+use maki_storage::id::SessionRef;
 
 const RESPONSES_PATH: &str = "/responses";
 const FAILED_RESPONSE_STATUS: u16 = 500;
+const NANO_AIU_PER_USD: f64 = 100_000_000_000.0;
 
-pub(crate) fn build_body(
-    model: &Model,
-    messages: &[Message],
-    system: &str,
-    tools: &Value,
-) -> Value {
+fn copilot_usd(copilot_usage: &Value) -> Option<f64> {
+    copilot_usage["total_nano_aiu"]
+        .as_f64()
+        .map(|nano_aiu| nano_aiu / NANO_AIU_PER_USD)
+}
+
+fn tool_parameters(tool: &Value) -> Value {
+    match tool.get("input_schema") {
+        Some(schema) if schema.is_object() => schema.clone(),
+        _ => json!({ "type": "object", "properties": {} }),
+    }
+}
+
+pub fn build_body(model: &Model, messages: &[Message], system: &str, tools: &Value) -> Value {
     let input = convert_input(messages);
     let wire_tools = convert_tools(tools);
 
@@ -237,7 +250,7 @@ async fn post_responses(
                 .method("POST")
                 .uri(format!("{base}{RESPONSES_PATH}"))
                 .header("content-type", "application/json")
-                .header("user-agent", super::super::user_agent()),
+                .header("user-agent", super::user_agent()),
         )
         .body(json_body)?;
 
@@ -259,6 +272,187 @@ async fn post_responses(
         .await
     } else {
         Err(AgentError::from_response(response).await)
+    }
+}
+
+pub struct ResponsesProvider {
+    pub slug: String,
+    pub base_url: Option<String>,
+    pub system_prefix: Option<String>,
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    client: HttpClient,
+    body_hook: Option<Arc<dyn super::codec::BodyHook>>,
+}
+
+impl ResponsesProvider {
+    pub fn new(
+        slug: String,
+        base_url: Option<String>,
+        auth: Arc<Mutex<ResolvedAuth>>,
+        timeouts: Timeouts,
+    ) -> Self {
+        Self {
+            slug,
+            base_url,
+            system_prefix: None,
+            auth,
+            timeouts,
+            client: super::http_client(timeouts),
+            body_hook: None,
+        }
+    }
+
+    pub fn with_body_hook(mut self, hook: Option<Arc<dyn super::codec::BodyHook>>) -> Self {
+        self.body_hook = hook;
+        self
+    }
+
+    pub fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
+        self.system_prefix = prefix;
+        self
+    }
+
+    fn resolve_url(&self, auth: &ResolvedAuth) -> Option<String> {
+        if let Some(b) = &auth.base_url {
+            return Some(b.clone());
+        }
+        if let Some(env) = maki_config::providers::base_url_override(&self.slug) {
+            return Some(env);
+        }
+        let config = ProvidersConfig::load();
+        if let Some(def) = config.get(&self.slug)
+            && let Some(b) = &def.base_url
+        {
+            return Some(b.clone());
+        }
+        self.base_url.clone()
+    }
+
+    async fn do_list_models(&self, auth: &ResolvedAuth) -> Result<Vec<ModelInfo>, AgentError> {
+        if let Some(base) = self.resolve_url(auth) {
+            let url = format!("{base}/models");
+            if let Ok(req) = auth
+                .configure_request(
+                    Request::builder()
+                        .method("GET")
+                        .uri(&url)
+                        .header("user-agent", super::user_agent()),
+                )
+                .body(())
+                && let Ok(mut resp) = self.client.send_async(req).await
+                && resp.status().as_u16() == 200
+            {
+                let mut text = String::new();
+                if resp.body_mut().read_to_string(&mut text).await.is_ok()
+                    && let Ok(val) = serde_json::from_str::<Value>(&text)
+                    && let Some(data) = val["data"].as_array()
+                {
+                    let mut models: Vec<ModelInfo> = data
+                        .iter()
+                        .filter_map(|m| {
+                            let id = m["id"].as_str()?;
+                            Some(ModelInfo {
+                                id: id.to_string(),
+                                context_window: m["context_length"]
+                                    .as_u64()
+                                    .or_else(|| m["max_model_len"].as_u64())
+                                    .and_then(|v| u32::try_from(v).ok()),
+                                max_output_tokens: m["max_tokens"]
+                                    .as_u64()
+                                    .and_then(|v| u32::try_from(v).ok()),
+                                pricing: None,
+                                supports_thinking: None,
+                                supports_vision: None,
+                                tier: None,
+                                provider_info: None,
+                                extra: None,
+                                effort: None,
+                            })
+                        })
+                        .collect();
+                    models.sort_by(|a, b| a.id.cmp(&b.id));
+                    if !models.is_empty() {
+                        return Ok(models);
+                    }
+                }
+            }
+        }
+        let config = ProvidersConfig::load();
+        if let Some(def) = config.get(&self.slug) {
+            let models: Vec<ModelInfo> = def
+                .models
+                .iter()
+                .map(|m| ModelInfo {
+                    id: m.id.clone(),
+                    context_window: m.context_window,
+                    max_output_tokens: m.max_output_tokens,
+                    pricing: None,
+                    supports_thinking: m.supports_thinking,
+                    supports_vision: m.supports_vision,
+                    tier: Some(m.tier),
+                    provider_info: None,
+                    extra: None,
+                    effort: None,
+                })
+                .collect();
+            return Ok(models);
+        }
+        Ok(Vec::new())
+    }
+}
+
+impl Provider for ResponsesProvider {
+    fn stream_message<'a>(
+        &'a self,
+        model: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        tools: &'a Value,
+        event_tx: &'a Sender<ProviderEvent>,
+        opts: RequestOptions,
+        _session_id: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        let mut auth = self.auth.lock().unwrap().clone();
+        if auth.base_url.is_none() {
+            auth.base_url = self.resolve_url(&auth);
+        }
+        Box::pin(async move {
+            let effective_system = match &self.system_prefix {
+                Some(prefix) => format!("{prefix}\n\n{system}"),
+                None => system.to_string(),
+            };
+            let mut body = build_body(model, messages, &effective_system, tools);
+            if let Some((fields, fallback)) = model.effective_thinking_fields() {
+                opts.thinking
+                    .apply_fields(&mut body, model, fields, fallback);
+            } else {
+                apply_responses_reasoning(&mut body, opts.thinking, model, &dialect::STANDARD);
+            }
+            if let Some(hook) = &self.body_hook {
+                let ctx = super::codec::RequestCtx {
+                    model,
+                    opts: &opts,
+                    session: _session_id,
+                    discovered: None,
+                };
+                body = hook.call(body, &ctx).await?;
+            }
+            do_stream(
+                &self.client,
+                model,
+                &body,
+                event_tx,
+                &auth,
+                self.timeouts.stream,
+            )
+            .await
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        let auth = self.auth.lock().unwrap().clone();
+        Box::pin(async move { self.do_list_models(&auth).await })
     }
 }
 

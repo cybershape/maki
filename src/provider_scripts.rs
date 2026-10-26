@@ -293,8 +293,7 @@ mod tests {
         write(dir.path(), PORTABLE, 0o700);
         write(dir.path(), "not-executable", 0o644);
         write(dir.path(), ".hidden", 0o755);
-        write(dir.path(), "anthropic", 0o755);
-        write(dir.path(), "deepseek", 0o755);
+        write(dir.path(), "responses", 0o755);
         fs::create_dir(dir.path().join("subdir")).unwrap();
 
         let slugs: Vec<String> = scripts_in(dir.path())
@@ -314,7 +313,7 @@ mod tests {
             "acme.bat",
             "notes.txt",
             "no-extension",
-            "anthropic.exe",
+            "responses.exe",
         ] {
             fs::write(dir.path().join(name), "").unwrap();
         }

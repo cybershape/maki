@@ -334,15 +334,13 @@ mod tests {
 
     use super::*;
     use crate::AgentConfig;
-    use crate::mcp::test_support::stub_session;
     use serde_json::json;
     use test_case::test_case;
 
     const DATE: &str = "2026-10-02";
     const NEXT_DATE: &str = "2026-10-03";
     const HINT_KEY: &str = "memory/after_instructions";
-    const NATIVE_MODEL: &str = "anthropic/claude-opus-5";
-    const CLIENT_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const NATIVE_MODEL: &str = "responses/opus-5";
 
     fn facts() -> LiveFacts {
         LiveFacts {
@@ -350,7 +348,7 @@ mod tests {
             prompt: Some(PromptFacts {
                 date: DATE.into(),
                 cwd: "/repo".into(),
-                model: "anthropic/claude-opus-5-5".into(),
+                model: "responses/opus-5-5".into(),
                 instructions: "\n\nProject instructions:\nbe nice".into(),
                 hints: BTreeMap::from([(HINT_KEY.into(), "tags: a, b".into())]),
             }),
@@ -407,12 +405,6 @@ mod tests {
         assert_ne!(
             base,
             fingerprint(&context("a", "custom prompt"), None, &native)
-        );
-        let mcp = stub_session(&[]);
-        assert_ne!(
-            fingerprint(&context("a", ""), Some(&mcp), &native),
-            fingerprint(&context("a", ""), Some(&mcp), &model(CLIENT_MODEL)),
-            "a model without tool search shapes the MCP entries another way"
         );
     }
 }

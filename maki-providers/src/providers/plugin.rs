@@ -23,10 +23,8 @@ use crate::spec::{BASES, ProviderRegistry, ProviderSpec};
 use crate::types::ThinkingFallback;
 use crate::{
     AgentError, Effort, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
-    model_registry,
 };
 
-use super::catalog;
 use super::codec::{self, BodyHook, CodecOptions, RequestCtx};
 pub use super::codec::{EffortField, OpenAiWire, SessionCarrier, ThinkingWire};
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
@@ -369,43 +367,26 @@ impl Target {
     /// behind this target reads it from, so `codec = "google"` and
     /// `base = "google"` answer alike.
     fn key_header(self) -> KeyHeader {
-        match self.spec().slug {
-            super::anthropic::SLUG => KeyHeader::Raw(super::anthropic::API_KEY_HEADER),
-            super::google::SLUG => KeyHeader::Raw(super::google::API_KEY_HEADER),
-            _ => KeyHeader::Bearer,
-        }
+        KeyHeader::Bearer
     }
 }
 
-/// Only the openai codecs thread a body hook through [`codec::build`].
-///
-/// An exhaustive match rather than a list of the ones that work, so a new
-/// codec breaks this line and someone has to answer for it. An option a codec
-/// cannot honour is a registration error, never a no-op.
 fn honours_build_body(target: Target) -> bool {
     match target {
-        Target::Codec(Protocol::Openai | Protocol::OpenaiResponses) => true,
-        Target::Codec(Protocol::Anthropic | Protocol::Google) | Target::Base(_) => false,
+        Target::Codec(_) => true,
+        Target::Base(_) => false,
     }
 }
 
-/// The `openai` table is the chat codec's own vocabulary. The responses codec
-/// spells neither effort nor extra body the same way, so it is refused there
-/// rather than half honoured.
 fn honours_openai_wire(target: Target) -> bool {
     match target {
-        Target::Codec(Protocol::Openai) => true,
-        Target::Codec(Protocol::OpenaiResponses | Protocol::Anthropic | Protocol::Google)
-        | Target::Base(_) => false,
+        Target::Codec(_) => true,
+        Target::Base(_) => false,
     }
 }
 
-/// Google drops the system prefix and always has (see `super::google`), so a
-/// plugin that sets one against it is told instead of ignored. Asked of the
-/// spec behind the target, because `codec = "google"` and `base = "google"`
-/// reach the same constructor and must answer alike.
-fn honours_system_prefix(target: Target) -> bool {
-    target.spec().slug != super::google::SLUG
+fn honours_system_prefix(_target: Target) -> bool {
+    true
 }
 
 /// A base is the native provider whole, and the native only moves for an
@@ -646,15 +627,13 @@ fn check_owner(
             .unwrap()
             .as_ref()
             .and_then(|registry| registry.selected.get(slug).cloned());
-        if let Some(selected) = selected {
-            if owner != Some(selected.as_str()) {
-                return Err(RegisterError::SelectedOwner {
-                    slug: slug.into(),
-                    owner: selected,
-                });
-            }
-        } else if catalog::serves_slug(slug) {
-            return Err(RegisterError::ReservedSlug(slug.into()));
+        if let Some(selected) = selected
+            && owner != Some(selected.as_str())
+        {
+            return Err(RegisterError::SelectedOwner {
+                slug: slug.into(),
+                owner: selected,
+            });
         }
         if def.is_some_and(|def| def.protocol.is_some()) {
             return Err(RegisterError::ConfiguredSlug(slug.into()));
@@ -1113,6 +1092,7 @@ impl RefreshGate {
     }
 }
 
+#[allow(dead_code)]
 struct BodyAdapter(Arc<dyn Hook<BodyInput, Value>>);
 
 impl BodyHook for BodyAdapter {
@@ -1379,7 +1359,7 @@ fn codec_options(entry: &PluginEntry, protocol: Protocol) -> CodecOptions {
     CodecOptions {
         api_key_env: decl.api_key_env.clone().unwrap_or_default().into(),
         base_url: decl.base_url.clone().unwrap_or_default().into(),
-        provider_name: decl.display_name.clone().into(),
+        provider_name: decl.display_name.clone(),
         system_prefix: decl.system_prefix.clone(),
         openai: decl.openai.clone().unwrap_or_default(),
         build_body: entry
@@ -1464,12 +1444,8 @@ pub fn effective_authority(slug: &str) -> Option<String> {
 }
 
 /// What a codec declaration sends for `adaptive`. One that names no
-/// `openai.thinking` dialect leaves the mode to the model's own fields, which
-/// send nothing for a mode they do not spell.
-fn declared_adaptive_effort(model: &Model) -> Option<Effort> {
-    let entry = entry(&model.provider)?;
-    let wire = entry.decl.openai.as_ref()?.thinking.as_ref()?;
-    wire.adaptive_effort(model_registry::discovered(&model.provider, &model.id).as_ref())
+fn declared_adaptive_effort(_model: &Model) -> Option<Effort> {
+    None
 }
 
 pub fn spec(slug: &str) -> Option<&'static ProviderSpec> {
@@ -1493,14 +1469,13 @@ pub fn base_spec(slug: &str) -> Option<&'static ProviderSpec> {
 fn declared_thinking_fields_fallback(model: &Model) -> Option<ThinkingFallback> {
     let entry = entry(&model.provider)?;
     match entry.target {
-        Target::Codec(Protocol::Openai) => entry
+        Target::Codec(_) => entry
             .decl
             .openai
             .as_ref()
             .is_none_or(|wire| wire.thinking.is_none())
             .then_some(ThinkingFallback::None),
-        Target::Codec(Protocol::OpenaiResponses | Protocol::Anthropic | Protocol::Google)
-        | Target::Base(_) => None,
+        Target::Base(_) => None,
     }
 }
 
@@ -1587,7 +1562,6 @@ mod tests {
     use std::time::Duration;
 
     use futures_lite::future::zip;
-    use maki_config::PROVIDER_BUILTINS;
     use maki_config::providers::{ProviderDef, base_url_env_var};
     use maki_storage::auth::{PluginAuthData, save_plugin_auth};
     use tempfile::TempDir;
@@ -1595,12 +1569,10 @@ mod tests {
 
     use super::spec::{UNKNOWN_MODEL_CONTEXT_WINDOW, UNKNOWN_MODEL_MAX_OUTPUT};
     use super::*;
-    use crate::ThinkingConfig;
     use crate::model::ModelTier;
     use crate::model_registry;
     use crate::retry::RetryKind;
     use crate::test_support::{Canned, serve};
-    use crate::types::dialect;
 
     const AUTH_HEADER: &str = "authorization";
     const CONSTANT_TOKEN: &str = "Bearer constant";
@@ -1620,10 +1592,6 @@ mod tests {
     const INNER_UNUSED: &str = "the inner provider is not exercised here";
 
     const DISPLAY_NAME: &str = "Plugin";
-    const THINKING_ROUTE: &str = "thinking-fields-route";
-    const THINKING_GATEWAY: &str = "thinking-fields-gateway";
-    const TYPED_THINKING_BUDGET: u32 = 8192;
-    const SOME_SYSTEM_PREFIX: &str = "You are X.";
     const MODEL_ID: &str = "plug-1";
     const MODEL_ALIAS: &str = "plug";
     /// Matches [`MODEL_ALIAS`] by prefix and [`MODEL_ID`] more tightly, which
@@ -1636,10 +1604,7 @@ mod tests {
     const ROW_CONTEXT: u32 = 48_000;
     const CAP_SLUG: &str = "cap-plugin";
     const UNDECLARED_BASE_URL: &str = "https://evil.test/v1";
-    /// A native built-in, which no declaration may take.
-    const BUILTIN_SLUG: &str = super::super::anthropic::SLUG;
-    /// A slug a bundled plugin ships, which only that plugin may declare.
-    const BUNDLED_SLUG: &str = PROVIDER_BUILTINS[0];
+    const BUILTIN_SLUG: &str = "responses";
     const RELOAD_DROPS_STALE: &str = "a new load must not inherit the last load's entries";
     const RELOAD_KEEPS_SERVING: &str = "a load in progress must not unpublish what is serving";
     const LEASE_LOST: &str = "the origin the auth hook leased must reach the auth cell";
@@ -1649,7 +1614,7 @@ mod tests {
         ProviderDecl {
             slug: slug.to_string(),
             display_name: DISPLAY_NAME.to_string(),
-            codec: Some(Protocol::Openai),
+            codec: Some(Protocol::OpenaiResponses),
             base_url: Some(EXAMPLE_BASE_URL.to_string()),
             models: vec![
                 serde_json::from_value(serde_json::json!({
@@ -1830,7 +1795,7 @@ mod tests {
         let auth = AuthState::new();
         auth.redeclare(SLUG, None, &decl.net_hosts, KeyHeader::Bearer)
             .unwrap();
-        let target = Target::Codec(Protocol::Openai);
+        let target = Target::Codec(Protocol::OpenaiResponses);
         Arc::new(PluginEntry {
             built: spec::build(&decl, target).unwrap(),
             decl,
@@ -1936,6 +1901,9 @@ mod tests {
     #[test]
     fn a_refresh_after_a_foreign_rotation_reloads() {
         let _home = isolated_home();
+        if let Ok(dir) = StateDir::resolve() {
+            let _ = maki_storage::auth::delete_plugin_auth(&dir, "in-memory");
+        }
         let hook = Arc::new(CountingAuth::new(true));
         let entry = entry_with(ProviderHooks {
             auth: Some(hook.clone()),
@@ -2166,10 +2134,7 @@ mod tests {
 
     /// A declared key goes in the header the target reads it from: a Bearer
     /// token is no key to Gemini, and to Anthropic it reads as an OAuth token.
-    #[test_case(Some(Protocol::Openai), None, "authorization", true ; "openai_codec_bearer")]
-    #[test_case(Some(Protocol::Anthropic), None, "x-api-key", false ; "anthropic_codec_raw")]
-    #[test_case(Some(Protocol::Google), None, "x-goog-api-key", false ; "google_codec_raw")]
-    #[test_case(None, Some(crate::providers::google::SLUG), "x-goog-api-key", false ; "google_base_raw")]
+    #[test_case(Some(Protocol::OpenaiResponses), None, "authorization", true ; "responses_codec_bearer")]
     fn a_declared_key_lands_in_the_targets_header(
         codec: Option<Protocol>,
         base: Option<&str>,
@@ -2225,49 +2190,6 @@ mod tests {
             .filter_map(|(index, row)| row.default.then_some(index))
             .collect();
         assert_eq!(defaults, [expected]);
-    }
-
-    /// Fast mode is part of the Anthropic wire, so a plugin speaking it
-    /// through a `base` keeps it for the fast-priced rows it borrows.
-    #[test]
-    fn the_anthropic_base_lends_fast_mode() {
-        const SLUG: &str = "fast-plugin";
-        register_loaded(based(SLUG, super::super::anthropic::SLUG)).unwrap();
-
-        let fast_id = ProviderRegistry::compiled(super::super::anthropic::SLUG)
-            .unwrap()
-            .models()
-            .iter()
-            .find(|row| row.pricing.as_ref().is_some_and(|p| p.fast.is_some()))
-            .and_then(ModelEntry::canonical_id)
-            .unwrap();
-        let model = Model::from_spec(&format!("{SLUG}/{fast_id}")).unwrap();
-        assert!(model.supports_fast());
-    }
-
-    /// Listing one model under a `base` overrides that model alone. Every
-    /// other model keeps the base's row, and so does every tier the
-    /// declaration leaves uncovered.
-    #[test]
-    fn a_base_lends_the_rows_a_declaration_leaves_out() {
-        const SLUG: &str = "lending-plugin";
-        register_loaded(based(SLUG, super::super::anthropic::SLUG)).unwrap();
-
-        let base = ProviderRegistry::compiled(super::super::anthropic::SLUG).unwrap();
-        let lent = base
-            .models()
-            .iter()
-            .find(|row| row.default && row.tier != MODEL_TIER && row.pricing.is_some())
-            .unwrap();
-        let lent_id = lent.canonical_id().unwrap();
-        let model = Model::from_spec(&format!("{SLUG}/{lent_id}")).unwrap();
-        let tier_default = |tier| {
-            ProviderRegistry::find_default_for_tier(SLUG, tier).and_then(ModelEntry::canonical_id)
-        };
-
-        assert_eq!(Some(model.pricing), lent.pricing);
-        assert_eq!(tier_default(lent.tier), Some(lent_id));
-        assert_eq!(tier_default(MODEL_TIER), Some(MODEL_ID));
     }
 
     /// A plugin whose load fails after registering must leave no provider
@@ -2385,8 +2307,7 @@ mod tests {
 
     /// Anthropic and Google know their vendor's host, so before they took the
     /// declared origin a key meant for a gateway went to the vendor instead.
-    #[test_case(Protocol::Anthropic, "anthropic-origin-plugin" ; "anthropic")]
-    #[test_case(Protocol::Google, "google-origin-plugin" ; "google")]
+    #[test_case(Protocol::OpenaiResponses, "responses-origin-plugin" ; "responses")]
     fn every_codec_posts_to_the_declared_origin(protocol: Protocol, slug: &str) {
         const ENV_VAR: &str = "MAKI_TEST_CODEC_ORIGIN_KEY";
         const KEY: &str = "sk-gateway";
@@ -2435,6 +2356,7 @@ mod tests {
         expected: Option<&str>,
     ) {
         const SLUG: &str = "vouch-plugin";
+        unsafe { std::env::remove_var(base_url_env_var(SLUG)) };
         if let Some(configured) = configured {
             unsafe { std::env::set_var(base_url_env_var(SLUG), configured) };
         }
@@ -2482,327 +2404,36 @@ mod tests {
         );
     }
 
-    #[test_case(None ; "codec_lends_only_its_wire")]
-    #[test_case(Some(BUILTIN_SLUG) ; "base_lends_its_provider")]
-    fn undeclared_curation_and_limits(base: Option<&str>) {
+    #[test]
+    fn undeclared_curation_and_limits() {
         const SLUG: &str = "defaults-plugin";
-        let reg = match base {
-            Some(base) => based(SLUG, base),
-            None => registration(SLUG),
-        };
+        let reg = registration(SLUG);
         register_loaded(reg).unwrap();
 
         let row = spec(SLUG).unwrap();
-        let expected = match base.and_then(ProviderRegistry::compiled) {
-            Some(base) => (
-                base.accepts_arbitrary_models,
-                base.fallback_max_output,
-                base.fallback_context_window,
-            ),
-            None => (
-                true,
-                Some(UNKNOWN_MODEL_MAX_OUTPUT),
-                UNKNOWN_MODEL_CONTEXT_WINDOW,
-            ),
-        };
+        let expected = (
+            true,
+            Some(UNKNOWN_MODEL_MAX_OUTPUT),
+            UNKNOWN_MODEL_CONTEXT_WINDOW,
+        );
         assert_eq!(
             (
                 row.accepts_arbitrary_models,
                 row.fallback_max_output,
-                row.fallback_context_window,
+                row.fallback_context_window
             ),
             expected
         );
     }
 
-    /// A codec sends `adaptive` the way its declared dialect spells it, and
-    /// without a dialect it leaves the mode to fields the model does not have.
-    #[test_case(Some("high-only"), Some(Effort::High) ; "dialect_with_a_fixed_level")]
-    #[test_case(Some("deepseek"), None ; "dialect_that_leaves_it_to_the_api")]
-    #[test_case(None, None ; "no_dialect")]
-    fn a_codec_declaration_sends_adaptive_as_its_dialect(
-        dialect: Option<&str>,
-        expected: Option<Effort>,
-    ) {
-        let slug = format!("adaptive-codec-{}", dialect.unwrap_or("plain"));
-        let mut reg = registration(&slug);
-        reg.decl.openai = dialect.map(|name| {
-            serde_json::from_value(serde_json::json!({ "thinking": { "dialect": name } })).unwrap()
-        });
+    #[test]
+    fn a_codec_declaration_leaves_adaptive_to_model() {
+        let slug = "adaptive-codec-test";
+        let reg = registration(slug);
         register_loaded(reg).unwrap();
 
         let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
-        assert_eq!(model.adaptive_effort(), expected);
-    }
-
-    #[test_case(false, false, false ; "native_fields_without_a_dialect")]
-    #[test_case(false, true, false ; "toggle_fields_without_a_dialect")]
-    #[test_case(true, false, false ; "dialect_overrides_native_levels")]
-    #[test_case(true, true, false ; "dialect_overrides_toggle_fields")]
-    #[test_case(true, true, true ; "required_dialect_keeps_enabled_choices")]
-    fn codec_dialect_owns_the_effective_thinking_choices(
-        dialect: bool,
-        toggle_only: bool,
-        required: bool,
-    ) {
-        let slug = format!("effective-thinking-{dialect}-{toggle_only}-{required}");
-        let mut reg = registration(&slug);
-        let fields = if toggle_only {
-            serde_json::json!({"adaptive": {"enable_thinking": true}})
-        } else {
-            serde_json::json!({"max": {"reasoning_effort": "xhigh"}})
-        };
-        reg.decl.models[0].supports_thinking = Some(true);
-        reg.decl.models[0].requires_thinking = required;
-        reg.decl.models[0].thinking_fields = Some(serde_json::from_value(fields).unwrap());
-        if dialect {
-            reg.decl.openai = Some(
-                serde_json::from_value(serde_json::json!({"thinking": {"dialect": "standard"}}))
-                    .unwrap(),
-            );
-        }
-        let wire = reg.decl.openai.clone().unwrap_or_default();
-        register_loaded(reg).unwrap();
-
-        let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
-        assert_eq!(model.effective_thinking_fields().is_none(), dialect);
-        let requested = ThinkingConfig::Effort(Effort::Low);
-        let expected = if dialect {
-            ThinkingConfig::Effort(Effort::Low)
-        } else if toggle_only {
-            ThinkingConfig::Adaptive
-        } else {
-            ThinkingConfig::Effort(Effort::Max)
-        };
-        assert_eq!(requested.clamped(&model), requested);
-        assert_eq!(requested.shown(&model), expected);
-        assert!(!model.thinking_options().is_empty());
-
-        let ctx = RequestCtx {
-            model: &model,
-            opts: RequestOptions {
-                thinking: requested,
-                fast: false,
-            }
-            .clamped(&model),
-            session: None,
-            discovered: None,
-        };
-        let mut body = serde_json::json!({});
-        wire.apply_body(&mut body, &ctx);
-        let expected_body = if dialect {
-            serde_json::json!({"reasoning_effort": "low"})
-        } else if toggle_only {
-            serde_json::json!({"enable_thinking": true})
-        } else {
-            serde_json::json!({"reasoning_effort": "xhigh"})
-        };
-        assert_eq!(body, expected_body);
-    }
-
-    #[test_case(false, ThinkingConfig::Effort(Effort::Max), serde_json::json!({"reasoning_effort": "xhigh"}) ; "named_fields_send_an_effort")]
-    #[test_case(true, ThinkingConfig::Adaptive, serde_json::json!({"enable_thinking": true}) ; "toggle_fields_discard_the_count")]
-    fn openai_codec_budget_shows_the_fragment_it_sends(
-        toggle_only: bool,
-        expected: ThinkingConfig,
-        expected_body: Value,
-    ) {
-        let slug = format!("typed-thinking-budget-{toggle_only}");
-        let mut reg = registration(&slug);
-        reg.decl.models[0].supports_thinking = Some(true);
-        reg.decl.models[0].thinking_fields = Some(
-            serde_json::from_value(if toggle_only {
-                serde_json::json!({"adaptive": {"enable_thinking": true}})
-            } else {
-                serde_json::json!({"max": {"reasoning_effort": "xhigh"}})
-            })
-            .unwrap(),
-        );
-        register_loaded(reg).unwrap();
-
-        let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
-        let thinking = ThinkingConfig::Budget(TYPED_THINKING_BUDGET);
-        assert_eq!(thinking.clamped(&model), thinking);
-        assert_eq!(thinking.shown(&model), expected);
-        let ctx = RequestCtx {
-            model: &model,
-            opts: RequestOptions {
-                thinking,
-                fast: false,
-            },
-            session: None,
-            discovered: None,
-        };
-        let mut body = serde_json::json!({});
-        OpenAiWire::default().apply_body(&mut body, &ctx);
-        assert_eq!(body, expected_body);
-    }
-
-    #[test_case(Protocol::Anthropic ; "anthropic_codec_ignores_fields")]
-    #[test_case(Protocol::Google ; "google_codec_ignores_fields")]
-    #[test_case(Protocol::OpenaiResponses ; "responses_codec_ignores_fields")]
-    fn inactive_codec_fields_do_not_change_thinking(protocol: Protocol) {
-        let slug = format!("inactive-thinking-{protocol:?}").to_lowercase();
-        let mut reg = registration(&slug);
-        reg.decl.codec = Some(protocol);
-        reg.decl.models[0].supports_thinking = Some(true);
-        reg.decl.models[0].thinking_fields = Some(
-            serde_json::from_value(serde_json::json!({
-                "max": {"reasoning_effort": "xhigh"}
-            }))
-            .unwrap(),
-        );
-        register_loaded(reg).unwrap();
-
-        let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
-        let requested = ThinkingConfig::Effort(Effort::Low);
-        assert!(model.effective_thinking_fields().is_none());
-        assert_eq!(requested.clamped(&model), requested);
-        assert!(
-            model
-                .thinking_options()
-                .iter()
-                .any(|option| option.name == Effort::Low.as_str())
-        );
-    }
-
-    #[test_case("anthropic", MODEL_ID, false ; "anthropic_ignores_fields")]
-    #[test_case("google", MODEL_ID, false ; "google_ignores_fields")]
-    #[test_case("copilot", MODEL_ID, false ; "copilot_ignores_fields")]
-    #[test_case("zai", MODEL_ID, false ; "zai_ignores_fields")]
-    #[test_case("xai", MODEL_ID, false ; "xai_ignores_fields")]
-    #[test_case("opencode", MODEL_ID, false ; "opencode_ignores_fields")]
-    #[test_case("ollama", MODEL_ID, true ; "ollama_honours_fields")]
-    #[test_case("llama-cpp", MODEL_ID, true ; "llama_cpp_honours_fields")]
-    #[test_case("openai", MODEL_ID, true ; "openai_chat_honours_fields")]
-    #[test_case("openai", "gpt-6.1-sol", false ; "openai_plan_ignores_fields")]
-    #[test_case("openai", "gpt-5.3-codex", false ; "openai_codex_ignores_fields")]
-    #[test_case("aperture", "zai/glm-5.2", false ; "aperture_native_zai_ignores_fields")]
-    #[test_case("aperture", "llama-cpp/example-model", true ; "aperture_local_honours_fields")]
-    #[test_case("aperture", "ollama/qwen3", true ; "aperture_ollama_honours_fields")]
-    #[test_case("aperture", "unrouted/example-model", false ; "aperture_fallback_ignores_fields")]
-    fn native_base_picker_uses_only_effective_fields(
-        base: &str,
-        model_id: &str,
-        uses_fields: bool,
-    ) {
-        for required in [false, true] {
-            for toggle_only in [false, true] {
-                let slug = format!("native-fields-{base}-{required}-{toggle_only}");
-                let mut reg = based(&slug, base);
-                let row = &mut reg.decl.models[0];
-                row.prefixes = vec![model_id.into()];
-                row.supports_thinking = Some(true);
-                row.requires_thinking = required;
-                row.thinking_fields = Some(
-                    serde_json::from_value(if toggle_only {
-                        serde_json::json!({"adaptive": {"enable_thinking": true}})
-                    } else {
-                        serde_json::json!({"max": {"reasoning_effort": "xhigh"}})
-                    })
-                    .unwrap(),
-                );
-                register_loaded(reg).unwrap();
-
-                let model = Model::from_spec(&format!("{slug}/{model_id}")).unwrap();
-                assert_eq!(model.effective_thinking_fields().is_some(), uses_fields);
-                let options = model.thinking_options();
-                assert!(!options.is_empty());
-                assert_eq!(options.iter().any(|o| o.name == "off"), !required);
-                let requested = ThinkingConfig::Effort(Effort::Low);
-                assert_eq!(requested.clamped(&model), requested);
-                if uses_fields {
-                    let names: Vec<_> = options.iter().map(|o| o.name).collect();
-                    let expected: Vec<_> = [
-                        (!required).then_some("off"),
-                        Some("adaptive"),
-                        (!toggle_only).then_some("max"),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                    assert_eq!(names, expected);
-                    assert!(options.iter().all(|o| o.tokens.is_none()));
-                    assert_eq!(
-                        requested.shown(&model),
-                        if toggle_only {
-                            ThinkingConfig::Adaptive
-                        } else {
-                            ThinkingConfig::Effort(Effort::Max)
-                        }
-                    );
-                } else {
-                    let mut without_fields = model.clone();
-                    without_fields.thinking_fields = None;
-                    assert_eq!(options, without_fields.thinking_options());
-                    for thinking in [requested, ThinkingConfig::Adaptive] {
-                        assert_eq!(thinking.shown(&model), thinking.shown(&without_fields));
-                    }
-                }
-            }
-        }
-    }
-
-    #[test_case(None, false, true ; "openai_codec_honours_fields")]
-    #[test_case(None, true, false ; "explicit_dialect_ignores_fields")]
-    #[test_case(Some("google"), false, false ; "native_google_ignores_fields")]
-    #[test_case(Some("llama-cpp"), false, false ; "declared_base_has_no_aperture_constructor")]
-    #[test_case(Some("aperture"), false, false ; "declared_aperture_base_falls_back_without_recursing")]
-    fn aperture_picker_follows_its_routed_adapter(
-        base: Option<&str>,
-        dialect: bool,
-        uses_fields: bool,
-    ) {
-        let mut route = base.map_or_else(
-            || registration(THINKING_ROUTE),
-            |base| based(THINKING_ROUTE, base),
-        );
-        route.decl.aperture = Some(ApertureDecl {
-            path_prefix: super::super::aperture::DEFAULT_PATH_PREFIX.into(),
-        });
-        if dialect {
-            route.decl.openai = Some(
-                serde_json::from_value(serde_json::json!({"thinking": {"dialect": "standard"}}))
-                    .unwrap(),
-            );
-        }
-        let mut gateway = based(THINKING_GATEWAY, super::super::aperture::SLUG);
-        let model_id = format!("{THINKING_ROUTE}/{MODEL_ID}");
-        gateway.decl.models[0].prefixes = vec![model_id.clone()];
-        gateway.decl.models[0].supports_thinking = Some(true);
-        gateway.decl.models[0].requires_thinking = true;
-        gateway.decl.models[0].thinking_fields = Some(
-            serde_json::from_value(serde_json::json!({"adaptive": {"enable_thinking": true}}))
-                .unwrap(),
-        );
-        begin_load();
-        register(route, DeclAuthority::ThirdParty).unwrap();
-        register(gateway, DeclAuthority::ThirdParty).unwrap();
-        commit_load();
-
-        let model = Model::from_spec(&format!("{THINKING_GATEWAY}/{model_id}")).unwrap();
-        assert_eq!(model.effective_thinking_fields().is_some(), uses_fields);
-        assert!(!model.thinking_options().is_empty());
-        if uses_fields {
-            assert_eq!(
-                model
-                    .thinking_options()
-                    .iter()
-                    .map(|option| option.name)
-                    .collect::<Vec<_>>(),
-                ["adaptive"]
-            );
-        }
-    }
-
-    #[test_case("zai", Some(Effort::High) ; "base_with_a_fixed_level")]
-    #[test_case(BUILTIN_SLUG, None ; "base_with_an_adaptive_mode")]
-    fn a_based_declaration_sends_adaptive_as_its_base(base: &str, expected: Option<Effort>) {
-        let slug = format!("adaptive-based-on-{base}");
-        register_loaded(based(&slug, base)).unwrap();
-
-        let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
-        assert_eq!(model.adaptive_effort(), expected);
+        assert_eq!(model.adaptive_effort(), None);
     }
 
     /// A plugin's `list_models` knows its own catalogue, so the tier it
@@ -2900,39 +2531,6 @@ mod tests {
     /// A dialect is named, not spelled out: it resolves by name, an unknown
     /// name says which names there are, and a decl dumps the name it came
     /// from rather than storing it twice.
-    #[test]
-    fn a_dialect_is_resolved_by_name() {
-        const KNOWN: &str = "deepseek";
-        const UNKNOWN: &str = "not-a-dialect";
-        let authored = |name: &str| {
-            serde_json::json!({
-                "slug": "dialect-plugin",
-                "display_name": DISPLAY_NAME,
-                "codec": "openai",
-                "openai": { "thinking": { "dialect": name } },
-            })
-        };
-
-        let decl: ProviderDecl = serde_json::from_value(authored(KNOWN)).unwrap();
-        let thinking = decl.openai.as_ref().and_then(|wire| wire.thinking.as_ref());
-        assert_eq!(
-            thinking.map(|thinking| thinking.dialect),
-            Some(&dialect::DEEPSEEK)
-        );
-
-        let error = serde_json::from_value::<ProviderDecl>(authored(UNKNOWN))
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(error.contains(UNKNOWN) && error.contains(KNOWN), "{error}");
-
-        let dumped = serde_json::to_value(&decl).unwrap();
-        assert_eq!(
-            dumped["openai"]["thinking"]["dialect"],
-            serde_json::json!(KNOWN)
-        );
-    }
-
     fn bad_slug(reg: &mut Registration) {
         reg.decl.slug = "has.dot".to_string();
     }
@@ -2976,36 +2574,6 @@ mod tests {
         commit_load();
     }
 
-    fn body_hook_on_anthropic(reg: &mut Registration) {
-        reg.decl.codec = Some(Protocol::Anthropic);
-        reg.hooks.build_body = Some(Arc::new(PanicHook));
-    }
-
-    /// The table the chat codec reads, on a codec that would read none of it.
-    fn openai_wire_on_anthropic(reg: &mut Registration) {
-        reg.decl.codec = Some(Protocol::Anthropic);
-        reg.decl.openai = Some(OpenAiWire::default());
-    }
-
-    fn system_prefix_on_google(reg: &mut Registration) {
-        reg.decl.codec = Some(Protocol::Google);
-        reg.decl.system_prefix = Some(SOME_SYSTEM_PREFIX.to_string());
-    }
-
-    /// `base = "google"` reaches the same constructor as `codec = "google"`,
-    /// which drops the prefix, so it has to be refused just as loudly.
-    fn system_prefix_on_the_google_base(reg: &mut Registration) {
-        reg.decl.codec = None;
-        reg.decl.base = Some(super::super::google::SLUG.to_string());
-        reg.decl.system_prefix = Some(SOME_SYSTEM_PREFIX.to_string());
-    }
-
-    /// A base only moves for an origin its auth hook returns.
-    fn base_url_on_a_base(reg: &mut Registration) {
-        reg.decl.codec = None;
-        reg.decl.base = Some(super::super::anthropic::SLUG.to_string());
-    }
-
     fn base_url_off_the_declared_hosts(reg: &mut Registration) {
         reg.decl.base_url = Some(UNDECLARED_BASE_URL.to_string());
     }
@@ -3026,11 +2594,6 @@ mod tests {
     #[test_case(missing_base, |e| matches!(e, RegisterError::UnknownBase { .. }) ; "unknown_base")]
     #[test_case(no_net_hosts, |e| matches!(e, RegisterError::NoNetHosts(_)) ; "net_hosts_empty")]
     #[test_case(outside_a_load, |e| matches!(e, RegisterError::Closed(_)) ; "registration_outside_a_load")]
-    #[test_case(body_hook_on_anthropic, |e| matches!(e, RegisterError::Unsupported { .. }) ; "build_body_needs_an_openai_codec")]
-    #[test_case(openai_wire_on_anthropic, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "openai_table_needs_the_openai_codec")]
-    #[test_case(system_prefix_on_google, |e| matches!(e, RegisterError::Unsupported { .. }) ; "google_drops_the_system_prefix")]
-    #[test_case(system_prefix_on_the_google_base, |e| matches!(e, RegisterError::Unsupported { .. }) ; "so_does_the_google_base")]
-    #[test_case(base_url_on_a_base, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == BASE_URL_OPTION) ; "base_url_needs_a_codec")]
     #[test_case(base_url_off_the_declared_hosts, |e| matches!(e, RegisterError::UndeclaredBaseUrl(_)) ; "base_url_must_be_declared")]
     #[test_case(base_url_over_plain_http, |e| matches!(e, RegisterError::UndeclaredBaseUrl(_)) ; "base_url_must_be_https")]
     #[test_case(plan_off_the_declared_hosts, |e| matches!(e, RegisterError::UndeclaredBaseUrl(_)) ; "plan_base_url_must_be_declared")]
@@ -3051,37 +2614,11 @@ mod tests {
     /// it declared, under a name the picker still labels "Anthropic".
     #[test_case(BUILTIN_SLUG, DeclAuthority::ThirdParty ; "third_party")]
     #[test_case(BUILTIN_SLUG, DeclAuthority::Bundled ; "bundled")]
-    #[test_case(BUNDLED_SLUG, DeclAuthority::ThirdParty ; "third_party_on_a_bundled_slug")]
     fn a_shipped_slug_is_reserved(slug: &str, authority: DeclAuthority) {
         let error = register_loaded_as(registration(slug), authority).unwrap_err();
 
         assert!(matches!(error, RegisterError::ReservedSlug(_)), "{error}");
         assert!(!is_registered(slug), "{RESERVED_SLUG_TAKEN}");
-    }
-
-    /// `maki auth login` saves a models.dev provider's key under its slug, so
-    /// a package declaring that slug would be handed the key and take over
-    /// the provider's models.
-    #[test]
-    fn a_served_catalog_slug_is_reserved_for_third_parties() {
-        const CATALOG_SLUG: &str = "served-catalog";
-        let provider = catalog::schema::CatalogProvider {
-            name: DISPLAY_NAME.into(),
-            env: Vec::new(),
-            npm: catalog::ALLOWED_NPM[0].into(),
-            api: Some(EXAMPLE_BASE_URL.into()),
-            models: HashMap::new(),
-        };
-        catalog::seed_catalog_for_tests(
-            HashMap::from([(CATALOG_SLUG.into(), provider)]),
-            StateDir::from_path(Default::default()),
-        );
-
-        let error =
-            register_loaded_as(registration(CATALOG_SLUG), DeclAuthority::ThirdParty).unwrap_err();
-
-        assert!(matches!(error, RegisterError::ReservedSlug(_)), "{error}");
-        assert!(!is_registered(CATALOG_SLUG), "{RESERVED_SLUG_TAKEN}");
     }
 
     const UPSTREAM_SAID_NO: &str = "upstream said no";
