@@ -7,7 +7,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flume::Sender;
-use maki_agent::agent::tool_dispatch::routed_view;
+use maki_agent::agent::tool_dispatch::{identifier_alias, routed_view};
 use maki_agent::permissions::is_universal_scope;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
 use maki_agent::tools::Tool;
@@ -1266,6 +1266,9 @@ fn routed_tool_entry(lua: &Lua, name: String) -> LuaResult<LuaValue> {
 fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
     let t = lua.create_table()?;
     t.set("name", entry.name())?;
+    if let Some(alias) = identifier_alias(entry.name()) {
+        t.set("alias", alias)?;
+    }
     t.set("schema", json_to_lua(lua, &entry.tool.schema())?)?;
     t.set("audiences", audiences_to_lua(lua, entry.tool.audience())?)?;
     if let Some(kind) = entry.tool.tool_kind() {
