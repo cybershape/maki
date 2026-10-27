@@ -28,6 +28,11 @@ const WORKFLOW_LABEL: &str = " [workflow]";
 const RESTRICTED_LABEL: &str = " [restricted]";
 const YOLO_LABEL: &str = " [yolo]";
 const YOLO_DIM_FACTOR: f32 = 0.15;
+const CONTEXT_BAR_FILLED: &str = "█";
+const CONTEXT_BAR_UNFILLED: &str = "░";
+const CONTEXT_BAR_WIDTH: usize = 10;
+const CONTEXT_BAR_PREFIX: &str = "  [";
+const CONTEXT_BAR_SUFFIX: &str = "]";
 
 pub struct UsageStats {
     /// The whole session's bill, drawn next to the focused chat's own once
@@ -244,11 +249,15 @@ impl StatusBar {
                 right_spans.extend(yolo_span);
             }
             _ => {
-                let pct = if ctx.stats.context_window > 0 {
-                    (ctx.stats.context_size as f64 / ctx.stats.context_window as f64 * 100.0) as u32
+                let (ratio, pct) = if ctx.stats.context_window > 0 {
+                    let r = ctx.stats.context_size as f64 / ctx.stats.context_window as f64;
+                    (r, r * 100.0)
                 } else {
-                    0
+                    (0.0, 0.0)
                 };
+                let filled =
+                    ((ratio * CONTEXT_BAR_WIDTH as f64).round() as usize).min(CONTEXT_BAR_WIDTH);
+                let unfilled = CONTEXT_BAR_WIDTH.saturating_sub(filled);
 
                 let mut rest_spans = Vec::new();
 
@@ -270,26 +279,33 @@ impl StatusBar {
                 }
                 rest_spans.extend(yolo_span);
 
-                let context_text = format!(
-                    "  {}/{} ({}%)",
-                    format_tokens(ctx.stats.context_size),
-                    format_tokens(ctx.stats.context_window),
-                    pct,
-                );
-                let rest_text = match (
+                let fg_style = Style::new().fg(theme::current().foreground);
+                rest_spans.push(Span::styled(CONTEXT_BAR_PREFIX, fg_style));
+                if filled > 0 {
+                    rest_spans.push(Span::styled(CONTEXT_BAR_FILLED.repeat(filled), fg_style));
+                }
+                if unfilled > 0 {
+                    rest_spans.push(Span::styled(
+                        CONTEXT_BAR_UNFILLED.repeat(unfilled),
+                        theme::current().status_dim,
+                    ));
+                }
+
+                let window = format_tokens(ctx.stats.context_window).to_uppercase();
+                let cost_text = match (
                     ctx.stats.cost,
                     ctx.stats.list_cost,
                     &ctx.stats.subsidy_source,
                 ) {
                     (Some(cost), Some(list), Some(source)) if list > 0.0 => {
-                        format!("{context_text} ${cost:.3} (~${list:.3} {source}) ")
+                        format!(" ${cost:.3} (~${list:.3} {source}) ")
                     }
-                    (Some(cost), _, _) => format!("{context_text} ${cost:.3} "),
-                    (None, _, _) => format!("{context_text} "),
+                    (Some(cost), _, _) => format!(" ${cost:.3} "),
+                    (None, _, _) => " ".to_string(),
                 };
                 rest_spans.push(Span::styled(
-                    rest_text,
-                    Style::new().fg(theme::current().foreground),
+                    format!("{CONTEXT_BAR_SUFFIX} {pct:.1}%/{window}{cost_text}"),
+                    fg_style,
                 ));
 
                 if let Some(global) = ctx.stats.global_cost.filter(|_| ctx.stats.show_global) {
@@ -777,5 +793,16 @@ mod tests {
         ctx.model_id = "GPT-6.1 Sol";
         let text = draw(&ctx);
         assert!(text.contains("GPT-6.1 Sol"), "{text}");
+    }
+
+    #[test_case(0, 1_000_000, "[░░░░░░░░░░] 0.0%/1.0M"         ; "empty")]
+    #[test_case(745_000, 1_000_000, "[███████░░░] 74.5%/1.0M"     ; "three_quarters")]
+    #[test_case(1_000_000, 1_000_000, "[██████████] 100.0%/1.0M" ; "full")]
+    fn context_bar_renders_progress_and_percentage(size: u32, window: u32, expected: &str) {
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.stats.context_size = size;
+        ctx.stats.context_window = window;
+        let text = draw(&ctx);
+        assert!(text.contains(expected), "{text}");
     }
 }
