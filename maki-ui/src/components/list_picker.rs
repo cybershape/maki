@@ -1,7 +1,5 @@
-use std::collections::HashSet;
-
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config, Matcher};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::Overlay;
@@ -34,6 +32,9 @@ type Hints = &'static [(&'static str, &'static str)];
 
 pub trait PickerItem {
     fn label(&self) -> &str;
+    fn search_keys(&self) -> Vec<&str> {
+        vec![self.label()]
+    }
     fn suffix(&self) -> Option<&str> {
         None
     }
@@ -124,23 +125,21 @@ impl<T: PickerItem> State<T> {
                 Normalization::Smart,
                 AtomKind::Fuzzy,
             );
-            // Create labels with their original indices
-            let labeled: Vec<(usize, &str)> = self
+            let mut buf = Vec::new();
+            self.filtered = self
                 .items
                 .iter()
                 .enumerate()
-                .map(|(idx, item)| (idx, item.label()))
-                .collect();
-            let matches: HashSet<&str> = pattern
-                .match_list(labeled.iter().map(|(_, label)| *label), &mut self.matcher)
-                .into_iter()
-                .map(|(matched_str, _score)| matched_str)
-                .collect();
-            // Find back all indices that have matching labels
-            self.filtered = labeled
-                .into_iter()
-                .filter(|(_, label)| matches.contains(label))
-                .map(|(idx, _)| idx)
+                .filter_map(|(idx, item)| {
+                    for key in item.search_keys() {
+                        buf.clear();
+                        let haystack = Utf32Str::new(key, &mut buf);
+                        if pattern.score(haystack, &mut self.matcher).is_some() {
+                            return Some(idx);
+                        }
+                    }
+                    None
+                })
                 .collect();
         }
     }
@@ -1017,6 +1016,44 @@ mod tests {
         p.handle_key(key(KeyCode::Char('u')));
         let filtered = ready_state(&p).filtered.clone();
         assert_eq!(filtered, vec![0]); // only claude-sonnet should match
+    }
+
+    struct MultiKeyEntry {
+        label: String,
+        extra_key: String,
+    }
+
+    impl PickerItem for MultiKeyEntry {
+        fn label(&self) -> &str {
+            &self.label
+        }
+        fn search_keys(&self) -> Vec<&str> {
+            vec![&self.label, &self.extra_key]
+        }
+    }
+
+    #[test]
+    fn fuzzy_search_matches_multiple_search_keys() {
+        let mut p = ListPicker::new();
+        p.open(
+            vec![
+                MultiKeyEntry {
+                    label: "Claude 3.7 Sonnet".into(),
+                    extra_key: "claude-3-7-sonnet-20250219".into(),
+                },
+                MultiKeyEntry {
+                    label: "GPT-4o".into(),
+                    extra_key: "gpt-4o-2024-08-06".into(),
+                },
+            ],
+            " Test ",
+        );
+
+        p.handle_key(key(KeyCode::Char('2')));
+        p.handle_key(key(KeyCode::Char('0')));
+        p.handle_key(key(KeyCode::Char('2')));
+        p.handle_key(key(KeyCode::Char('5')));
+        assert_eq!(ready_state(&p).filtered, vec![0]);
     }
 
     #[test]

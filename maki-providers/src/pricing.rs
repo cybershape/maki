@@ -260,6 +260,7 @@ mod tests {
     fn model(id: &str, input_rate: f64) -> Model {
         Model {
             id: id.into(),
+            name: None,
             provider: Arc::from("responses"),
             tier: ModelTier::Medium,
             family: ModelFamily::Gpt,

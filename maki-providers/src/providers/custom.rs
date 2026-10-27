@@ -105,12 +105,8 @@ fn model_from_def(
     model_id: &str,
 ) -> Model {
     let subsidy_source = def.subsidised_by.as_deref();
-    let mut row = def
-        .models
-        .iter()
-        .find(|m| m.id == model_id)
-        .map(ModelEntry::from)
-        .unwrap_or_default();
+    let def_model = def.models.iter().find(|m| m.id == model_id);
+    let mut row = def_model.map(ModelEntry::from).unwrap_or_default();
     let discovered = crate::model_registry::discovered(slug, model_id);
     let discovered = discovered.as_ref();
     row.max_output_tokens = row
@@ -159,6 +155,9 @@ fn model_from_def(
             model.supports_fast_override = Some(crate::model::FastSupport::Supported);
         }
     }
+    model.name = def_model
+        .and_then(|m| m.name.clone())
+        .or_else(|| discovered.and_then(|d| d.name.clone()));
     model
 }
 
@@ -257,6 +256,7 @@ mod tests {
                 base_url: Some("http://localhost:8000/v1".to_string()),
                 models: vec![ModelDef {
                     id: "test-model".to_string(),
+                    name: None,
                     tier: ModelTier::Strong,
                     context_window: Some(64000),
                     max_output_tokens: Some(4096),
@@ -290,6 +290,7 @@ mod tests {
             slug,
             vec![crate::model::ModelInfo {
                 id: model_id.to_string(),
+                name: None,
                 context_window: Some(500000),
                 max_output_tokens: Some(500000),
                 pricing: Some(ModelPricing {

@@ -60,6 +60,7 @@ fn provider_entry(model: &ModelEntry, count: usize) -> ModelEntry {
     ModelEntry {
         spec: model.provider.clone(),
         id: model.provider_display.clone(),
+        name: None,
         provider: model.provider.clone(),
         provider_display: model.provider_display.clone(),
         suffix: None,
@@ -67,6 +68,7 @@ fn provider_entry(model: &ModelEntry, count: usize) -> ModelEntry {
         override_tiers: Vec::new(),
         free: false,
         is_provider: true,
+        prefer_model_name: false,
     }
 }
 
@@ -85,6 +87,7 @@ struct ModelEntry {
     /// The qualified spec, or the bare slug on a provider row.
     spec: String,
     id: String,
+    name: Option<String>,
     provider: String,
     provider_display: String,
     suffix: Option<String>,
@@ -92,11 +95,25 @@ struct ModelEntry {
     override_tiers: Vec<ModelTier>,
     free: bool,
     is_provider: bool,
+    prefer_model_name: bool,
 }
 
 impl PickerItem for ModelEntry {
     fn label(&self) -> &str {
-        &self.id
+        if self.prefer_model_name {
+            self.name.as_deref().unwrap_or(&self.id)
+        } else {
+            &self.id
+        }
+    }
+
+    fn search_keys(&self) -> Vec<&str> {
+        let mut keys = Vec::with_capacity(2);
+        keys.push(self.label());
+        if self.prefer_model_name && self.name.is_some() && self.name.as_deref() != Some(&self.id) {
+            keys.push(&self.id);
+        }
+        keys
     }
 
     fn suffix(&self) -> Option<&str> {
@@ -133,6 +150,7 @@ pub struct ModelPicker {
     anchor: Option<(bool, String)>,
     /// Folded providers, by slug.
     collapsed: BTreeSet<String>,
+    prefer_model_name: bool,
 }
 
 impl ModelPicker {
@@ -146,7 +164,13 @@ impl ModelPicker {
             needs_rebuild: false,
             anchor: None,
             collapsed: BTreeSet::new(),
+            prefer_model_name: true,
         }
+    }
+
+    pub fn with_prefer_model_name(mut self, prefer: bool) -> Self {
+        self.prefer_model_name = prefer;
+        self
     }
 
     pub fn set_collapsed(&mut self, collapsed: BTreeSet<String>) {
@@ -211,20 +235,25 @@ impl ModelPicker {
         let specs = self.available.get().map(|list| &list.specs);
         let mut entries = Vec::new();
         for spec in &self.recents {
-            if let Some(mut e) = parse_model_entry(spec) {
+            if let Some(mut e) = parse_model_entry(spec, self.prefer_model_name) {
                 e.suffix = Some(std::mem::take(&mut e.provider_display));
                 e.provider_display = RECENT_SECTION.to_string();
                 entries.push(e);
             }
         }
         let mut full: Vec<ModelEntry> = specs
-            .map(|s| s.iter().filter_map(|s| parse_model_entry(s)).collect())
+            .map(|s| {
+                s.iter()
+                    .filter_map(|s| parse_model_entry(s, self.prefer_model_name))
+                    .collect()
+            })
             .unwrap_or_default();
         full.sort_by(|a, b| {
             a.provider_display
                 .cmp(&b.provider_display)
                 .then_with(|| a.provider.cmp(&b.provider))
                 .then_with(|| b.free.cmp(&a.free))
+                .then_with(|| a.label().cmp(b.label()))
                 .then_with(|| a.id.cmp(&b.id))
         });
         let mut full = full.into_iter().peekable();
@@ -375,7 +404,7 @@ fn format_pricing(model: &Model) -> Option<String> {
     })
 }
 
-fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
+fn parse_model_entry(spec: &str, prefer_model_name: bool) -> Option<ModelEntry> {
     let (provider_str, model_id) = spec.split_once('/')?;
 
     // A catalog-backed row like `opencode-go` takes the name models.dev gives it.
@@ -413,9 +442,11 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         None => tier,
     };
     let id = model_id.to_string();
+    let name = model_registry::resolve_model_name(provider_str, model_id);
     Some(ModelEntry {
         spec: spec.to_string(),
         id,
+        name,
         provider: provider_str.to_string(),
         provider_display,
         suffix: None,
@@ -423,6 +454,7 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         override_tiers,
         free,
         is_provider: false,
+        prefer_model_name,
     })
 }
 
@@ -622,7 +654,7 @@ mod tests {
 
     #[test]
     fn parse_model_entry_valid() {
-        let entry = parse_model_entry("responses/my-model").unwrap();
+        let entry = parse_model_entry("responses/my-model", true).unwrap();
         assert_eq!(entry.id, "my-model");
         assert_eq!(entry.provider_display, "Responses API");
         assert!(!entry.detail.is_empty());
@@ -630,7 +662,7 @@ mod tests {
 
     #[test]
     fn parse_model_entry_paid_model_not_marked_free() {
-        let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514").unwrap();
+        let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514", true).unwrap();
         assert!(
             !entry.detail.starts_with(FREE_PREFIX),
             "paid anthropic model must not be marked free"
@@ -639,7 +671,7 @@ mod tests {
 
     #[test]
     fn parse_model_entry_no_slash() {
-        assert!(parse_model_entry("no-slash").is_none());
+        assert!(parse_model_entry("no-slash", true).is_none());
     }
 
     #[test_case(key(KeyCode::Char('!')),           ModelTier::Strong     ; "legacy_bang_strong")]
@@ -949,7 +981,7 @@ mod tests {
     #[test]
     fn zero_priced_discovery_marks_entry_free() {
         register_discovered_models();
-        let entry = parse_model_entry(OX_SPEC).unwrap();
+        let entry = parse_model_entry(OX_SPEC, true).unwrap();
         assert!(
             entry.detail.starts_with(FREE_PREFIX),
             "zero-priced discovery must mark the entry free"
@@ -959,7 +991,7 @@ mod tests {
     #[test]
     fn paid_discovery_not_marked_free() {
         register_discovered_models();
-        let entry = parse_model_entry(&format!("responses/{PAID_ID}")).unwrap();
+        let entry = parse_model_entry(&format!("responses/{PAID_ID}"), true).unwrap();
         assert!(
             !entry.detail.starts_with(FREE_PREFIX),
             "paid discovery must not mark the entry free"
@@ -985,5 +1017,49 @@ mod tests {
         let entries = p.load_entries();
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["stealth/ox-alpha", PAID_ID]);
+    }
+
+    #[test]
+    fn model_entry_label_and_search_keys_respect_prefer_model_name() {
+        let entry_with_name = ModelEntry {
+            spec: "responses/gpt-6.1-sol".into(),
+            id: "gpt-6.1-sol".into(),
+            name: Some("GPT-6.1 Sol".into()),
+            provider: "responses".into(),
+            provider_display: "Responses".into(),
+            suffix: None,
+            detail: "".into(),
+            override_tiers: Vec::new(),
+            free: false,
+            is_provider: false,
+            prefer_model_name: true,
+        };
+
+        assert_eq!(entry_with_name.label(), "GPT-6.1 Sol");
+        assert_eq!(
+            entry_with_name.search_keys(),
+            vec!["GPT-6.1 Sol", "gpt-6.1-sol"]
+        );
+
+        let mut entry_disabled = entry_with_name;
+        entry_disabled.prefer_model_name = false;
+        assert_eq!(entry_disabled.label(), "gpt-6.1-sol");
+        assert_eq!(entry_disabled.search_keys(), vec!["gpt-6.1-sol"]);
+
+        let entry_no_name = ModelEntry {
+            spec: "responses/raw-model".into(),
+            id: "raw-model".into(),
+            name: None,
+            provider: "responses".into(),
+            provider_display: "Responses".into(),
+            suffix: None,
+            detail: "".into(),
+            override_tiers: Vec::new(),
+            free: false,
+            is_provider: false,
+            prefer_model_name: true,
+        };
+        assert_eq!(entry_no_name.label(), "raw-model");
+        assert_eq!(entry_no_name.search_keys(), vec!["raw-model"]);
     }
 }

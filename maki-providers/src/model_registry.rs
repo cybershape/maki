@@ -73,6 +73,26 @@ pub fn set_known_models(provider: &str, models: Vec<ModelInfo>) {
     write().set_known_models(provider, models);
 }
 
+/// Resolve model name: user-configured ModelDef name in ProvidersConfig takes priority,
+/// falling back to API-discovered ModelInfo.name.
+pub fn resolve_model_name(provider: &str, model_id: &str) -> Option<String> {
+    let config = maki_config::providers::ProvidersConfig::load();
+    config
+        .get(provider)
+        .and_then(|def| def.models.iter().find(|m| m.id == model_id))
+        .and_then(|m| m.name.clone())
+        .or_else(|| discovered(provider, model_id).and_then(|info| info.name))
+}
+
+pub fn resolve_model_name_for_spec(spec: &str) -> Option<String> {
+    let (provider, model_id) = spec.split_once('/')?;
+    resolve_model_name(provider, model_id)
+}
+
+pub fn resolve_model_name_or(spec: &str, fallback: &str) -> String {
+    resolve_model_name_for_spec(spec).unwrap_or_else(|| fallback.to_string())
+}
+
 /// Tiers whose override points at `spec`, in descending tier order.
 pub fn override_tiers(spec: &str) -> Vec<ModelTier> {
     read().override_tiers(spec)
@@ -583,5 +603,67 @@ mod tests {
         assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/qwen3");
         assert_eq!(loaded.get(&ModelTier::Medium).unwrap(), "ollama/qwen3");
         assert_eq!(loaded.get(&ModelTier::Weak).unwrap(), "ollama/qwen3:8b");
+    }
+
+    #[test]
+    fn resolve_model_name_prefers_config_over_discovery() {
+        let mut def = maki_config::providers::ProviderDef::default();
+        def.models.push(maki_config::providers::ModelDef {
+            id: "m1".to_string(),
+            name: Some("Configured Name".to_string()),
+            tier: ModelTier::Strong,
+            context_window: None,
+            max_output_tokens: None,
+            supports_tool_examples: None,
+            supports_thinking: None,
+            requires_thinking: None,
+            thinking_fields: None,
+            supports_vision: None,
+            pricing_input: None,
+            pricing_output: None,
+            pricing_cache_write: None,
+            pricing_cache_read: None,
+            pricing_fast_input: None,
+            pricing_fast_output: None,
+        });
+        let mut config = maki_config::providers::ProvidersConfig::default();
+        config.providers.insert("my-provider".to_string(), def);
+        let _guard = maki_config::providers::set_override(config);
+
+        set_known_models(
+            "my-provider",
+            vec![ModelInfo {
+                id: "m1".to_string(),
+                name: Some("Discovered Name".to_string()),
+                ..ModelInfo::id_only("m1".to_string())
+            }],
+        );
+
+        assert_eq!(
+            resolve_model_name("my-provider", "m1"),
+            Some("Configured Name".to_string())
+        );
+
+        set_known_models(
+            "my-provider",
+            vec![ModelInfo {
+                id: "m2".to_string(),
+                name: Some("Discovered Only".to_string()),
+                ..ModelInfo::id_only("m2".to_string())
+            }],
+        );
+
+        assert_eq!(
+            resolve_model_name("my-provider", "m2"),
+            Some("Discovered Only".to_string())
+        );
+        assert_eq!(
+            resolve_model_name_or("my-provider/m2", "fallback"),
+            "Discovered Only"
+        );
+        assert_eq!(
+            resolve_model_name_or("my-provider/m3", "fallback"),
+            "fallback"
+        );
     }
 }

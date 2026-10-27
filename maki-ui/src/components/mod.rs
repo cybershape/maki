@@ -431,6 +431,7 @@ pub(crate) fn test_pricing() -> ModelPricing {
 pub(crate) fn test_model() -> maki_providers::Model {
     maki_providers::Model {
         id: "test-model".into(),
+        name: None,
         provider: std::sync::Arc::<str>::from("responses"),
         tier: maki_providers::ModelTier::Medium,
         family: maki_providers::ModelFamily::Gpt,

@@ -434,8 +434,15 @@ fn parse_model_info(m: &Value) -> Option<ModelInfo> {
         (None, None)
     };
 
+    let name = m
+        .get("name")
+        .or_else(|| m.get("display_name"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
     Some(ModelInfo {
         id: id.to_string(),
+        name,
         context_window,
         max_output_tokens,
         pricing,
@@ -538,6 +545,7 @@ impl ResponsesProvider {
                     });
                     ModelInfo {
                         id: m.id.clone(),
+                        name: m.name.clone(),
                         context_window: m.context_window,
                         max_output_tokens: m.max_output_tokens,
                         pricing: None,
@@ -1797,5 +1805,31 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
         assert_eq!(pricing.cache_read, 0.1);
         assert_eq!(pricing.cache_write, 2.5);
         assert!(info.extra.is_some());
+    }
+
+    #[test]
+    fn parse_model_info_extracts_name_and_display_name() {
+        let with_name = json!({
+            "id": "gpt-6.1-sol",
+            "name": "GPT-6.1 Sol"
+        });
+        let info = parse_model_info(&with_name).expect("parses model info");
+        assert_eq!(info.id, "gpt-6.1-sol");
+        assert_eq!(info.name.as_deref(), Some("GPT-6.1 Sol"));
+
+        let with_display_name = json!({
+            "id": "claude-opus-4-7",
+            "display_name": "Claude Opus 4.7"
+        });
+        let info = parse_model_info(&with_display_name).expect("parses model info");
+        assert_eq!(info.id, "claude-opus-4-7");
+        assert_eq!(info.name.as_deref(), Some("Claude Opus 4.7"));
+
+        let without_name = json!({
+            "id": "raw-model"
+        });
+        let info = parse_model_info(&without_name).expect("parses model info");
+        assert_eq!(info.id, "raw-model");
+        assert_eq!(info.name, None);
     }
 }

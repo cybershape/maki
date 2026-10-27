@@ -491,7 +491,8 @@ impl App {
                 lua_command_reader,
             ),
             theme_picker: ThemePicker::new(),
-            model_picker: ModelPicker::new(available_models),
+            model_picker: ModelPicker::new(available_models)
+                .with_prefer_model_name(ui_config.prefer_model_name),
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),

@@ -71,6 +71,8 @@ pub struct ModelPricing {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ModelInfo {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(default)]
     pub context_window: Option<u32>,
     #[serde(default)]
@@ -291,6 +293,7 @@ impl ModelEntry {
     pub(crate) fn to_model(&self, slug: &str, base: &ProviderSpec, id: String) -> Model {
         Model {
             id,
+            name: None,
             provider: Arc::from(slug),
             tier: self.tier,
             family: self.family.unwrap_or(base.family),
@@ -503,6 +506,7 @@ pub enum FastSupport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
     pub id: String,
+    pub name: Option<String>,
     pub provider: Arc<str>,
     pub tier: ModelTier,
     pub family: ModelFamily,
@@ -586,8 +590,11 @@ impl Model {
         });
         let thinking_fields =
             overlay_fields.or_else(|| entry.and_then(|e| e.thinking_fields.clone().map(Box::new)));
+        let name = model_registry::resolve_model_name(slug, model_id)
+            .or_else(|| model_registry::resolve_model_name(base.slug, model_id));
         Self {
             id: model_id.to_string(),
+            name,
             provider: Arc::from(slug),
             tier,
             family,
@@ -604,6 +611,10 @@ impl Model {
             context_window,
             thinking_fields,
         }
+    }
+
+    pub fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.id)
     }
 
     pub fn supports_thinking(&self) -> bool {
@@ -1313,6 +1324,14 @@ mod tests {
     }
 
     #[test]
+    fn model_display_name_prefers_name_over_id() {
+        let mut model = Model::from_spec("responses/test-model").unwrap();
+        assert_eq!(model.display_name(), "test-model");
+        model.name = Some("Test Friendly Name".to_string());
+        assert_eq!(model.display_name(), "Test Friendly Name");
+    }
+
+    #[test]
     fn tier_with_policy_errors_without_allowed_candidate() {
         let policy = policy(&["anthropic/*"], &[]);
 
@@ -1568,6 +1587,7 @@ mod tests {
     fn ladder_model(support: ThinkingSupport, max_output_tokens: Option<u32>) -> Model {
         Model {
             id: "test-model".into(),
+            name: None,
             provider: Arc::from("responses"),
             tier: ModelTier::Medium,
             family: ModelFamily::Gpt,

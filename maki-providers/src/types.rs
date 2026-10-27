@@ -2505,6 +2505,7 @@ mod tests {
     fn clamp_test_model(spec: &'static crate::spec::ProviderSpec) -> crate::model::Model {
         crate::model::Model {
             id: "test-model".into(),
+            name: None,
             provider: std::sync::Arc::<str>::from(spec.slug),
             tier: crate::model::ModelTier::Medium,
             family: spec.family,

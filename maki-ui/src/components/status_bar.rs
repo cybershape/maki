@@ -770,4 +770,12 @@ mod tests {
         bar.clear_flash();
         assert!(bar.flash.is_none());
     }
+
+    #[test]
+    fn status_bar_renders_model_name() {
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.model_id = "GPT-6.1 Sol";
+        let text = draw(&ctx);
+        assert!(text.contains("GPT-6.1 Sol"), "{text}");
+    }
 }

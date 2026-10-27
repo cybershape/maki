@@ -128,6 +128,8 @@ impl FromStr for ModelTier {
 #[serde(deny_unknown_fields)]
 pub struct ModelDef {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(default)]
     pub tier: ModelTier,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1120,6 +1122,7 @@ tier = "{input}"
     fn every_model_def_field_is_read_or_reported() {
         let every_field_set = ModelDef {
             id: "qwen".to_string(),
+            name: Some("Qwen".to_string()),
             tier: ModelTier::Strong,
             context_window: Some(131_072),
             max_output_tokens: Some(8192),

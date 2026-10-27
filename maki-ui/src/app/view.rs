@@ -348,14 +348,23 @@ impl App {
             fast: self.state.fast,
         });
         let (mode_label, mode_style) = self.mode_label();
+        let model_str = if self.ui_config.prefer_model_name {
+            if let Some(ref chat_model_id) = chat.model_id {
+                maki_providers::model_registry::resolve_model_name_or(chat_model_id, chat_model_id)
+            } else {
+                self.state.model.display_name().to_string()
+            }
+        } else {
+            chat.model_id
+                .as_deref()
+                .unwrap_or(&self.state.session.model)
+                .to_string()
+        };
         let ctx = StatusBarContext {
             status: &self.status,
             mode_label,
             mode_style,
-            model_id: chat
-                .model_id
-                .as_deref()
-                .unwrap_or(&self.state.session.model),
+            model_id: &model_str,
             stats: UsageStats {
                 global_cost: self.state.cost,
                 context_size: chat.context_size,

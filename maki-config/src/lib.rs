@@ -659,6 +659,7 @@ pub struct UiFileConfig {
     pub clock_format: Option<ClockFormat>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub max_input_lines: Option<u32>,
+    pub prefer_model_name: Option<bool>,
 }
 
 impl UiFileConfig {
@@ -677,7 +678,8 @@ impl UiFileConfig {
             show_thinking,
             theme,
             clock_format,
-            max_input_lines
+            max_input_lines,
+            prefer_model_name
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -1339,6 +1341,12 @@ pub struct UiConfig {
 
     #[config(skip, default = "ToolOutputLines::default()")]
     pub tool_output_lines: ToolOutputLines,
+
+    #[config(
+        default = true,
+        desc = "Display human-readable model name instead of raw model ID in model picker and status bar when available"
+    )]
+    pub prefer_model_name: bool,
 }
 
 impl UiConfig {
@@ -1364,6 +1372,7 @@ impl UiConfig {
             clock_format: f.clock_format.unwrap_or_default(),
             theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
+            prefer_model_name: f.prefer_model_name.unwrap_or(true),
         }
     }
 
@@ -5015,6 +5024,16 @@ mod tests {
     #[test_case("${A} ${NOT_CLOSED", &["A"] ; "unterminated_skipped")]
     fn env_var_refs_names(value: &str, expected: &[&str]) {
         assert_eq!(env_var_refs(value).collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn prefer_model_name_defaults_to_true_and_can_be_disabled() {
+        let default_cfg = UiConfig::from_file(UiFileConfig::default());
+        assert!(default_cfg.prefer_model_name);
+
+        let parsed: RawConfig = toml::from_str("[ui]\nprefer_model_name = false\n").unwrap();
+        let cfg = UiConfig::from_file(parsed.ui);
+        assert!(!cfg.prefer_model_name);
     }
 
     #[test]

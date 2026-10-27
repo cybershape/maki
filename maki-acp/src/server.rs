@@ -2349,6 +2349,7 @@ mod tests {
             slug,
             vec![maki_providers::model::ModelInfo {
                 id: model_id.to_string(),
+                name: None,
                 context_window: Some(500000),
                 max_output_tokens: Some(500000),
                 pricing: None,
