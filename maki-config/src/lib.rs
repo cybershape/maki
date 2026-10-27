@@ -662,6 +662,7 @@ pub struct UiFileConfig {
     pub max_input_lines: Option<u32>,
     pub prefer_model_name: Option<bool>,
     pub show_cost: Option<bool>,
+    pub compact_tools: Option<bool>,
 }
 
 impl UiFileConfig {
@@ -682,7 +683,8 @@ impl UiFileConfig {
             clock_format,
             max_input_lines,
             prefer_model_name,
-            show_cost
+            show_cost,
+            compact_tools
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -1364,6 +1366,12 @@ pub struct UiConfig {
         desc = "Show cost and pricing amounts in the UI (status bar, messages, usage modal, and model picker)"
     )]
     pub show_cost: bool,
+
+    #[config(
+        default = false,
+        desc = "Render tool calls and reasoning in a compact tree view"
+    )]
+    pub compact_tools: bool,
 }
 
 impl UiConfig {
@@ -1391,6 +1399,7 @@ impl UiConfig {
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
             prefer_model_name: f.prefer_model_name.unwrap_or(true),
             show_cost: f.show_cost.unwrap_or(true),
+            compact_tools: f.compact_tools.unwrap_or(false),
         }
     }
 
@@ -5042,6 +5051,16 @@ mod tests {
         let parsed: RawConfig = toml::from_str("[ui]\nshow_cost = false\n").unwrap();
         let cfg = UiConfig::from_file(parsed.ui);
         assert!(!cfg.show_cost);
+    }
+
+    #[test]
+    fn compact_tools_defaults_to_false_and_can_be_enabled() {
+        let default_cfg = UiConfig::from_file(UiFileConfig::default());
+        assert!(!default_cfg.compact_tools);
+
+        let parsed: RawConfig = toml::from_str("[ui]\ncompact_tools = true\n").unwrap();
+        let cfg = UiConfig::from_file(parsed.ui);
+        assert!(cfg.compact_tools);
     }
 
     #[test]

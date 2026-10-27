@@ -18,7 +18,8 @@ use super::tool_display::{
     user_style,
 };
 use super::{
-    DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER, ToolRole, ToolStatus, code_view::SectionFlags,
+    DisplayMessage, DisplayRole, GroupEntry, GroupThinkingEntry, GroupToolEntry, IMAGE_PLACEHOLDER,
+    ToolGroupRole, ToolRole, ToolStatus, code_view::SectionFlags, tool_group,
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
@@ -114,6 +115,7 @@ pub struct MessagesPanel {
     /// Where the streaming segments start. `view` drops and rebuilds them
     /// every frame, so they always sit at the end of the cache.
     live_start: usize,
+    pub compact_tools: bool,
 }
 
 impl MessagesPanel {
@@ -164,6 +166,7 @@ impl MessagesPanel {
             session_id: None,
             task_id: None,
             live_start: 0,
+            compact_tools: ui_config.compact_tools,
         }
     }
 
@@ -232,16 +235,141 @@ impl MessagesPanel {
         self.live_thinking_expanded = false;
     }
 
+    pub fn seal_open_group(&mut self) {
+        if !self.compact_tools {
+            return;
+        }
+        if let Some(DisplayMessage {
+            role: DisplayRole::ToolGroup(g),
+            ..
+        }) = self.messages.last_mut()
+            && !g.sealed
+        {
+            g.sealed = true;
+            for entry in &mut g.entries {
+                if let GroupEntry::Thinking(th) = entry {
+                    th.active = false;
+                }
+            }
+            let group_id = g.id.clone();
+            self.rebuild_tool_group_segment(&group_id);
+        }
+    }
+
     pub fn thinking_delta(&mut self, text: &str) {
+        if self.compact_tools {
+            let mut group_id = None;
+            if let Some(DisplayMessage {
+                role: DisplayRole::ToolGroup(g),
+                ..
+            }) = self.messages.last_mut()
+                && !g.sealed
+            {
+                group_id = Some(g.id.clone());
+                if let Some(GroupEntry::Thinking(th)) = g.entries.last_mut() {
+                    if th.active {
+                        th.text.push_str(text);
+                        th.tokens = th.text.len().div_ceil(4);
+                    } else {
+                        g.entries.push(GroupEntry::Thinking(GroupThinkingEntry {
+                            id: g.entries.len(),
+                            text: text.to_string(),
+                            tokens: text.len().div_ceil(4),
+                            active: true,
+                        }));
+                    }
+                } else {
+                    g.entries.push(GroupEntry::Thinking(GroupThinkingEntry {
+                        id: g.entries.len(),
+                        text: text.to_string(),
+                        tokens: text.len().div_ceil(4),
+                        active: true,
+                    }));
+                }
+            }
+
+            if let Some(gid) = group_id {
+                self.rebuild_tool_group_segment(&gid);
+            } else {
+                let gid = format!("compact-group-{}", self.messages.len());
+                let group = ToolGroupRole {
+                    id: gid,
+                    sealed: false,
+                    entries: vec![GroupEntry::Thinking(GroupThinkingEntry {
+                        id: 0,
+                        text: text.to_string(),
+                        tokens: text.len().div_ceil(4),
+                        active: true,
+                    })],
+                };
+                self.messages.push(DisplayMessage::new(
+                    DisplayRole::ToolGroup(Box::new(group)),
+                    String::new(),
+                ));
+            }
+            return;
+        }
         self.streaming_thinking.push(text);
     }
 
     pub fn text_delta(&mut self, text: &str) {
+        if self.compact_tools && !text.trim().is_empty() {
+            self.seal_open_group();
+        }
         self.flush_thinking();
         self.streaming_text.push(text);
     }
 
     pub fn tool_pending(&mut self, id: String, name: &str) {
+        if self.compact_tools {
+            if let Some(DisplayMessage {
+                role: DisplayRole::ToolGroup(g),
+                ..
+            }) = self.messages.last_mut()
+                && !g.sealed
+            {
+                if let Some(GroupEntry::Thinking(th)) = g.entries.last_mut() {
+                    th.active = false;
+                }
+                if let Some(entry) = g.entries.iter_mut().find_map(|e| match e {
+                    GroupEntry::Tool(t) if t.id == id => Some(t),
+                    _ => None,
+                }) {
+                    entry.name = Arc::from(name);
+                } else {
+                    g.entries.push(GroupEntry::Tool(GroupToolEntry {
+                        id: id.clone(),
+                        name: Arc::from(name),
+                        summary: String::new(),
+                        status: ToolStatus::InProgress,
+                        started_at: Some(Instant::now()),
+                        duration: None,
+                    }));
+                }
+                let gid = g.id.clone();
+                self.rebuild_tool_group_segment(&gid);
+                return;
+            }
+
+            let gid = format!("compact-group-{}", self.messages.len());
+            let group = ToolGroupRole {
+                id: gid,
+                sealed: false,
+                entries: vec![GroupEntry::Tool(GroupToolEntry {
+                    id,
+                    name: Arc::from(name),
+                    summary: String::new(),
+                    status: ToolStatus::InProgress,
+                    started_at: Some(Instant::now()),
+                    duration: None,
+                })],
+            };
+            self.messages.push(DisplayMessage::new(
+                DisplayRole::ToolGroup(Box::new(group)),
+                String::new(),
+            ));
+            return;
+        }
         self.flush();
         let role = DisplayRole::Tool(Box::new(ToolRole {
             id,
@@ -254,6 +382,70 @@ impl MessagesPanel {
     }
 
     pub fn tool_start(&mut self, event: ToolStartEvent) {
+        if self.compact_tools {
+            let mut found_group = None;
+            for msg in self.messages.iter_mut().rev() {
+                if let DisplayRole::ToolGroup(g) = &mut msg.role
+                    && let Some(entry) = g.entries.iter_mut().find_map(|e| match e {
+                        GroupEntry::Tool(t) if t.id == event.id => Some(t),
+                        _ => None,
+                    })
+                {
+                    entry.name = Arc::clone(&event.tool);
+                    entry.summary = event.summary.clone();
+                    if entry.started_at.is_none() {
+                        entry.started_at = Some(Instant::now());
+                    }
+                    found_group = Some(g.id.clone());
+                    break;
+                }
+            }
+            if let Some(gid) = found_group {
+                self.rebuild_tool_group_segment(&gid);
+                return;
+            }
+
+            if let Some(DisplayMessage {
+                role: DisplayRole::ToolGroup(g),
+                ..
+            }) = self.messages.last_mut()
+                && !g.sealed
+            {
+                if let Some(GroupEntry::Thinking(th)) = g.entries.last_mut() {
+                    th.active = false;
+                }
+                g.entries.push(GroupEntry::Tool(GroupToolEntry {
+                    id: event.id,
+                    name: Arc::clone(&event.tool),
+                    summary: event.summary,
+                    status: ToolStatus::InProgress,
+                    started_at: Some(Instant::now()),
+                    duration: None,
+                }));
+                let gid = g.id.clone();
+                self.rebuild_tool_group_segment(&gid);
+                return;
+            }
+
+            let gid = format!("compact-group-{}", self.messages.len());
+            let group = ToolGroupRole {
+                id: gid,
+                sealed: false,
+                entries: vec![GroupEntry::Tool(GroupToolEntry {
+                    id: event.id,
+                    name: Arc::clone(&event.tool),
+                    summary: event.summary,
+                    status: ToolStatus::InProgress,
+                    started_at: Some(Instant::now()),
+                    duration: None,
+                })],
+            };
+            self.messages.push(DisplayMessage::new(
+                DisplayRole::ToolGroup(Box::new(group)),
+                String::new(),
+            ));
+            return;
+        }
         if let Some(msg) = self.find_tool_msg_mut(&event.id) {
             if let DisplayRole::Tool(t) = &mut msg.role {
                 t.name = Arc::clone(&event.tool);
@@ -304,6 +496,35 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
+        if self.compact_tools {
+            let mut found_group = None;
+            for msg in self.messages.iter_mut().rev() {
+                if let DisplayRole::ToolGroup(g) = &mut msg.role
+                    && let Some(entry) = g.entries.iter_mut().find_map(|e| match e {
+                        GroupEntry::Tool(t) if t.id == event.id => Some(t),
+                        _ => None,
+                    })
+                {
+                    entry.status = if event.is_error {
+                        ToolStatus::Error
+                    } else {
+                        ToolStatus::Success
+                    };
+                    let dur = event
+                        .call
+                        .as_ref()
+                        .map(|c| c.duration)
+                        .or_else(|| entry.started_at.map(|st| st.elapsed()));
+                    entry.duration = dur;
+                    found_group = Some(g.id.clone());
+                    break;
+                }
+            }
+            if let Some(gid) = found_group {
+                self.rebuild_tool_group_segment(&gid);
+                return;
+            }
+        }
         let had_live_buf = self.retire_live_buf(&event.id);
         let Some(msg) = self
             .messages
@@ -499,15 +720,56 @@ impl MessagesPanel {
             self.retire_live_buf(id);
             self.rebuild_tool_segment(id);
         }
+
+        if self.compact_tools {
+            let mut affected_groups = Vec::new();
+            for msg in &mut self.messages {
+                if let DisplayRole::ToolGroup(g) = &mut msg.role {
+                    let mut changed = false;
+                    for entry in &mut g.entries {
+                        match entry {
+                            GroupEntry::Tool(t) if t.status == ToolStatus::InProgress => {
+                                t.status = ToolStatus::Error;
+                                changed = true;
+                            }
+                            GroupEntry::Thinking(th) if th.active => {
+                                th.active = false;
+                                changed = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !g.sealed {
+                        g.sealed = true;
+                        changed = true;
+                    }
+                    if changed {
+                        affected_groups.push(g.id.clone());
+                    }
+                }
+            }
+            for gid in affected_groups {
+                self.rebuild_tool_group_segment(&gid);
+            }
+        }
     }
 
     pub fn in_progress_count(&self) -> usize {
         self.messages
             .iter()
-            .filter(
-                |m| matches!(&m.role, DisplayRole::Tool(t) if t.status == ToolStatus::InProgress),
-            )
-            .count()
+            .map(|m| match &m.role {
+                DisplayRole::Tool(t) if t.status == ToolStatus::InProgress => 1,
+                DisplayRole::ToolGroup(g) => g
+                    .entries
+                    .iter()
+                    .filter(|e| match e {
+                        GroupEntry::Tool(t) => t.status == ToolStatus::InProgress,
+                        GroupEntry::Thinking(th) => th.active,
+                    })
+                    .count(),
+                _ => 0,
+            })
+            .sum()
     }
 
     #[cfg(test)]
@@ -597,6 +859,7 @@ impl MessagesPanel {
     }
 
     pub fn flush(&mut self) {
+        self.seal_open_group();
         self.flush_thinking();
         self.prompt_progress = None;
         if !self.streaming_text.is_empty() {
@@ -898,6 +1161,14 @@ impl MessagesPanel {
         }
         self.rebuild_line_cache();
         if self.in_progress_count() > 0 {
+            if self.compact_tools
+                && let Some(gid) = self.messages.iter().rev().find_map(|m| match &m.role {
+                    DisplayRole::ToolGroup(g) if !g.sealed => Some(g.id.clone()),
+                    _ => None,
+                })
+            {
+                self.rebuild_tool_group_segment(&gid);
+            }
             self.update_spinners();
         }
 
@@ -1411,6 +1682,29 @@ impl MessagesPanel {
         }
     }
 
+    fn rebuild_tool_group_segment(&mut self, group_id: &str) {
+        let Some(msg) = self
+            .messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::ToolGroup(g) if g.id == group_id))
+        else {
+            return;
+        };
+        let DisplayRole::ToolGroup(g) = &msg.role else {
+            return;
+        };
+        let Some(seg_idx) = self.cache.find_by_tool_id(group_id) else {
+            return;
+        };
+        let tl = tool_group::build_tool_group_lines(
+            g,
+            self.viewport_width,
+            self.started_at.elapsed().as_millis(),
+        );
+        let seg = self.cache.get_mut(seg_idx).unwrap();
+        seg.update_with_reuse(tl, &self.hl_worker);
+    }
+
     fn rebuild_line_cache(&mut self) {
         if !self.cache.needs_rebuild(self.messages.len()) {
             return;
@@ -1437,6 +1731,17 @@ impl MessagesPanel {
                 if let Some(blocks) = blocks {
                     self.upsert_instruction_segment(&id, &blocks);
                 }
+            } else if let DisplayRole::ToolGroup(g) = &msg.role {
+                let tl = tool_group::build_tool_group_lines(
+                    g,
+                    self.viewport_width,
+                    self.started_at.elapsed().as_millis(),
+                );
+                let id = g.id.clone();
+                self.cache.push_spacer_if_needed();
+                let mut seg = Segment::with_tool(id);
+                seg.apply_highlight(tl, &self.hl_worker);
+                self.cache.push(seg);
             } else {
                 let (lines, truncated) =
                     message_view(msg, self.thinking_lines, self.viewport_width);
@@ -1568,7 +1873,7 @@ fn message_style(role: &DisplayRole) -> RoleStyle {
         DisplayRole::Error => error_style(),
         DisplayRole::Done => done_style(),
         DisplayRole::Notice => notice_style(),
-        DisplayRole::Tool(_) => unreachable!(),
+        DisplayRole::Tool(_) | DisplayRole::ToolGroup(_) => unreachable!(),
     }
 }
 

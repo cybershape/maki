@@ -609,6 +609,7 @@ fn a_notice_line_keeps_its_history_position(live: &[LiveStep], saved: &[SavedSte
         &history,
         &HashMap::new(),
         &app.ui_config.tool_output_lines,
+        app.ui_config.compact_tools,
     );
 
     let chat = app.main_chat();
@@ -10543,6 +10544,7 @@ fn reset_session_stamps_the_new_main_chat_with_the_new_session() {
         ],
         &HashMap::new(),
         &app.ui_config.tool_output_lines,
+        app.ui_config.compact_tools,
     );
 
     app.reset_session();

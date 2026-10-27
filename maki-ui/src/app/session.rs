@@ -282,6 +282,7 @@ impl App {
             self.state.session.messages(),
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
+            self.ui_config.compact_tools,
         );
         self.main_chat().load_messages(display_msgs);
         let cost = self.state.cost;
@@ -316,6 +317,7 @@ impl App {
                 messages,
                 self.state.session.tool_outputs(),
                 &self.ui_config.tool_output_lines,
+                self.ui_config.compact_tools,
             );
             // Plugin tasks are never routed through `chat_index`.
             if sa.plugin.is_none() {

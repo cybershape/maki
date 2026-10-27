@@ -84,6 +84,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `clock_format` | String | `system` | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
 | `prefer_model_name` | bool | `true` | - | Display human-readable model name instead of raw model ID in model picker and status bar when available |
 | `show_cost` | bool | `true` | - | Show cost and pricing amounts in the UI (status bar, messages, usage modal, and model picker) |
+| `compact_tools` | bool | `false` | - | Render tool calls and reasoning in a compact tree view |
 
 ### `ui.theme`
 

@@ -28,6 +28,7 @@ pub(crate) mod streaming_content;
 pub(crate) mod theme_picker;
 pub(crate) mod thinking;
 pub(crate) mod tool_display;
+pub(crate) mod tool_group;
 pub(crate) mod usage_modal;
 
 use std::sync::Arc;
@@ -400,11 +401,43 @@ pub struct ToolRole {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct GroupToolEntry {
+    pub id: String,
+    pub name: Arc<str>,
+    pub summary: String,
+    pub status: ToolStatus,
+    pub started_at: Option<Instant>,
+    pub duration: Option<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupThinkingEntry {
+    pub id: usize,
+    pub text: String,
+    pub tokens: usize,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GroupEntry {
+    Tool(GroupToolEntry),
+    Thinking(GroupThinkingEntry),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolGroupRole {
+    pub id: String,
+    pub sealed: bool,
+    pub entries: Vec<GroupEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum DisplayRole {
     User,
     Assistant,
     Thinking,
     Tool(Box<ToolRole>),
+    ToolGroup(Box<ToolGroupRole>),
     Error,
     Done,
     /// One dim line about what the host told the model on the user's behalf.

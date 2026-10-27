@@ -3010,3 +3010,133 @@ fn selection_survives_a_resize() {
         "the reflow above the selection dragged the copy with it"
     );
 }
+
+#[test]
+fn compact_tools_groups_consecutive_tools() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    panel.tool_pending("call-1".into(), "edit");
+    panel.tool_start(start("call-1", "edit"));
+    panel.tool_done(ToolDoneEvent {
+        call: Some(Box::new(maki_agent::CallRecord {
+            input: serde_json::Value::Null,
+            duration: std::time::Duration::from_millis(7430),
+        })),
+        ..done("call-1")
+    });
+
+    panel.tool_pending("call-2".into(), "bash");
+    panel.tool_start(start("call-2", "bash"));
+    panel.tool_done(ToolDoneEvent {
+        call: Some(Box::new(maki_agent::CallRecord {
+            input: serde_json::Value::Null,
+            duration: std::time::Duration::from_millis(15900),
+        })),
+        is_error: true,
+        ..done("call-2")
+    });
+
+    assert_eq!(panel.messages.len(), 1);
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!("expected ToolGroup");
+    };
+    assert_eq!(g.entries.len(), 2);
+    assert!(!g.sealed);
+
+    let GroupEntry::Tool(t1) = &g.entries[0] else {
+        panic!()
+    };
+    assert_eq!(t1.name.as_ref(), "edit");
+    assert_eq!(t1.status, ToolStatus::Success);
+    assert_eq!(t1.duration, Some(std::time::Duration::from_millis(7430)));
+
+    let GroupEntry::Tool(t2) = &g.entries[1] else {
+        panic!()
+    };
+    assert_eq!(t2.name.as_ref(), "bash");
+    assert_eq!(t2.status, ToolStatus::Error);
+    assert_eq!(t2.duration, Some(std::time::Duration::from_millis(15900)));
+}
+
+#[test]
+fn compact_tools_text_delta_seals_group() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    panel.tool_start(start("call-1", "edit"));
+    panel.tool_done(done("call-1"));
+
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!()
+    };
+    assert!(!g.sealed);
+
+    panel.text_delta("Here is the answer");
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!()
+    };
+    assert!(g.sealed);
+
+    // Next tool starts a new group
+    panel.tool_start(start("call-2", "bash"));
+    assert_eq!(panel.messages.len(), 2);
+    let DisplayRole::ToolGroup(g2) = &panel.messages[1].role else {
+        panic!()
+    };
+    assert_eq!(g2.id, "compact-group-1");
+    assert!(!g2.sealed);
+}
+
+#[test]
+fn compact_tools_merges_thinking_and_tool() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    panel.thinking_delta("I need to run a test");
+    panel.tool_start(start("call-1", "bash"));
+    panel.tool_done(done("call-1"));
+
+    assert_eq!(panel.messages.len(), 1);
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!()
+    };
+    assert_eq!(g.entries.len(), 2);
+    assert!(
+        matches!(&g.entries[0], GroupEntry::Thinking(th) if th.text == "I need to run a test" && !th.active)
+    );
+    assert!(matches!(&g.entries[1], GroupEntry::Tool(t) if t.name.as_ref() == "bash"));
+}
+
+#[test]
+fn compact_tools_cancel_in_progress() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    panel.tool_start(start("call-1", "bash"));
+    assert_eq!(panel.in_progress_count(), 1);
+
+    panel.cancel_in_progress();
+    assert_eq!(panel.in_progress_count(), 0);
+
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!()
+    };
+    assert!(g.sealed);
+    let GroupEntry::Tool(t) = &g.entries[0] else {
+        panic!()
+    };
+    assert_eq!(t.status, ToolStatus::Error);
+}

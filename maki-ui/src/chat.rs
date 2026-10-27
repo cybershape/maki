@@ -9,7 +9,10 @@ use crate::app::tasks::{TaskOutcome, TaskStatus};
 use crate::components::input::Draft;
 use crate::components::messages::{MessagesPanel, PromptProgress, ScrollPos};
 use crate::components::tool_display::append_annotation;
-use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
+use crate::components::{
+    DisplayMessage, DisplayRole, GroupEntry, GroupThinkingEntry, GroupToolEntry, ToolGroupRole,
+    ToolRole, ToolStatus,
+};
 use crate::markdown::truncate_output;
 
 use crate::selection::{DocPos, RowPos, Selection};
@@ -566,14 +569,27 @@ pub fn history_to_display(
     messages: &[Message],
     tool_outputs: &HashMap<String, Arc<ToolOutput>>,
     tool_output_lines: &ToolOutputLines,
+    compact_tools: bool,
 ) -> (Vec<DisplayMessage>, Vec<maki_lua::RestoreItem>) {
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
     let mut restore_items: Vec<maki_lua::RestoreItem> = Vec::new();
+
+    let seal_last_group = |display: &mut Vec<DisplayMessage>| {
+        if let Some(DisplayMessage {
+            role: DisplayRole::ToolGroup(g),
+            ..
+        }) = display.last_mut()
+        {
+            g.sealed = true;
+        }
+    };
+
     for item in display_order(messages) {
         let msg = match item {
             DisplayItem::Message(msg) => msg,
             DisplayItem::ObservationLine { text, .. } => {
+                seal_last_group(&mut display);
                 display.push(DisplayMessage::new(DisplayRole::Notice, text.to_owned()));
                 continue;
             }
@@ -583,6 +599,7 @@ pub fn history_to_display(
         }
         match msg.role {
             Role::User => {
+                seal_last_group(&mut display);
                 // An empty `display_text` marks a message the transcript never
                 // shows, so its attachments must not sneak in either.
                 if msg.display_text.as_deref() == Some("") {
@@ -602,9 +619,11 @@ pub fn history_to_display(
                 for block in &msg.content {
                     match block {
                         ContentBlock::Text { text } if !text.is_empty() => {
+                            seal_last_group(&mut display);
                             display.push(DisplayMessage::new(DisplayRole::Assistant, text.clone()));
                         }
                         ContentBlock::Image { source } => {
+                            seal_last_group(&mut display);
                             display.push(DisplayMessage::with_images(
                                 DisplayRole::Assistant,
                                 String::new(),
@@ -612,6 +631,39 @@ pub fn history_to_display(
                             ));
                         }
                         ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                            if compact_tools {
+                                let entry = GroupThinkingEntry {
+                                    id: display
+                                        .last()
+                                        .and_then(|m| match &m.role {
+                                            DisplayRole::ToolGroup(g) => Some(g.entries.len()),
+                                            _ => None,
+                                        })
+                                        .unwrap_or(0),
+                                    text: thinking.clone(),
+                                    tokens: thinking.len().div_ceil(4),
+                                    active: false,
+                                };
+                                if let Some(DisplayMessage {
+                                    role: DisplayRole::ToolGroup(g),
+                                    ..
+                                }) = display.last_mut()
+                                    && !g.sealed
+                                {
+                                    g.entries.push(GroupEntry::Thinking(entry));
+                                    continue;
+                                }
+                                let group = ToolGroupRole {
+                                    id: format!("compact-group-{}", display.len()),
+                                    sealed: false,
+                                    entries: vec![GroupEntry::Thinking(entry)],
+                                };
+                                display.push(DisplayMessage::new(
+                                    DisplayRole::ToolGroup(Box::new(group)),
+                                    String::new(),
+                                ));
+                                continue;
+                            }
                             display
                                 .push(DisplayMessage::new(DisplayRole::Thinking, thinking.clone()));
                         }
@@ -675,6 +727,35 @@ pub fn history_to_display(
                                     reason: maki_lua::RestoreReason::Load,
                                 });
                             }
+                            if compact_tools {
+                                let entry = GroupToolEntry {
+                                    id: id.clone(),
+                                    name: Arc::from(static_name),
+                                    summary,
+                                    status,
+                                    started_at: None,
+                                    duration: None,
+                                };
+                                if let Some(DisplayMessage {
+                                    role: DisplayRole::ToolGroup(g),
+                                    ..
+                                }) = display.last_mut()
+                                    && !g.sealed
+                                {
+                                    g.entries.push(GroupEntry::Tool(entry));
+                                    continue;
+                                }
+                                let group = ToolGroupRole {
+                                    id: format!("compact-group-{}", display.len()),
+                                    sealed: false,
+                                    entries: vec![GroupEntry::Tool(entry)],
+                                };
+                                display.push(DisplayMessage::new(
+                                    DisplayRole::ToolGroup(Box::new(group)),
+                                    String::new(),
+                                ));
+                                continue;
+                            }
                             display.push(DisplayMessage {
                                 role: DisplayRole::Tool(Box::new(ToolRole {
                                     id: id.clone(),
@@ -704,6 +785,7 @@ pub fn history_to_display(
             }
         }
     }
+    seal_last_group(&mut display);
     (display, restore_items)
 }
 
@@ -865,6 +947,7 @@ mod tests {
             ],
             &empty_outputs(),
             &ToolOutputLines::default(),
+            false,
         );
         assert_eq!(display.len(), 2);
         assert_eq!(display[0].role, DisplayRole::User);
@@ -1127,7 +1210,7 @@ mod tests {
             ..Default::default()
         }];
         assert!(
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default())
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false)
                 .0
                 .is_empty()
         );
@@ -1137,7 +1220,8 @@ mod tests {
     #[test_case(Message::context_update("<context-update>Date is now tomorrow.</context-update>".into(), Default::default()) ; "context_update")]
     fn history_hides_host_messages_but_keeps_the_prompt(host: Message) {
         let msgs = vec![host, Message::user(USER_TEXT.into())];
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false).0;
         let shown: Vec<(DisplayRole, &str)> = display
             .iter()
             .map(|d| (d.role.clone(), d.text.as_str()))
@@ -1160,8 +1244,13 @@ mod tests {
         let saved = serde_json::to_string(&[observation, next]).unwrap();
         let restored: Vec<Message> = serde_json::from_str(&saved).unwrap();
 
-        let display =
-            history_to_display(&restored, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display = history_to_display(
+            &restored,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            false,
+        )
+        .0;
 
         let shown: Vec<(DisplayRole, &str)> = display
             .iter()
@@ -1199,7 +1288,8 @@ mod tests {
             "output",
             is_error,
         );
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false).0;
         assert_eq!(display.len(), 1);
         assert!(matches!(&display[0].role, DisplayRole::Tool(t) if t.status == expected));
     }
@@ -1231,7 +1321,8 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false).0;
         assert_eq!(display.len(), 4);
         assert_eq!(display[0].role, DisplayRole::User);
         assert_eq!(display[1].role, DisplayRole::Assistant);
@@ -1279,7 +1370,7 @@ mod tests {
             let discriminant = std::mem::discriminant(&output);
             let msgs = tool_use_pair(tool_name, input_json, "ok", false);
             let outputs = HashMap::from([("t1".into(), Arc::new(output))]);
-            let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
+            let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), false).0;
             assert_eq!(
                 std::mem::discriminant(display[0].tool_output.as_deref().unwrap()),
                 discriminant,
@@ -1302,7 +1393,7 @@ mod tests {
             false,
         );
         let outputs = HashMap::from([("t1".into(), Arc::new(write_output))]);
-        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), false).0;
         assert!(display[0].annotation.is_some());
     }
 
@@ -1316,7 +1407,8 @@ mod tests {
             &joined,
             false,
         );
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false).0;
         let line_count = display[0].text.lines().count();
         assert!(
             line_count < long_output.len(),
@@ -1332,7 +1424,8 @@ mod tests {
             "1: fn main() {}",
             false,
         );
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false).0;
         assert!(display[0].tool_output.is_none());
         assert!(display[0].text.contains("fn main"));
     }
@@ -1353,7 +1446,8 @@ mod tests {
             ],
             ..Default::default()
         }];
-        let display = history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default(), false).0;
         assert_eq!(display.len(), 2);
         assert_eq!(display[0].role, DisplayRole::Thinking);
         assert_eq!(display[0].text, "reasoning");
@@ -1405,11 +1499,64 @@ mod tests {
             false,
         );
         let outputs = HashMap::from([("t1".to_owned(), Arc::new(edit_output("a")))]);
-        let (_, items) = history_to_display(&msgs, &outputs, &ToolOutputLines::default());
+        let (_, items) = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), false);
         assert!(items.is_empty(), "Rust owns Diff rendering on restore");
 
-        let (_, items) = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default());
+        let (_, items) =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false);
         assert_eq!(items.len(), 1, "text-only history still restores via Lua");
+    }
+
+    #[test]
+    fn history_compact_tools_groups_consecutive_tools() {
+        let msgs = vec![
+            Message::user("run tasks".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "thinking step".into(),
+                        signature: None,
+                    },
+                    ContentBlock::tool_use(
+                        "t1",
+                        "bash",
+                        serde_json::json!({"command": "cargo test"}),
+                    ),
+                    ContentBlock::tool_use("t2", "read", serde_json::json!({"path": "src/lib.rs"})),
+                ],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::tool_result("t1", "ok", false),
+                    ContentBlock::tool_result("t2", "code", false),
+                ],
+                ..Default::default()
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "all passed".into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let display =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), true).0;
+        assert_eq!(display.len(), 3);
+        assert_eq!(display[0].role, DisplayRole::User);
+        let DisplayRole::ToolGroup(g) = &display[1].role else {
+            panic!("expected ToolGroup in display[1]");
+        };
+        assert!(g.sealed);
+        assert_eq!(g.entries.len(), 3);
+        assert!(matches!(&g.entries[0], GroupEntry::Thinking(th) if th.text == "thinking step"));
+        assert!(matches!(&g.entries[1], GroupEntry::Tool(t) if t.name.as_ref() == "bash"));
+        assert!(matches!(&g.entries[2], GroupEntry::Tool(t) if t.name.as_ref() == "read"));
+        assert_eq!(display[2].role, DisplayRole::Assistant);
+        assert_eq!(display[2].text, "all passed");
     }
 
     #[test]
