@@ -34,10 +34,10 @@ use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaul
 use maki_providers::model::Model;
 use maki_providers::models_cache::{cached_model_specs, fetch_all_models_cached};
 use maki_providers::provider::available_model_specs;
-use maki_providers::{add_cost, settle_session};
+use maki_providers::{ThinkingConfig, add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
-use maki_storage::sessions::{SessionClaim, SessionError};
+use maki_storage::sessions::{SessionClaim, SessionError, StoredThinking};
 use serde::Serialize;
 use serde_json::Value;
 use smol::Task;
@@ -89,6 +89,7 @@ struct SessionState {
     mcp: Option<McpHandle>,
     current_mode: AgentMode,
     current_model: String,
+    current_thinking: ThinkingConfig,
     pending: PendingState,
     /// Shared with the run, so reloading the same session reads under this
     /// claim instead of clashing with it.
@@ -236,11 +237,19 @@ fn refresh_models(srv: &mut Server, batch: Vec<String>) {
     srv.should_wait_models = false;
     // Merged even with no session yet, since session/new builds its selector from this list.
     let Some(session) = &srv.session else { return };
-    let option = methods::model_config_option(&session.current_model, &srv.model_specs);
+    let options = match Model::from_spec(&session.current_model) {
+        Ok(model) => {
+            methods::session_config_options(&model, &srv.model_specs, session.current_thinking)
+        }
+        Err(_) => vec![methods::model_config_option(
+            &session.current_model,
+            &srv.model_specs,
+        )],
+    };
     session_update(
         &srv.out_tx,
         &SessionId::from(session.handle.session_id.to_string()),
-        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(vec![option])),
+        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
     );
 }
 
@@ -351,6 +360,7 @@ async fn new_session(
     );
     let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone()).await;
     let claim = SessionClaim::fresh(&params.storage);
+    let current_thinking = ThinkingConfig::from(params.defaults.thinking);
     let session_ref = start_session(
         srv,
         params,
@@ -360,11 +370,12 @@ async fn new_session(
         mcp,
         project_config,
         None,
+        current_thinking,
     );
     maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(session_ref.as_str()));
-    let spec = params.model.spec();
-    let resp = methods::new_session_response(session_ref.as_str())
-        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
+    let options =
+        methods::session_config_options(&params.model, &srv.model_specs, current_thinking);
+    let resp = methods::new_session_response(session_ref.as_str()).config_options(options);
     Ok(AgentResponse::NewSessionResponse(resp))
 }
 
@@ -429,6 +440,12 @@ async fn load_session(
         &recorded_model,
         RESTORED_FAST,
     );
+    let current_thinking = restored
+        .session
+        .meta
+        .thinking
+        .map(ThinkingConfig::from)
+        .unwrap_or_else(|| ThinkingConfig::from(params.defaults.thinking));
     let started = start_session(
         srv,
         params,
@@ -438,11 +455,12 @@ async fn load_session(
         mcp,
         project_config,
         restored_cost,
+        current_thinking,
     );
     maki_otel::emit::session_started(maki_otel::emit::START_RESUME, Some(started.as_str()));
-    let spec = params.model.spec();
-    let resp = methods::load_session_response()
-        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
+    let options =
+        methods::session_config_options(&params.model, &srv.model_specs, current_thinking);
+    let resp = methods::load_session_response().config_options(options);
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
@@ -505,6 +523,7 @@ fn start_session(
     mcp: Option<McpHandle>,
     project_config: ProjectConfig,
     initial_cost: Option<f64>,
+    current_thinking: ThinkingConfig,
 ) -> SessionRef {
     let pending = PendingState::default();
     // Without form elicitation the question tool would spin forever waiting
@@ -560,6 +579,7 @@ fn start_session(
         mcp,
         current_mode: AgentMode::Build,
         current_model: params.model.spec(),
+        current_thinking,
         pending,
         claim,
     });
@@ -804,13 +824,14 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     let session = srv.session.as_ref().ok_or_else(no_session)?;
 
     let (message, images) = extract_prompt_content(&req.prompt);
-    let input = AgentInput::from_defaults(
+    let mut input = AgentInput::from_defaults(
         message,
         session.current_mode.clone(),
         images,
         srv.defaults,
         InputSource::Acp,
     );
+    input.thinking = session.current_thinking;
 
     // One outstanding id per session, checked and set under the same guard:
     // `input_tx` is unbounded, so a second prompt would queue happily and
@@ -848,37 +869,106 @@ fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpEr
     ))
 }
 
+fn parse_thinking_value(
+    value_str: &str,
+    defaults: &SessionDefaults,
+) -> Result<ThinkingConfig, String> {
+    let trimmed = value_str.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "default" => Ok(defaults.thinking.into()),
+        "none" | "off" | "disabled" => Ok(ThinkingConfig::Off),
+        "adaptive" | "auto" => Ok(ThinkingConfig::Adaptive),
+        "minimal" => Ok(ThinkingConfig::Effort(
+            maki_storage::sessions::Effort::Minimal,
+        )),
+        "low" => Ok(ThinkingConfig::Effort(maki_storage::sessions::Effort::Low)),
+        "medium" => Ok(ThinkingConfig::Effort(
+            maki_storage::sessions::Effort::Medium,
+        )),
+        "high" => Ok(ThinkingConfig::Effort(maki_storage::sessions::Effort::High)),
+        "xhigh" | "x-high" | "extra_high" | "extra high" => Ok(ThinkingConfig::Effort(
+            maki_storage::sessions::Effort::XHigh,
+        )),
+        "max" => Ok(ThinkingConfig::Effort(maki_storage::sessions::Effort::Max)),
+        _ => StoredThinking::parse_setting(trimmed)
+            .map(ThinkingConfig::from)
+            .map_err(|e| e.to_string()),
+    }
+}
+
 fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
     let req: SetSessionConfigOptionRequest = parse_params(raw)?;
-    if req.config_id.0.as_ref() != methods::MODEL_CONFIG_ID {
+    if req.config_id.0.as_ref() == methods::MODEL_CONFIG_ID {
+        let SessionConfigOptionValue::ValueId { value } = req.value else {
+            return Err(AcpError::invalid_params().data(json_str(&"model must be a value id")));
+        };
+        let spec = value.0.to_string();
+        if !srv.model_policy.allows(&spec) {
+            return Err(
+                AcpError::invalid_params().data(json_str(&"model is not allowed by policy"))
+            );
+        }
+        let model =
+            Model::from_spec(&spec).map_err(|e| AcpError::invalid_params().data(json_str(&e)))?;
+
+        let session = srv.session.as_mut().ok_or_else(no_session)?;
+        session
+            .handle
+            .model_tx
+            .send(model.clone())
+            .map_err(|_| AcpError::new(-32603, "session ended"))?;
+        session.current_model = spec.clone();
+
+        let options =
+            methods::session_config_options(&model, &srv.model_specs, session.current_thinking);
+        Ok(AgentResponse::SetSessionConfigOptionResponse(
+            SetSessionConfigOptionResponse::new(options),
+        ))
+    } else if methods::is_thought_level_config_id(req.config_id.0.as_ref()) {
+        let session = srv.session.as_mut().ok_or_else(no_session)?;
+        let model = Model::from_spec(&session.current_model)
+            .map_err(|e| AcpError::invalid_params().data(json_str(&e)))?;
+
+        let thinking = match req.value {
+            SessionConfigOptionValue::ValueId { value } => {
+                parse_thinking_value(value.0.as_ref(), &srv.defaults)
+                    .map_err(|e| AcpError::invalid_params().data(json_str(&e)))?
+            }
+            SessionConfigOptionValue::Boolean { value } => {
+                if value {
+                    if model.supports_thinking() {
+                        ThinkingConfig::Adaptive.clamped(&model)
+                    } else {
+                        ThinkingConfig::Adaptive
+                    }
+                } else {
+                    ThinkingConfig::Off
+                }
+            }
+            _ => return Err(AcpError::invalid_params().data(json_str(&"unsupported config value"))),
+        };
+
+        if !model.supports_thinking() && thinking.is_enabled() {
+            return Err(
+                AcpError::invalid_params().data(json_str(&"model does not support thinking"))
+            );
+        }
+        if model.requires_thinking() && !thinking.is_enabled() {
+            return Err(AcpError::invalid_params().data(json_str(&"model requires thinking")));
+        }
+
+        session.current_thinking = thinking;
+
+        let options =
+            methods::session_config_options(&model, &srv.model_specs, session.current_thinking);
+        Ok(AgentResponse::SetSessionConfigOptionResponse(
+            SetSessionConfigOptionResponse::new(options),
+        ))
+    } else {
         let detail = format!("unknown config option: {}", req.config_id);
-        return Err(AcpError::invalid_params().data(json_str(&detail)));
+        Err(AcpError::invalid_params().data(json_str(&detail)))
     }
-
-    let SessionConfigOptionValue::ValueId { value } = req.value else {
-        return Err(AcpError::invalid_params().data(json_str(&"model must be a value id")));
-    };
-    let spec = value.0.to_string();
-    if !srv.model_policy.allows(&spec) {
-        return Err(AcpError::invalid_params().data(json_str(&"model is not allowed by policy")));
-    }
-    let model =
-        Model::from_spec(&spec).map_err(|e| AcpError::invalid_params().data(json_str(&e)))?;
-
-    let session = srv.session.as_mut().ok_or_else(no_session)?;
-    session
-        .handle
-        .model_tx
-        .send(model)
-        .map_err(|_| AcpError::new(-32603, "session ended"))?;
-    session.current_model = spec.clone();
-
-    Ok(AgentResponse::SetSessionConfigOptionResponse(
-        SetSessionConfigOptionResponse::new(vec![methods::model_config_option(
-            &spec,
-            &srv.model_specs,
-        )]),
-    ))
 }
 
 fn handle_notification(srv: &Server, method: &str) {
@@ -1443,6 +1533,7 @@ mod tests {
                 mcp: None,
                 current_mode: AgentMode::Build,
                 current_model: String::new(),
+                current_thinking: ThinkingConfig::default(),
                 pending: Arc::default(),
                 claim,
             }),
@@ -2581,6 +2672,109 @@ mod tests {
         assert_eq!(
             stdio.environment.get("TOKEN").map(String::as_str),
             Some("t")
+        );
+    }
+
+    #[test]
+    fn set_config_updates_thought_level_and_aliases() {
+        use agent_client_protocol_schema::v1::{SessionConfigKind, SessionConfigOptionCategory};
+
+        let (mut srv, .., _out_rx) = test_server();
+        srv.session.as_mut().unwrap().current_model = SELECTED_SPEC.to_string();
+
+        let raw = serde_json::json!({
+            "params": {
+                "sessionId": "test-session",
+                "configId": "thought_level",
+                "value": "high"
+            }
+        });
+        let res = handle_set_config(&mut srv, &raw).expect("set thought_level to high");
+        let AgentResponse::SetSessionConfigOptionResponse(resp) = res else {
+            panic!("expected SetSessionConfigOptionResponse");
+        };
+        assert_eq!(
+            srv.session.as_ref().unwrap().current_thinking,
+            ThinkingConfig::Effort(maki_storage::sessions::Effort::High)
+        );
+        let thought_opt = resp
+            .config_options
+            .iter()
+            .find(|o| o.category == Some(SessionConfigOptionCategory::ThoughtLevel))
+            .expect("thought_level option must be returned");
+        assert_eq!(thought_opt.id.0.as_ref(), "thought_level");
+        let SessionConfigKind::Select(select) = &thought_opt.kind else {
+            panic!("expected select");
+        };
+        assert_eq!(select.current_value.0.as_ref(), "high");
+
+        // Test alias reasoning_effort
+        let raw_alias = serde_json::json!({
+            "params": {
+                "sessionId": "test-session",
+                "configId": "reasoning_effort",
+                "value": "low"
+            }
+        });
+        handle_set_config(&mut srv, &raw_alias).expect("set reasoning_effort to low");
+        assert_eq!(
+            srv.session.as_ref().unwrap().current_thinking,
+            ThinkingConfig::Effort(maki_storage::sessions::Effort::Low)
+        );
+
+        // Test boolean false -> off
+        let raw_bool = serde_json::json!({
+            "params": {
+                "sessionId": "test-session",
+                "configId": "thought_level",
+                "type": "boolean",
+                "value": false
+            }
+        });
+        handle_set_config(&mut srv, &raw_bool).expect("set thought_level to false");
+        assert_eq!(
+            srv.session.as_ref().unwrap().current_thinking,
+            ThinkingConfig::Off
+        );
+    }
+
+    #[test]
+    fn set_config_rejects_invalid_thought_level() {
+        let (mut srv, .., _out_rx) = test_server();
+        srv.session.as_mut().unwrap().current_model = SELECTED_SPEC.to_string();
+
+        let raw = serde_json::json!({
+            "params": {
+                "sessionId": "test-session",
+                "configId": "thought_level",
+                "value": "invalid_mode_xyz"
+            }
+        });
+        let err = handle_set_config(&mut srv, &raw).expect_err("should reject invalid thinking");
+        assert_eq!(err.code, AcpError::invalid_params().code);
+    }
+
+    #[test]
+    fn handle_prompt_carries_session_thinking() {
+        let (mut srv, .., _out_rx) = test_server();
+        let (input_tx, input_rx) = flume::unbounded();
+        srv.session.as_mut().unwrap().handle.input_tx = input_tx;
+        srv.session.as_mut().unwrap().current_thinking =
+            ThinkingConfig::Effort(maki_storage::sessions::Effort::High);
+
+        let raw = serde_json::json!({
+            "params": {
+                "sessionId": "test-session",
+                "prompt": [{ "type": "text", "text": "hello" }]
+            }
+        });
+        let id = RequestId::from(42);
+        handle_prompt(&mut srv, &raw, &id).expect("prompt succeeds");
+
+        let input = input_rx.try_recv().expect("input received");
+        assert_eq!(
+            input.thinking,
+            ThinkingConfig::Effort(maki_storage::sessions::Effort::High)
         );
     }
 }
