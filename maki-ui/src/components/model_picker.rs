@@ -151,6 +151,7 @@ pub struct ModelPicker {
     /// Folded providers, by slug.
     collapsed: BTreeSet<String>,
     prefer_model_name: bool,
+    show_cost: bool,
 }
 
 impl ModelPicker {
@@ -165,11 +166,17 @@ impl ModelPicker {
             anchor: None,
             collapsed: BTreeSet::new(),
             prefer_model_name: true,
+            show_cost: true,
         }
     }
 
     pub fn with_prefer_model_name(mut self, prefer: bool) -> Self {
         self.prefer_model_name = prefer;
+        self
+    }
+
+    pub fn with_show_cost(mut self, show: bool) -> Self {
+        self.show_cost = show;
         self
     }
 
@@ -235,7 +242,7 @@ impl ModelPicker {
         let specs = self.available.get().map(|list| &list.specs);
         let mut entries = Vec::new();
         for spec in &self.recents {
-            if let Some(mut e) = parse_model_entry(spec, self.prefer_model_name) {
+            if let Some(mut e) = parse_model_entry(spec, self.prefer_model_name, self.show_cost) {
                 e.suffix = Some(std::mem::take(&mut e.provider_display));
                 e.provider_display = RECENT_SECTION.to_string();
                 entries.push(e);
@@ -244,7 +251,7 @@ impl ModelPicker {
         let mut full: Vec<ModelEntry> = specs
             .map(|s| {
                 s.iter()
-                    .filter_map(|s| parse_model_entry(s, self.prefer_model_name))
+                    .filter_map(|s| parse_model_entry(s, self.prefer_model_name, self.show_cost))
                     .collect()
             })
             .unwrap_or_default();
@@ -404,7 +411,7 @@ fn format_pricing(model: &Model) -> Option<String> {
     })
 }
 
-fn parse_model_entry(spec: &str, prefer_model_name: bool) -> Option<ModelEntry> {
+fn parse_model_entry(spec: &str, prefer_model_name: bool, show_cost: bool) -> Option<ModelEntry> {
     let (provider_str, model_id) = spec.split_once('/')?;
 
     // A catalog-backed row like `opencode-go` takes the name models.dev gives it.
@@ -419,7 +426,11 @@ fn parse_model_entry(spec: &str, prefer_model_name: bool) -> Option<ModelEntry> 
 
     let override_tiers = model_registry::override_tiers(spec);
     let (tier, free, price) = match Model::from_spec(spec) {
-        Ok(m) => (m.tier.to_string(), m.is_free(), format_pricing(&m)),
+        Ok(m) => (
+            m.tier.to_string(),
+            m.is_free(),
+            show_cost.then(|| format_pricing(&m)).flatten(),
+        ),
         Err(_) => (String::new(), false, None),
     };
     let tier = if override_tiers.is_empty() {
@@ -654,7 +665,7 @@ mod tests {
 
     #[test]
     fn parse_model_entry_valid() {
-        let entry = parse_model_entry("responses/my-model", true).unwrap();
+        let entry = parse_model_entry("responses/my-model", true, true).unwrap();
         assert_eq!(entry.id, "my-model");
         assert_eq!(entry.provider_display, "Responses API");
         assert!(!entry.detail.is_empty());
@@ -662,7 +673,7 @@ mod tests {
 
     #[test]
     fn parse_model_entry_paid_model_not_marked_free() {
-        let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514", true).unwrap();
+        let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514", true, true).unwrap();
         assert!(
             !entry.detail.starts_with(FREE_PREFIX),
             "paid anthropic model must not be marked free"
@@ -671,7 +682,7 @@ mod tests {
 
     #[test]
     fn parse_model_entry_no_slash() {
-        assert!(parse_model_entry("no-slash", true).is_none());
+        assert!(parse_model_entry("no-slash", true, true).is_none());
     }
 
     #[test_case(key(KeyCode::Char('!')),           ModelTier::Strong     ; "legacy_bang_strong")]
@@ -981,7 +992,7 @@ mod tests {
     #[test]
     fn zero_priced_discovery_marks_entry_free() {
         register_discovered_models();
-        let entry = parse_model_entry(OX_SPEC, true).unwrap();
+        let entry = parse_model_entry(OX_SPEC, true, true).unwrap();
         assert!(
             entry.detail.starts_with(FREE_PREFIX),
             "zero-priced discovery must mark the entry free"
@@ -991,7 +1002,7 @@ mod tests {
     #[test]
     fn paid_discovery_not_marked_free() {
         register_discovered_models();
-        let entry = parse_model_entry(&format!("responses/{PAID_ID}"), true).unwrap();
+        let entry = parse_model_entry(&format!("responses/{PAID_ID}"), true, true).unwrap();
         assert!(
             !entry.detail.starts_with(FREE_PREFIX),
             "paid discovery must not mark the entry free"
@@ -1001,6 +1012,16 @@ mod tests {
                 .detail
                 .ends_with(&format!("{PRICE_SEPARATOR}{PAID_PRICE_LABEL}")),
             "paid discovery must show its price"
+        );
+    }
+
+    #[test]
+    fn paid_discovery_hides_price_when_show_cost_is_false() {
+        register_discovered_models();
+        let entry = parse_model_entry(&format!("responses/{PAID_ID}"), true, false).unwrap();
+        assert!(
+            !entry.detail.contains('$'),
+            "paid discovery must not show price when show_cost is false"
         );
     }
 

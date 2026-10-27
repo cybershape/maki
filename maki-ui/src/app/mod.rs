@@ -492,7 +492,8 @@ impl App {
             ),
             theme_picker: ThemePicker::new(),
             model_picker: ModelPicker::new(available_models)
-                .with_prefer_model_name(ui_config.prefer_model_name),
+                .with_prefer_model_name(ui_config.prefer_model_name)
+                .with_show_cost(ui_config.show_cost),
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
@@ -1714,9 +1715,15 @@ impl App {
             );
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.set_context_size(chat_idx, ctx_size);
-            self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
+            let cost = self.ui_config.show_cost.then_some(tc.cost).flatten();
+            self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(cost));
             if let Some(tool_id) = &subagent_id {
-                let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
+                let sum_cost = self
+                    .ui_config
+                    .show_cost
+                    .then_some(self.chats[chat_idx].cost)
+                    .flatten();
+                let formatted = tc.usage.format_sum_cost(sum_cost);
                 self.chats[MAIN_CHAT].set_tool_turn_usage(tool_id, formatted);
             }
         }

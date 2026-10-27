@@ -315,12 +315,21 @@ impl App {
         if self.usage_modal.is_open() {
             let ctx = UsageModalContext {
                 total: &self.state.token_usage,
-                total_cost: self.state.cost,
-                total_list_cost: self.state.subsidised_list_cost,
+                total_cost: self
+                    .ui_config
+                    .show_cost
+                    .then_some(self.state.cost)
+                    .flatten(),
+                total_list_cost: self
+                    .ui_config
+                    .show_cost
+                    .then_some(self.state.subsidised_list_cost)
+                    .flatten(),
                 by_model: self.state.session.usage_by_model(),
                 model: &self.state.model,
                 fast: self.state.fast,
                 clock_format: self.ui_config.clock_format,
+                show_cost: self.ui_config.show_cost,
             };
             let r = self.usage_modal.view(frame, full, &ctx);
             if r.width > 0 {
@@ -366,10 +375,14 @@ impl App {
             mode_style,
             model_id: &model_str,
             stats: UsageStats {
-                global_cost: self.state.cost,
+                global_cost: self
+                    .ui_config
+                    .show_cost
+                    .then_some(self.state.cost)
+                    .flatten(),
                 context_size: chat.context_size,
-                cost: chat.cost,
-                list_cost: chat.list_cost,
+                cost: self.ui_config.show_cost.then_some(chat.cost).flatten(),
+                list_cost: self.ui_config.show_cost.then_some(chat.list_cost).flatten(),
                 subsidy_source: self.state.model.subsidised_by.clone(),
                 context_window: self.state.model.context_window,
                 show_global: self.chats.len() > 1,

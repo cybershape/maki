@@ -660,6 +660,7 @@ pub struct UiFileConfig {
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub max_input_lines: Option<u32>,
     pub prefer_model_name: Option<bool>,
+    pub show_cost: Option<bool>,
 }
 
 impl UiFileConfig {
@@ -679,7 +680,8 @@ impl UiFileConfig {
             theme,
             clock_format,
             max_input_lines,
-            prefer_model_name
+            prefer_model_name,
+            show_cost
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -1347,6 +1349,12 @@ pub struct UiConfig {
         desc = "Display human-readable model name instead of raw model ID in model picker and status bar when available"
     )]
     pub prefer_model_name: bool,
+
+    #[config(
+        default = true,
+        desc = "Show cost and pricing amounts in the UI (status bar, messages, usage modal, and model picker)"
+    )]
+    pub show_cost: bool,
 }
 
 impl UiConfig {
@@ -1373,6 +1381,7 @@ impl UiConfig {
             theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
             prefer_model_name: f.prefer_model_name.unwrap_or(true),
+            show_cost: f.show_cost.unwrap_or(true),
         }
     }
 
@@ -5034,6 +5043,16 @@ mod tests {
         let parsed: RawConfig = toml::from_str("[ui]\nprefer_model_name = false\n").unwrap();
         let cfg = UiConfig::from_file(parsed.ui);
         assert!(!cfg.prefer_model_name);
+    }
+
+    #[test]
+    fn show_cost_defaults_to_true_and_can_be_disabled() {
+        let default_cfg = UiConfig::from_file(UiFileConfig::default());
+        assert!(default_cfg.show_cost);
+
+        let parsed: RawConfig = toml::from_str("[ui]\nshow_cost = false\n").unwrap();
+        let cfg = UiConfig::from_file(parsed.ui);
+        assert!(!cfg.show_cost);
     }
 
     #[test]

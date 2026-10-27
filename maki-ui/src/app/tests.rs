@@ -2224,6 +2224,37 @@ fn parent_turn_flush_stamps_the_last_unstamped_tool(subagent_ran: bool) {
 }
 
 #[test]
+fn turn_usage_omits_cost_when_show_cost_is_false() {
+    let mut app = streaming_app();
+    app.ui_config.show_cost = false;
+    app.update(main_turn());
+    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(agent_msg(tool_results_submitted()));
+
+    let expected = MAIN_TOKENS.format(None);
+    assert_eq!(
+        app.chats[0].tool_turn_usage(TASK_ID),
+        Some(expected.as_str())
+    );
+    assert!(!expected.contains('$'));
+}
+
+#[test]
+fn subagent_turn_usage_omits_cost_when_show_cost_is_false() {
+    let mut app = app_with_subagent();
+    app.ui_config.show_cost = false;
+    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(sub_turn_complete());
+
+    let expected = SUB_TOKENS.format_sum_cost(None);
+    assert_eq!(
+        app.chats[0].tool_turn_usage(TASK_ID),
+        Some(expected.as_str())
+    );
+    assert!(!expected.contains('$'));
+}
+
+#[test]
 fn tool_inside_subagent_chat_gets_its_turn_usage() {
     const TOOL_ID: &str = "sub_bash";
     let mut app = streaming_app();

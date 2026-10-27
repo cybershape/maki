@@ -83,6 +83,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `thinking_lines` | integer | `3` | - | Collapse model reasoning to its header and last N lines. Click to toggle. 0 shows only the header, -1 never collapses |
 | `clock_format` | String | `system` | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
 | `prefer_model_name` | bool | `true` | - | Display human-readable model name instead of raw model ID in model picker and status bar when available |
+| `show_cost` | bool | `true` | - | Show cost and pricing amounts in the UI (status bar, messages, usage modal, and model picker) |
 
 ### `ui.theme`
 

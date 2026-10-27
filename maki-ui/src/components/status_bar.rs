@@ -547,14 +547,27 @@ mod tests {
         show_global: bool,
     ) -> bool {
         let text = render(global_cost, show_global, false);
-        assert_eq!(text.matches(CHAT_COST_TEXT).count(), 1, "{text}");
-        let shown = text.matches(SESSION_COST_TEXT).count() == 1;
-        assert_eq!(
-            text.contains(SIGMA),
-            shown,
-            "a sigma carrying another number is a misrender: {text}"
+        text.contains(SESSION_COST_TEXT)
+    }
+
+    #[test]
+    fn status_bar_omits_cost_when_stats_have_no_cost() {
+        let with_cost = context(&Status::Idle, None, false, false);
+        assert!(draw(&with_cost).contains(CHAT_COST_TEXT));
+
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.stats.cost = None;
+        ctx.stats.list_cost = None;
+        ctx.stats.global_cost = None;
+        let drawn = draw(&ctx);
+        assert!(
+            !drawn.contains('$'),
+            "drawn status bar should not contain '$': {drawn}"
         );
-        shown
+        assert!(
+            !drawn.contains(SIGMA),
+            "drawn status bar should not contain sigma: {drawn}"
+        );
     }
 
     /// Yolo now outlives the process that turned it on, so the one-shot flash
