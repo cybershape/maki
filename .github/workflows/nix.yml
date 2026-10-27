@@ -1,17 +1,14 @@
 name: Nix
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      code: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.code == 'true' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v3
