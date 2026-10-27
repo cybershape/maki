@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::process;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, MutexGuard, RwLock};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,7 @@ const PROVIDERS_FILE: &str = "providers.toml";
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
 const OPENCODE_SLUG: &str = "opencode";
-const LOCAL_OVERLAY_SLUGS: [&str; 2] = ["ollama", "llama-cpp"];
+const LOCAL_OVERLAY_SLUGS: [&str; 3] = ["ollama", "llama-cpp", "responses"];
 
 /// Where the last parse came from and what the file looked like then. The
 /// config path follows the project directory, so one process can read more
@@ -32,6 +32,8 @@ type FileStamp = (PathBuf, Option<SystemTime>, u64);
 /// those costs a read plus a full TOML parse. A broken file is kept too, so a
 /// caller that polls it parses and reports it once per edit.
 static PARSED: Mutex<Option<(FileStamp, Result<ProvidersConfig, String>)>> = Mutex::new(None);
+static OVERRIDE: RwLock<Option<ProvidersConfig>> = RwLock::new(None);
+static OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Valid `top_p` is in the open interval exclusive of 0, up to 1 inclusive.
 const TOP_P_MIN: f64 = 0.0;
@@ -387,6 +389,9 @@ impl ProvidersConfig {
     }
 
     fn read() -> Result<Self, String> {
+        if let Some(config) = OVERRIDE.read().unwrap_or_else(|e| e.into_inner()).clone() {
+            return Ok(config);
+        }
         let path = providers_file_path();
         let meta = match fs::metadata(&path) {
             Ok(meta) => meta,
@@ -419,6 +424,12 @@ impl ProvidersConfig {
     }
 
     pub fn save(&self) -> Result<(), std::io::Error> {
+        let mut override_lock = OVERRIDE.write().unwrap_or_else(|e| e.into_inner());
+        if override_lock.is_some() {
+            *override_lock = Some(self.clone());
+            return Ok(());
+        }
+        drop(override_lock);
         let path = providers_file_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -454,6 +465,31 @@ fn providers_file_path() -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(PROVIDERS_FILE)
     })
+}
+
+pub struct ConfigOverrideGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Drop for ConfigOverrideGuard {
+    fn drop(&mut self) {
+        *OVERRIDE.write().unwrap_or_else(|e| e.into_inner()) = None;
+        *PARSED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+impl ConfigOverrideGuard {
+    pub fn update(&mut self, config: ProvidersConfig) {
+        *OVERRIDE.write().unwrap_or_else(|e| e.into_inner()) = Some(config);
+        *PARSED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+pub fn set_override(config: ProvidersConfig) -> ConfigOverrideGuard {
+    let lock = OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    *OVERRIDE.write().unwrap_or_else(|e| e.into_inner()) = Some(config);
+    *PARSED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    ConfigOverrideGuard { _lock: lock }
 }
 
 pub fn set_registered_providers(rows: Vec<&'static BuiltInProvider>) {
@@ -772,6 +808,78 @@ mod tests {
         assert!(toml::from_str::<ProvidersConfig>("[slug]\nplugin = \" padded\"\n").is_err());
     }
 
+    #[test]
+    fn config_override_replaces_loaded_config_and_resets_on_drop() {
+        const SLUG: &str = "test-override-slug";
+        let mut config = ProvidersConfig::default();
+        config.upsert(
+            SLUG.into(),
+            ProviderDef {
+                plugin: Some("test-plugin".into()),
+                ..ProviderDef::default()
+            },
+        );
+        {
+            let mut guard = set_override(config.clone());
+            assert_eq!(
+                ProvidersConfig::load_or_default()
+                    .get(SLUG)
+                    .unwrap()
+                    .plugin
+                    .as_deref(),
+                Some("test-plugin")
+            );
+            config.upsert(
+                SLUG.into(),
+                ProviderDef {
+                    plugin: Some("updated-plugin".into()),
+                    ..ProviderDef::default()
+                },
+            );
+            guard.update(config);
+            assert_eq!(
+                ProvidersConfig::load_or_default()
+                    .get(SLUG)
+                    .unwrap()
+                    .plugin
+                    .as_deref(),
+                Some("updated-plugin")
+            );
+        }
+        assert!(ProvidersConfig::load_or_default().get(SLUG).is_none());
+    }
+
+    #[test]
+    fn config_override_intercepts_save() {
+        const SLUG: &str = "test-save-override-slug";
+        let mut config = ProvidersConfig::default();
+        config.upsert(
+            SLUG.into(),
+            ProviderDef {
+                plugin: Some("p1".into()),
+                ..ProviderDef::default()
+            },
+        );
+        let _guard = set_override(config.clone());
+        let mut updated = config;
+        updated.upsert(
+            SLUG.into(),
+            ProviderDef {
+                plugin: Some("p2".into()),
+                ..ProviderDef::default()
+            },
+        );
+        updated.save().unwrap();
+        assert_eq!(
+            ProvidersConfig::load_or_default()
+                .get(SLUG)
+                .unwrap()
+                .plugin
+                .as_deref(),
+            Some("p2")
+        );
+    }
+
     const UNKNOWN_TIER_TOML: &str = r#"id = "x"
 tier = "mediums"
 "#;
@@ -996,6 +1104,7 @@ tier = "{input}"
     /// drops still has to say so: exempting the whole table would leave a user
     /// wondering why their `tier` never took.
     #[test_case("ollama", THINKING_MODEL, Vec::new() ; "local_slug_reads_thinking_keys")]
+    #[test_case("responses", THINKING_MODEL, Vec::new() ; "responses_slug_reads_thinking_keys")]
     #[test_case("anthropic", THINKING_MODEL, vec!["models"] ; "other_builtins_keep_their_catalog")]
     #[test_case("ollama", RICH_MODEL, vec!["models.tier", "models.context_window", "models.supports_vision", "models.pricing_*"] ; "local_slug_names_what_it_dropped")]
     fn ignored_builtin_fields_on_declared_models(slug: &str, entry: &str, expected: Vec<&str>) {

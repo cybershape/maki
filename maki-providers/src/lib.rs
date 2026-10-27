@@ -27,7 +27,9 @@ pub use model::{
 pub use pricing::{model_cost, settle_session};
 pub use providers::custom;
 pub use providers::plugin;
-pub use providers::responses::{ResponsesProvider, build_body};
+pub use providers::responses::{
+    ResponsesProvider, apply_responses_reasoning, build_body, responses_dialect,
+};
 pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 pub use providers::{Timeouts, user_agent};
 

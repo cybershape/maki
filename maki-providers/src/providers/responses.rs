@@ -88,7 +88,7 @@ pub fn responses_dialect<'a>(
     }
 }
 
-pub(crate) fn apply_responses_reasoning(
+pub fn apply_responses_reasoning(
     body: &mut Value,
     thinking: ThinkingConfig,
     model: &Model,

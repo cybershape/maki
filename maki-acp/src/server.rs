@@ -2240,6 +2240,100 @@ mod tests {
         assert!(!srv.should_wait_models);
     }
 
+    #[test]
+    fn acp_discovered_reasoning_model_sends_reasoning_effort() {
+        let slug = "magpie-acp";
+        let model_id = "group/grok-4.7";
+        let mut config = maki_config::providers::ProvidersConfig::default();
+        config.upsert(
+            slug.into(),
+            maki_config::providers::ProviderDef {
+                base_url: Some("http://maclinux.ts:3425/v1".into()),
+                ..Default::default()
+            },
+        );
+        let _guard = maki_config::providers::set_override(config);
+
+        maki_providers::model_registry::set_known_models(
+            slug,
+            vec![maki_providers::model::ModelInfo {
+                id: model_id.to_string(),
+                context_window: Some(500000),
+                max_output_tokens: Some(500000),
+                pricing: None,
+                supports_thinking: Some(true),
+                supports_vision: Some(true),
+                tier: None,
+                provider_info: None,
+                extra: None,
+                effort: Some(maki_providers::model::ModelEffort {
+                    supported: vec![maki_providers::Effort::Low, maki_providers::Effort::High],
+                    send_off: Some(false),
+                }),
+            }],
+        );
+
+        let model = Model::from_spec(&format!("{slug}/{model_id}")).unwrap();
+        assert!(model.supports_thinking());
+        assert!(model.requires_thinking());
+
+        let defaults = SessionDefaults::default();
+        let input = AgentInput::from_defaults(
+            "hello".into(),
+            AgentMode::Build,
+            Vec::new(),
+            defaults,
+            InputSource::Acp,
+        );
+        let opts = maki_providers::RequestOptions {
+            thinking: input.thinking,
+            fast: input.fast,
+        }
+        .clamped(&model);
+        assert_eq!(
+            opts.thinking,
+            maki_providers::ThinkingConfig::Effort(maki_providers::Effort::Minimal)
+        );
+
+        let discovered = maki_providers::model_registry::discovered(slug, model_id);
+        let dialect = maki_providers::responses_dialect(model_id, discovered.as_ref());
+        let mut body = serde_json::json!({});
+        maki_providers::apply_responses_reasoning(&mut body, opts.thinking, &model, &dialect);
+        assert_eq!(body["reasoning"]["effort"], "low");
+
+        // When user configures always_thinking
+        let defaults_high = SessionDefaults {
+            thinking: Some(maki_storage::sessions::StoredThinking::Effort {
+                level: maki_storage::sessions::Effort::High,
+            }),
+            ..Default::default()
+        };
+        let input_high = AgentInput::from_defaults(
+            "hello".into(),
+            AgentMode::Build,
+            Vec::new(),
+            defaults_high,
+            InputSource::Acp,
+        );
+        let opts_high = maki_providers::RequestOptions {
+            thinking: input_high.thinking,
+            fast: input_high.fast,
+        }
+        .clamped(&model);
+        assert_eq!(
+            opts_high.thinking,
+            maki_providers::ThinkingConfig::Effort(maki_providers::Effort::High)
+        );
+        let mut body_high = serde_json::json!({});
+        maki_providers::apply_responses_reasoning(
+            &mut body_high,
+            opts_high.thinking,
+            &model,
+            &dialect,
+        );
+        assert_eq!(body_high["reasoning"]["effort"], "high");
+    }
+
     /// Editor clients call `session/list` to offer resuming a session. The
     /// response must contain only the requested project's stored sessions,
     /// with the fields the picker renders (title, ISO 8601 updated_at).

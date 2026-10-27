@@ -125,6 +125,10 @@ fn model_from_def(
         .supports_thinking
         .or_else(|| discovered.and_then(|d| d.supports_thinking))
         .or(Some(base.supports_thinking));
+    row.requires_thinking = row.requires_thinking
+        || discovered
+            .and_then(|d| d.effort.as_ref())
+            .is_some_and(|e| e.send_off == Some(false) && !e.supported.is_empty());
     row.supports_vision = row
         .supports_vision
         .or_else(|| discovered.and_then(|d| d.supports_vision))
@@ -276,5 +280,74 @@ mod tests {
         assert_eq!(model.id, "test-model");
         assert_eq!(model.provider.as_ref(), "custom-gw");
         assert_eq!(model.context_window, 64000);
+    }
+
+    #[test]
+    fn custom_model_inherits_discovered_requires_thinking_and_pricing() {
+        let slug = "magpie-gw";
+        let model_id = "group/grok-4.7";
+        crate::model_registry::set_known_models(
+            slug,
+            vec![crate::model::ModelInfo {
+                id: model_id.to_string(),
+                context_window: Some(500000),
+                max_output_tokens: Some(500000),
+                pricing: Some(ModelPricing {
+                    input: 2.0,
+                    output: 6.0,
+                    cache_read: 0.5,
+                    cache_write: 0.0,
+                    fast: None,
+                }),
+                supports_thinking: Some(true),
+                supports_vision: Some(true),
+                tier: None,
+                provider_info: None,
+                extra: None,
+                effort: Some(crate::model::ModelEffort {
+                    supported: vec![
+                        crate::Effort::Low,
+                        crate::Effort::Medium,
+                        crate::Effort::High,
+                        crate::Effort::XHigh,
+                    ],
+                    send_off: Some(false),
+                }),
+            }],
+        );
+
+        let def = ProviderDef {
+            base_url: Some("http://maclinux.ts:3425/v1".to_string()),
+            ..Default::default()
+        };
+        let model = model_from_def(&def, &RESPONSES_SPEC, slug, model_id);
+        assert_eq!(model.id, model_id);
+        assert_eq!(model.context_window, 500000);
+        assert_eq!(model.max_output_tokens, Some(500000));
+        assert!(model.supports_thinking());
+        assert!(model.requires_thinking());
+        assert_eq!(model.pricing.input, 2.0);
+        assert_eq!(model.pricing.output, 6.0);
+
+        // When user asks for Off, it is clamped to minimal (snapped to low on dialect)
+        let opts = crate::RequestOptions {
+            thinking: crate::ThinkingConfig::Off,
+            fast: false,
+        }
+        .clamped(&model);
+        assert_eq!(
+            opts.thinking,
+            crate::ThinkingConfig::Effort(crate::Effort::Minimal)
+        );
+        let discovered = crate::model_registry::discovered(slug, model_id);
+        let dialect = crate::providers::responses::responses_dialect(model_id, discovered.as_ref());
+        let mut body = serde_json::json!({});
+        crate::providers::responses::apply_responses_reasoning(
+            &mut body,
+            opts.thinking,
+            &model,
+            &dialect,
+        );
+        assert_eq!(body["reasoning"]["effort"], "low");
     }
 }
