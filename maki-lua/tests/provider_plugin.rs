@@ -72,7 +72,7 @@ const RELOADED_SOURCE: &str = "-- the provider plugin, reloaded without its regi
 /// Shipped as a built-in provider.
 const BUILTIN_SLUG: &str = "responses";
 const BUILTIN_HOST: &str = "api.openai.com";
-const RESERVED_SLUG_MESSAGE: &str = "is reserved";
+const RESERVED_SLUG_MESSAGE: &str = "belongs to a provider maki ships";
 const CLAIM_ALLOWED: &str = "a third-party plugin took a built-in slug";
 const BUILTIN_TAKEN: &str = "a refused declaration must not be serving the slug";
 
