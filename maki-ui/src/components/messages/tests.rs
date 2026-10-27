@@ -3140,3 +3140,99 @@ fn compact_tools_cancel_in_progress() {
     };
     assert_eq!(t.status, ToolStatus::Error);
 }
+
+#[test]
+fn compact_tools_state_text_transitions() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    // 1. Pending: receiving args
+    panel.tool_pending("call-1".into(), "edit");
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!()
+    };
+    let tl1 = tool_group::build_tool_group_lines(g, 80, 0);
+    let h1: String = tl1.lines[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(h1.contains("tool call receiving..."));
+
+    // 2. Start: calling
+    panel.tool_start(start("call-1", "edit"));
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!()
+    };
+    let tl2 = tool_group::build_tool_group_lines(g, 80, 0);
+    let h2: String = tl2.lines[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(h2.contains("tool calling..."));
+
+    // 3. Done: single completed tool renders single line
+    panel.tool_done(done("call-1"));
+    panel.seal_open_group();
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!()
+    };
+    let tl3 = tool_group::build_tool_group_lines(g, 80, 0);
+    assert_eq!(tl3.lines.len(), 1);
+
+    // 4. Multiple tools completed: tools done
+    let mut group2 = ToolGroupRole {
+        id: "group-2".into(),
+        sealed: true,
+        entries: vec![
+            GroupEntry::Tool(GroupToolEntry {
+                id: "c1".into(),
+                name: Arc::from("edit"),
+                summary: "a.rs".into(),
+                status: ToolStatus::Success,
+                receiving_args: false,
+                started_at: None,
+                duration: Some(std::time::Duration::from_millis(100)),
+            }),
+            GroupEntry::Tool(GroupToolEntry {
+                id: "c2".into(),
+                name: Arc::from("bash"),
+                summary: "test".into(),
+                status: ToolStatus::Success,
+                receiving_args: false,
+                started_at: None,
+                duration: Some(std::time::Duration::from_millis(200)),
+            }),
+        ],
+    };
+    let tl4 = tool_group::build_tool_group_lines(&group2, 80, 0);
+    let h4: String = tl4.lines[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(h4.contains("tools done"));
+
+    // 5. Mixed with thinking: done
+    group2.entries.insert(
+        0,
+        GroupEntry::Thinking(GroupThinkingEntry {
+            id: 0,
+            text: "think".into(),
+            tokens: 10,
+            active: false,
+        }),
+    );
+    let tl5 = tool_group::build_tool_group_lines(&group2, 80, 0);
+    let h5: String = tl5.lines[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(h5.contains("done"));
+    assert!(!h5.contains("tools done"));
+}

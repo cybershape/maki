@@ -336,12 +336,14 @@ impl MessagesPanel {
                     _ => None,
                 }) {
                     entry.name = Arc::from(name);
+                    entry.receiving_args = true;
                 } else {
                     g.entries.push(GroupEntry::Tool(GroupToolEntry {
                         id: id.clone(),
                         name: Arc::from(name),
                         summary: String::new(),
                         status: ToolStatus::InProgress,
+                        receiving_args: true,
                         started_at: Some(Instant::now()),
                         duration: None,
                     }));
@@ -360,6 +362,7 @@ impl MessagesPanel {
                     name: Arc::from(name),
                     summary: String::new(),
                     status: ToolStatus::InProgress,
+                    receiving_args: true,
                     started_at: Some(Instant::now()),
                     duration: None,
                 })],
@@ -393,6 +396,7 @@ impl MessagesPanel {
                 {
                     entry.name = Arc::clone(&event.tool);
                     entry.summary = event.summary.clone();
+                    entry.receiving_args = false;
                     if entry.started_at.is_none() {
                         entry.started_at = Some(Instant::now());
                     }
@@ -419,6 +423,7 @@ impl MessagesPanel {
                     name: Arc::clone(&event.tool),
                     summary: event.summary,
                     status: ToolStatus::InProgress,
+                    receiving_args: false,
                     started_at: Some(Instant::now()),
                     duration: None,
                 }));
@@ -436,6 +441,7 @@ impl MessagesPanel {
                     name: Arc::clone(&event.tool),
                     summary: event.summary,
                     status: ToolStatus::InProgress,
+                    receiving_args: false,
                     started_at: Some(Instant::now()),
                     duration: None,
                 })],
@@ -510,6 +516,7 @@ impl MessagesPanel {
                     } else {
                         ToolStatus::Success
                     };
+                    entry.receiving_args = false;
                     let dur = event
                         .call
                         .as_ref()

@@ -733,6 +733,7 @@ pub fn history_to_display(
                                     name: Arc::from(static_name),
                                     summary,
                                     status,
+                                    receiving_args: false,
                                     started_at: None,
                                     duration: None,
                                 };

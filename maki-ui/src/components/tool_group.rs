@@ -1,7 +1,7 @@
 use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::animation::spinner_frame;
@@ -12,8 +12,25 @@ use super::tool_display::ToolLines;
 use super::{GroupEntry, GroupThinkingEntry, GroupToolEntry, ToolGroupRole, ToolStatus};
 
 pub const MAX_COMPACT_ENTRIES: usize = 10;
+const GROUP_PADDING: &str = " ";
 const RAIL_CONTINUE: &str = "│  ";
 const RAIL_LAST: &str = "└  ";
+
+const THINKING_FRAMES: [&str; 4] = ["·", "•", "●", "•"];
+const THINKING_INTERVAL_MS: u128 = 140;
+
+pub fn thinking_spinner_frame(elapsed_ms: u128) -> (&'static str, Style) {
+    let theme = theme::current();
+    let idx = ((elapsed_ms / THINKING_INTERVAL_MS) % 4) as usize;
+    let frame = THINKING_FRAMES[idx];
+    let style = match idx {
+        0 => theme.tool_dim,
+        1 | 3 => theme.status_dim,
+        2 => theme.accent,
+        _ => theme.tool_dim,
+    };
+    (frame, style)
+}
 
 pub fn format_tool_duration(dur: Duration) -> String {
     let millis = dur.as_millis();
@@ -113,7 +130,9 @@ fn render_tool_row(
     };
 
     let mut spans = Vec::new();
-    let mut span_idx = 0;
+    spans.push(Span::raw(GROUP_PADDING));
+    let mut span_idx = 1;
+
     if !rail.is_empty() {
         spans.push(Span::styled(rail.to_string(), theme.tool_dim));
         span_idx += 1;
@@ -145,7 +164,7 @@ fn render_tool_row(
         theme.status_dim
     };
 
-    let left_len = rail.width() + 1 + 1 + tool.name.width();
+    let left_len = GROUP_PADDING.width() + rail.width() + 1 + 1 + tool.name.width();
     let summary_clean = single_line(&tool.summary);
 
     if !summary_clean.is_empty() {
@@ -184,7 +203,7 @@ fn render_tool_row(
 fn render_thinking_row(
     rail: &str,
     thinking: &GroupThinkingEntry,
-    spinner_frame_char: char,
+    spinner_millis: u128,
     width: u16,
     is_dim: bool,
     spinner_lines: &mut Vec<(usize, usize)>,
@@ -192,7 +211,8 @@ fn render_thinking_row(
 ) -> Line<'static> {
     let theme = theme::current();
     let (icon, icon_style) = if thinking.active {
-        (spinner_frame_char.to_string(), theme.spinner)
+        let (f, s) = thinking_spinner_frame(spinner_millis);
+        (f.to_string(), s)
     } else {
         (
             "✓".to_string(),
@@ -205,7 +225,9 @@ fn render_thinking_row(
     };
 
     let mut spans = Vec::new();
-    let mut span_idx = 0;
+    spans.push(Span::raw(GROUP_PADDING));
+    let mut span_idx = 1;
+
     if !rail.is_empty() {
         spans.push(Span::styled(rail.to_string(), theme.tool_dim));
         span_idx += 1;
@@ -247,7 +269,7 @@ fn render_thinking_row(
         theme.status_dim
     };
 
-    let left_len = rail.width() + 1 + 1 + label.width();
+    let left_len = GROUP_PADDING.width() + rail.width() + 1 + 1 + label.width();
 
     if !preview.is_empty() {
         let max_preview_len = (width as usize).saturating_sub(left_len + 1 + right_len + 1);
@@ -291,14 +313,28 @@ pub fn build_tool_group_lines(
     let mut spinner_lines = Vec::new();
     let frame_char = spinner_frame(spinner_millis);
 
-    let has_pending_tool = group
+    let pending_tools: Vec<&GroupToolEntry> = group
         .entries
         .iter()
-        .any(|e| matches!(e, GroupEntry::Tool(t) if t.status == ToolStatus::InProgress));
-    let has_active_thinking = group
-        .entries
-        .iter()
-        .any(|e| matches!(e, GroupEntry::Thinking(th) if th.active));
+        .filter_map(|e| match e {
+            GroupEntry::Tool(t) if t.status == ToolStatus::InProgress => Some(t),
+            _ => None,
+        })
+        .collect();
+    let has_pending_tool = !pending_tools.is_empty();
+    let receiving_tool_args = has_pending_tool && pending_tools.iter().all(|t| t.receiving_args);
+
+    let is_thinking = !group.sealed
+        && group
+            .entries
+            .iter()
+            .any(|e| matches!(e, GroupEntry::Thinking(th) if th.active));
+    let has_active_thinking_tokens = group.entries.iter().any(|e| {
+        matches!(
+            e,
+            GroupEntry::Thinking(th) if th.active && (th.tokens > 0 || !th.text.trim().is_empty())
+        )
+    });
     let has_tools = group
         .entries
         .iter()
@@ -307,8 +343,8 @@ pub fn build_tool_group_lines(
         .entries
         .iter()
         .any(|e| matches!(e, GroupEntry::Thinking(_)));
-    let working =
-        has_pending_tool || has_active_thinking || (!group.sealed && group.entries.is_empty());
+    let open_no_tools = !group.sealed && !has_tools;
+    let working = has_pending_tool || is_thinking || open_no_tools;
 
     if group.entries.len() == 1 && !working {
         let entry = &group.entries[0];
@@ -317,7 +353,7 @@ pub fn build_tool_group_lines(
                 render_tool_row("", t, frame_char, width, false, &mut spinner_lines, 0)
             }
             GroupEntry::Thinking(th) => {
-                render_thinking_row("", th, frame_char, width, false, &mut spinner_lines, 0)
+                render_thinking_row("", th, spinner_millis, width, false, &mut spinner_lines, 0)
             }
         };
         lines.push(line);
@@ -332,25 +368,40 @@ pub fn build_tool_group_lines(
     }
 
     let theme = theme::current();
-    let (icon, icon_style) = if working {
-        (frame_char.to_string(), theme.spinner)
-    } else {
-        ("✓".to_string(), theme.tool_success)
-    };
-
     let (state_text, state_style) = if has_pending_tool {
-        ("tool calling...", theme.accent)
+        if receiving_tool_args {
+            ("tool call receiving...", theme.accent)
+        } else {
+            ("tool calling...", theme.accent)
+        }
     } else if !has_tools {
         if working {
-            ("thinking...", theme.thinking)
+            if has_active_thinking_tokens {
+                ("thinking...", theme.thinking)
+            } else {
+                ("waiting for first token...", theme.thinking)
+            }
         } else {
             ("thinking", theme.thinking)
         }
-    } else if has_active_thinking {
-        ("thinking...", theme.thinking)
+    } else if is_thinking {
+        if has_active_thinking_tokens {
+            ("thinking...", theme.thinking)
+        } else {
+            ("waiting for first token...", theme.thinking)
+        }
     } else {
         let text = if has_thinking { "done" } else { "tools done" };
         (text, theme.tool_success)
+    };
+
+    let (left_icon, left_style) = if has_pending_tool {
+        (frame_char.to_string(), theme.accent)
+    } else if working {
+        let (frame, style) = thinking_spinner_frame(spinner_millis);
+        (frame.to_string(), style)
+    } else {
+        ("✓".to_string(), theme.tool_success)
     };
 
     let hidden_count = group.entries.len().saturating_sub(MAX_COMPACT_ENTRIES);
@@ -361,10 +412,13 @@ pub fn build_tool_group_lines(
     };
 
     let mut header_spans = Vec::new();
+    header_spans.push(Span::raw(GROUP_PADDING));
     if working {
-        spinner_lines.push((0, 0));
+        header_spans.push(Span::styled(format!("{left_icon} "), left_style));
+        spinner_lines.push((0, 1));
+    } else {
+        header_spans.push(Span::styled(format!("{left_icon} "), left_style));
     }
-    header_spans.push(Span::styled(format!("{icon} "), icon_style));
     header_spans.push(Span::styled(state_text, state_style));
     if !hidden_suffix.is_empty() {
         header_spans.push(Span::styled(hidden_suffix, theme.status_dim));
@@ -394,7 +448,7 @@ pub fn build_tool_group_lines(
             GroupEntry::Thinking(th) => render_thinking_row(
                 rail,
                 th,
-                frame_char,
+                spinner_millis,
                 width,
                 is_dim,
                 &mut spinner_lines,
@@ -434,6 +488,14 @@ mod tests {
     }
 
     #[test]
+    fn thinking_spinner_frames_and_styles() {
+        assert_eq!(thinking_spinner_frame(0).0, "·");
+        assert_eq!(thinking_spinner_frame(140).0, "•");
+        assert_eq!(thinking_spinner_frame(280).0, "●");
+        assert_eq!(thinking_spinner_frame(420).0, "•");
+    }
+
+    #[test]
     fn single_completed_tool_renders_single_line_without_header() {
         let group = ToolGroupRole {
             id: "group-1".into(),
@@ -443,6 +505,7 @@ mod tests {
                 name: Arc::from("bash"),
                 summary: "cargo check".into(),
                 status: ToolStatus::Success,
+                receiving_args: false,
                 started_at: None,
                 duration: Some(Duration::from_millis(1200)),
             })],
@@ -455,11 +518,59 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
+        assert!(text.starts_with(" "));
         assert!(text.contains("✓"));
         assert!(text.contains("bash"));
         assert!(text.contains("cargo check"));
         assert!(text.contains("(1.20s)"));
         assert!(!text.contains("tools done"));
+    }
+
+    #[test]
+    fn tool_call_receiving_state_when_all_pending_tools_receiving() {
+        let group = ToolGroupRole {
+            id: "group-1".into(),
+            sealed: false,
+            entries: vec![GroupEntry::Tool(GroupToolEntry {
+                id: "call-1".into(),
+                name: Arc::from("bash"),
+                summary: String::new(),
+                status: ToolStatus::InProgress,
+                receiving_args: true,
+                started_at: None,
+                duration: None,
+            })],
+        };
+
+        let tl = build_tool_group_lines(&group, 80, 0);
+        let header_text: String = tl.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(header_text.contains("tool call receiving..."));
+    }
+
+    #[test]
+    fn waiting_for_first_token_when_thinking_empty() {
+        let group = ToolGroupRole {
+            id: "group-1".into(),
+            sealed: false,
+            entries: vec![GroupEntry::Thinking(GroupThinkingEntry {
+                id: 0,
+                text: String::new(),
+                tokens: 0,
+                active: true,
+            })],
+        };
+
+        let tl = build_tool_group_lines(&group, 80, 0);
+        let header_text: String = tl.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(header_text.contains("waiting for first token..."));
     }
 
     #[test]
@@ -473,6 +584,7 @@ mod tests {
                     name: Arc::from("edit"),
                     summary: "foo.rs".into(),
                     status: ToolStatus::Success,
+                    receiving_args: false,
                     started_at: None,
                     duration: Some(Duration::from_millis(7430)),
                 }),
@@ -481,6 +593,7 @@ mod tests {
                     name: Arc::from("bash"),
                     summary: "cargo test".into(),
                     status: ToolStatus::Error,
+                    receiving_args: false,
                     started_at: None,
                     duration: Some(Duration::from_millis(15900)),
                 }),
@@ -494,6 +607,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
+        assert!(header_text.starts_with(" "));
         assert!(header_text.contains("tools done"));
 
         let row1: String = tl.lines[1]
@@ -501,6 +615,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
+        assert!(row1.starts_with(" "));
         assert!(row1.contains(RAIL_CONTINUE));
         assert!(row1.contains("edit"));
         assert!(row1.contains("(7.43s)"));
@@ -510,6 +625,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
+        assert!(row2.starts_with(" "));
         assert!(row2.contains(RAIL_LAST));
         assert!(row2.contains("✗"));
         assert!(row2.contains("bash"));
@@ -525,6 +641,7 @@ mod tests {
                 name: Arc::from("read"),
                 summary: format!("file_{i}.rs"),
                 status: ToolStatus::Success,
+                receiving_args: false,
                 started_at: None,
                 duration: Some(Duration::from_millis(100)),
             }));
@@ -537,7 +654,6 @@ mod tests {
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
-        // Header + 10 visible entries
         assert_eq!(tl.lines.len(), 11);
         let header_text: String = tl.lines[0]
             .spans

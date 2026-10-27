@@ -406,6 +406,7 @@ pub struct GroupToolEntry {
     pub name: Arc<str>,
     pub summary: String,
     pub status: ToolStatus,
+    pub receiving_args: bool,
     pub started_at: Option<Instant>,
     pub duration: Option<Duration>,
 }
