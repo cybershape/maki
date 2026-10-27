@@ -135,7 +135,7 @@ Use for chained/dependent tool calls and filtering/processing results, e.g. filt
 - Available libs: re, asyncio, sys, os, json. No other imports, no classes, no network access. `open()` works on text files.
 - Fresh sandbox each run: no state persists between executions.
 - 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
-- Skip it when a single tool call needs no transformation.
+- NEVER use as a proxy or wrapper for a single tool call. If no code logic, chaining, or output filtering is needed, invoke the tool directly.
 - NOT a thinking scratchpad. Reason in your response text.
 ]]
 
