@@ -4,18 +4,22 @@
 
 ---
 
-## 1. 上游仓库与基准分支点 (Merge Base)
+## 1. 上游仓库与基准分支点 (Merge Base / Sync Point)
 
 - **上游仓库地址**: `https://github.com/tontinton/maki.git`
 - **上游跟踪分支**: `upstream/main`
 - **当前本地分支**: `main`（跟踪 `origin/main`: `git@github.com:cybershape/maki.git`）
-- **基准分叉点 (Merge Base Commit)**:
+- **最新同步的上游 Commit**:
+  - **Commit SHA**: `60f8f438ad0e3f0e8e3bba9c8961cb201606ab4c`
+  - **Commit 日期**: `Tue Sep 8 20:02:18 2026 +0300`
+  - **Commit 作者**: `Sebastian Dröge <sebastian@centricular.com>`
+  - **Commit 信息**: `feat(agent): configurable instruction files via instructions.files and projects`
+- **初始分叉点 (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit 日期**: `Sun Oct 25 11:34:26 2026 +0100`
-  - **Commit 作者**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
   - **Commit 信息**: `chore(deps): move monty to crates.io 1.x`
 
-> 验证命令: `git merge-base main upstream/main` 输出应为 `70348ec0a50b84544003cb119550778652e0d7d8`。
+> 本次已成功合并 `upstream/main`（至 commit `60f8f438`）。
 
 ---
 

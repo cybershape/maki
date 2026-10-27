@@ -160,6 +160,7 @@ pub struct Agent<'h> {
     recent_calls: RecentCalls,
     auto_compact: bool,
     loaded_instructions: LoadedInstructions,
+    instruction_files: Arc<Vec<String>>,
     rollback_len: usize,
     carry_from: usize,
     mcp: Option<McpSession>,
@@ -210,6 +211,7 @@ impl<'h> Agent<'h> {
             recent_calls: RecentCalls::new(),
             auto_compact: compaction::auto_compact_enabled(),
             loaded_instructions: LoadedInstructions::new(),
+            instruction_files: Arc::default(),
             rollback_len: 0,
             carry_from: 0,
             mcp: None,
@@ -277,8 +279,13 @@ impl<'h> Agent<'h> {
         self
     }
 
-    pub fn with_loaded_instructions(mut self, loaded: LoadedInstructions) -> Self {
+    pub fn with_loaded_instructions(
+        mut self,
+        loaded: LoadedInstructions,
+        files: Arc<Vec<String>>,
+    ) -> Self {
         self.loaded_instructions = loaded;
+        self.instruction_files = files;
         self
     }
 
@@ -953,6 +960,7 @@ impl<'h> Agent<'h> {
             user_response_rx: self.user_response_rx.clone(),
             reauth: self.reauth,
             loaded_instructions: self.loaded_instructions.clone(),
+            instruction_files: self.instruction_files.clone(),
             call_instructions: CallInstructions::default(),
             cancel: self.cancel.clone(),
             mcp: self.mcp.clone(),

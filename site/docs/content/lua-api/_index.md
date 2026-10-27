@@ -4365,6 +4365,12 @@ while the plugin loads. The plugin needs a non-empty `net_hosts` list in its
 `plugin.toml`. The [Providers guide](/docs/providers/#plugin-providers)
 walks through a full example.
 
+A slug models.dev serves has to be one the package was granted: the
+manifest lists it under `providers`, and the install approval covers it.
+List every slug the package registers, so a name the catalog adds later
+is already approved. A slug maki ships is reserved. See
+[granted slugs](/docs/providers/#granted-slugs).
+
 Set exactly one of `codec` or `base`. An unknown key, or an option the
 chosen codec cannot honour, fails registration.
 
@@ -4529,9 +4535,10 @@ maki.provider.register({
 maki.provider.is_selected({slug})
 ```
 
-Whether providers.toml selects this package to implement {slug}. A package
-that ships several providers calls it at load time to skip the ones the user
-did not [select](/docs/providers/#select-a-provider-package).
+Whether this package was granted {slug}: the manifest lists it under
+`providers` and the install approval covers it. Kept from maki 0.6.3,
+where multi-provider packages called it to skip the ones the user did not
+select; it now answers from the same list.
 
 **Parameters:**
 
@@ -7799,10 +7806,11 @@ function M.resolve(opts, ctx)
 --- opts.max_line_bytes, or 0 (no limit) in full mode.
 function M.line_bytes(opts, ctx)
 
---- Last {n} lines of {text}, or all of it when it has fewer. Newlines separate
---- lines here rather than terminate them, so a trailing one is an empty last
---- line and counts as one.
-function M.tail(text, n)
+--- Cuts {text} to the limits keeping its head and its tail, since on a long
+--- build or test run the errors and the summary sit at the end. Each end gets
+--- half of every limit. A nil limit is unlimited. The marker between the two
+--- notes how many lines and bytes it dropped.
+function M.cut_middle(text, max_lines, max_bytes)
 ```
 
 ### `require("maki.partial")`
@@ -7815,8 +7823,8 @@ function M.tail(text, n)
 --- Close {view} on the marker and build the tool reply. {out} is everything
 --- the tool streamed, already truncated; empty means the view still shows a
 --- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
---- "timeout").
-function M.cut(view, out, reason, timeout_secs)
+--- "timeout"). {started_at} is the `os.time()` the tool began at.
+function M.cut(view, out, reason, timeout_secs, started_at)
 ```
 
 ### `require("maki.provider_parse")`

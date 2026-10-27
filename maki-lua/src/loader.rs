@@ -11,7 +11,7 @@ use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
-use maki_providers::plugin::DeclAuthority;
+use maki_providers::plugin::{DeclAuthority, keep_granted};
 
 use crate::agent_autocmd::HostEvent;
 use crate::api::keymap::{KeybindTicket, KeymapReader};
@@ -25,7 +25,7 @@ use crate::error::PluginError;
 use crate::pack::{DiscoveredPackage, Interaction};
 use crate::plugin_permissions::{
     MANIFEST_FILE, PluginPermissions, Requested, check_plugin_compatibility,
-    load_plugin_permissions,
+    load_plugin_granted_providers, load_plugin_permissions,
 };
 use crate::runtime::{
     self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, Request,
@@ -43,6 +43,10 @@ pub const PERMISSION_NAME_WARNING: &str = "inherits maki's permission rules for 
      tool of the same name, together with any \"always allow\" you saved";
 pub const TRUST_SCOPE_WARNING: &str =
     "trust is only read from the global init.lua; ignoring the trust table in";
+pub const INSTRUCTIONS_SCOPE_WARNING: &str =
+    "instructions is only read from the global init.lua; ignoring the instructions table in";
+pub const PROJECTS_SCOPE_WARNING: &str =
+    "projects is only read from the global init.lua; ignoring the projects list in";
 
 /// How far user `init.lua` may reach. `--no-plugins` turns it off, and a
 /// project folder nobody vouched for stops at the global file.
@@ -429,11 +433,21 @@ impl PluginHost {
             // A folder cannot vouch for itself: ACP resolves many
             // client-chosen cwds against the config it read once at startup,
             // so one trusted project's `trust.paths` would reach folders
-            // nobody ever trusted. Stripped rather than rejected, because
-            // there is no fallback config at this point and a hard error would
-            // brick the folder the user just trusted over an ignored setting.
-            if !global && std::mem::take(&mut raw.trust).is_set() {
-                warnings.push(format!("{TRUST_SCOPE_WARNING} {owner}"));
+            // nobody ever trusted. The same holds for `instructions` and
+            // `projects`, which pick what a folder's checkout loads into the
+            // model. Stripped rather than rejected, because there is no
+            // fallback config at this point and a hard error would brick the
+            // folder the user just trusted over an ignored setting.
+            if !global {
+                if std::mem::take(&mut raw.trust).is_set() {
+                    warnings.push(format!("{TRUST_SCOPE_WARNING} {owner}"));
+                }
+                if std::mem::take(&mut raw.instructions).is_set() {
+                    warnings.push(format!("{INSTRUCTIONS_SCOPE_WARNING} {owner}"));
+                }
+                if !std::mem::take(&mut raw.projects).is_empty() {
+                    warnings.push(format!("{PROJECTS_SCOPE_WARNING} {owner}"));
+                }
             }
             match merged {
                 Some(existing) => existing.merge(raw),
@@ -645,6 +659,20 @@ impl PluginHost {
         )
     }
 
+    /// Runs a source with a provider grant, for tests and embedders that load
+    /// a plugin registering providers outside the package system.
+    pub fn load_source_with_grant(
+        &self,
+        name: &str,
+        source: &str,
+        permissions: PluginPermissions,
+        granted_providers: Vec<String>,
+    ) -> Result<(), PluginError> {
+        let mut context = LoadContext::plain(None, permissions);
+        context.granted_providers = Arc::from(granted_providers);
+        self.send_load(Arc::from(name), vec![LoadChunk::new(name, source)], context)
+    }
+
     pub fn load_plugin_file(&self, path: &Path) -> Result<(), PluginError> {
         let source = fs::read_to_string(path).map_err(|e| PluginError::Io {
             path: path.to_path_buf(),
@@ -653,14 +681,17 @@ impl PluginHost {
         let plugin_dir = path.parent().map(Path::to_path_buf);
         check_plugin_compatibility(USER_PLUGIN, plugin_dir.as_deref())?;
         let permissions = load_plugin_permissions(plugin_dir.as_deref());
+        let granted_providers = load_plugin_granted_providers(plugin_dir.as_deref());
         // Test-only path today. Once user plugin dirs exist: derive a real
         // plugin name, since the hardcoded "user" would collide across files,
         // pass the `plugins.<name>` opts through, and teach the
         // unknown-plugin guards about user plugin names.
+        let mut context = LoadContext::plain(plugin_dir, permissions);
+        context.granted_providers = Arc::from(granted_providers);
         self.send_load(
             Arc::from(USER_PLUGIN),
             vec![LoadChunk::new(path.display().to_string(), source)],
-            LoadContext::plain(plugin_dir, permissions),
+            context,
         )
     }
 
@@ -682,6 +713,7 @@ impl PluginHost {
         declared: crate::api::pack::Declared,
         package: &DiscoveredPackage,
         permissions: PluginPermissions,
+        granted_providers: Arc<[String]>,
         opts: PluginOpts,
     ) -> Result<(), PluginError> {
         check_plugin_compatibility(&package.name, Some(&package.dir))?;
@@ -693,6 +725,7 @@ impl PluginHost {
                 context: LoadContext {
                     plugin_dir: Some(package.dir.clone()),
                     permissions,
+                    granted_providers,
                     opts,
                     revision_guard: package.revision_guard.clone(),
                     package: true,
@@ -716,7 +749,7 @@ impl PluginHost {
         permissions: PluginPermissions,
         opts: PluginOpts,
     ) -> Result<(), PluginError> {
-        self.load_package_with_guard(name, dir, permissions, opts, None)
+        self.load_package_with_guard(name, dir, permissions, Arc::from(Vec::new()), opts, None)
     }
 
     fn load_package_with_guard(
@@ -724,6 +757,7 @@ impl PluginHost {
         name: &str,
         dir: &Path,
         permissions: PluginPermissions,
+        granted_providers: Arc<[String]>,
         opts: PluginOpts,
         revision_guard: Option<Arc<maki_pack::lock::Lock>>,
     ) -> Result<(), PluginError> {
@@ -770,6 +804,7 @@ impl PluginHost {
             LoadContext {
                 plugin_dir: Some(root),
                 permissions,
+                granted_providers,
                 opts,
                 revision_guard,
                 package: true,
@@ -869,7 +904,12 @@ impl PluginHost {
                     .cloned()
                     .map(Arc::new)
                     .unwrap_or_default();
-                let permissions = crate::pack::effective_permissions(pkg);
+                let (permissions, granted_providers) = crate::pack::effective_grant(pkg);
+                let granted_providers = Arc::from(granted_providers);
+                // Keep the granted slugs owned even if the load fails, so the
+                // catalog client cannot take over the slug and receive the
+                // key the user saved for it.
+                keep_granted(&pkg.name, &granted_providers);
                 loaded.push(&pkg.name);
                 let custom = declared
                     .iter()
@@ -883,13 +923,18 @@ impl PluginHost {
                             )
                     });
                 let result = match custom {
-                    Some(declaration) => {
-                        self.run_pack_loader(declaration.clone(), pkg, permissions, opts)
-                    }
+                    Some(declaration) => self.run_pack_loader(
+                        declaration.clone(),
+                        pkg,
+                        permissions,
+                        granted_providers,
+                        opts,
+                    ),
                     None => self.load_package_with_guard(
                         &pkg.name,
                         &pkg.dir,
                         permissions,
+                        granted_providers,
                         opts,
                         pkg.revision_guard.clone(),
                     ),
@@ -1833,6 +1878,61 @@ mod tests {
             }),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    fn project_scope_cannot_set_instructions_or_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        fs::create_dir_all(dir.path().join(".maki")).unwrap();
+        fs::create_dir(&global).unwrap();
+        fs::write(
+            global.join("init.lua"),
+            "maki.setup({ instructions = { files = { \"CLAUDE.md\" } }, \
+                 projects = { { path = \"~/src/me/*\", instructions = { files = {} } } } })",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".maki/init.lua"),
+            "maki.setup({ instructions = { files = {} }, \
+                 projects = { { remote = \"github.com/*\", instructions = { files = {} } } } })",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let merged = host
+            .load_init_files_from_dirs(
+                InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
+                [global],
+                &mut warnings,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            merged
+                .instructions
+                .files
+                .expect("the global instructions table survives"),
+            ["CLAUDE.md"]
+        );
+        assert_eq!(
+            merged.projects[0]
+                .path
+                .as_deref()
+                .expect("the global projects list survives"),
+            "~/src/me/*"
+        );
+        for warning_text in [INSTRUCTIONS_SCOPE_WARNING, PROJECTS_SCOPE_WARNING] {
+            assert!(
+                warnings.iter().any(|warning| {
+                    warning.starts_with(warning_text)
+                        && warning.contains(ConfigScope::Project.label())
+                }),
+                "{warnings:?}"
+            );
+        }
     }
 
     #[test]

@@ -12,6 +12,9 @@ use maki_providers::plugin::{
     self, DeclAuthority, PlanDecl, ProviderDecl, RegisterError, Registration,
 };
 use maki_providers::spec::Owner;
+use maki_storage::StateDir;
+use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
+use serde_json::json;
 use tempfile::TempDir;
 use test_case::test_case;
 
@@ -87,6 +90,7 @@ fn load_bundled() {
     plugin::register(
         declaration(DECLARED_SLUG, DECLARED_DISPLAY_NAME, DECLARED_HOST),
         DeclAuthority::Bundled,
+        &[],
     )
     .expect(PROVIDER_LOST);
     plugin::commit_load();
@@ -142,6 +146,7 @@ fn a_bad_header_on_a_bundled_slug_fails_only_its_build() {
 /// With `plan = "..."` the user picks, but the plugin wrote every origin on
 /// the menu. So the origin is only trusted when maki itself wrote it.
 #[test_case(DeclAuthority::ThirdParty, false ; "third_party")]
+#[test_case(DeclAuthority::Config, false ; "config")]
 #[test_case(DeclAuthority::Bundled, true ; "bundled")]
 fn a_planned_origin_is_vouched_only_for_a_bundled_declaration(
     authority: DeclAuthority,
@@ -160,7 +165,11 @@ fn a_planned_origin_is_vouched_only_for_a_bundled_declaration(
         login_url: None,
     }];
     plugin::begin_load();
-    plugin::register(reg, authority).expect(PROVIDER_LOST);
+    let grant = match authority {
+        DeclAuthority::ThirdParty => vec![DECLARED_SLUG.to_owned()],
+        DeclAuthority::Bundled | DeclAuthority::Config => Vec::new(),
+    };
+    plugin::register(reg, authority, &grant).expect(PROVIDER_LOST);
     plugin::commit_load();
 
     assert_eq!(
@@ -179,9 +188,90 @@ fn a_slug_providers_toml_defines_is_still_refused() {
     let error = plugin::register(
         declaration(OWN_SLUG, OWN_DISPLAY_NAME, OWN_HOST),
         DeclAuthority::ThirdParty,
+        &[OWN_SLUG.to_owned()],
     )
     .unwrap_err();
     plugin::commit_load();
 
     assert!(matches!(error, RegisterError::ConfiguredSlug(_)), "{error}");
+}
+
+const CATALOG_SLUG: &str = "takeover-catalog";
+const CATALOG_FILE: &str = "models-dev-catalog.json";
+const SAVED_KEY: &str = "sk-takeover";
+const SAVED_BEARER: &str = "Bearer sk-takeover";
+const KEY_ENV: &str = "MAKI_TEST_TAKEOVER_CATALOG_KEY";
+const CREDENTIALS_LOST: &str = "the takeover must hand the plugin the saved key";
+
+/// The takeover's whole point, and its risk: `maki auth login` saved the key
+/// under the slug, and the plugin that replaced the catalog provider sends it.
+fn saved_catalog_key() -> TempDir {
+    let home = isolated("");
+    let cache = maki_storage::paths::cache_dir().unwrap();
+    fs::write(
+        cache.join(CATALOG_FILE),
+        json!({
+            CATALOG_SLUG: {
+                "npm": "@ai-sdk/openai-compatible",
+                "api": DECLARED_URL,
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    save_provider_credentials(
+        &StateDir::resolve().unwrap(),
+        CATALOG_SLUG,
+        &ProviderCredentials {
+            api_key: SAVED_KEY.into(),
+            host: None,
+        },
+    )
+    .unwrap();
+    unsafe { std::env::remove_var(KEY_ENV) };
+    home
+}
+
+#[test]
+fn a_taken_over_slugs_saved_key_becomes_the_plugins() {
+    let _home = saved_catalog_key();
+    let mut reg = declaration(CATALOG_SLUG, DECLARED_DISPLAY_NAME, DECLARED_HOST);
+    reg.decl.api_key_env = Some(KEY_ENV.to_owned());
+    plugin::begin_load();
+    plugin::register(reg, DeclAuthority::ThirdParty, &[CATALOG_SLUG.to_owned()])
+        .expect(CREDENTIALS_LOST);
+    plugin::commit_load();
+
+    let auth = plugin::resolved_auth(CATALOG_SLUG).expect(CREDENTIALS_LOST);
+    assert!(
+        auth.headers.iter().any(|(name, value)| (name, value)
+            == (&"authorization".to_owned(), &SAVED_BEARER.to_owned())),
+        "{:?}",
+        auth.headers
+    );
+}
+
+/// A v0.6.4 `plugin =` selection in `providers.toml` keeps the slug owned by
+/// the named package, so the catalog client cannot take it over and receive
+/// the saved key. The load warns the user to migrate.
+const LEGACY_SLUG: &str = "legacy-selected";
+const LEGACY_PACKAGE: &str = "legacy-package";
+const LEGACY_OWNED: &str = "a legacy selection keeps its slug owned";
+const LEGACY_WARNED: &str = "a legacy selection warns the user to migrate";
+
+#[test]
+fn a_legacy_plugin_selection_keeps_the_slug_owned() {
+    let _home = isolated(&format!("[{LEGACY_SLUG}]\nplugin = \"{LEGACY_PACKAGE}\"\n"));
+
+    plugin::begin_load();
+    let warnings = plugin::keep_legacy_selections();
+    plugin::commit_load();
+
+    assert!(plugin::owns_slug(LEGACY_SLUG), "{LEGACY_OWNED}");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains(LEGACY_SLUG) && w.contains(LEGACY_PACKAGE)),
+        "{LEGACY_WARNED}: {warnings:?}"
+    );
 }
