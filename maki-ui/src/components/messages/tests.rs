@@ -21,6 +21,14 @@ use test_case::test_case;
 const UNDECODABLE_IMAGE: &str = "invalid image";
 const VIEW_WIDTH: u16 = 80;
 const VIEW_HEIGHT: u16 = 24;
+const GROUP_RESIZE_WIDE: u16 = 120;
+const GROUP_RESIZE_NARROW: u16 = 40;
+const GROUP_RESIZE_TEXT: &str =
+    "检查视图调整后的分组布局，包括摘要截断、右侧信息对齐以及历史记录滚动后的重新绘制";
+const GROUP_RESIZE_DURATION: Duration = Duration::from_millis(7430);
+const GROUP_RESIZE_TOKENS: usize = 1234;
+const GROUP_RESIZE_DURATION_TEXT: &str = "(7.43s)";
+const GROUP_RESIZE_TOKENS_TEXT: &str = "(1.2k)";
 
 #[test_case(false ; "live")]
 #[test_case(true ; "loaded")]
@@ -3009,6 +3017,117 @@ fn selection_survives_a_resize() {
         before,
         "the reflow above the selection dragged the copy with it"
     );
+}
+
+fn panel_with_sealed_groups(tools: usize, thinking: usize, groups: usize) -> MessagesPanel {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            compact_tools: true,
+            ..Default::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    for group in 0..groups {
+        let entries = (0..thinking)
+            .map(|id| {
+                GroupEntry::Thinking(GroupThinkingEntry {
+                    id,
+                    text: GROUP_RESIZE_TEXT.into(),
+                    tokens: GROUP_RESIZE_TOKENS,
+                    active: false,
+                })
+            })
+            .chain((0..tools).map(|id| {
+                GroupEntry::Tool(GroupToolEntry {
+                    id: format!("tool-{group}-{id}"),
+                    name: BASH_TOOL_NAME.into(),
+                    summary: GROUP_RESIZE_TEXT.into(),
+                    status: ToolStatus::Success,
+                    receiving_args: false,
+                    started_at: None,
+                    duration: Some(GROUP_RESIZE_DURATION),
+                })
+            }))
+            .collect();
+        panel.push(DisplayMessage::new(
+            DisplayRole::ToolGroup(Box::new(ToolGroupRole {
+                id: format!("group-{group}"),
+                sealed: true,
+                entries,
+            })),
+            String::new(),
+        ));
+    }
+    panel
+}
+
+#[test_case(1, 0; "single_tool")]
+#[test_case(0, 1; "single_thinking")]
+#[test_case(2, 0; "multiple_tools")]
+#[test_case(0, 2; "multiple_thinking")]
+#[test_case(1, 1; "mixed")]
+fn resize_reflows_sealed_groups(tools: usize, thinking: usize) {
+    for (from, to) in [
+        (GROUP_RESIZE_WIDE, GROUP_RESIZE_NARROW),
+        (GROUP_RESIZE_NARROW, GROUP_RESIZE_WIDE),
+    ] {
+        let mut panel = panel_with_sealed_groups(tools, thinking, 1);
+        render(&mut panel, from, VIEW_HEIGHT);
+        let count = panel.cache.len();
+        let resized = render(&mut panel, to, VIEW_HEIGHT);
+        let mut fresh = panel_with_sealed_groups(tools, thinking, 1);
+        let expected = render(&mut fresh, to, VIEW_HEIGHT);
+
+        assert_eq!(panel.cache.len(), count);
+        assert_eq!(
+            panel.cache.segments()[0].lines(),
+            fresh.cache.segments()[0].lines()
+        );
+        assert_eq!(resized.backend().buffer(), expected.backend().buffer());
+        assert!(matches!(&panel.messages[0].role, DisplayRole::ToolGroup(g) if g.sealed));
+        for line in panel.cache.segments()[0]
+            .lines()
+            .iter()
+            .rev()
+            .take(tools + thinking)
+        {
+            assert_eq!(line.width(), usize::from(to - 1));
+            assert!(
+                line.to_string().ends_with(GROUP_RESIZE_DURATION_TEXT)
+                    || line.to_string().ends_with(GROUP_RESIZE_TOKENS_TEXT)
+            );
+        }
+    }
+}
+
+#[test_case(GROUP_RESIZE_WIDE, GROUP_RESIZE_NARROW; "narrower")]
+#[test_case(GROUP_RESIZE_NARROW, GROUP_RESIZE_WIDE; "wider")]
+fn resize_reflows_sealed_groups_when_scrolled_into_view(from: u16, to: u16) {
+    const GROUPS: usize = 30;
+    const HEIGHT: u16 = 10;
+
+    let mut panel = panel_with_sealed_groups(1, 1, GROUPS);
+    render(&mut panel, from, HEIGHT);
+    let count = panel.cache.len();
+    let original = panel.cache.segments()[0].lines().to_vec();
+    render(&mut panel, to, HEIGHT);
+    assert!(panel.cache.segments()[0].stale);
+    assert_eq!(panel.cache.segments()[0].lines(), original);
+
+    panel.scroll_to_top();
+    let resized = render(&mut panel, to, HEIGHT);
+    let mut fresh = panel_with_sealed_groups(1, 1, GROUPS);
+    render(&mut fresh, to, HEIGHT);
+    fresh.scroll_to_top();
+    let expected = render(&mut fresh, to, HEIGHT);
+
+    assert!(!panel.cache.segments()[0].stale);
+    assert_eq!(panel.cache.len(), count);
+    assert_eq!(
+        panel.cache.segments()[0].lines(),
+        fresh.cache.segments()[0].lines()
+    );
+    assert_eq!(resized.backend().buffer(), expected.backend().buffer());
 }
 
 #[test]

@@ -1719,17 +1719,21 @@ impl MessagesPanel {
     }
 
     fn rebuild_tool_segment(&mut self, tool_id: &str) {
-        let Some(msg) = self
-            .messages
-            .iter()
-            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
-        else {
+        let Some(msg) = self.messages.iter().rfind(|m| match &m.role {
+            DisplayRole::Tool(t) => t.id == tool_id,
+            DisplayRole::ToolGroup(g) => g.id == tool_id,
+            _ => false,
+        }) else {
             return;
         };
-        let DisplayRole::Tool(t) = &msg.role else {
-            unreachable!()
+        let status = match &msg.role {
+            DisplayRole::Tool(t) => t.status,
+            DisplayRole::ToolGroup(_) => {
+                self.rebuild_tool_group_segment(tool_id);
+                return;
+            }
+            _ => unreachable!(),
         };
-        let status = t.status;
         let Some(seg_idx) = self.cache.find_by_tool_id(tool_id) else {
             return;
         };
