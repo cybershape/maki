@@ -715,7 +715,12 @@ pub(crate) async fn parse_sse(
                     .unwrap_or(tool_accumulators.len() as u64);
                 if item["type"].as_str() == Some("function_call") {
                     let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
-                    let name = item["name"].as_str().unwrap_or_default().to_string();
+                    let name = item["name"]
+                        .as_str()
+                        .or_else(|| item["function"]["name"].as_str())
+                        .or_else(|| item["function_call"]["name"].as_str())
+                        .unwrap_or_default()
+                        .to_string();
                     if !name.is_empty() {
                         event_tx
                             .send_async(ProviderEvent::ToolUseStart {
@@ -745,13 +750,29 @@ pub(crate) async fn parse_sse(
                 } else {
                     Cow::Borrowed("")
                 };
-                if !delta.is_empty() {
-                    let acc = if let Some(idx) = parsed["output_index"].as_u64() {
-                        tool_accumulators.iter_mut().find(|a| a.output_index == idx)
-                    } else {
-                        tool_accumulators.last_mut()
-                    };
-                    if let Some(acc) = acc {
+                let acc = if let Some(idx) = parsed["output_index"].as_u64() {
+                    tool_accumulators.iter_mut().find(|a| a.output_index == idx)
+                } else {
+                    tool_accumulators.last_mut()
+                };
+                if let Some(acc) = acc {
+                    if acc.name.is_empty() {
+                        let name = parsed["name"]
+                            .as_str()
+                            .or_else(|| parsed["item"]["name"].as_str())
+                            .or_else(|| parsed["item"]["function"]["name"].as_str())
+                            .unwrap_or_default();
+                        if !name.is_empty() {
+                            acc.name = name.to_string();
+                            event_tx
+                                .send_async(ProviderEvent::ToolUseStart {
+                                    id: acc.call_id.clone(),
+                                    name: acc.name.clone(),
+                                })
+                                .await?;
+                        }
+                    }
+                    if !delta.is_empty() {
                         acc.arguments.push_str(&delta);
                     }
                 }
@@ -784,7 +805,12 @@ pub(crate) async fn parse_sse(
                 let item = &parsed["item"];
                 if item["type"].as_str() == Some("function_call") {
                     let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
-                    let name = item["name"].as_str().unwrap_or_default().to_string();
+                    let name = item["name"]
+                        .as_str()
+                        .or_else(|| item["function"]["name"].as_str())
+                        .or_else(|| item["function_call"]["name"].as_str())
+                        .unwrap_or_default()
+                        .to_string();
                     let arguments = if let Some(s) = item["arguments"].as_str() {
                         s.to_string()
                     } else if let Some(obj) = item["arguments"].as_object() {

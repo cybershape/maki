@@ -256,6 +256,30 @@ impl MessagesPanel {
         }
     }
 
+    pub fn ensure_active_group(&mut self) {
+        if !self.compact_tools {
+            return;
+        }
+        if let Some(DisplayMessage {
+            role: DisplayRole::ToolGroup(g),
+            ..
+        }) = self.messages.last()
+            && !g.sealed
+        {
+            return;
+        }
+        let gid = format!("compact-group-{}", self.messages.len());
+        let group = ToolGroupRole {
+            id: gid,
+            sealed: false,
+            entries: Vec::new(),
+        };
+        self.messages.push(DisplayMessage::new(
+            DisplayRole::ToolGroup(Box::new(group)),
+            String::new(),
+        ));
+    }
+
     pub fn thinking_delta(&mut self, text: &str) {
         if self.compact_tools {
             let mut group_id = None;
@@ -1071,10 +1095,18 @@ impl MessagesPanel {
             || self.accent.is_animating()
             || (self.streaming_thinking.is_animating()
                 && thinking::reveals_text(self.thinking_lines, self.live_thinking_expanded));
+        let compact_animating = self.compact_tools
+            && self
+                .messages
+                .last()
+                .is_some_and(|m| matches!(&m.role, DisplayRole::ToolGroup(g) if !g.sealed));
         Cadence::any([
             // A running tool draws a spinner. Its output arriving is data, and
             // `tick` reports that separately.
-            Cadence::when(self.in_progress_count() > 0, Cadence::SPINNER),
+            Cadence::when(
+                self.in_progress_count() > 0 || compact_animating,
+                Cadence::SPINNER,
+            ),
             Cadence::when(smooth, Cadence::SMOOTH),
             Cadence::when(self.show_idle_splash(), self.idle_splash.cadence()),
         ])
@@ -1167,7 +1199,12 @@ impl MessagesPanel {
             );
         }
         self.rebuild_line_cache();
-        if self.in_progress_count() > 0 {
+        let compact_animating = self.compact_tools
+            && self
+                .messages
+                .last()
+                .is_some_and(|m| matches!(&m.role, DisplayRole::ToolGroup(g) if !g.sealed));
+        if self.in_progress_count() > 0 || compact_animating {
             if self.compact_tools
                 && let Some(gid) = self.messages.iter().rev().find_map(|m| match &m.role {
                     DisplayRole::ToolGroup(g) if !g.sealed => Some(g.id.clone()),

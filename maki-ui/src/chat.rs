@@ -504,7 +504,12 @@ impl Chat {
             text.into(),
             images,
         ));
+        self.messages_panel.ensure_active_group();
         self.enable_auto_scroll();
+    }
+
+    pub fn ensure_active_group(&mut self) {
+        self.messages_panel.ensure_active_group();
     }
 
     pub fn shell_tool_start(&mut self, event: ToolStartEvent) {

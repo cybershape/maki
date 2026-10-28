@@ -3236,3 +3236,77 @@ fn compact_tools_state_text_transitions() {
     assert!(h5.contains("done"));
     assert!(!h5.contains("tools done"));
 }
+
+#[test]
+fn compact_tools_waiting_for_response_on_ensure_active_group() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    // Prompt submitted -> active group initialized
+    panel.ensure_active_group();
+    assert_eq!(panel.messages.len(), 1);
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!()
+    };
+    assert!(!g.sealed);
+    assert!(g.entries.is_empty());
+
+    let tl = tool_group::build_tool_group_lines(g, 80, 0);
+    let h: String = tl.lines[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(h.contains("waiting for response..."));
+
+    // Tool finishes but group unsealed -> waiting for next output...
+    panel.tool_pending("c1".into(), "edit");
+    panel.tool_start(start("c1", "edit"));
+    panel.tool_done(done("c1"));
+
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!()
+    };
+    assert!(!g.sealed);
+    let tl2 = tool_group::build_tool_group_lines(g, 80, 0);
+    let h2: String = tl2.lines[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(h2.contains("waiting for next output..."));
+    assert!(!h2.contains("tools done"));
+
+    // Next tool arrives
+    panel.tool_pending("c2".into(), "bash");
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!()
+    };
+    let tl3 = tool_group::build_tool_group_lines(g, 80, 0);
+    let h3: String = tl3.lines[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(h3.contains("tool call receiving..."));
+
+    // Sealed via text delta
+    panel.tool_start(start("c2", "bash"));
+    panel.tool_done(done("c2"));
+    panel.text_delta("all done");
+
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!()
+    };
+    assert!(g.sealed);
+    let tl4 = tool_group::build_tool_group_lines(g, 80, 0);
+    let h4: String = tl4.lines[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(h4.contains("tools done"));
+}

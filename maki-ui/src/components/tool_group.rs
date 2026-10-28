@@ -335,18 +335,13 @@ pub fn build_tool_group_lines(
             GroupEntry::Thinking(th) if th.active && (th.tokens > 0 || !th.text.trim().is_empty())
         )
     });
-    let has_tools = group
-        .entries
-        .iter()
-        .any(|e| matches!(e, GroupEntry::Tool(_)));
     let has_thinking = group
         .entries
         .iter()
         .any(|e| matches!(e, GroupEntry::Thinking(_)));
-    let open_no_tools = !group.sealed && !has_tools;
-    let working = has_pending_tool || is_thinking || open_no_tools;
+    let working = !group.sealed;
 
-    if group.entries.len() == 1 && !working {
+    if group.sealed && group.entries.len() == 1 {
         let entry = &group.entries[0];
         let line = match entry {
             GroupEntry::Tool(t) => {
@@ -374,21 +369,17 @@ pub fn build_tool_group_lines(
         } else {
             ("tool calling...", theme.accent)
         }
-    } else if !has_tools {
-        if working {
-            if has_active_thinking_tokens {
-                ("thinking...", theme.thinking)
-            } else {
-                ("waiting for first token...", theme.thinking)
-            }
-        } else {
-            ("thinking", theme.thinking)
-        }
     } else if is_thinking {
         if has_active_thinking_tokens {
             ("thinking...", theme.thinking)
         } else {
             ("waiting for first token...", theme.thinking)
+        }
+    } else if working {
+        if group.entries.is_empty() {
+            ("waiting for response...", theme.thinking)
+        } else {
+            ("waiting for next output...", theme.thinking)
         }
     } else {
         let text = if has_thinking { "done" } else { "tools done" };
@@ -397,9 +388,11 @@ pub fn build_tool_group_lines(
 
     let (left_icon, left_style) = if has_pending_tool {
         (frame_char.to_string(), theme.accent)
-    } else if working {
+    } else if is_thinking {
         let (frame, style) = thinking_spinner_frame(spinner_millis);
         (frame.to_string(), style)
+    } else if working {
+        (frame_char.to_string(), theme.thinking)
     } else {
         ("✓".to_string(), theme.tool_success)
     };
@@ -524,6 +517,76 @@ mod tests {
         assert!(text.contains("cargo check"));
         assert!(text.contains("(1.20s)"));
         assert!(!text.contains("tools done"));
+    }
+
+    #[test]
+    fn waiting_for_response_when_group_empty_and_unsealed() {
+        let group = ToolGroupRole {
+            id: "group-1".into(),
+            sealed: false,
+            entries: vec![],
+        };
+
+        let tl = build_tool_group_lines(&group, 80, 0);
+        let header_text: String = tl.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(header_text.contains("waiting for response..."));
+    }
+
+    #[test]
+    fn waiting_for_next_output_when_all_tools_done_but_unsealed() {
+        let group = ToolGroupRole {
+            id: "group-1".into(),
+            sealed: false,
+            entries: vec![GroupEntry::Tool(GroupToolEntry {
+                id: "call-1".into(),
+                name: Arc::from("bash"),
+                summary: "ls".into(),
+                status: ToolStatus::Success,
+                receiving_args: false,
+                started_at: None,
+                duration: Some(Duration::from_millis(100)),
+            })],
+        };
+
+        let tl = build_tool_group_lines(&group, 80, 0);
+        let header_text: String = tl.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(header_text.contains("waiting for next output..."));
+        assert!(!header_text.contains("tools done"));
+    }
+
+    #[test]
+    fn single_tool_unsealed_renders_header_with_calling_state() {
+        let group = ToolGroupRole {
+            id: "group-1".into(),
+            sealed: false,
+            entries: vec![GroupEntry::Tool(GroupToolEntry {
+                id: "call-1".into(),
+                name: Arc::from("bash"),
+                summary: "cargo check".into(),
+                status: ToolStatus::InProgress,
+                receiving_args: false,
+                started_at: None,
+                duration: None,
+            })],
+        };
+
+        let tl = build_tool_group_lines(&group, 80, 0);
+        // Header + 1 tool row
+        assert_eq!(tl.lines.len(), 2);
+        let header_text: String = tl.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(header_text.contains("tool calling..."));
     }
 
     #[test]

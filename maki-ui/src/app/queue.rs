@@ -308,6 +308,8 @@ impl App {
         if !display.is_empty() || !input.images.is_empty() {
             self.main_chat()
                 .show_user_message(display, input.images.clone());
+        } else {
+            self.main_chat().ensure_active_group();
         }
         vec![Action::SendMessage(Box::new(input))]
     }
