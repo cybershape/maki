@@ -5,7 +5,7 @@ use agent_client_protocol_schema::v1::{
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionListCapabilities, SessionMode,
     SessionModeId, SessionModeState,
 };
-use maki_providers::{Model, ThinkingConfig};
+use maki_providers::{Model, ThinkingConfig, model_registry};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -56,18 +56,31 @@ pub fn load_session_response() -> LoadSessionResponse {
 }
 
 pub fn model_config_option(current: &str, specs: &[String]) -> SessionConfigOption {
-    let mut options: Vec<SessionConfigSelectOption> = specs
-        .iter()
-        .map(|spec| SessionConfigSelectOption::new(spec.clone(), spec.clone()))
-        .collect();
+    let mut options: Vec<SessionConfigSelectOption> =
+        specs.iter().map(|spec| model_select_option(spec)).collect();
     if !specs.iter().any(|spec| spec == current) {
-        options.insert(
-            0,
-            SessionConfigSelectOption::new(current.to_string(), current.to_string()),
-        );
+        options.insert(0, model_select_option(current));
     }
     SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current.to_string(), options)
         .category(SessionConfigOptionCategory::Model)
+}
+
+fn model_select_option(spec: &str) -> SessionConfigSelectOption {
+    let name = model_display_name(spec);
+    let has_display_name = name != spec;
+    let mut option = SessionConfigSelectOption::new(spec.to_string(), name);
+    if has_display_name {
+        option = option.description(spec.to_string());
+    }
+    option
+}
+
+fn model_display_name(spec: &str) -> String {
+    Model::from_spec(spec)
+        .ok()
+        .and_then(|m| m.name)
+        .or_else(|| model_registry::resolve_model_name_for_spec(spec))
+        .unwrap_or_else(|| spec.to_string())
 }
 
 pub fn thought_level_config_option(
@@ -145,6 +158,7 @@ pub fn mode_id_to_agent_mode(mode_id: &str) -> Option<maki_agent::AgentMode> {
 mod tests {
     use super::*;
     use agent_client_protocol_schema::v1::{SessionConfigKind, SessionConfigSelectOptions};
+    use maki_providers::ModelInfo;
     use maki_storage::sessions::Effort;
     use test_case::test_case;
 
@@ -215,5 +229,63 @@ mod tests {
         let opts = session_config_options(&model, &specs, ThinkingConfig::Effort(Effort::High));
         assert_eq!(opts.len(), 1);
         assert_eq!(opts[0].id.0.as_ref(), MODEL_CONFIG_ID);
+    }
+
+    #[test]
+    fn model_config_option_resolves_display_name_and_description() {
+        let slug = "responses";
+        let model_id = "friendly-model";
+        let spec = format!("{slug}/{model_id}");
+        model_registry::set_known_models(
+            slug,
+            vec![ModelInfo {
+                name: Some("Friendly Model Name".to_string()),
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+
+        let opt = model_config_option(&spec, std::slice::from_ref(&spec));
+        let SessionConfigKind::Select(select) = opt.kind else {
+            panic!("expected select kind");
+        };
+        let SessionConfigSelectOptions::Ungrouped(options) = select.options else {
+            panic!("expected ungrouped options");
+        };
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].value.0.as_ref(), spec);
+        assert_eq!(options[0].name, "Friendly Model Name");
+        assert_eq!(options[0].description.as_deref(), Some(spec.as_str()));
+    }
+
+    #[test]
+    fn model_config_option_falls_back_when_name_unknown() {
+        let spec = "unknown-provider/unknown-model";
+        let opt = model_config_option(spec, &[spec.to_string()]);
+        let SessionConfigKind::Select(select) = opt.kind else {
+            panic!("expected select kind");
+        };
+        let SessionConfigSelectOptions::Ungrouped(options) = select.options else {
+            panic!("expected ungrouped options");
+        };
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].value.0.as_ref(), spec);
+        assert_eq!(options[0].name, spec);
+        assert_eq!(options[0].description, None);
+    }
+
+    #[test]
+    fn model_config_option_inserts_missing_current() {
+        let current = "unknown-provider/current";
+        let other = "unknown-provider/other";
+        let opt = model_config_option(current, &[other.to_string()]);
+        let SessionConfigKind::Select(select) = opt.kind else {
+            panic!("expected select kind");
+        };
+        let SessionConfigSelectOptions::Ungrouped(options) = select.options else {
+            panic!("expected ungrouped options");
+        };
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].value.0.as_ref(), current);
+        assert_eq!(options[1].value.0.as_ref(), other);
     }
 }
