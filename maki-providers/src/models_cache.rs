@@ -8,6 +8,7 @@
 //! [`crate::model_registry::discovery_complete`] only ever see this run's
 //! probe.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use maki_config::ModelPolicy;
@@ -16,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
+use crate::model::ModelInfo;
+use crate::model_registry;
 use crate::provider::{ModelBatch, fetch_all_models, provider_available};
 use crate::providers::custom;
 use crate::spec::ProviderRegistry;
@@ -39,6 +42,8 @@ struct ModelsCache {
     /// Unix milliseconds, for [`MAX_AGE_MS`].
     written_at: u64,
     specs: Vec<String>,
+    #[serde(default)]
+    models: HashMap<String, Vec<ModelInfo>>,
 }
 
 /// What the model picker should show right now.
@@ -218,6 +223,9 @@ fn replay(path: &Path, policy: &ModelPolicy, fingerprint: &str, now_ms: u64) -> 
         debug!("discovered-models cache is past its maximum age; ignoring");
         return Vec::new();
     }
+    if !cache.models.is_empty() {
+        model_registry::restore_cached_models(cache.models);
+    }
     // The policy is applied on replay, not trusted from the cache file:
     // exclusions can change between runs.
     let mut specs = cache.specs;
@@ -242,6 +250,7 @@ fn store_discovery(path: &Path, listing: &Listing, fingerprint: String, now_ms: 
             fingerprint,
             written_at: now_ms,
             specs: listing.live.clone(),
+            models: model_registry::all_known_models(),
         },
     );
 }
@@ -315,6 +324,7 @@ mod tests {
             fingerprint: FINGERPRINT.to_string(),
             written_at: NOW,
             specs: specs(cached),
+            models: HashMap::new(),
         }
     }
 
@@ -418,5 +428,39 @@ mod tests {
         std::fs::write(&path, b"{ not json").unwrap();
         assert!(load_from(&path).is_none());
         assert!(load_from(&dir.path().join("missing.json")).is_none());
+    }
+
+    #[test]
+    fn replay_restores_known_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CACHE_FILE);
+        let slug = "cached-provider";
+        let model_id = "cached-model";
+        let mut models = HashMap::new();
+        models.insert(
+            slug.to_string(),
+            vec![ModelInfo {
+                name: Some("Cached Model Name".to_string()),
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+        store_at(
+            &path,
+            &ModelsCache {
+                fingerprint: FINGERPRINT.to_string(),
+                written_at: NOW,
+                specs: vec![format!("{slug}/{model_id}")],
+                models,
+            },
+        );
+
+        let policy = ModelPolicy::default();
+        let replayed = replay(&path, &policy, FINGERPRINT, NOW);
+        assert_eq!(replayed, [format!("{slug}/{model_id}")]);
+
+        assert_eq!(
+            model_registry::resolve_model_name(slug, model_id).as_deref(),
+            Some("Cached Model Name")
+        );
     }
 }

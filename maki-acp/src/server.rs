@@ -12,9 +12,10 @@ use agent_client_protocol_schema::v1::{
     InitializeRequest, JsonRpcMessage, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, McpServer, NewSessionRequest, Notification, PromptRequest, PromptResponse,
     Request, RequestId, RequestPermissionRequest, RequestPermissionResponse, Response,
-    SessionConfigOptionValue, SessionId, SessionInfo, SessionModeId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
+    SessionConfigOption, SessionConfigOptionValue, SessionId, SessionInfo, SessionModeId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent,
 };
 use color_eyre::eyre::Context;
 use flume::{Receiver, Sender, WeakSender};
@@ -103,6 +104,7 @@ struct SessionState {
     /// claim instead of clashing with it.
     claim: SessionClaim,
     usage: SharedUsage,
+    config_options: Vec<SessionConfigOption>,
 }
 
 struct Server {
@@ -234,18 +236,18 @@ fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Vec<String>>) {
 /// Discovery lands in batches after the client built its selector from the
 /// offline list, so every batch that adds something announces the fuller list.
 fn refresh_models(srv: &mut Server, batch: Vec<String>) {
-    let known = srv.model_specs.len();
+    let mut added = false;
     for spec in batch {
         if !srv.model_specs.contains(&spec) {
             srv.model_specs.push(spec);
+            added = true;
         }
-    }
-    if srv.model_specs.len() == known {
-        return;
     }
     srv.should_wait_models = false;
     // Merged even with no session yet, since session/new builds its selector from this list.
-    let Some(session) = &srv.session else { return };
+    let Some(session) = &mut srv.session else {
+        return;
+    };
     let sid = SessionId::from(session.handle.session_id.to_string());
     let options = match Model::from_spec(&session.current_model) {
         Ok(model) => {
@@ -266,6 +268,10 @@ fn refresh_models(srv: &mut Server, batch: Vec<String>) {
             &srv.model_specs,
         )],
     };
+    if !added && options == session.config_options {
+        return;
+    }
+    session.config_options = options.clone();
     session_update(
         &srv.out_tx,
         &sid,
@@ -413,6 +419,9 @@ async fn new_session(
     maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(session_ref.as_str()));
     let options =
         methods::session_config_options(&params.model, &srv.model_specs, current_thinking);
+    if let Some(session) = &mut srv.session {
+        session.config_options = options.clone();
+    }
     let resp = methods::new_session_response(session_ref.as_str()).config_options(options);
     Ok(AgentResponse::NewSessionResponse(resp))
 }
@@ -509,6 +518,9 @@ async fn load_session(
     maki_otel::emit::session_started(maki_otel::emit::START_RESUME, Some(started.as_str()));
     let options =
         methods::session_config_options(&params.model, &srv.model_specs, current_thinking);
+    if let Some(session) = &mut srv.session {
+        session.config_options = options.clone();
+    }
     let resp = methods::load_session_response().config_options(options);
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
@@ -638,6 +650,7 @@ fn start_session(
         pending,
         claim,
         usage,
+        config_options: Vec::new(),
     });
     session_ref
 }
@@ -989,6 +1002,7 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
 
         let options =
             methods::session_config_options(&model, &srv.model_specs, session.current_thinking);
+        session.config_options = options.clone();
         Ok(AgentResponse::SetSessionConfigOptionResponse(
             SetSessionConfigOptionResponse::new(options),
         ))
@@ -1029,6 +1043,7 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
 
         let options =
             methods::session_config_options(&model, &srv.model_specs, session.current_thinking);
+        session.config_options = options.clone();
         Ok(AgentResponse::SetSessionConfigOptionResponse(
             SetSessionConfigOptionResponse::new(options),
         ))
@@ -1640,6 +1655,7 @@ mod tests {
                 pending: Arc::default(),
                 claim,
                 usage: Arc::default(),
+                config_options: Vec::new(),
             }),
             should_wait_models: false,
             models_rx: None,
@@ -2384,6 +2400,42 @@ mod tests {
 
         refresh_models(&mut srv, batch);
         assert!(out_rx.is_empty(), "a batch adding nothing is not announced");
+    }
+
+    #[test]
+    fn refresh_models_announces_when_options_change_without_new_specs() {
+        let (mut srv, .., out_rx) = test_server();
+        let target_spec = "responses/model-with-name";
+        srv.model_specs = vec![target_spec.to_owned()];
+        srv.session.as_mut().unwrap().current_model = target_spec.to_string();
+
+        // Initially session config_options has the fallback name (the spec itself)
+        let initial_opt = methods::model_config_option(target_spec, &[target_spec.to_string()]);
+        srv.session.as_mut().unwrap().config_options = vec![initial_opt];
+
+        // Model registry now discovers the friendly name
+        model_registry::set_known_models(
+            "responses",
+            vec![ModelInfo {
+                name: Some("Resolved Friendly Name".to_string()),
+                ..ModelInfo::id_only("model-with-name".to_string())
+            }],
+        );
+
+        // Same specs in the batch, but options now produce friendly display name
+        refresh_models(&mut srv, vec![target_spec.to_owned()]);
+        let mut found_opt_update = None;
+        while let Ok(msg) = out_rx.try_recv() {
+            if msg["params"]["update"]["configOptions"].is_array() {
+                found_opt_update = Some(msg["params"]["update"].clone());
+            }
+        }
+        let update = found_opt_update.expect("config_option_update announced on name resolution");
+        let option = &update["configOptions"][0];
+        let first = &option["options"][0];
+        assert_eq!(first["name"], "Resolved Friendly Name");
+        assert_eq!(first["value"], target_spec);
+        assert_eq!(first["description"], target_spec);
     }
 
     #[test_case(true ; "without_session")]

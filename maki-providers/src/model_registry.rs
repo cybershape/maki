@@ -73,6 +73,17 @@ pub fn set_known_models(provider: &str, models: Vec<ModelInfo>) {
     write().set_known_models(provider, models);
 }
 
+pub fn all_known_models() -> HashMap<String, Vec<ModelInfo>> {
+    read().known_models.clone()
+}
+
+pub fn restore_cached_models(models: HashMap<String, Vec<ModelInfo>>) {
+    let mut reg = write();
+    for (provider, list) in models {
+        reg.known_models.entry(provider).or_insert(list);
+    }
+}
+
 /// Resolve model name: user-configured ModelDef name in ProvidersConfig takes priority,
 /// falling back to API-discovered ModelInfo.name.
 pub fn resolve_model_name(provider: &str, model_id: &str) -> Option<String> {
