@@ -3102,7 +3102,11 @@ impl App {
                 let actions = match pending.then {
                     Some(PlanRowAction::Implement) => self.implement_plan(false),
                     Some(PlanRowAction::ClearAndImplement) => self.implement_plan(true),
-                    Some(PlanRowAction::Refine) | None => vec![],
+                    Some(PlanRowAction::Refine) => {
+                        self.transition_plan(PlanTrigger::InteractivePrompt);
+                        vec![]
+                    }
+                    None => vec![],
                 };
                 self.pending_actions.extend(actions);
             }
@@ -3329,6 +3333,12 @@ impl App {
                 self.plan_form.hide();
                 vec![]
             }
+            PlanFormAction::Refine => {
+                self.plan_answers.abandon();
+                self.plan_form.hide();
+                self.transition_plan(PlanTrigger::InteractivePrompt);
+                vec![]
+            }
             PlanFormAction::OpenEditor => match self.state.plan.path() {
                 Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
                 None => {
@@ -3411,11 +3421,11 @@ impl App {
         let parallel = self.plan_form.parallel();
         self.plan_form.reset();
         let plan_snapshot = match std::mem::take(&mut self.state.plan) {
-            PlanState::Ready(p) => Some((
+            PlanState::Ready(p) | PlanState::Drafting(p) => Some((
                 std::fs::read_to_string(&p).unwrap_or_default(),
                 p.display().to_string(),
             )),
-            _ => None,
+            PlanState::None => None,
         };
 
         self.state.mode = Mode::Build;
@@ -3442,7 +3452,7 @@ impl App {
             text,
             images: vec![],
         };
-        actions.extend(self.start_from_queue(&msg));
+        actions.extend(self.submit_or_queue(msg));
         actions
     }
 }

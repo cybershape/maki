@@ -94,10 +94,8 @@ impl App {
                 }
             }
             PlanTrigger::InteractivePrompt => {
-                if self.state.plan.is_ready() {
-                    self.state.plan.mark_drafting();
-                    self.plan_form.on_plan_drafting();
-                }
+                self.state.plan.mark_drafting();
+                self.plan_form.on_plan_drafting();
             }
         }
     }

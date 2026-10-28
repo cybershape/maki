@@ -6,6 +6,7 @@ use std::borrow::Cow;
 use maki_agent::{AgentInput, AgentMode, ImageSource, InputSource};
 use maki_lua::agent_autocmd::HostEvent;
 
+use super::mode::{Mode, PlanTrigger};
 use super::{Action, App, Status};
 
 use crate::agent::shared_queue::{Compaction, QueueItem, QueueSender, QueuedInput};
@@ -129,6 +130,9 @@ impl App {
     pub(crate) fn submit_prompt(&mut self, msg: QueuedMessage) -> SubmitOutcome {
         if msg.text.trim().is_empty() && msg.images.is_empty() {
             return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR);
+        }
+        if self.state.mode == Mode::Plan {
+            self.transition_plan(PlanTrigger::InteractivePrompt);
         }
         if self.status == Status::Streaming {
             if self.queue_and_notify(msg) {

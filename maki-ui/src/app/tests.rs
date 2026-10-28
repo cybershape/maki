@@ -5845,6 +5845,7 @@ fn plan_app() -> App {
         annotation: None,
         written_path: Some("test-plan.md".into()),
     }))));
+    app.update(agent_msg(done()));
     app
 }
 
@@ -5904,6 +5905,7 @@ fn re_edit_keeps_plan_form_visible() {
     assert!(app.plan_form.is_visible());
 }
 
+#[test_case(0, Mode::Plan,  false, false ; "refine_keeps_planning")]
 #[test_case(1, Mode::Build, true,  true  ; "clear_and_implement")]
 #[test_case(2, Mode::Build, false, true  ; "implement_keeps_context")]
 fn plan_form_menu_options(
@@ -5921,7 +5923,11 @@ fn plan_form_menu_options(
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(!app.plan_form.is_visible());
     assert_eq!(app.state.mode, expected_mode);
-    assert_eq!(app.state.plan, PlanState::None);
+    if expected_mode == Mode::Plan {
+        assert!(matches!(app.state.plan, PlanState::Drafting(_)));
+    } else {
+        assert_eq!(app.state.plan, PlanState::None);
+    }
     assert_eq!(
         actions
             .iter()
@@ -5961,16 +5967,23 @@ fn plan_form_open_editor() {
     assert!(matches!(&actions[..], [Action::OpenEditor(p)] if p == Path::new("test-plan.md")));
 }
 
+fn rewrite_plan_with_run_id(app: &mut App, run_id: u64) {
+    app.update(agent_msg_with_run_id(
+        AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            call: None,
+            id: "t2".into(),
+            tool: "write".into(),
+            output: Arc::new(ToolOutput::Plain("wrote 99 bytes to test-plan.md".into())),
+            is_error: false,
+            annotation: None,
+            written_path: Some("test-plan.md".into()),
+        })),
+        run_id,
+    ));
+}
+
 fn rewrite_plan(app: &mut App) {
-    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-        call: None,
-        id: "t2".into(),
-        tool: "write".into(),
-        output: Arc::new(ToolOutput::Plain("wrote 99 bytes to test-plan.md".into())),
-        is_error: false,
-        annotation: None,
-        written_path: Some("test-plan.md".into()),
-    }))));
+    rewrite_plan_with_run_id(app, app.run_id);
 }
 
 fn dismiss_plan_esc(app: &mut App) {
@@ -5989,6 +6002,57 @@ fn rewrite_does_not_reopen_after_dismiss() {
     rewrite_plan(&mut app);
     assert!(!app.plan_form.is_visible());
     assert!(app.state.plan.is_ready());
+}
+
+#[test]
+fn refine_selection_reopens_form_on_next_write() {
+    let mut app = plan_app();
+    assert!(app.plan_form.is_visible());
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(!app.plan_form.is_visible());
+    assert!(matches!(app.state.plan, PlanState::Drafting(_)));
+
+    rewrite_plan(&mut app);
+    assert!(app.plan_form.is_visible());
+    assert!(app.state.plan.is_ready());
+}
+
+#[test]
+fn prompt_in_plan_mode_reopens_form_on_next_write() {
+    let mut app = plan_app();
+    assert!(app.plan_form.is_visible());
+
+    dismiss_plan_esc(&mut app);
+    assert!(!app.plan_form.is_visible());
+    assert!(app.state.plan.is_ready());
+
+    app.submit_prompt(queued_msg("refine step 2"));
+    assert!(matches!(app.state.plan, PlanState::Drafting(_)));
+
+    rewrite_plan(&mut app);
+    assert!(app.plan_form.is_visible());
+    assert!(app.state.plan.is_ready());
+}
+
+#[test]
+fn implement_plan_while_streaming_queues_without_bumping_run_id() {
+    let mut app = plan_app();
+    assert!(app.plan_form.is_visible());
+    app.status = Status::Streaming;
+
+    let initial_run_id = app.run_id;
+    let actions = app.handle_plan_form_action(PlanFormAction::Implement);
+    assert!(
+        actions.is_empty(),
+        "queued messages do not emit SendMessage actions immediately"
+    );
+    assert_eq!(
+        app.run_id, initial_run_id,
+        "run_id must not be bumped while streaming"
+    );
+    assert_eq!(app.state.mode, Mode::Build);
+    assert_eq!(app.queue.len(), 1);
 }
 
 #[test]
