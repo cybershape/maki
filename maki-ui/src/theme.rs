@@ -408,6 +408,7 @@ named_styles!(t => {
     "dim" | "tool_dim" => t.tool_dim,
     "path" | "tool_path" => t.tool_path,
     "tool" => t.tool,
+    "tool_bg" => t.tool_bg,
     "tool_prefix" => t.tool_prefix,
     "tool_success" => t.tool_success,
     "tool_error" => t.tool_error,
@@ -465,6 +466,7 @@ pub struct Theme {
     pub assistant: Style,
     pub assistant_prefix: Style,
     pub thinking: Style,
+    #[allow(dead_code)]
     pub tool_bg: Style,
     pub tool: Style,
     pub tool_path: Style,

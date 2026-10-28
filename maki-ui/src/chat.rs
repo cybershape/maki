@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::app::tasks::{TaskOutcome, TaskStatus};
 use crate::components::input::Draft;
@@ -587,6 +588,19 @@ pub fn history_to_display(
         }) = display.last_mut()
         {
             g.sealed = true;
+            if g.duration.is_none() {
+                let sum: Duration = g
+                    .entries
+                    .iter()
+                    .filter_map(|e| match e {
+                        GroupEntry::Tool(t) => t.duration,
+                        _ => None,
+                    })
+                    .sum();
+                if !sum.is_zero() {
+                    g.duration = Some(sum);
+                }
+            }
         }
     };
 
@@ -662,6 +676,9 @@ pub fn history_to_display(
                                     id: format!("compact-group-{}", display.len()),
                                     sealed: false,
                                     entries: vec![GroupEntry::Thinking(entry)],
+                                    started_at: None,
+                                    duration: None,
+                                    waiting_since: None,
                                 };
                                 display.push(DisplayMessage::new(
                                     DisplayRole::ToolGroup(Box::new(group)),
@@ -755,6 +772,9 @@ pub fn history_to_display(
                                     id: format!("compact-group-{}", display.len()),
                                     sealed: false,
                                     entries: vec![GroupEntry::Tool(entry)],
+                                    started_at: None,
+                                    duration: None,
+                                    waiting_since: None,
                                 };
                                 display.push(DisplayMessage::new(
                                     DisplayRole::ToolGroup(Box::new(group)),

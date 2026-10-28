@@ -46,6 +46,29 @@ pub fn format_tool_duration(dur: Duration) -> String {
     }
 }
 
+pub fn format_group_duration(dur: Duration) -> String {
+    let total_secs = dur.as_secs();
+    if total_secs >= 3600 {
+        let hours = total_secs / 3600;
+        let mins = (total_secs % 3600) / 60;
+        let secs = total_secs % 60;
+        format!("{hours}h{mins}m{secs}s")
+    } else if total_secs >= 60 {
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        format!("{mins}m{secs}s")
+    } else if total_secs > 0 {
+        format!("{total_secs}s")
+    } else {
+        let millis = dur.as_millis();
+        if millis > 0 {
+            format!("{millis}ms")
+        } else {
+            "0s".to_string()
+        }
+    }
+}
+
 pub fn format_thinking_tokens(tokens: usize) -> String {
     if tokens < 1000 {
         format!("({tokens}t)")
@@ -273,7 +296,7 @@ fn render_thinking_row(
             let content_style = if is_dim {
                 theme.tool_dim
             } else {
-                theme.thinking
+                theme.thinking.remove_modifier(Modifier::ITALIC)
             };
             spans.push(Span::raw(" "));
             spans.push(Span::styled(truncated, content_style));
@@ -323,16 +346,6 @@ pub fn build_tool_group_lines(
             .entries
             .iter()
             .any(|e| matches!(e, GroupEntry::Thinking(th) if th.active));
-    let has_active_thinking_tokens = group.entries.iter().any(|e| {
-        matches!(
-            e,
-            GroupEntry::Thinking(th) if th.active && (th.tokens > 0 || !th.text.trim().is_empty())
-        )
-    });
-    let has_thinking = group
-        .entries
-        .iter()
-        .any(|e| matches!(e, GroupEntry::Thinking(_)));
     let working = !group.sealed;
 
     if group.sealed && group.entries.is_empty() {
@@ -368,27 +381,25 @@ pub fn build_tool_group_lines(
     }
 
     let theme = theme::current();
-    let (state_text, state_style) = if has_pending_tool {
+    let state_text = if has_pending_tool {
         if receiving_tool_args {
-            ("tool call receiving...", theme.accent)
+            "tool call receiving...".to_string()
         } else {
-            ("tool calling...", theme.accent)
+            "tool calling...".to_string()
         }
     } else if is_thinking {
-        if has_active_thinking_tokens {
-            ("thinking...", theme.thinking)
-        } else {
-            ("waiting for first token...", theme.thinking)
-        }
+        "thinking...".to_string()
     } else if working {
-        if group.entries.is_empty() {
-            ("waiting for response...", theme.thinking)
-        } else {
-            ("waiting for next output...", theme.thinking)
-        }
+        let timer = group
+            .waiting_duration()
+            .map(|dur| format!(" ({})", format_tool_duration(dur)))
+            .unwrap_or_default();
+        format!("waiting for response...{timer}")
     } else {
-        let text = if has_thinking { "done" } else { "tools done" };
-        (text, theme.tool_success)
+        format!(
+            "worked for {}",
+            format_group_duration(group.total_duration())
+        )
     };
 
     let (left_icon, left_style) = if has_pending_tool {
@@ -415,7 +426,7 @@ pub fn build_tool_group_lines(
     if working && (has_pending_tool || (!is_thinking && working)) {
         spinner_lines.push((0, 1));
     }
-    header_spans.push(Span::styled(state_text, state_style));
+    header_spans.push(Span::styled(state_text, Style::default()));
     if !hidden_suffix.is_empty() {
         header_spans.push(Span::styled(hidden_suffix, theme.status_dim));
     }
@@ -462,6 +473,7 @@ pub fn build_tool_group_lines(
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::time::Instant;
 
     #[test]
     fn format_durations() {
@@ -486,11 +498,23 @@ mod tests {
     }
 
     #[test]
+    fn format_group_durations() {
+        assert_eq!(format_group_duration(Duration::from_millis(0)), "0s");
+        assert_eq!(format_group_duration(Duration::from_millis(500)), "500ms");
+        assert_eq!(format_group_duration(Duration::from_secs(5)), "5s");
+        assert_eq!(format_group_duration(Duration::from_secs(95)), "1m35s");
+        assert_eq!(format_group_duration(Duration::from_secs(3665)), "1h1m5s");
+    }
+
+    #[test]
     fn empty_sealed_group_renders_empty_lines() {
         let group = ToolGroupRole {
             id: "group-1".into(),
             sealed: true,
             entries: vec![],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -511,6 +535,9 @@ mod tests {
                 started_at: None,
                 duration: Some(Duration::from_millis(1200)),
             })],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -525,7 +552,7 @@ mod tests {
         assert!(text.contains("bash"));
         assert!(text.contains("cargo check"));
         assert!(text.contains("(1.20s)"));
-        assert!(!text.contains("tools done"));
+        assert!(!text.contains("worked for"));
     }
 
     #[test]
@@ -534,6 +561,9 @@ mod tests {
             id: "group-1".into(),
             sealed: false,
             entries: vec![],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -546,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn waiting_for_next_output_when_all_tools_done_but_unsealed() {
+    fn waiting_for_response_when_all_tools_done_but_unsealed() {
         let group = ToolGroupRole {
             id: "group-1".into(),
             sealed: false,
@@ -559,6 +589,9 @@ mod tests {
                 started_at: None,
                 duration: Some(Duration::from_millis(100)),
             })],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -567,8 +600,28 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(header_text.contains("waiting for next output..."));
-        assert!(!header_text.contains("tools done"));
+        assert!(header_text.contains("waiting for response..."));
+        assert!(!header_text.contains("worked for"));
+    }
+
+    #[test]
+    fn waiting_for_response_shows_timer() {
+        let group = ToolGroupRole {
+            id: "group-1".into(),
+            sealed: false,
+            entries: vec![],
+            started_at: None,
+            duration: None,
+            waiting_since: Some(Instant::now() - Duration::from_millis(1520)),
+        };
+
+        let tl = build_tool_group_lines(&group, 80, 0);
+        let header_text: String = tl.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(header_text.contains("waiting for response... (1.52s)"));
     }
 
     #[test]
@@ -585,6 +638,9 @@ mod tests {
                 started_at: None,
                 duration: None,
             })],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -612,6 +668,9 @@ mod tests {
                 started_at: None,
                 duration: None,
             })],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -634,6 +693,9 @@ mod tests {
                 tokens: 0,
                 active: true,
             })],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -642,7 +704,8 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(header_text.contains("waiting for first token..."));
+        assert!(header_text.contains("thinking..."));
+        assert!(!header_text.contains("waiting for"));
     }
 
     #[test]
@@ -670,6 +733,9 @@ mod tests {
                     duration: Some(Duration::from_millis(15900)),
                 }),
             ],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -680,7 +746,7 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(header_text.starts_with(" "));
-        assert!(header_text.contains("tools done"));
+        assert!(header_text.contains("worked for 23s"));
 
         let row1: String = tl.lines[1]
             .spans
@@ -723,6 +789,9 @@ mod tests {
             id: "group-1".into(),
             sealed: true,
             entries,
+            started_at: None,
+            duration: None,
+            waiting_since: None,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -760,6 +829,9 @@ mod tests {
                     duration: None,
                 }),
             ],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
         };
 
         let mut tl = build_tool_group_lines(&group, 80, 0);
@@ -804,5 +876,87 @@ mod tests {
             "updated busy row should still have 1 space: {updated_busy_line}"
         );
         assert!(!updated_busy_line.contains("⠙  bash"));
+    }
+
+    #[test]
+    fn group_title_has_default_style() {
+        let group = ToolGroupRole {
+            id: "group-1".into(),
+            sealed: false,
+            entries: vec![GroupEntry::Tool(GroupToolEntry {
+                id: "call-1".into(),
+                name: Arc::from("bash"),
+                summary: "ls".into(),
+                status: ToolStatus::InProgress,
+                receiving_args: false,
+                started_at: None,
+                duration: None,
+            })],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
+        };
+
+        let tl = build_tool_group_lines(&group, 80, 0);
+        let title_span = &tl.lines[0].spans[2];
+        assert_eq!(title_span.content.as_ref(), "tool calling...");
+        assert_eq!(title_span.style, Style::default());
+    }
+
+    #[test]
+    fn thinking_preview_has_no_italic_modifier() {
+        let group = ToolGroupRole {
+            id: "group-1".into(),
+            sealed: false,
+            entries: vec![GroupEntry::Thinking(GroupThinkingEntry {
+                id: 0,
+                text: "analyzing requirements".into(),
+                tokens: 10,
+                active: false,
+            })],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
+        };
+
+        let tl = build_tool_group_lines(&group, 80, 0);
+        let preview_span = tl.lines[1]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("analyzing requirements"))
+            .expect("preview span found");
+        assert!(!preview_span.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn sealed_group_title_shows_worked_for_and_hidden() {
+        let mut entries = Vec::new();
+        for i in 0..22 {
+            entries.push(GroupEntry::Tool(GroupToolEntry {
+                id: format!("c{i}"),
+                name: Arc::from("tool"),
+                summary: format!("op {i}"),
+                status: ToolStatus::Success,
+                receiving_args: false,
+                started_at: None,
+                duration: None,
+            }));
+        }
+        let group = ToolGroupRole {
+            id: "group-done".into(),
+            sealed: true,
+            entries,
+            started_at: None,
+            duration: Some(Duration::from_secs(95)),
+            waiting_since: None,
+        };
+
+        let tl = build_tool_group_lines(&group, 80, 0);
+        let header: String = tl.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(header.contains("worked for 1m35s (12 hidden)"));
     }
 }

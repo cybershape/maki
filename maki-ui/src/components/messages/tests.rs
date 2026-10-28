@@ -3078,6 +3078,9 @@ fn panel_with_sealed_groups(tools: usize, thinking: usize, groups: usize) -> Mes
                 id: format!("group-{group}"),
                 sealed: true,
                 entries,
+                started_at: None,
+                duration: None,
+                waiting_since: None,
             })),
             String::new(),
         ));
@@ -3329,7 +3332,7 @@ fn compact_tools_state_text_transitions() {
     let tl3 = tool_group::build_tool_group_lines(g, 80, 0);
     assert_eq!(tl3.lines.len(), 1);
 
-    // 4. Multiple tools completed: tools done
+    // 4. Multiple tools completed: worked for
     let mut group2 = ToolGroupRole {
         id: "group-2".into(),
         sealed: true,
@@ -3353,6 +3356,9 @@ fn compact_tools_state_text_transitions() {
                 duration: Some(std::time::Duration::from_millis(200)),
             }),
         ],
+        started_at: None,
+        duration: None,
+        waiting_since: None,
     };
     let tl4 = tool_group::build_tool_group_lines(&group2, 80, 0);
     let h4: String = tl4.lines[0]
@@ -3360,9 +3366,9 @@ fn compact_tools_state_text_transitions() {
         .iter()
         .map(|s| s.content.as_ref())
         .collect();
-    assert!(h4.contains("tools done"));
+    assert!(h4.contains("worked for 300ms"));
 
-    // 5. Mixed with thinking: done
+    // 5. Mixed with thinking: worked for
     group2.entries.insert(
         0,
         GroupEntry::Thinking(GroupThinkingEntry {
@@ -3378,8 +3384,7 @@ fn compact_tools_state_text_transitions() {
         .iter()
         .map(|s| s.content.as_ref())
         .collect();
-    assert!(h5.contains("done"));
-    assert!(!h5.contains("tools done"));
+    assert!(h5.contains("worked for 300ms"));
 }
 
 #[test]
@@ -3389,16 +3394,12 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         ..Default::default()
     };
     let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
-
-    // Prompt submitted -> active group initialized
     panel.ensure_active_group();
-    assert_eq!(panel.messages.len(), 1);
+
     let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
         panic!()
     };
     assert!(!g.sealed);
-    assert!(g.entries.is_empty());
-
     let tl = tool_group::build_tool_group_lines(g, 80, 0);
     let h: String = tl.lines[0]
         .spans
@@ -3407,7 +3408,7 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         .collect();
     assert!(h.contains("waiting for response..."));
 
-    // Tool finishes but group unsealed -> waiting for next output...
+    // Tool finishes but group unsealed -> waiting for response...
     panel.tool_pending("c1".into(), "edit");
     panel.tool_start(start("c1", "edit"));
     panel.tool_done(done("c1"));
@@ -3422,14 +3423,15 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         .iter()
         .map(|s| s.content.as_ref())
         .collect();
-    assert!(h2.contains("waiting for next output..."));
-    assert!(!h2.contains("tools done"));
+    assert!(h2.contains("waiting for response..."));
+    assert!(!h2.contains("worked for"));
 
     // Next tool arrives
     panel.tool_pending("c2".into(), "bash");
     let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
         panic!()
     };
+    assert!(!g.sealed);
     let tl3 = tool_group::build_tool_group_lines(g, 80, 0);
     let h3: String = tl3.lines[0]
         .spans
@@ -3453,7 +3455,7 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         .iter()
         .map(|s| s.content.as_ref())
         .collect();
-    assert!(h4.contains("tools done"));
+    assert!(h4.contains("worked for"));
 }
 
 #[test]

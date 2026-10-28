@@ -430,6 +430,39 @@ pub struct ToolGroupRole {
     pub id: String,
     pub sealed: bool,
     pub entries: Vec<GroupEntry>,
+    pub started_at: Option<Instant>,
+    pub duration: Option<Duration>,
+    pub waiting_since: Option<Instant>,
+}
+
+impl ToolGroupRole {
+    pub fn total_duration(&self) -> Duration {
+        if let Some(dur) = self.duration {
+            return dur;
+        }
+        let tool_sum: Duration = self
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                GroupEntry::Tool(t) => t.duration.or_else(|| t.started_at.map(|st| st.elapsed())),
+                _ => None,
+            })
+            .sum();
+        if !tool_sum.is_zero() {
+            return tool_sum;
+        }
+        self.started_at.map_or(Duration::ZERO, |st| st.elapsed())
+    }
+
+    pub fn waiting_duration(&self) -> Option<Duration> {
+        self.waiting_since.map(|ws| ws.elapsed()).or_else(|| {
+            if self.entries.is_empty() {
+                self.started_at.map(|st| st.elapsed())
+            } else {
+                None
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -257,6 +257,10 @@ impl MessagesPanel {
             && !g.sealed
         {
             g.sealed = true;
+            g.waiting_since = None;
+            if g.duration.is_none() {
+                g.duration = g.started_at.map(|st| st.elapsed());
+            }
             for entry in &mut g.entries {
                 if let GroupEntry::Thinking(th) = entry {
                     th.active = false;
@@ -284,6 +288,9 @@ impl MessagesPanel {
             id: gid,
             sealed: false,
             entries: Vec::new(),
+            started_at: Some(Instant::now()),
+            duration: None,
+            waiting_since: Some(Instant::now()),
         };
         self.messages.push(DisplayMessage::new(
             DisplayRole::ToolGroup(Box::new(group)),
@@ -302,6 +309,7 @@ impl MessagesPanel {
                 && !g.sealed
             {
                 group_id = Some(g.id.clone());
+                g.waiting_since = None;
                 if let Some(GroupEntry::Thinking(th)) = g.entries.last_mut() {
                     if th.active {
                         th.text.push_str(text);
@@ -337,6 +345,9 @@ impl MessagesPanel {
                         tokens: text.len().div_ceil(4),
                         active: true,
                     })],
+                    started_at: Some(Instant::now()),
+                    duration: None,
+                    waiting_since: None,
                 };
                 self.messages.push(DisplayMessage::new(
                     DisplayRole::ToolGroup(Box::new(group)),
@@ -365,6 +376,7 @@ impl MessagesPanel {
             }) = self.messages.last_mut()
                 && !g.sealed
             {
+                g.waiting_since = None;
                 if let Some(GroupEntry::Thinking(th)) = g.entries.last_mut() {
                     th.active = false;
                 }
@@ -403,6 +415,9 @@ impl MessagesPanel {
                     started_at: Some(Instant::now()),
                     duration: None,
                 })],
+                started_at: Some(Instant::now()),
+                duration: None,
+                waiting_since: None,
             };
             self.messages.push(DisplayMessage::new(
                 DisplayRole::ToolGroup(Box::new(group)),
@@ -454,6 +469,7 @@ impl MessagesPanel {
             }) = self.messages.last_mut()
                 && !g.sealed
             {
+                g.waiting_since = None;
                 if let Some(GroupEntry::Thinking(th)) = g.entries.last_mut() {
                     th.active = false;
                 }
@@ -484,6 +500,9 @@ impl MessagesPanel {
                     started_at: Some(Instant::now()),
                     duration: None,
                 })],
+                started_at: Some(Instant::now()),
+                duration: None,
+                waiting_since: None,
             };
             self.messages.push(DisplayMessage::new(
                 DisplayRole::ToolGroup(Box::new(group)),
@@ -562,6 +581,13 @@ impl MessagesPanel {
                         .map(|c| c.duration)
                         .or_else(|| entry.started_at.map(|st| st.elapsed()));
                     entry.duration = dur;
+                    let all_done = g.entries.iter().all(|e| match e {
+                        GroupEntry::Tool(t) => t.status != ToolStatus::InProgress,
+                        GroupEntry::Thinking(th) => !th.active,
+                    });
+                    if all_done {
+                        g.waiting_since = Some(Instant::now());
+                    }
                     found_group = Some(g.id.clone());
                     break;
                 }
@@ -797,6 +823,10 @@ impl MessagesPanel {
                     }
                     if !g.sealed {
                         g.sealed = true;
+                        g.waiting_since = None;
+                        if g.duration.is_none() {
+                            g.duration = g.started_at.map(|st| st.elapsed());
+                        }
                         changed = true;
                     }
                     if changed {
@@ -1270,8 +1300,7 @@ impl MessagesPanel {
                 break;
             }
             let highlight = self.highlight_segment == Some(i);
-            let style = seg.tool_id.as_ref().map(|_| theme::current().tool_bg);
-            cursor.render_segment(seg, style, highlight, frame);
+            cursor.render_segment(seg, None, highlight, frame);
             for image in &mut seg.images {
                 cursor.render_image(image, self.image_picker.as_ref(), images_visible, frame);
             }
