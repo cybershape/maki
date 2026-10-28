@@ -16,6 +16,7 @@ use serde_json::Value;
 /// text regardless of frontend.
 pub const DISMISSED: &str = "(question dismissed by user)";
 const NO_ANSWER: &str = "(no answer)";
+const DEFAULT_QUESTION_TITLE: &str = "Question";
 
 #[derive(Deserialize)]
 struct Question {
@@ -59,17 +60,31 @@ fn enum_options(options: &[QuestionOption]) -> Vec<EnumOption> {
 }
 
 fn property(q: &Question) -> ElicitationPropertySchema {
-    let title = q.question.clone();
-    if q.options.is_empty() {
-        ElicitationPropertySchema::String(StringPropertySchema::new().title(title))
-    } else if q.multi_select {
-        ElicitationPropertySchema::Array(
-            MultiSelectPropertySchema::titled(enum_options(&q.options)).title(title),
-        )
+    let title = if q.header.is_empty() {
+        DEFAULT_QUESTION_TITLE.to_owned()
     } else {
+        q.header.clone()
+    };
+    let description = q.question.clone();
+    if q.options.is_empty() {
         ElicitationPropertySchema::String(
             StringPropertySchema::new()
                 .title(title)
+                .description(description),
+        )
+    } else if q.multi_select {
+        ElicitationPropertySchema::Array(
+            MultiSelectPropertySchema::titled(enum_options(&q.options))
+                .title(title)
+                .description(description),
+        )
+    } else {
+        let enum_values: Vec<String> = q.options.iter().map(|opt| opt.label.clone()).collect();
+        ElicitationPropertySchema::String(
+            StringPropertySchema::new()
+                .title(title)
+                .description(description)
+                .enum_values(enum_values)
                 .one_of(enum_options(&q.options)),
         )
     }
@@ -206,9 +221,17 @@ mod tests {
         assert_eq!(json["mode"], "form");
         let props = &json["requestedSchema"]["properties"];
         assert_eq!(props["q1"]["type"], "string");
+        assert_eq!(props["q1"]["title"], "Framework");
+        assert_eq!(props["q1"]["description"], "Pick a framework");
+        assert_eq!(props["q1"]["enum"], serde_json::json!(["axum", "actix"]));
         assert_eq!(props["q1"]["oneOf"][0]["const"], "axum");
         assert_eq!(props["q2"]["type"], "array");
+        assert_eq!(props["q2"]["title"], "Features");
+        assert_eq!(props["q2"]["description"], "Which features?");
         assert_eq!(props["q3"]["type"], "string");
+        assert_eq!(props["q3"]["title"], DEFAULT_QUESTION_TITLE);
+        assert_eq!(props["q3"]["description"], "Anything else?");
+        assert!(props["q3"].get("enum").is_none());
         assert!(props["q3"].get("oneOf").is_none());
     }
 
@@ -257,6 +280,56 @@ mod tests {
     #[test_case("null" ; "jsonrpc_error_forwarded_as_null")]
     fn non_accept_is_dismissed(raw: &str) {
         assert_eq!(format_response(&questions_input(), raw), DISMISSED);
+    }
+
+    #[test]
+    fn single_select_options_contain_enum_and_titles() {
+        let q = Question {
+            question: "Choose color".to_owned(),
+            header: "Color".to_owned(),
+            options: vec![
+                QuestionOption {
+                    label: "red".to_owned(),
+                    description: "Bright red".to_owned(),
+                },
+                QuestionOption {
+                    label: "blue".to_owned(),
+                    description: String::new(),
+                },
+            ],
+            multi_select: false,
+        };
+        let schema = serde_json::to_value(property(&q)).unwrap();
+        assert_eq!(schema["type"], "string");
+        assert_eq!(schema["title"], "Color");
+        assert_eq!(schema["description"], "Choose color");
+        assert_eq!(schema["enum"], serde_json::json!(["red", "blue"]));
+        assert_eq!(schema["oneOf"][0]["const"], "red");
+        assert_eq!(schema["oneOf"][0]["title"], "red - Bright red");
+        assert_eq!(schema["oneOf"][1]["const"], "blue");
+        assert_eq!(schema["oneOf"][1]["title"], "blue");
+    }
+
+    #[test]
+    fn t3_code_single_selection_response_formats() {
+        let input = serde_json::json!({
+            "questions": [
+                {
+                    "question": "Pick a framework",
+                    "header": "Framework",
+                    "options": [
+                        { "label": "axum" },
+                        { "label": "actix" }
+                    ]
+                }
+            ]
+        });
+        let raw = serde_json::json!({
+            "action": "accept",
+            "content": { "q1": "axum" }
+        })
+        .to_string();
+        assert_eq!(format_response(&input, &raw), "Framework: axum");
     }
 
     #[test]
