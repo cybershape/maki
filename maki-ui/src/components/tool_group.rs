@@ -335,6 +335,17 @@ pub fn build_tool_group_lines(
         .any(|e| matches!(e, GroupEntry::Thinking(_)));
     let working = !group.sealed;
 
+    if group.sealed && group.entries.is_empty() {
+        return ToolLines {
+            lines: Vec::new(),
+            highlight: None,
+            spinner_lines: Vec::new(),
+            snapshot_base: None,
+            content_indent: "",
+            truncation: SectionFlags::default(),
+        };
+    }
+
     if group.sealed && group.entries.len() == 1 {
         let entry = &group.entries[0];
         let line = match entry {
@@ -472,6 +483,18 @@ mod tests {
         assert_eq!(thinking_spinner_frame(140).0, "•");
         assert_eq!(thinking_spinner_frame(280).0, "●");
         assert_eq!(thinking_spinner_frame(420).0, "•");
+    }
+
+    #[test]
+    fn empty_sealed_group_renders_empty_lines() {
+        let group = ToolGroupRole {
+            id: "group-1".into(),
+            sealed: true,
+            entries: vec![],
+        };
+
+        let tl = build_tool_group_lines(&group, 80, 0);
+        assert!(tl.lines.is_empty());
     }
 
     #[test]

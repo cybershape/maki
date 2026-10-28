@@ -309,6 +309,7 @@ impl App {
             self.main_chat()
                 .show_user_message(display, input.images.clone());
         } else {
+            self.main_chat().flush();
             self.main_chat().ensure_active_group();
         }
         vec![Action::SendMessage(Box::new(input))]

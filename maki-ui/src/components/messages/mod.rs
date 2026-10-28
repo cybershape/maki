@@ -242,6 +242,17 @@ impl MessagesPanel {
         if let Some(DisplayMessage {
             role: DisplayRole::ToolGroup(g),
             ..
+        }) = self.messages.last()
+            && !g.sealed
+            && g.entries.is_empty()
+        {
+            self.messages.pop();
+            self.cache.clear();
+            return;
+        }
+        if let Some(DisplayMessage {
+            role: DisplayRole::ToolGroup(g),
+            ..
         }) = self.messages.last_mut()
             && !g.sealed
         {
@@ -282,6 +293,7 @@ impl MessagesPanel {
 
     pub fn thinking_delta(&mut self, text: &str) {
         if self.compact_tools {
+            self.flush_streaming_text();
             let mut group_id = None;
             if let Some(DisplayMessage {
                 role: DisplayRole::ToolGroup(g),
@@ -346,6 +358,7 @@ impl MessagesPanel {
 
     pub fn tool_pending(&mut self, id: String, name: &str) {
         if self.compact_tools {
+            self.flush_streaming_text();
             if let Some(DisplayMessage {
                 role: DisplayRole::ToolGroup(g),
                 ..
@@ -432,6 +445,8 @@ impl MessagesPanel {
                 self.rebuild_tool_group_segment(&gid);
                 return;
             }
+
+            self.flush_streaming_text();
 
             if let Some(DisplayMessage {
                 role: DisplayRole::ToolGroup(g),
@@ -753,6 +768,16 @@ impl MessagesPanel {
         }
 
         if self.compact_tools {
+            if let Some(DisplayMessage {
+                role: DisplayRole::ToolGroup(g),
+                ..
+            }) = self.messages.last()
+                && !g.sealed
+                && g.entries.is_empty()
+            {
+                self.messages.pop();
+                self.cache.clear();
+            }
             let mut affected_groups = Vec::new();
             for msg in &mut self.messages {
                 if let DisplayRole::ToolGroup(g) = &mut msg.role {
@@ -889,16 +914,21 @@ impl MessagesPanel {
         self.prompt_progress = None;
     }
 
+    fn flush_streaming_text(&mut self) {
+        if !self.streaming_text.is_empty() {
+            let text = self.streaming_text.take_all();
+            if !text.trim().is_empty() {
+                self.messages
+                    .push(DisplayMessage::new(DisplayRole::Assistant, text));
+            }
+        }
+    }
+
     pub fn flush(&mut self) {
         self.seal_open_group();
         self.flush_thinking();
         self.prompt_progress = None;
-        if !self.streaming_text.is_empty() {
-            self.messages.push(DisplayMessage::new(
-                DisplayRole::Assistant,
-                self.streaming_text.take_all(),
-            ));
-        }
+        self.flush_streaming_text();
     }
 
     fn layout(&self) -> Layout<'_> {

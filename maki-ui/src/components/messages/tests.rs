@@ -3084,13 +3084,15 @@ fn compact_tools_text_delta_seals_group() {
     };
     assert!(g.sealed);
 
-    // Next tool starts a new group
+    // Next tool starts a new group separated by the output
     panel.tool_start(start("call-2", "bash"));
-    assert_eq!(panel.messages.len(), 2);
-    let DisplayRole::ToolGroup(g2) = &panel.messages[1].role else {
+    assert_eq!(panel.messages.len(), 3);
+    assert_eq!(panel.messages[1].role, DisplayRole::Assistant);
+    assert_eq!(panel.messages[1].text, "Here is the answer");
+    let DisplayRole::ToolGroup(g2) = &panel.messages[2].role else {
         panic!()
     };
-    assert_eq!(g2.id, "compact-group-1");
+    assert_eq!(g2.id, "compact-group-2");
     assert!(!g2.sealed);
 }
 
@@ -3309,4 +3311,91 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         .map(|s| s.content.as_ref())
         .collect();
     assert!(h4.contains("tools done"));
+}
+
+#[test]
+fn compact_tools_ensure_active_group_popped_when_text_starts_first() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    panel.ensure_active_group();
+    assert_eq!(panel.messages.len(), 1);
+
+    // Text output arrives before any tools/thinking -> empty group popped
+    panel.text_delta("I am going to help you");
+    assert_eq!(panel.messages.len(), 0);
+
+    // Tool call arrives -> flushed text message sits ahead of the tool group
+    panel.tool_pending("call-1".into(), "edit");
+    assert_eq!(panel.messages.len(), 2);
+    assert_eq!(panel.messages[0].role, DisplayRole::Assistant);
+    assert_eq!(panel.messages[0].text, "I am going to help you");
+    assert!(matches!(panel.messages[1].role, DisplayRole::ToolGroup(_)));
+}
+
+#[test]
+fn compact_tools_groups_separated_by_output_and_consecutive_tools_merged() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    panel.ensure_active_group();
+    // Turn 1: text output then tool
+    panel.text_delta("first output");
+    panel.tool_start(start("t1", "batch"));
+    panel.tool_done(done("t1"));
+
+    // Turn 2: tool without text output -> merges into group 1
+    panel.tool_start(start("t2", "batch"));
+    panel.tool_done(done("t2"));
+
+    // Turn 3: text output seals group 1, then tool starts group 2
+    panel.text_delta("second output");
+    panel.tool_start(start("t3", "batch"));
+    panel.tool_done(done("t3"));
+
+    // Turn 4: thinking and tool merge into group 2
+    panel.thinking_delta("generating visuals");
+    panel.tool_start(start("t4", "batch"));
+
+    // Assert the layout: [Assistant, ToolGroup 1, Assistant, ToolGroup 2]
+    assert_eq!(panel.messages.len(), 4);
+
+    assert_eq!(panel.messages[0].role, DisplayRole::Assistant);
+    assert_eq!(panel.messages[0].text, "first output");
+
+    let DisplayRole::ToolGroup(g1) = &panel.messages[1].role else {
+        panic!("expected ToolGroup 1");
+    };
+    assert!(g1.sealed);
+    assert_eq!(g1.entries.len(), 2);
+
+    assert_eq!(panel.messages[2].role, DisplayRole::Assistant);
+    assert_eq!(panel.messages[2].text, "second output");
+
+    let DisplayRole::ToolGroup(g2) = &panel.messages[3].role else {
+        panic!("expected ToolGroup 2");
+    };
+    assert!(!g2.sealed);
+    assert_eq!(g2.entries.len(), 3);
+}
+
+#[test]
+fn compact_tools_cancel_in_progress_drops_empty_waiting_group() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    panel.ensure_active_group();
+    assert_eq!(panel.messages.len(), 1);
+
+    panel.cancel_in_progress();
+    assert_eq!(panel.messages.len(), 0);
 }
