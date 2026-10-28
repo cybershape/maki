@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 use ratatui_image::{
     Image,
     picker::Picker,
@@ -10,6 +10,7 @@ use ratatui_image::{
 };
 
 use crate::terminal_image::InlineImage;
+use crate::wrap;
 
 use super::segment::Segment;
 
@@ -112,16 +113,18 @@ impl RenderCursor {
             .saturating_sub(self.skip)
             .min(self.bottom.saturating_sub(self.y));
         let seg_area = Rect::new(self.viewport.x, self.y, self.viewport.width, visible_h);
-        let mut p = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
+        let mut p = Paragraph::new(wrap::visible_lines(
+            lines,
+            self.viewport.width,
+            self.skip,
+            visible_h,
+        ));
+        self.skip = 0;
         let mut base = style.unwrap_or_default();
         if highlight {
             base = base.add_modifier(Modifier::REVERSED);
         }
         p = p.style(base);
-        if self.skip > 0 {
-            p = p.scroll((self.skip, 0));
-            self.skip = 0;
-        }
         frame.render_widget(p, seg_area);
         self.y += visible_h;
     }
@@ -163,7 +166,7 @@ mod tests {
     use color_eyre::eyre::Result;
     use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
     use maki_providers::{ImageMediaType, ImageSource};
-    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+    use ratatui::{Terminal, backend::TestBackend, buffer::CellWidth, layout::Rect, text::Line};
     use ratatui_image::{
         FontSize,
         picker::{Picker, ProtocolType},
@@ -171,7 +174,38 @@ mod tests {
     use test_case::test_case;
 
     use super::RenderCursor;
+    use crate::components::messages::segment::Segment;
     use crate::terminal_image::InlineImage;
+
+    #[test_case(0, &["maki> 我", "会新增文", "件你好末"]; "first_rows")]
+    #[test_case(1, &["会新增文", "件你好末", "尾"]; "scrolled_rows")]
+    fn chinese_rows_render_inside_the_viewport(skip: u16, expected: &[&str]) -> Result<()> {
+        let viewport = Rect::new(2, 1, 8, 3);
+        let segment = Segment::with_lines(vec![Line::from("maki> 我会新增文件你好末尾")], None);
+        let mut terminal = Terminal::new(TestBackend::new(12, 5))?;
+        terminal.draw(|frame| {
+            RenderCursor::new(skip, viewport).render_segment(&segment, None, false, frame);
+        })?;
+        let buffer = terminal.backend().buffer();
+        for (row, expected) in expected.iter().enumerate() {
+            let mut actual = String::new();
+            let mut x = viewport.x;
+            while x < viewport.right() {
+                let symbol = buffer[(x, viewport.y + row as u16)].symbol();
+                actual.push_str(symbol);
+                x += symbol.cell_width().max(1);
+            }
+            assert_eq!(actual.trim_end(), *expected);
+        }
+        for y in buffer.area.y..buffer.area.bottom() {
+            for x in buffer.area.x..buffer.area.right() {
+                if !viewport.contains((x, y).into()) {
+                    assert_eq!(buffer[(x, y)].symbol(), " ");
+                }
+            }
+        }
+        Ok(())
+    }
 
     const VIEWPORT: Rect = Rect::new(2, 2, 4, 2);
     const IMAGE_HEIGHT: u16 = 6;

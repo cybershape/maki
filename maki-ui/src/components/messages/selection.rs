@@ -1,9 +1,10 @@
 use super::segment::SegmentCache;
 use crate::selection::{self, LineBreaks, ScreenSelection, Selection};
+use crate::wrap;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::widgets::{Paragraph, Widget, Wrap};
+use ratatui::widgets::{Paragraph, Widget};
 
 /// Rows re-rendered per pass of the copy path. A `Cell` is 40 bytes, so at a
 /// usual terminal width this holds the scratch buffer near a megabyte however
@@ -68,16 +69,8 @@ pub(super) fn extract_selection_text(
             // The buffer sits at the rows it draws, so `ss` keeps talking in
             // segment rows across every chunk.
             let area = Rect::new(0, chunk.start, width, chunk.end - chunk.start);
-            // A double width grapheme landing on the last column makes ratatui
-            // write one past the area it wrapped to, so the scratch buffer
-            // holds a spare column for that write. `area` keeps the real width,
-            // which is what decides the wrap and the columns copied.
-            let mut tmp = Buffer::empty(Rect {
-                width: width.saturating_add(1),
-                ..area
-            });
-            Paragraph::new(lines.to_vec())
-                .wrap(Wrap { trim: false })
+            let mut tmp = Buffer::empty(area);
+            Paragraph::new(wrap::visible_lines(lines, width, 0, area.height))
                 .render(area, &mut tmp);
 
             // The chunk runs to a line boundary, so it can reach past the
@@ -130,25 +123,25 @@ mod tests {
         extract_selection_text(&cache, width, &sel, area)
     }
 
-    /// A stale segment can hold a line far wider than the terminal now is, and
-    /// at two columns ratatui writes a double width grapheme one cell past the
-    /// area it wrapped to. The scrape used to hand that write a buffer exactly
-    /// as wide as the area, so releasing the mouse took the whole UI down.
-    ///
-    /// The last grapheme is the one ratatui shoved over the edge, so it is off
-    /// screen and copying it back would not match what the user sees.
     #[test]
     fn copying_into_two_columns_gives_back_what_is_on_screen() {
         assert_eq!(
             copy_whole_segment(vec![Line::from("a\u{4f60}\u{597d}")], 2),
-            "a\u{4f60}"
+            "a\u{4f60}\u{597d}"
         );
     }
 
-    /// Blank rows are held back until content follows them, and the first row
-    /// copied never gets a newline in front. Both live in state that only
-    /// survives if it is carried across a chunk boundary, and with this many
-    /// lead lines the boundary falls right between the two blanks.
+    #[test]
+    fn spaces_survive_a_chunk_boundary_and_a_wide_character_gap() {
+        const WIDTH: u16 = 3;
+        let body = format!(
+            "{}   你好 a    b",
+            "x".repeat(usize::from(COPY_CHUNK_ROWS * WIDTH - 1))
+        );
+        let lines = vec![Line::from(body.clone())];
+        assert_eq!(copy_whole_segment(lines, WIDTH), body);
+    }
+
     #[test]
     fn blank_rows_survive_a_chunk_boundary() {
         const WIDTH: u16 = 40;

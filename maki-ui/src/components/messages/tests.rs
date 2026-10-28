@@ -292,6 +292,30 @@ fn a_flush_leaves_one_copy_of_the_text() {
     assert_eq!(text.matches(STREAMED).count(), 1, "{text}");
 }
 
+#[test_case(101 ; "screenshot_width")]
+#[test_case(41 ; "narrow_width")]
+#[test_case(18 ; "odd_content_width")]
+fn chinese_wrapping_survives_flush_resize_and_copy(width: u16) {
+    const BODY: &str = "我会新增 `progress.md`，在 `AGENTS.md` 中加入修改前回顾决策、提交时记录决策的要求，并补记本次扫码登录调整，然后一起提交并推送当前改动。";
+    const VISIBLE: &str = "maki> 我会新增 progress.md，在 AGENTS.md 中加入修改前回顾决策、提交时记录决策的要求，并补记本次扫码登录调整，然后一起提交并推送当前改动。";
+    const HEIGHT: u16 = 24;
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.streaming_text.set_buffer(BODY);
+    let live = render(&mut panel, width, HEIGHT).backend().buffer().clone();
+    panel.flush();
+    let finished = render(&mut panel, width, HEIGHT).backend().buffer().clone();
+    assert_eq!(finished, live);
+
+    render(&mut panel, VIEW_WIDTH, HEIGHT);
+    let resized = render(&mut panel, width, HEIGHT).backend().buffer().clone();
+    assert_eq!(resized, finished);
+    let area = Rect::new(0, 0, width, HEIGHT);
+    let total = panel.layout().total_rows();
+    let selection = make_sel(&panel, area, (0, 0), (total - 1, width - 2));
+    assert_eq!(panel.extract_selection_text(&selection, area), VISIBLE);
+}
+
 #[test]
 fn thinking_delta_separate_from_text() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());

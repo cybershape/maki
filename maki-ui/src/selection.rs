@@ -18,14 +18,6 @@
 //! The rightmost column of each area is reserved for the scrollbar, so
 //! `highlight_area()` / `msg_area()` are 1 column narrower than the full
 //! area and all column math uses `width - 1`.
-//!
-//! When text is word-wrapped, ratatui eats the space at the break point,
-//! so the copied text would lose that space unless we put it back. But we
-//! should only add a space for word-boundary wraps, not mid-word ones
-//! (where a long token just overflows the column). `LineBreaks` tracks
-//! both line starts and word wraps: `from_lines()` replays ratatui's wrap
-//! machine through [`crate::wrap`] and marks the rows that start after a
-//! swallowed space, then `append_rows` calls `needs_space()`.
 
 use std::cmp::Ordering;
 use std::ops::Range;
@@ -40,7 +32,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::repaint::Cadence;
 use crate::theme;
-use crate::wrap::{self, Break};
+use crate::wrap;
 use maki_markdown::render::{CODE_BAR, CODE_BAR_WRAP};
 
 /// Position in the full logical document, not just the visible window. For
@@ -315,7 +307,7 @@ pub enum LineBreaks {
     EveryRow,
     Bitmap {
         line_starts: Vec<u64>,
-        word_wraps: Vec<u64>,
+        row_widths: Vec<u16>,
     },
 }
 
@@ -338,7 +330,7 @@ impl LineBreaks {
             return Self::EveryRow;
         }
         let mut line_starts = Vec::new();
-        let mut word_wraps = Vec::new();
+        let mut row_widths = Vec::new();
         let mut row: u16 = 0;
         for line in lines {
             // Continuation rows belong to the line above, so they set no bits
@@ -349,17 +341,14 @@ impl LineBreaks {
             if starts_line {
                 set_bit(&mut line_starts, row);
             }
-            wrap::breaks(line, width, |kind| {
+            wrap::row_widths(line, width, |cols| {
+                row_widths.push(cols);
                 row = row.saturating_add(1);
-                if starts_line && kind == Break::Word {
-                    set_bit(&mut word_wraps, row);
-                }
             });
-            row = row.saturating_add(1);
         }
         Self::Bitmap {
             line_starts,
-            word_wraps,
+            row_widths,
         }
     }
 
@@ -370,10 +359,10 @@ impl LineBreaks {
         }
     }
 
-    pub fn needs_space(&self, row: u16) -> bool {
+    fn row_width(&self, row: u16) -> Option<u16> {
         match self {
-            Self::EveryRow => false,
-            Self::Bitmap { word_wraps, .. } => get_bit(word_wraps, row),
+            Self::EveryRow => None,
+            Self::Bitmap { row_widths, .. } => row_widths.get(usize::from(row)).copied(),
         }
     }
 }
@@ -514,16 +503,21 @@ pub(crate) fn append_rows(
         let is_new_line = breaks.is_line_start(rel_row);
 
         let (col_start, col_end) = col_range(ss, area.x, right, row);
+        let col_end = breaks
+            .row_width(rel_row)
+            .map_or(col_end.saturating_add(1), |width| {
+                col_end.saturating_add(1).min(area.x + width)
+            });
         let line_start = out.len();
         // Wide chars (CJK, emoji) leave continuation cells with " "; skip them.
         // An empty column range copies nothing from this row, so there is no
         // cell to its left worth measuring.
-        let mut skip_next: usize = if col_start > area.x && col_start <= col_end {
+        let mut skip_next: usize = if col_start > area.x && col_start < col_end {
             UnicodeWidthStr::width(buf[(col_start - 1, row)].symbol()).saturating_sub(1)
         } else {
             0
         };
-        for col in col_start..=col_end {
+        for col in col_start..col_end {
             if skip_next > 0 {
                 skip_next -= 1;
                 continue;
@@ -534,14 +528,17 @@ pub(crate) fn append_rows(
             skip_next = w.saturating_sub(1);
         }
 
-        let stripped = if col_start == area.x {
-            strip_code_bar_prefix(&buf[(col_start, row)], out, line_start)
-        } else {
-            0
-        };
+        if col_start == area.x && col_start < col_end {
+            strip_code_bar_prefix(&buf[(col_start, row)], out, line_start);
+        }
 
-        let trimmed_len = out[line_start..].trim_end().len() + line_start;
-        out.truncate(trimmed_len);
+        if breaks.row_width(rel_row).is_none()
+            || row == ss.end_row
+            || breaks.is_line_start(rel_row.saturating_add(1))
+        {
+            let trimmed_len = out[line_start..].trim_end().len() + line_start;
+            out.truncate(trimmed_len);
+        }
         let has_content = out.len() > line_start;
         let is_first_row = !carry.started;
         carry.started |= has_content;
@@ -556,8 +553,6 @@ pub(crate) fn append_rows(
                 carry.pending_newlines = 0;
                 out.insert(line_start, '\n');
             }
-        } else if has_content && !is_first_row && stripped == 0 && breaks.needs_space(rel_row) {
-            out.insert(line_start, ' ');
         }
     }
 }
@@ -655,7 +650,7 @@ mod tests {
         }
         LineBreaks::Bitmap {
             line_starts,
-            word_wraps: Vec::new(),
+            row_widths: Vec::new(),
         }
     }
 
@@ -974,7 +969,7 @@ mod tests {
     fn line_breaks_query_beyond_stored_bits() {
         let lb = from_heights(&[1]);
         assert!(!lb.is_line_start(100));
-        assert!(!lb.needs_space(200));
+        assert_eq!(lb.row_width(200), None);
     }
 
     #[test]
@@ -1025,14 +1020,12 @@ mod tests {
     }
 
     fn wrap_extract(input: &str, width: u16) -> String {
-        use ratatui::widgets::{Paragraph, Widget, Wrap};
+        use ratatui::widgets::{Paragraph, Widget};
         let lines = vec![Line::from(input)];
-        let p = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
-        let height = p.line_count(width) as u16;
+        let height = wrap::total_rows(&lines, width);
         let area = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(area);
-        Paragraph::new(lines.clone())
-            .wrap(Wrap { trim: false })
+        Paragraph::new(wrap::visible_lines(&lines, area.width, 0, area.height))
             .render(area, &mut buf);
         let breaks = LineBreaks::from_lines(&lines, width);
         let region = ContentRegion {
@@ -1052,7 +1045,7 @@ mod tests {
     #[test_case("abcdefgh ij", 5, "abcdefgh ij" ; "long_word_then_short")]
     #[test_case("abcde fghij", 5, "abcde fghij" ; "word_fills_row_exactly")]
     #[test_case("ab cd ef",    3, "ab cd ef"    ; "three_short_words")]
-    #[test_case("a    b",      4, "a b"         ; "many_spaces_between_words")]
+    #[test_case("a    b",      4, "a    b"         ; "many_spaces_between_words")]
     #[test_case("你好世界",    4, "你好世界"   ; "cjk_wraps_no_extra_spaces")]
     #[test_case("你好world",  10, "你好world"  ; "cjk_mixed_ascii")]
     #[test_case("a你b好",     10, "a你b好"     ; "mixed_single_double_width")]
@@ -1067,18 +1060,18 @@ mod tests {
         assert!(lb.is_line_start(0));
         assert!(lb.is_line_start(1));
         assert!(lb.is_line_start(2));
-        assert!(!lb.needs_space(0));
-        assert!(!lb.needs_space(1));
-        assert!(!lb.needs_space(2));
+        assert_eq!(lb.row_width(0), Some(3));
+        assert_eq!(lb.row_width(1), Some(3));
+        assert_eq!(lb.row_width(2), Some(3));
     }
 
     #[test]
-    fn from_lines_word_wrap_marks_continuation_rows() {
+    fn from_lines_marks_continuation_rows() {
         let lines = vec![Line::from("hello world")];
         let lb = LineBreaks::from_lines(&lines, 6);
         assert!(lb.is_line_start(0));
         assert!(!lb.is_line_start(1), "continuation row is not a line start");
-        assert!(lb.needs_space(1), "word-boundary continuation needs space");
+        assert_eq!(lb.row_width(1), Some(5));
     }
 
     /// A code block wrapped for a wider terminal leaves continuation rows
@@ -1112,14 +1105,14 @@ mod tests {
     }
 
     #[test]
-    fn word_wrap_across_64_row_boundary_needs_space() {
+    fn row_widths_across_64_row_boundary() {
         let long = (0..66).map(|_| "xx").collect::<Vec<_>>().join(" ");
         let lines = vec![Line::from(long.as_str())];
         let lb = LineBreaks::from_lines(&lines, 3);
         assert!(lb.is_line_start(0));
         assert!(!lb.is_line_start(1));
-        assert!(lb.needs_space(1), "first continuation needs space");
-        assert!(lb.needs_space(65), "continuation past row 64 needs space");
+        assert_eq!(lb.row_width(1), Some(3));
+        assert_eq!(lb.row_width(65), Some(2));
     }
 
     #[test_case(Rect::new(0, 0, 0, 5), Rect::new(0, 0, 1, 5), ss(0, 0, 4, 0), 0, 5 ; "zero_width")]
@@ -1155,28 +1148,23 @@ mod tests {
             Line::from("foo bar baz"),
         ];
         let lb = LineBreaks::from_lines(&lines, 6);
-        // row layout: "hello world" wraps to rows 0-1, "ok" is row 2,
-        // "foo bar baz" wraps to rows 3-5
         assert!(lb.is_line_start(0));
         assert!(!lb.is_line_start(1));
-        assert!(lb.needs_space(1));
+        assert_eq!(lb.row_width(1), Some(5));
         assert!(lb.is_line_start(2));
         assert!(lb.is_line_start(3));
         assert!(!lb.is_line_start(4));
-        assert!(lb.needs_space(4));
-        assert!(!lb.is_line_start(5));
-        assert!(lb.needs_space(5));
+        assert_eq!(lb.row_width(4), Some(5));
+        assert_eq!(lb.row_width(5), None);
     }
     #[test]
     fn wrap_extract_two_lines_first_wraps_second_doesnt() {
-        use ratatui::widgets::{Paragraph, Widget, Wrap};
+        use ratatui::widgets::{Paragraph, Widget};
         let lines = vec![Line::from("hello world"), Line::from("ok")];
-        let p = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
-        let height = p.line_count(6) as u16;
+        let height = wrap::total_rows(&lines, 6);
         let area = Rect::new(0, 0, 6, height);
         let mut buf = Buffer::empty(area);
-        Paragraph::new(lines.clone())
-            .wrap(Wrap { trim: false })
+        Paragraph::new(wrap::visible_lines(&lines, area.width, 0, area.height))
             .render(area, &mut buf);
         let breaks = LineBreaks::from_lines(&lines, 6);
         let region = ContentRegion {
