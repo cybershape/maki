@@ -667,6 +667,7 @@ pub struct UiFileConfig {
     pub prefer_model_name: Option<bool>,
     pub show_cost: Option<bool>,
     pub compact_tools: Option<bool>,
+    pub max_width: Option<u16>,
 }
 
 impl UiFileConfig {
@@ -688,7 +689,8 @@ impl UiFileConfig {
             max_input_lines,
             prefer_model_name,
             show_cost,
-            compact_tools
+            compact_tools,
+            max_width
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -1377,6 +1379,14 @@ pub struct UiConfig {
         desc = "Render tool calls and reasoning in a compact tree view"
     )]
     pub compact_tools: bool,
+
+    #[config(
+        default = None,
+        ty = "integer",
+        default_doc = "none",
+        desc = "Maximum width of the UI in terminal columns, centered horizontally when terminal is wider"
+    )]
+    pub max_width: Option<u16>,
 }
 
 impl UiConfig {
@@ -1405,6 +1415,7 @@ impl UiConfig {
             prefer_model_name: f.prefer_model_name.unwrap_or(true),
             show_cost: f.show_cost.unwrap_or(true),
             compact_tools: f.compact_tools.unwrap_or(false),
+            max_width: f.max_width,
         }
     }
 
@@ -5221,6 +5232,21 @@ mod tests {
         let parsed: RawConfig = toml::from_str("[ui]\ncompact_tools = true\n").unwrap();
         let cfg = UiConfig::from_file(parsed.ui);
         assert!(cfg.compact_tools);
+    }
+
+    #[test]
+    fn max_width_defaults_to_none_and_can_be_configured() {
+        let default_cfg = UiConfig::from_file(UiFileConfig::default());
+        assert_eq!(default_cfg.max_width, None);
+
+        let parsed: RawConfig = toml::from_str("[ui]\nmax_width = 120\n").unwrap();
+        let cfg = UiConfig::from_file(parsed.ui);
+        assert_eq!(cfg.max_width, Some(120));
+
+        let mut base: UiFileConfig = toml::from_str("max_width = 120\n").unwrap();
+        let overlay: UiFileConfig = toml::from_str("max_width = 80\n").unwrap();
+        base.merge(overlay);
+        assert_eq!(base.max_width, Some(80));
     }
 
     #[test]

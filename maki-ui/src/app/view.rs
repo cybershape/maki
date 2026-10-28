@@ -19,6 +19,21 @@ use ratatui::widgets::{Block, Borders, Widget};
 
 use super::{App, Mode, Status};
 
+pub fn center_rect(area: Rect, max_width: Option<u16>) -> Rect {
+    match max_width {
+        Some(max_w) if max_w > 0 && area.width > max_w => {
+            let x_offset = (area.width - max_w) / 2;
+            Rect {
+                x: area.x + x_offset,
+                y: area.y,
+                width: max_w,
+                height: area.height,
+            }
+        }
+        _ => area,
+    }
+}
+
 struct ViewLayout {
     msg_area: Rect,
     bottom_area: Rect,
@@ -63,6 +78,10 @@ impl App {
             && self.compute_layout(area).input_area.height > BORDER_ROWS
     }
 
+    pub(crate) fn ui_area(&self, area: Rect) -> Rect {
+        center_rect(area, self.ui_config.max_width)
+    }
+
     /// Returns the cell the terminal cursor belongs on, the cell the input box
     /// reversed. An overlay owning the keyboard leaves none, so there is
     /// nothing to park an IME on.
@@ -72,22 +91,24 @@ impl App {
     /// or a window on it would jump to the middle of the screen the moment it
     /// started reading keys.
     pub fn view(&mut self, frame: &mut Frame) -> Option<Position> {
-        let layout = self.compute_layout(frame.area());
+        let area = self.ui_area(frame.area());
+        let layout = self.compute_layout(area);
         let render_chat = self.active_chat;
 
         self.render_background(frame);
         self.render_messages(frame, &layout, render_chat);
         let caret = self.render_bottom_panel(frame, &layout);
         self.render_splits(frame, &layout);
-        let mut overlay_rect = self.render_picker_overlays(frame, &layout);
+        let mut overlay_rect = self.render_picker_overlays(frame, &layout, area);
         self.render_status_bar(frame, layout.status_area, render_chat);
-        overlay_rect = self.render_top_modals(frame, overlay_rect, caret);
+        overlay_rect = self.render_top_modals(frame, overlay_rect, caret, area);
         self.register_zones(&layout, overlay_rect);
         self.apply_selection(frame, render_chat);
         caret.filter(|_| self.input_has_keyboard())
     }
 
     fn compute_layout(&self, area: Rect) -> ViewLayout {
+        let area = self.ui_area(area);
         let prompt_open = self.prompt_open();
 
         // Carve the full-width status bar first so the split carving below only
@@ -267,9 +288,13 @@ impl App {
         }
     }
 
-    fn render_picker_overlays(&mut self, frame: &mut Frame, layout: &ViewLayout) -> Rect {
+    fn render_picker_overlays(
+        &mut self,
+        frame: &mut Frame,
+        layout: &ViewLayout,
+        full: Rect,
+    ) -> Rect {
         let mut overlay_rect = Rect::default();
-        let full = frame.area();
 
         if self.search_modal.is_open() {
             overlay_rect = self.search_modal.view(frame, layout.msg_area);
@@ -303,8 +328,8 @@ impl App {
         frame: &mut Frame,
         mut overlay_rect: Rect,
         caret: Option<Position>,
+        full: Rect,
     ) -> Rect {
-        let full = frame.area();
         let r = self.btw_modal.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;

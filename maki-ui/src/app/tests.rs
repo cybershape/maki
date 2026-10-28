@@ -11102,3 +11102,58 @@ fn ctrl_l_opens_model_picker() {
     app.update(Msg::Key(key));
     assert!(app.model_picker.is_open());
 }
+
+#[test]
+fn center_rect_handles_bounds() {
+    use super::view::center_rect;
+    let full = Rect::new(0, 0, 200, 50);
+
+    assert_eq!(center_rect(full, None), full);
+    assert_eq!(center_rect(full, Some(0)), full);
+    assert_eq!(center_rect(full, Some(200)), full);
+    assert_eq!(center_rect(full, Some(220)), full);
+
+    let centered = center_rect(full, Some(120));
+    assert_eq!(centered, Rect::new(40, 0, 120, 50));
+
+    let odd = Rect::new(0, 0, 201, 50);
+    let centered_odd = center_rect(odd, Some(120));
+    assert_eq!(centered_odd, Rect::new(40, 0, 120, 50));
+
+    let offset_area = Rect::new(10, 5, 200, 50);
+    assert_eq!(
+        center_rect(offset_area, Some(120)),
+        Rect::new(50, 5, 120, 50)
+    );
+}
+
+#[test]
+fn max_width_constrains_and_centers_layout() {
+    let mut app = test_app();
+    app.ui_config.max_width = Some(100);
+
+    let area = Rect::new(0, 0, 160, 40);
+    let (msg, _bottom, status, input, splits) = app.layout_geometry(area);
+
+    assert_eq!(status.x, 30);
+    assert_eq!(status.width, 100);
+    assert_eq!(msg.x, 30);
+    assert_eq!(msg.width, 100);
+    assert_eq!(input.x, 30);
+    assert_eq!(input.width, 100);
+    assert_eq!(splits.inner.x, 30);
+    assert_eq!(splits.inner.width, 100);
+
+    let small_area = Rect::new(0, 0, 80, 40);
+    let (msg_small, _bottom, status_small, input_small, splits_small) =
+        app.layout_geometry(small_area);
+
+    assert_eq!(status_small.x, 0);
+    assert_eq!(status_small.width, 80);
+    assert_eq!(msg_small.x, 0);
+    assert_eq!(msg_small.width, 80);
+    assert_eq!(input_small.x, 0);
+    assert_eq!(input_small.width, 80);
+    assert_eq!(splits_small.inner.x, 0);
+    assert_eq!(splits_small.inner.width, 80);
+}

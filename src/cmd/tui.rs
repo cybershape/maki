@@ -114,6 +114,9 @@ fn load_config(
                 .filter_map(|t| normalize_tool_name(t).ok()),
         );
     }
+    if let Some(max_width) = cli.max_width {
+        config.ui.max_width = Some(max_width);
+    }
     config.validate()?;
     Ok(config)
 }
@@ -805,5 +808,26 @@ mod tests {
         assert_eq!(session.id, id);
         assert!(session.messages().is_empty());
         assert_eq!(session.model, STARTUP_SPEC);
+    }
+
+    #[test]
+    fn cli_max_width_overrides_ui_config() {
+        let dir = tempdir().expect("tempdir");
+        let cli = Cli::parse_from(["maki", "--max-width", "100"]);
+        assert_eq!(cli.max_width, Some(100));
+
+        let plugin_host = PluginHost::new(Arc::new(ToolRegistry::new())).expect("live host boots");
+
+        let config = load_config(
+            &plugin_host,
+            &cli,
+            InitFiles::Disabled,
+            &ProjectConfig::for_project(dir.path()),
+            &no_names,
+            &mut Vec::new(),
+        )
+        .expect("load config");
+
+        assert_eq!(config.ui.max_width, Some(100));
     }
 }

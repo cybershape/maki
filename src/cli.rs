@@ -120,6 +120,10 @@ pub struct Cli {
     #[arg(long)]
     pub max_turns: Option<u32>,
 
+    /// Maximum width of the UI in terminal columns (centers UI if terminal is wider)
+    #[arg(long, value_name = "COLUMNS")]
+    pub max_width: Option<u16>,
+
     /// System prompt override
     #[arg(long)]
     pub system_prompt: Option<String>,
