@@ -386,7 +386,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                 .try_iter()
                 .last()
                 .filter(|candidate| params.model_policy.allows(&candidate.spec()))
-                && new_model.spec() != model.spec()
+                && new_model != model
             {
                 let Some(switched) = connect(&mut new_model, params.timeouts, &error_tx).await
                 else {

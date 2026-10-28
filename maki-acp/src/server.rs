@@ -84,6 +84,14 @@ enum Ask {
 
 type PendingState = Arc<Mutex<Pending>>;
 
+#[derive(Debug, Default, Clone)]
+struct SessionUsage {
+    used: u64,
+    cost: Option<f64>,
+}
+
+type SharedUsage = Arc<Mutex<SessionUsage>>;
+
 struct SessionState {
     handle: InteractiveHandle,
     mcp: Option<McpHandle>,
@@ -94,6 +102,7 @@ struct SessionState {
     /// Shared with the run, so reloading the same session reads under this
     /// claim instead of clashing with it.
     claim: SessionClaim,
+    usage: SharedUsage,
 }
 
 struct Server {
@@ -237,8 +246,19 @@ fn refresh_models(srv: &mut Server, batch: Vec<String>) {
     srv.should_wait_models = false;
     // Merged even with no session yet, since session/new builds its selector from this list.
     let Some(session) = &srv.session else { return };
+    let sid = SessionId::from(session.handle.session_id.to_string());
     let options = match Model::from_spec(&session.current_model) {
         Ok(model) => {
+            let _ = session.handle.model_tx.send(model.clone());
+            let (used, cost) = {
+                let u = session.usage.lock().unwrap();
+                (u.used, u.cost)
+            };
+            session_update(
+                &srv.out_tx,
+                &sid,
+                translate::gauge_usage_update(used, u64::from(model.context_window), cost),
+            );
             methods::session_config_options(&model, &srv.model_specs, session.current_thinking)
         }
         Err(_) => vec![methods::model_config_option(
@@ -248,7 +268,7 @@ fn refresh_models(srv: &mut Server, batch: Vec<String>) {
     };
     session_update(
         &srv.out_tx,
-        &SessionId::from(session.handle.session_id.to_string()),
+        &sid,
         SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
     );
 }
@@ -386,6 +406,7 @@ async fn new_session(
         claim,
         mcp,
         project_config,
+        0,
         None,
         current_thinking,
     );
@@ -481,6 +502,7 @@ async fn load_session(
         claim,
         mcp,
         project_config,
+        used,
         restored_cost,
         current_thinking,
     );
@@ -549,6 +571,7 @@ fn start_session(
     claim: SessionClaim,
     mcp: Option<McpHandle>,
     project_config: ProjectConfig,
+    initial_used: u64,
     initial_cost: Option<f64>,
     current_thinking: ThinkingConfig,
 ) -> SessionRef {
@@ -590,6 +613,10 @@ fn start_session(
         local_tools,
     });
     let session_ref = handle.session_id.clone();
+    let usage = Arc::new(Mutex::new(SessionUsage {
+        used: initial_used,
+        cost: initial_cost,
+    }));
     start_event_pump(
         events,
         session_ref.clone(),
@@ -599,6 +626,7 @@ fn start_session(
         maki_storage::paths::home(),
         project_trusted,
         initial_cost,
+        Arc::clone(&usage),
     )
     .detach();
     srv.session = Some(SessionState {
@@ -609,6 +637,7 @@ fn start_session(
         current_thinking,
         pending,
         claim,
+        usage,
     });
     session_ref
 }
@@ -947,6 +976,17 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
             .map_err(|_| AcpError::new(-32603, "session ended"))?;
         session.current_model = spec.clone();
 
+        let sid = SessionId::from(session.handle.session_id.to_string());
+        let (used, cost) = {
+            let u = session.usage.lock().unwrap();
+            (u.used, u.cost)
+        };
+        session_update(
+            &srv.out_tx,
+            &sid,
+            translate::gauge_usage_update(used, u64::from(model.context_window), cost),
+        );
+
         let options =
             methods::session_config_options(&model, &srv.model_specs, session.current_thinking);
         Ok(AgentResponse::SetSessionConfigOptionResponse(
@@ -1116,6 +1156,7 @@ fn start_event_pump(
     home: Option<PathBuf>,
     project_trusted: bool,
     initial_cost: Option<f64>,
+    usage: SharedUsage,
 ) -> Task<()> {
     smol::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
@@ -1216,12 +1257,45 @@ fn start_event_pump(
                 }
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
                 AgentEvent::ToolDone(event) => translate::tool_done(&event, &cwd, home.as_deref()),
-                AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
+                AgentEvent::TurnComplete(event) => {
+                    let used = event
+                        .context_size
+                        .unwrap_or_else(|| event.usage.context_tokens())
+                        as u64;
+                    {
+                        let mut u = usage.lock().unwrap();
+                        u.used = used;
+                        u.cost = cost_total;
+                    }
+                    translate::usage_update(&event, cost_total)
+                }
+                AgentEvent::CompactionDone {
+                    context_size_after,
+                    context_window,
+                    ..
+                } => {
+                    let used = u64::from(context_size_after);
+                    {
+                        let mut u = usage.lock().unwrap();
+                        u.used = used;
+                        u.cost = cost_total;
+                    }
+                    translate::gauge_usage_update(used, u64::from(context_window), cost_total)
+                }
                 AgentEvent::ObservationLine { text } => {
                     translate::notice(&MakiId::generate().to_string(), &text)
                 }
-                AgentEvent::Done { reason, .. } => {
+                AgentEvent::Done {
+                    context_size,
+                    reason,
+                    ..
+                } => {
                     tool_inputs.clear();
+                    {
+                        let mut u = usage.lock().unwrap();
+                        u.used = u64::from(context_size);
+                        u.cost = cost_total;
+                    }
                     if let Some(id) = finish_turn(&pending) {
                         let resp = PromptResponse::new(translate::map_done_reason(reason));
                         send(
@@ -1306,7 +1380,9 @@ mod tests {
     };
     use maki_config::project::TrustQuestion;
     use maki_config::{AgentConfig, Effect, ToolKey, TrustFileConfig};
-    use maki_providers::{ContentBlock as MsgBlock, Message, Role, Timeouts, TokenUsage};
+    use maki_providers::{
+        ContentBlock as MsgBlock, Message, ModelInfo, Role, Timeouts, TokenUsage, model_registry,
+    };
     use maki_storage::StateDir;
     use maki_storage::sessions::{Session, StoredTokenUsage};
     use maki_storage::trusted_folders::{CanonicalFolder, TrustStatus, TrustedFolders};
@@ -1563,6 +1639,7 @@ mod tests {
                 current_thinking: ThinkingConfig::default(),
                 pending: Arc::default(),
                 claim,
+                usage: Arc::default(),
             }),
             should_wait_models: false,
             models_rx: None,
@@ -1691,6 +1768,7 @@ mod tests {
             None,
             PUMP_TRUSTED,
             initial_cost,
+            Arc::clone(&session.usage),
         );
         let sender = guard.sender(0);
         feed(&sender);
@@ -2882,6 +2960,91 @@ mod tests {
         let usage = found_usage.expect("usage_update must be sent during load_session");
         assert_eq!(usage["used"], 42_000);
         assert_eq!(usage["size"], params.model.context_window);
+    }
+
+    #[test]
+    fn set_config_option_model_emits_usage_update() {
+        let (mut srv, _answer_rx, out_rx) = test_server();
+        let (model_tx, _model_rx) = flume::unbounded();
+        srv.session.as_mut().unwrap().handle.model_tx = model_tx;
+        let target_spec = "responses/custom-large";
+        model_registry::set_known_models(
+            "responses",
+            vec![ModelInfo {
+                context_window: Some(300_000),
+                ..ModelInfo::id_only("custom-large".to_string())
+            }],
+        );
+        let raw = serde_json::json!({
+            "params": {
+                "sessionId": "test-session",
+                "configId": methods::MODEL_CONFIG_ID,
+                "value": target_spec
+            }
+        });
+        let resp = handle_set_config(&mut srv, &raw).expect("set_config succeeds");
+        assert!(matches!(
+            resp,
+            AgentResponse::SetSessionConfigOptionResponse(_)
+        ));
+
+        let notif = out_rx.try_recv().expect("usage update notification");
+        assert_eq!(notif["method"], "session/update");
+        let update = &notif["params"]["update"];
+        assert_eq!(update["sessionUpdate"], "usage_update");
+        assert_eq!(update["size"], 300_000);
+    }
+
+    #[test]
+    fn compaction_done_emits_usage_update() {
+        let (srv, _answer_rx, out_rx) = test_server();
+        run_pump(&srv, Some(0.05), |sender| {
+            let _ = sender.send(AgentEvent::CompactionDone {
+                context_size_before: 150_000,
+                context_size_after: 25_000,
+                context_window: 200_000,
+                summary: "summary".to_string(),
+            });
+        });
+
+        let mut found_usage = None;
+        while let Ok(msg) = out_rx.try_recv() {
+            if msg["method"] == "session/update"
+                && msg["params"]["update"]["sessionUpdate"] == "usage_update"
+            {
+                found_usage = Some(msg["params"]["update"].clone());
+            }
+        }
+        let update = found_usage.expect("must emit usage_update on CompactionDone");
+        assert_eq!(update["used"], 25_000);
+        assert_eq!(update["size"], 200_000);
+        assert_eq!(update["cost"]["amount"], 0.05);
+    }
+
+    #[test]
+    fn refresh_models_emits_usage_update_when_context_window_resolved() {
+        let (mut srv, _answer_rx, out_rx) = test_server();
+        let target_spec = "responses/custom-large";
+        srv.session.as_mut().unwrap().current_model = target_spec.to_string();
+        model_registry::set_known_models(
+            "responses",
+            vec![ModelInfo {
+                context_window: Some(300_000),
+                ..ModelInfo::id_only("custom-large".to_string())
+            }],
+        );
+        refresh_models(&mut srv, vec![target_spec.to_string()]);
+
+        let mut found_usage = None;
+        while let Ok(msg) = out_rx.try_recv() {
+            if msg["method"] == "session/update"
+                && msg["params"]["update"]["sessionUpdate"] == "usage_update"
+            {
+                found_usage = Some(msg["params"]["update"].clone());
+            }
+        }
+        let update = found_usage.expect("must emit usage_update on refresh_models");
+        assert_eq!(update["size"], 300_000);
     }
 }
 
