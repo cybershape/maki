@@ -10,16 +10,16 @@
 - **上游跟踪分支**: `upstream/main`
 - **当前本地分支**: `main`（跟踪 `origin/main`: `git@github.com:cybershape/maki.git`）
 - **最新同步的上游 Commit**:
-  - **Commit SHA**: `60f8f438ad0e3f0e8e3bba9c8961cb201606ab4c`
-  - **Commit 日期**: `Tue Sep 8 20:02:18 2026 +0300`
-  - **Commit 作者**: `Sebastian Dröge <sebastian@centricular.com>`
-  - **Commit 信息**: `feat(agent): configurable instruction files via instructions.files and projects`
+  - **Commit SHA**: `08793b9f1972f38aa59148f7d98d99caaf7e5a98`
+  - **Commit 日期**: `Mon Oct 26 13:49:17 2026 +0100`
+  - **Commit 作者**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
+  - **Commit 信息**: `refactor(otel): export through the official OpenTelemetry SDK`
 - **初始分叉点 (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit 日期**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit 信息**: `chore(deps): move monty to crates.io 1.x`
 
-> 本次已成功合并 `upstream/main`（至 commit `60f8f438`）。
+> 本次已成功合并 `upstream/main`（至 commit `08793b9f`）。
 
 ---
 
@@ -36,6 +36,15 @@
 | `d6e7f018` | `Merge branch 'fix/code-execution-builtin-alias' into main` | 合并代码执行内置别名修复分支 |
 | `aafeca09` | `refactor(tools): rename built-in tool list to list_dir` | 工具重构：将内置工具 `list` 正式重命名为 `list_dir` |
 | `afe978f9` | `feat(providers): support thinking level and full model discovery fields for responses` | **核心定制**: 为 responses provider 完善 OpenAI 标准 thinking level (reasoning effort) 及 `/models` 发现接口字段完整解析 |
+| `7da1e933` | `feat(acp): ensure discovered reasoning models send reasoning effort` | ACP 协议确保发现的推理模型携带 reasoning effort 参数 |
+| `5297e50f` | `test(lua): match reserved slug error message for responses provider` | 修复并匹配 responses provider 保留 slug 报错测试 |
+| `06b8b8ee` | `feat(acp): support thought_level session config option for reasoning effort` | ACP 协议支持通过 `thought_level` 配置项切换 reasoning effort |
+| `6e81fa86` | `ci: run build and release only on tags for windows, linux, mac-arm64` | CI 仅在 tag 触发构建发布，仅包含 windows, linux, mac-arm64 |
+| `89d6d5c0` | `feat(ui): support model name in picker and status bar via prefer_model_name` | UI 支持配置 `prefer_model_name`，在模型选择器和状态栏展示友好名称 |
+| `cc5c037d` | `feat(ui): display context window usage as progress bar in status bar` | 状态栏上下文窗口使用率以字符进度条形式可视化展示 |
+| `9fbeeaff` | `fix(code_execution): clarify description to discourage proxying single tool calls` | 明确 code_execution 提示词，避免代理单次工具调用 |
+| `5e429368` | `feat(ui): add show_cost configuration to hide cost and pricing in UI` | 新增 `show_cost` 配置项，允许隐藏 UI 中的全部开销与定价 |
+| `c206adff` | `Merge branch 'upstream/main' into main` | 合并上游提交（至 `08793b9f`），包含官方 OTel SDK 导出、输入多行/语法高亮重构、代码沙箱文件系统访问等 |
 
 ---
 
@@ -59,6 +68,25 @@
 - **变动文件**: `maki-acp/`
 - **主要逻辑**:
   - 增加了模型发现的本地持久化缓存并在冷启动时提供同步等待机制。
+  - 支持 `thought_level` 会话配置选项以映射各推理级别的 reasoning effort。
+
+### 3.4. UI 定制与显示增强
+- **变动文件**: `maki-ui/`、`maki-config/`
+- **主要逻辑**:
+  - `show_cost`: 支持在配置文件中设置 `show_cost = false`，从而在状态栏、Usage 统计弹窗和模型选择器中彻底隐藏价格和计费信息。
+  - `prefer_model_name`: 支持在状态栏和模型选择器中优先显示模型的自然名称（如 "GPT-6.1 Sol"）而非原始 slug。
+  - 上下文使用率进度条：状态栏支持以进度条（如 `[████░░░░░░] 40.0%/1.0M`）直观呈现当前会话的 context window 消耗。
+  - 长通知自适应让路：状态栏 flash 通知较长时，优先保证通知文本完整展示，自动收缩或隐藏常驻的 path 与 model 显示。
+
+### 3.5. CI 与发布流程精简
+- **变动文件**: `.github/workflows/`
+- **主要逻辑**:
+  - 构建发布精简至 `windows`、`linux` 和 `mac-arm64`，移除了 NetBSD 等构建目标；仅在 git tag 时触发 release。
+
+### 3.6. 解释器与沙箱文件系统访问适配
+- **变动文件**: `plugins/code_execution/`、`maki-lua/`
+- **主要逻辑**:
+  - 沙箱文件系统操作全面适配内置工具重命名为 `list_dir` 的逻辑，同时兼容 `list` 钩子与槽位。
 
 ---
 
