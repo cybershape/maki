@@ -11,15 +11,15 @@ local format_output = helpers.format_output
 local parse_output = helpers.parse_output
 
 local PROJECT_SKILL_DIRS = {
-  ".maki/skills",
-  ".claude/skills",
-  ".opencode/skills",
-  ".agents/skills",
+  { ".maki/skills" },
+  { ".claude/skills", "claude" },
+  { ".opencode/skills", "opencode" },
+  { ".agents/skills" },
 }
 local GLOBAL_SKILL_DIRS = {
-  ".claude/skills",
-  ".config/opencode/skills",
-  ".agents/skills",
+  { ".claude/skills", "claude" },
+  { ".config/opencode/skills", "opencode" },
+  { ".agents/skills" },
 }
 
 local function scan_skill_dir(dir, skills)
@@ -117,14 +117,18 @@ local function discover_skills()
 
   local home = maki.uv.os_homedir()
   if home then
-    for _, rel in ipairs(GLOBAL_SKILL_DIRS) do
-      scan_skill_dir(maki.fs.joinpath(home, rel), skills)
+    for _, source in ipairs(GLOBAL_SKILL_DIRS) do
+      if not source[2] or maki.api.agent_enabled(source[2]) then
+        scan_skill_dir(maki.fs.joinpath(home, source[1]), skills)
+      end
     end
   end
 
   for _, ancestor in ipairs(find_project_ancestors()) do
-    for _, rel in ipairs(PROJECT_SKILL_DIRS) do
-      scan_skill_dir(maki.fs.joinpath(ancestor, rel), skills)
+    for _, source in ipairs(PROJECT_SKILL_DIRS) do
+      if not source[2] or maki.api.agent_enabled(source[2]) then
+        scan_skill_dir(maki.fs.joinpath(ancestor, source[1]), skills)
+      end
     end
   end
 

@@ -143,10 +143,7 @@ pub fn default_instruction_files() -> Vec<String> {
 /// checkout is never probed: the list cannot depend on it.
 fn resolve_instruction_files(config: &InstructionsConfig, cwd: &Path) -> Vec<String> {
     if config.overrides.is_empty() {
-        return config
-            .files
-            .clone()
-            .unwrap_or_else(default_instruction_files);
+        return config.resolve_files(cwd, &[], INSTRUCTION_FILES);
     }
     let root = project::project_root(cwd);
     let remotes = if config.needs_remotes() {
@@ -425,6 +422,67 @@ mod tests {
             ..Default::default()
         })
         .unwrap()
+    }
+
+    #[test_case(false, false ; "default_list")]
+    #[test_case(true, false ; "explicit_list")]
+    #[test_case(true, true ; "override_list")]
+    fn disabled_compatibility_filters_startup_and_subdirectories(explicit: bool, overrides: bool) {
+        const EXCLUDED: &str = "excluded rules";
+        const COMMON: &str = "common rules";
+        const LOCAL: &str = "local rules";
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("src");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        for dir in [root.path(), child.as_path()] {
+            fs::write(dir.join("CLAUDE.md"), EXCLUDED).unwrap();
+            fs::write(dir.join("AGENTS.md"), COMMON).unwrap();
+            fs::write(dir.join("AGENTS.local.md"), LOCAL).unwrap();
+        }
+        let mut config = if overrides {
+            project_override(None, None, &["CLAUDE.md", "AGENTS.md"])
+        } else if explicit {
+            files_config(&["CLAUDE.md", "AGENTS.md"])
+        } else {
+            InstructionsConfig::default()
+        };
+        config.compatibility.all = Some(false);
+        config.compatibility.claude = Some(true);
+        let instructions =
+            load_instructions_with_home(root.path().to_str().unwrap(), None, None, &config);
+        assert!(!instructions.text.contains(EXCLUDED));
+        assert!(instructions.text.contains(COMMON));
+        assert!(instructions.text.contains(LOCAL));
+        assert!(!is_instruction_file(&instructions.files, "CLAUDE.md"));
+        let blocks = find_subdirectory_instructions(
+            &child,
+            root.path(),
+            &instructions.loaded,
+            &instructions.files,
+        );
+        assert!(blocks.iter().all(|block| block.content != EXCLUDED));
+        assert!(blocks.iter().any(|block| block.content == COMMON));
+        assert!(is_instruction_file(
+            &instructions.files,
+            LOCAL_INSTRUCTION_FILE
+        ));
+    }
+
+    #[test_case(false ; "claude_disabled")]
+    #[test_case(true ; "claude_enabled")]
+    fn disabled_instruction_falls_back_to_next_source(enabled: bool) {
+        const CLAUDE: &str = "claude rules";
+        const GEMINI: &str = "gemini rules";
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("CLAUDE.md"), CLAUDE).unwrap();
+        fs::write(root.path().join("GEMINI.md"), GEMINI).unwrap();
+        let mut config = InstructionsConfig::default();
+        config.compatibility.claude = Some(enabled);
+        let instructions =
+            load_instructions_with_home(root.path().to_str().unwrap(), None, None, &config);
+        assert_eq!(instructions.text.contains(CLAUDE), enabled);
+        assert_eq!(instructions.text.contains(GEMINI), !enabled);
     }
 
     #[test]

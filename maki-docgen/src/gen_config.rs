@@ -280,6 +280,46 @@ fn write_instructions_section(out: &mut String) {
     .unwrap();
 }
 
+fn write_compatibility_section(out: &mut String) {
+    out.push_str(r#"### `compatibility`
+
+Control automatic loading from other agents. This table is read only from the global `~/.config/maki/init.lua`. Project settings are ignored with a warning.
+
+```lua
+maki.setup({
+    compatibility = { all = false },
+})
+```
+
+Every setting defaults to `true`. Set `all = false` to disable every agent compatibility source, including sources added in future versions. It overrides individual `true` settings. To disable selected agents, omit `all` and set their fields to `false`:
+
+```lua
+maki.setup({
+    compatibility = {
+        claude = false,
+        opencode = false,
+    },
+})
+```
+
+| Field | Sources |
+|---|---|
+| `all` | All agent compatibility sources below and future additions |
+| `claude` | `CLAUDE.md`, user and project `.claude/skills/` and `.claude/commands/` |
+| `opencode` | User `~/.config/opencode/skills/` and project `.opencode/skills/` |
+| `copilot` | `.github/copilot-instructions.md`, `COPILOT.md` |
+| `cursor` | `.cursorrules` |
+| `windsurf` | `.windsurfrules` |
+| `cline` | `.clinerules` |
+| `gemini` | `GEMINI.md` |
+
+Disabled sources are skipped before reading their content, at startup and during later discovery. The policy also applies to known agent instruction files explicitly listed in `instructions.files` or `instructions.overrides`.
+
+Maki skills and commands, the builtin skill, `AGENTS.md`, `AGENTS.local.md`, and `.agents/skills/` remain available. `CONVENTIONS.md`, `CODING_AGENT.md`, and custom instruction filenames keep their existing behavior. This controls automatic discovery, not explicit file reads by tools. Restart Maki or use `/reload` after changing the policy. Existing conversation content is retained.
+
+"#);
+}
+
 fn write_telemetry_section(out: &mut String) {
     write_section(out, "[telemetry]", TelemetryConfig::FIELDS);
     writeln!(
@@ -398,6 +438,7 @@ All fields are optional. Typos in field names cause an error right away.
     write_net_section(&mut out);
     write_trust_section(&mut out);
     write_instructions_section(&mut out);
+    write_compatibility_section(&mut out);
     write_telemetry_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();

@@ -117,6 +117,8 @@ At session start Maki walks from the project git root down to the working direct
 | 9 | `GEMINI.md` |
 | 10 | `CODING_AGENT.md` |
 
+The global [compatibility settings](/docs/configuration/#compatibility) exclude disabled agent sources before choosing a file, including files explicitly named in `instructions.files` or `instructions.overrides`. The same policy applies when discovering subdirectory instructions.
+
 After the match it always loads `AGENTS.local.md` from the same directory if present: that one is yours, keep it gitignored. Closer directories win on conflicts. Finally one global `~/.config/maki/AGENTS.md` for preferences that follow you across projects.
 
 ```

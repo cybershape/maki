@@ -817,6 +817,22 @@ end
 
 ---
 
+### `maki.api.agent_enabled()` {#maki-api-agent_enabled}
+
+```lua
+maki.api.agent_enabled({name})
+```
+
+Return whether automatic loading from an agent is enabled by the global compatibility policy.
+
+**Parameters:**
+
+- `{name}` (`string`) Agent name: claude, opencode, copilot, cursor, windsurf, cline, or gemini.
+
+**Returns:** (`boolean`) False when compatibility.all or the agent setting is false.
+
+---
+
 ### `maki.api.run_command()` {#maki-api-run_command}
 
 ```lua

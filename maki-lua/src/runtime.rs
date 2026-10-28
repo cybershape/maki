@@ -32,7 +32,7 @@ use mlua::{Function, Lua, MaybeSend, MultiValue, RegistryKey, Table, Value as Lu
 use serde_json::Value;
 use strum::{EnumString, IntoStaticStr};
 
-use maki_config::RawConfig;
+use maki_config::{CompatibilityConfig, RawConfig};
 use maki_providers::plugin::DeclAuthority;
 use maki_storage::id::{MakiId, SessionRef};
 
@@ -377,6 +377,7 @@ pub enum Request {
     /// Plugins are loaded, so native codegen may start using idle time. Sent
     /// last so it never interleaves with the loads themselves.
     WarmJit,
+    SetCompatibility(CompatibilityConfig),
     /// Install a `SessionSnapshotSlot` on the Lua thread. Headless drivers send
     /// one so `maki.session.read` works without a UI to ask.
     InstallSessionSnapshot {
@@ -4915,6 +4916,9 @@ pub fn spawn(
                     match msg {
                         Request::Shutdown => break,
                         Request::WarmJit => codegen_armed = true,
+                        Request::SetCompatibility(config) => {
+                            rt.lua.set_app_data(config);
+                        }
                         Request::InstallSessionSnapshot { provider } => {
                             rt.lua
                                 .set_app_data(crate::api::session::SessionSnapshotSlot(provider));

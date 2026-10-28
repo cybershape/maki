@@ -68,7 +68,7 @@ Later sources override earlier ones when the command **name** matches (the stem 
 
 Because the walk goes cwd → … → git root, a command at the **repository root overrides** the same name found only under a nested cwd. Project commands override user commands. Palette names are `/project:<name>` or `/user:<name>` depending on which scope won.
 
-Skip all of the above with `--no-commands` (see [CLI](/docs/cli/)).
+Skip all of the above with `--no-commands` (see [CLI](/docs/cli/)). To skip only Claude commands, set `compatibility.claude = false` or `compatibility.all = false` in your global config (see [Compatibility](/docs/configuration/#compatibility)).
 
 ### Metadata
 

@@ -10,7 +10,9 @@ use include_dir::{Dir, File, include_dir};
 use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
-use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
+use maki_config::{
+    CompatibilityConfig, GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig,
+};
 use maki_providers::plugin::{DeclAuthority, keep_granted};
 
 use crate::agent_autocmd::HostEvent;
@@ -46,6 +48,8 @@ pub const TRUST_SCOPE_WARNING: &str =
     "trust is only read from the global init.lua; ignoring the trust table in";
 pub const INSTRUCTIONS_SCOPE_WARNING: &str =
     "instructions is only read from the global init.lua; ignoring the instructions table in";
+pub const COMPATIBILITY_SCOPE_WARNING: &str =
+    "compatibility is only read from the global init.lua; ignoring the compatibility table in";
 
 /// How far user `init.lua` may reach. `--no-plugins` turns it off, and a
 /// project folder nobody vouched for stops at the global file.
@@ -445,6 +449,9 @@ impl PluginHost {
                 if std::mem::take(&mut raw.instructions).is_set() {
                     warnings.push(format!("{INSTRUCTIONS_SCOPE_WARNING} {owner}"));
                 }
+                if std::mem::take(&mut raw.compatibility).is_set() {
+                    warnings.push(format!("{COMPATIBILITY_SCOPE_WARNING} {owner}"));
+                }
             }
             match merged {
                 Some(existing) => existing.merge(raw),
@@ -453,6 +460,13 @@ impl PluginHost {
         }
         warnings.extend(self.permission_name_warning(&owner));
         Ok(())
+    }
+
+    pub fn set_compatibility(&self, config: CompatibilityConfig) -> Result<(), PluginError> {
+        self.inner
+            .tx
+            .send(Request::SetCompatibility(config))
+            .map_err(|_| PluginError::HostDead)
     }
 
     pub fn load_builtins(&mut self, config: &PluginsConfig) -> Result<(), PluginError> {
@@ -2260,6 +2274,48 @@ mod tests {
                     && warning.contains(ConfigScope::Project.label())
             }),
             "{warnings:?}"
+        );
+    }
+
+    #[test_case("all" ; "all_switch")]
+    #[test_case("claude" ; "individual_switch")]
+    fn project_scope_cannot_set_compatibility(field: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        let project = dir.path().join(".maki/init.lua");
+        fs::create_dir(&global).unwrap();
+        fs::create_dir(project.parent().unwrap()).unwrap();
+        fs::write(
+            global.join("init.lua"),
+            format!("maki.setup({{ compatibility = {{ {field} = false }} }})"),
+        )
+        .unwrap();
+        fs::write(
+            &project,
+            format!("maki.setup({{ compatibility = {{ {field} = true }} }})"),
+        )
+        .unwrap();
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut warnings = Vec::new();
+        let config = host
+            .load_init_files_from_dirs(
+                InitFiles::GlobalAndProject(project),
+                [global],
+                &mut warnings,
+            )
+            .unwrap()
+            .unwrap()
+            .into_config(&[])
+            .unwrap();
+        assert!(
+            !config
+                .compatibility
+                .agent_enabled(maki_config::CompatibilityAgent::Claude)
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with(COMPATIBILITY_SCOPE_WARNING))
         );
     }
 

@@ -2,12 +2,17 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use maki_config::{CompatibilityAgent, CompatibilityConfig};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
 const COMMANDS_DIR: &str = "commands";
-const PROJECT_COMMAND_DIRS: &[&str] = &[".maki/commands", ".claude/commands"];
-const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[&str] = &[".claude/commands"];
+const PROJECT_COMMAND_DIRS: &[(&str, Option<CompatibilityAgent>)] = &[
+    (".maki/commands", None),
+    (".claude/commands", Some(CompatibilityAgent::Claude)),
+];
+const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[(&str, CompatibilityAgent)] =
+    &[(".claude/commands", CompatibilityAgent::Claude)];
 const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
 
 #[derive(Debug, Default, Deserialize)]
@@ -103,11 +108,12 @@ impl CustomCommand {
     }
 }
 
-pub fn discover_commands(cwd: &Path) -> Vec<CustomCommand> {
+pub fn discover_commands(cwd: &Path, compatibility: &CompatibilityConfig) -> Vec<CustomCommand> {
     discover_commands_inner(
         cwd,
         maki_storage::paths::home().as_deref(),
         maki_storage::paths::xdg_config_dir().ok().as_deref(),
+        compatibility,
     )
 }
 
@@ -115,6 +121,7 @@ fn discover_commands_inner(
     cwd: &Path,
     home: Option<&Path>,
     xdg_config: Option<&Path>,
+    compatibility: &CompatibilityConfig,
 ) -> Vec<CustomCommand> {
     let mut commands: HashMap<String, CustomCommand> = HashMap::new();
 
@@ -122,14 +129,18 @@ fn discover_commands_inner(
         scan_command_dir(&dir.join(COMMANDS_DIR), CommandScope::User, &mut commands);
     }
     if let Some(home) = home {
-        for dir in GLOBAL_THIRD_PARTY_COMMAND_DIRS {
-            scan_command_dir(&home.join(dir), CommandScope::User, &mut commands);
+        for (dir, agent) in GLOBAL_THIRD_PARTY_COMMAND_DIRS {
+            if compatibility.agent_enabled(*agent) {
+                scan_command_dir(&home.join(dir), CommandScope::User, &mut commands);
+            }
         }
     }
 
     for dir in project_ancestor_dirs(cwd) {
-        for cmd_dir in PROJECT_COMMAND_DIRS {
-            scan_command_dir(&dir.join(cmd_dir), CommandScope::Project, &mut commands);
+        for (cmd_dir, agent) in PROJECT_COMMAND_DIRS {
+            if agent.is_none_or(|agent| compatibility.agent_enabled(agent)) {
+                scan_command_dir(&dir.join(cmd_dir), CommandScope::Project, &mut commands);
+            }
         }
     }
 
@@ -249,6 +260,50 @@ mod tests {
         assert_eq!(cmd.display_name(), expected);
     }
 
+    #[test_case(true, true, false ; "default_sources")]
+    #[test_case(false, true, false ; "claude_disabled")]
+    #[test_case(true, false, false ; "all_disabled")]
+    #[test_case(false, true, true ; "no_commands_remain")]
+    fn discover_filters_compatibility(claude: bool, all: bool, only_claude: bool) {
+        const CONTENT: &str = "command content";
+        let root = TempDir::new().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        fs::create_dir_all(project.join(".git")).unwrap();
+        for (base, source, name) in [
+            (&home, ".claude/commands", "global_claude"),
+            (&project, ".claude/commands", "project_claude"),
+            (&home, ".config/maki/commands", "global_maki"),
+            (&project, ".maki/commands", "project_maki"),
+        ] {
+            if only_claude && name.ends_with("maki") {
+                continue;
+            }
+            let dir = base.join(source);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(format!("{name}.md")), CONTENT).unwrap();
+        }
+        let config = CompatibilityConfig {
+            all: Some(all),
+            claude: Some(claude),
+            ..Default::default()
+        };
+        let commands = discover_commands_inner(
+            &project,
+            Some(&home),
+            Some(&home.join(".config/maki")),
+            &config,
+        );
+        let names: Vec<_> = commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert_eq!(names.contains(&"global_claude"), claude && all);
+        assert_eq!(names.contains(&"project_claude"), claude && all);
+        assert_eq!(names.contains(&"global_maki"), !only_claude);
+        assert_eq!(names.contains(&"project_maki"), !only_claude);
+    }
+
     #[test]
     fn discover_project_overrides_global() {
         let project = TempDir::new().unwrap();
@@ -269,7 +324,12 @@ mod tests {
         )
         .unwrap();
 
-        let commands = discover_commands_inner(project.path(), Some(global.path()), None);
+        let commands = discover_commands_inner(
+            project.path(),
+            Some(global.path()),
+            None,
+            &CompatibilityConfig::default(),
+        );
         let overlap: Vec<_> = commands.iter().filter(|c| c.name == "overlap").collect();
         assert_eq!(overlap.len(), 1);
         assert_eq!(overlap[0].description, "Project version");
@@ -289,7 +349,8 @@ mod tests {
             fs::write(path.join(filename), "Content").unwrap();
         }
 
-        let commands = discover_commands_inner(dir.path(), None, None);
+        let commands =
+            discover_commands_inner(dir.path(), None, None, &CompatibilityConfig::default());
         let names: Vec<_> = commands.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"a-cmd"));
         assert!(names.contains(&"b-cmd"));
@@ -306,7 +367,7 @@ mod tests {
             fs::write(command_dir.join(format!("{name}.md")), name).unwrap();
         }
 
-        let commands = discover_commands_inner(&child, None, None);
+        let commands = discover_commands_inner(&child, None, None, &CompatibilityConfig::default());
         let names = commands
             .iter()
             .map(|command| command.name.as_str())
@@ -322,7 +383,8 @@ mod tests {
         fs::write(cmd_dir.join("valid.md"), "Content").unwrap();
         fs::write(cmd_dir.join("invalid.txt"), "Content").unwrap();
 
-        let commands = discover_commands_inner(dir.path(), None, None);
+        let commands =
+            discover_commands_inner(dir.path(), None, None, &CompatibilityConfig::default());
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "valid");
     }

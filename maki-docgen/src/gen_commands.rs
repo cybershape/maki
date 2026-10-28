@@ -245,7 +245,7 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "Skip all of the above with `--no-commands` (see [CLI](/docs/cli/))."
+        "Skip all of the above with `--no-commands` (see [CLI](/docs/cli/)). To skip only Claude commands, set `compatibility.claude = false` or `compatibility.all = false` in your global config (see [Compatibility](/docs/configuration/#compatibility))."
     )
     .unwrap();
     writeln!(out).unwrap();

@@ -11,7 +11,7 @@ use maki_storage::sessions::{SessionMeta, StoredThinking, ThinkingParseError};
 use serde::de::{Error as DeError, IgnoredAny};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use strum::VariantArray;
+use strum::{EnumString, VariantArray};
 use thiserror::Error;
 use tracing::warn;
 
@@ -541,6 +541,7 @@ pub struct RawConfig {
     pub net: NetFileConfig,
     pub trust: TrustFileConfig,
     pub instructions: InstructionsFileConfig,
+    pub compatibility: CompatibilityConfig,
     pub telemetry: TelemetryConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
 }
@@ -562,6 +563,7 @@ impl RawConfig {
         self.net.merge(overlay.net);
         self.trust.merge(overlay.trust);
         self.instructions.merge(overlay.instructions);
+        self.compatibility.merge(overlay.compatibility);
         self.telemetry.merge(overlay.telemetry);
         for (name, plugin) in overlay.plugins {
             let entry = self.plugins.entry(name).or_default();
@@ -583,6 +585,7 @@ impl RawConfig {
         self.validate_plugin_tables(packages)?;
         let mut agent = AgentConfig::from_file(self.agent);
         agent.instructions = InstructionsConfig::from_file(self.instructions)?;
+        agent.instructions.compatibility = self.compatibility.clone();
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             session_defaults: SessionDefaults {
@@ -600,6 +603,7 @@ impl RawConfig {
             net: NetConfig::from_file(self.net),
             trust: TrustConfig::from_file(self.trust)?,
             telemetry: self.telemetry,
+            compatibility: self.compatibility,
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::from_plugins_and_packages(self.plugins, packages),
         })
@@ -1287,6 +1291,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub net: NetConfig,
     pub trust: TrustConfig,
+    pub compatibility: CompatibilityConfig,
     pub telemetry: TelemetryConfig,
     pub permissions: PermissionsConfig,
     pub plugins: PluginsConfig,
@@ -1923,6 +1928,76 @@ fn expand_home(pattern: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, EnumString, VariantArray)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum CompatibilityAgent {
+    Claude,
+    Opencode,
+    Copilot,
+    Cursor,
+    Windsurf,
+    Cline,
+    Gemini,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompatibilityConfig {
+    pub all: Option<bool>,
+    pub claude: Option<bool>,
+    pub opencode: Option<bool>,
+    pub copilot: Option<bool>,
+    pub cursor: Option<bool>,
+    pub windsurf: Option<bool>,
+    pub cline: Option<bool>,
+    pub gemini: Option<bool>,
+}
+
+impl CompatibilityConfig {
+    fn merge(&mut self, overlay: Self) {
+        merge_option!(
+            self, overlay, all, claude, opencode, copilot, cursor, windsurf, cline, gemini
+        );
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.all.is_some()
+            || CompatibilityAgent::VARIANTS
+                .iter()
+                .any(|agent| self.setting(*agent).is_some())
+    }
+
+    fn setting(&self, agent: CompatibilityAgent) -> Option<bool> {
+        match agent {
+            CompatibilityAgent::Claude => self.claude,
+            CompatibilityAgent::Opencode => self.opencode,
+            CompatibilityAgent::Copilot => self.copilot,
+            CompatibilityAgent::Cursor => self.cursor,
+            CompatibilityAgent::Windsurf => self.windsurf,
+            CompatibilityAgent::Cline => self.cline,
+            CompatibilityAgent::Gemini => self.gemini,
+        }
+    }
+
+    pub fn agent_enabled(&self, agent: CompatibilityAgent) -> bool {
+        self.all.unwrap_or(true) && self.setting(agent).unwrap_or(true)
+    }
+
+    pub fn allows_instruction(&self, file: &str) -> bool {
+        let agent = match Path::new(file).file_name().and_then(|name| name.to_str()) {
+            Some("CLAUDE.md") => CompatibilityAgent::Claude,
+            Some("copilot-instructions.md" | "COPILOT.md") => CompatibilityAgent::Copilot,
+            Some(".cursorrules") => CompatibilityAgent::Cursor,
+            Some(".windsurfrules") => CompatibilityAgent::Windsurf,
+            Some(".clinerules") => CompatibilityAgent::Cline,
+            Some("GEMINI.md") => CompatibilityAgent::Gemini,
+            _ => return true,
+        };
+        self.agent_enabled(agent)
+    }
+}
+
 /// Resolved `instructions` config. Carried on [`AgentConfig`] so every
 /// instruction load sees the same answer.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1930,6 +2005,7 @@ pub struct InstructionsConfig {
     /// `None` loads the built-in file list.
     pub files: Option<Vec<String>>,
     pub overrides: Vec<ProjectOverride>,
+    pub compatibility: CompatibilityConfig,
 }
 
 impl InstructionsConfig {
@@ -1947,6 +2023,7 @@ impl InstructionsConfig {
         Ok(Self {
             files: file.files,
             overrides: resolved,
+            compatibility: CompatibilityConfig::default(),
         })
     }
 
@@ -1974,7 +2051,11 @@ impl InstructionsConfig {
                 break;
             }
         }
-        files.unwrap_or_else(|| default.iter().map(|file| file.to_string()).collect())
+        files
+            .unwrap_or_else(|| default.iter().map(|file| file.to_string()).collect())
+            .into_iter()
+            .filter(|file| self.compatibility.allows_instruction(file))
+            .collect()
     }
 }
 
@@ -3004,6 +3085,84 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
+    #[test_case("{}", true, true ; "defaults")]
+    #[test_case(r#"{"claude":false}"#, false, true ; "claude_only")]
+    #[test_case(r#"{"all":false,"claude":true}"#, false, false ; "all_overrides_individual")]
+    #[test_case(r#"{"all":true,"claude":false}"#, false, true ; "individual_overrides_enabled_all")]
+    fn compatibility_switches(source: &str, claude: bool, opencode: bool) {
+        let config: CompatibilityConfig = serde_json::from_str(source).unwrap();
+        assert_eq!(config.agent_enabled(CompatibilityAgent::Claude), claude);
+        assert_eq!(config.agent_enabled(CompatibilityAgent::Opencode), opencode);
+        if config.all == Some(false) {
+            for agent in CompatibilityAgent::VARIANTS {
+                assert!(!config.agent_enabled(*agent));
+            }
+        }
+    }
+
+    #[test_case(r#"{"unknown":false}"# ; "unknown_agent")]
+    #[test_case(r#"{"claude":"false"}"# ; "invalid_type")]
+    fn compatibility_rejects_invalid_config(source: &str) {
+        assert!(serde_json::from_str::<CompatibilityConfig>(source).is_err());
+    }
+
+    #[test_case("CLAUDE.md", CompatibilityAgent::Claude ; "claude")]
+    #[test_case(".github/copilot-instructions.md", CompatibilityAgent::Copilot ; "copilot_path")]
+    #[test_case("copilot-instructions.md", CompatibilityAgent::Copilot ; "copilot_basename")]
+    #[test_case("COPILOT.md", CompatibilityAgent::Copilot ; "copilot")]
+    #[test_case(".cursorrules", CompatibilityAgent::Cursor ; "cursor")]
+    #[test_case(".windsurfrules", CompatibilityAgent::Windsurf ; "windsurf")]
+    #[test_case(".clinerules", CompatibilityAgent::Cline ; "cline")]
+    #[test_case("GEMINI.md", CompatibilityAgent::Gemini ; "gemini")]
+    fn compatibility_filters_instruction_sources(file: &str, agent: CompatibilityAgent) {
+        let mut config = CompatibilityConfig::default();
+        assert!(config.allows_instruction(file));
+        let name = match agent {
+            CompatibilityAgent::Claude => "claude",
+            CompatibilityAgent::Copilot => "copilot",
+            CompatibilityAgent::Cursor => "cursor",
+            CompatibilityAgent::Windsurf => "windsurf",
+            CompatibilityAgent::Cline => "cline",
+            CompatibilityAgent::Gemini => "gemini",
+            CompatibilityAgent::Opencode => unreachable!(),
+        };
+        config = serde_json::from_value(serde_json::json!({ name: false })).unwrap();
+        assert!(!config.allows_instruction(file));
+        for common in [
+            "AGENTS.md",
+            "AGENTS.local.md",
+            "CONVENTIONS.md",
+            "CODING_AGENT.md",
+            "RULES.md",
+        ] {
+            assert!(config.allows_instruction(common));
+        }
+    }
+
+    #[test_case(false ; "merge_disables")]
+    #[test_case(true ; "merge_enables")]
+    fn compatibility_merges_explicit_fields(enabled: bool) {
+        let mut raw = RawConfig::default();
+        raw.compatibility.all = Some(false);
+        raw.compatibility.claude = Some(false);
+        let mut overlay = RawConfig::default();
+        overlay.compatibility.all = Some(enabled);
+        raw.merge(overlay);
+        let config = raw.into_config(&[]).unwrap();
+        assert!(
+            !config
+                .compatibility
+                .agent_enabled(CompatibilityAgent::Claude)
+        );
+        assert_eq!(
+            config
+                .compatibility
+                .agent_enabled(CompatibilityAgent::Gemini),
+            enabled
+        );
+        assert_eq!(config.agent.instructions.compatibility.all, Some(enabled));
+    }
+
     const GLOBAL_ALLOWED_HOST: &str = "ollama.lan";
     const PROJECT_ALLOWED_HOST: &str = "searx.lan:8888";
     const HOME_GLOB: &str = "~/src/me/*";
@@ -3768,6 +3927,7 @@ mod tests {
             storage: StorageConfig::default(),
             net: NetConfig::default(),
             trust: TrustConfig::default(),
+            compatibility: CompatibilityConfig::default(),
             telemetry: TelemetryConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::default(),

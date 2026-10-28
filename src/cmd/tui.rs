@@ -72,11 +72,11 @@ impl Drop for Teardown {
     }
 }
 
-fn discover_commands(disable: bool, cwd: &Path) -> Vec<CustomCommand> {
+fn discover_commands(disable: bool, cwd: &Path, config: &Config) -> Vec<CustomCommand> {
     if disable {
         return Vec::new();
     }
-    command::discover_commands(cwd)
+    command::discover_commands(cwd, &config.compatibility)
 }
 
 fn load_config(
@@ -180,7 +180,7 @@ fn build_stack(
         },
     )?;
 
-    let commands = discover_commands(cli.no_commands, launch.cwd);
+    let commands = discover_commands(cli.no_commands, launch.cwd, &config);
 
     setup::remember_thinking(&mut config.session_defaults, launch.storage);
     let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage);

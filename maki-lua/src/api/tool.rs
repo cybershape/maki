@@ -21,7 +21,9 @@ use maki_agent::tools::{
 use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, SharedBuf, TextOutput, ToolOutput,
 };
-use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
+use maki_config::{
+    CompatibilityAgent, CompatibilityConfig, Effect, PermissionRule, ToolKey, ToolOutputLines,
+};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{
     Function, Lua, LuaSerdeExt, LuaString, MultiValue, RegistryKey, Result as LuaResult, Table,
@@ -1203,6 +1205,19 @@ fn get_tool(lua: &Lua, name: String) -> LuaResult<LuaValue> {
     Ok(LuaValue::Table(t))
 }
 
+/// Return whether automatic loading from an agent is enabled by the global compatibility policy.
+/// @param name string Agent name: claude, opencode, copilot, cursor, windsurf, cline, or gemini.
+/// @return (boolean) False when compatibility.all or the agent setting is false.
+#[lua_fn]
+fn agent_enabled(lua: &Lua, name: String) -> LuaResult<bool> {
+    let agent = name
+        .parse::<CompatibilityAgent>()
+        .map_err(mlua::Error::external)?;
+    Ok(lua
+        .app_data_ref::<CompatibilityConfig>()
+        .is_none_or(|config| config.agent_enabled(agent)))
+}
+
 lua_table! {
     /// Plugin registration. This is where you tell maki about your tools,
     /// slash commands, and prompt contributions.
@@ -1217,7 +1232,7 @@ lua_table! {
     extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, reach: PluginReach, plugin: Arc<str>, opts: PluginOpts), DOCS [
         register_tool(pending, reach), register_permission_rule(pending_rules, reach), register_command(plugin, reach),
         register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
-        get_tools, get_tool,
+        get_tools, get_tool, agent_enabled,
         manual run_command,
     ]
 }
