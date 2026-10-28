@@ -330,7 +330,24 @@ async fn handle_request(
                 methods::initialize_response(),
             ))
         }
-        "session/new" => new_session(srv, raw, params).await,
+        "session/new" => {
+            let resp = new_session(srv, raw, params).await;
+            let sid = match &resp {
+                Ok(AgentResponse::NewSessionResponse(r)) => {
+                    Some(SessionId::from(r.session_id.0.clone()))
+                }
+                _ => None,
+            };
+            srv.respond(id, resp);
+            if let Some(sid) = sid {
+                session_update(
+                    &srv.out_tx,
+                    &sid,
+                    translate::gauge_usage_update(0, u64::from(params.model.context_window), None),
+                );
+            }
+            return;
+        }
         "session/load" => load_session(srv, raw, params).await,
         "session/list" => list_sessions(raw, &params.storage).await,
         "session/prompt" => match handle_prompt(srv, raw, &id) {
@@ -439,6 +456,16 @@ async fn load_session(
         &mut by_model,
         &recorded_model,
         RESTORED_FAST,
+    );
+    let used = if restored.session.meta.context_size > 0 {
+        u64::from(restored.session.meta.context_size)
+    } else {
+        u64::from(restored.session.token_usage.context_tokens())
+    };
+    session_update(
+        &srv.out_tx,
+        &sid,
+        translate::gauge_usage_update(used, u64::from(params.model.context_window), restored_cost),
     );
     let current_thinking = restored
         .session
@@ -2777,6 +2804,84 @@ mod tests {
             input.thinking,
             ThinkingConfig::Effort(maki_storage::sessions::Effort::High)
         );
+    }
+
+    #[test]
+    fn new_session_emits_response_then_initial_usage_update() {
+        let (mut srv, _answer_rx, out_rx) = test_server();
+        srv.session = None;
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let params = acp_params(dir);
+        let raw = serde_json::json!({
+            "params": { "cwd": "/project", "mcpServers": [] }
+        });
+        smol::block_on(handle_request(
+            &mut srv,
+            "session/new",
+            RequestId::Number(1),
+            &raw,
+            &params,
+        ));
+
+        let resp = out_rx.recv().expect("new session response");
+        assert_eq!(resp["id"], 1);
+        let session_id = resp["result"]["sessionId"].as_str().expect("sessionId");
+
+        let notif = out_rx.recv().expect("usage update notification");
+        assert_eq!(notif["method"], "session/update");
+        assert_eq!(notif["params"]["sessionId"], session_id);
+        let update = &notif["params"]["update"];
+        assert_eq!(update["sessionUpdate"], "usage_update");
+        assert_eq!(update["used"], 0);
+        assert_eq!(update["size"], params.model.context_window);
+        assert!(update.get("cost").is_none());
+    }
+
+    #[test]
+    fn load_session_emits_restored_usage_update() {
+        let (mut srv, _answer_rx, out_rx) = test_server();
+        srv.session = None;
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let params = acp_params(dir.clone());
+
+        let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
+            Session::new(SELECTED_SPEC, "/project");
+        session.meta.context_size = 42_000;
+        session.token_usage = TokenUsage {
+            input: 30_000,
+            output: 12_000,
+            ..Default::default()
+        };
+        session
+            .save(&SessionClaim::acquire(session.id, &dir).unwrap(), &dir)
+            .unwrap();
+
+        let raw = load_request(session.id);
+        smol::block_on(handle_request(
+            &mut srv,
+            "session/load",
+            RequestId::Number(2),
+            &raw,
+            &params,
+        ));
+
+        let mut found_usage = None;
+        let mut found_response = false;
+        while let Ok(msg) = out_rx.try_recv() {
+            if msg.get("id") == Some(&serde_json::json!(2)) {
+                found_response = true;
+            } else if msg["method"] == "session/update"
+                && msg["params"]["update"]["sessionUpdate"] == "usage_update"
+            {
+                found_usage = Some(msg["params"]["update"].clone());
+            }
+        }
+        assert!(found_response, "must respond to session/load");
+        let usage = found_usage.expect("usage_update must be sent during load_session");
+        assert_eq!(usage["used"], 42_000);
+        assert_eq!(usage["size"], params.model.context_window);
     }
 }
 

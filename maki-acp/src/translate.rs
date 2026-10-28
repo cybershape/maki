@@ -373,6 +373,14 @@ pub fn map_done_reason(reason: DoneReason) -> StopReason {
     }
 }
 
+pub fn gauge_usage_update(used: u64, size: u64, cost_total: Option<f64>) -> SessionUpdate {
+    let mut update = UsageUpdate::new(used, size);
+    if let Some(cost) = cost_total {
+        update = update.cost(Cost::new(cost, CURRENCY));
+    }
+    SessionUpdate::UsageUpdate(update)
+}
+
 /// Per ACP "Session Usage Updates": the current context gauge plus the
 /// session's cumulative cost. Each turn's event only carries its own turn's
 /// share, so the caller tracks the running total across turns.
@@ -380,11 +388,7 @@ pub fn usage_update(event: &TurnCompleteEvent, cost_total: Option<f64>) -> Sessi
     let used = event
         .context_size
         .unwrap_or_else(|| event.usage.context_tokens()) as u64;
-    let mut update = UsageUpdate::new(used, u64::from(event.context_window));
-    if let Some(cost) = cost_total {
-        update = update.cost(Cost::new(cost, CURRENCY));
-    }
-    SessionUpdate::UsageUpdate(update)
+    gauge_usage_update(used, u64::from(event.context_window), cost_total)
 }
 
 /// A replayed card is named by its observation's place in history, which
@@ -898,6 +902,20 @@ mod tests {
             context_size,
             context_window,
         }
+    }
+
+    #[test]
+    fn gauge_usage_update_with_and_without_cost() {
+        let json = serde_json::to_value(gauge_usage_update(0, 200_000, None)).unwrap();
+        assert_eq!(json["sessionUpdate"], "usage_update");
+        assert_eq!(json["used"], 0);
+        assert_eq!(json["size"], 200_000);
+        assert!(json.get("cost").is_none());
+
+        let json = serde_json::to_value(gauge_usage_update(5000, 200_000, Some(0.042))).unwrap();
+        assert_eq!(json["used"], 5000);
+        assert_eq!(json["cost"]["amount"], 0.042);
+        assert_eq!(json["cost"]["currency"], CURRENCY);
     }
 
     #[test]
