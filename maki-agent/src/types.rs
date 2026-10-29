@@ -1045,6 +1045,19 @@ pub struct InlineStyle {
     pub reversed: bool,
 }
 
+/// Wall-clock metrics of the request behind a turn.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct TurnTiming {
+    /// Request start to response complete, including every retried attempt
+    /// before the one that answered.
+    pub elapsed_ms: u64,
+    /// Request start to the provider's first content event. `None` when no
+    /// content ever streamed.
+    pub ttft_ms: Option<u64>,
+    /// Time the model spent streaming thinking content.
+    pub thinking_ms: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct TurnCompleteEvent {
     pub message: Message,
@@ -1067,6 +1080,10 @@ pub struct TurnCompleteEvent {
     /// The model's context window, so consumers can gauge `context_size`
     /// against the ceiling without resolving the model.
     pub context_window: u32,
+    /// How long the request behind this turn took, frontends render it as a
+    /// per-turn stats line. All zero on history replay, where no request ran.
+    #[serde(default)]
+    pub timing: TurnTiming,
 }
 
 /// What one run spent, itself and everything it spawned.

@@ -21,7 +21,7 @@ use super::frame::{
 use super::history::{History, sanitize_cancelled_history};
 use super::hook::{AgentHooks, AgentSlot};
 use super::instructions::{CallInstructions, LoadedInstructions};
-use super::streaming::{StreamError, StreamRequest, stream_with_retry};
+use super::streaming::{StreamError, StreamRequest, StreamedResponse, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::{McpSession, ToolDeferral};
@@ -34,7 +34,7 @@ use crate::tools::{
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
     ExtractedCommand, InputSource, InterruptSource, RunLedger, SessionMailbox, SteerKind,
-    TurnCompleteEvent,
+    TurnCompleteEvent, TurnTiming,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::{MakiId, SessionRef};
@@ -558,7 +558,7 @@ impl<'h> Agent<'h> {
         let Some((system, tools)) = self.history.request_prefix() else {
             return Err(no_frame());
         };
-        let response = match stream_with_retry(
+        let StreamedResponse { response, timing } = match stream_with_retry(
             StreamRequest {
                 provider: &*self.provider,
                 model: &self.model,
@@ -626,7 +626,7 @@ impl<'h> Agent<'h> {
         );
 
         // The gauge already took the provider's own count inside the stream.
-        self.emit_turn_complete(&response)?;
+        self.emit_turn_complete(&response, timing)?;
 
         if has_tools {
             let history_len_before = self.history.len();
@@ -863,7 +863,11 @@ impl<'h> Agent<'h> {
         }
     }
 
-    fn emit_turn_complete(&self, response: &StreamResponse) -> Result<(), AgentError> {
+    fn emit_turn_complete(
+        &self,
+        response: &StreamResponse,
+        timing: TurnTiming,
+    ) -> Result<(), AgentError> {
         let cost = self.model.billed_cost(&response.usage, self.opts.fast);
         // The ledger banks the un-subsidised list price for every model, not
         // just subsidised ones, so `Done.list_cost` is a real total on a
@@ -886,6 +890,7 @@ impl<'h> Agent<'h> {
                     .subsidised_list_cost(&response.usage, self.opts.fast),
                 context_size: Some(self.gauge.size()),
                 context_window: self.model.context_window,
+                timing,
             })))
     }
 

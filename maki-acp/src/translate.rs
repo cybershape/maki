@@ -901,6 +901,7 @@ mod tests {
             subsidised_list_cost: None,
             context_size,
             context_window,
+            timing: Default::default(),
         }
     }
 

@@ -1801,6 +1801,7 @@ mod tests {
             subsidised_list_cost: None,
             context_size: None,
             context_window: CONTEXT_WINDOW,
+            timing: Default::default(),
         })
     }
 

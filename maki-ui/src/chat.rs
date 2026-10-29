@@ -21,11 +21,11 @@ use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_N
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
     AgentEvent, BufferSnapshot, DisplayItem, SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput,
-    ToolStartEvent, display_order,
+    ToolStartEvent, TurnCompleteEvent, display_order,
 };
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::{LuaCommandInfo, WinView};
-use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
+use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role, format_tokens};
 use maki_storage::id::MakiId;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -189,6 +189,7 @@ impl Chat {
                 }
             }
             AgentEvent::TurnComplete(turn) => {
+                let stats = turn_stats_line(&turn);
                 for block in turn.message.content {
                     if let ContentBlock::Image { source } = block {
                         self.messages_panel.flush();
@@ -198,6 +199,11 @@ impl Chat {
                             vec![source],
                         ));
                     }
+                }
+                if let Some(line) = stats {
+                    self.messages_panel.flush();
+                    self.messages_panel
+                        .push(DisplayMessage::new(DisplayRole::Notice, line));
                 }
             }
             AgentEvent::ToolResultsSubmitted { .. } => {
@@ -925,13 +931,59 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
     map
 }
 
+/// The one-line timing and token readout a turn ends with. `None` when the
+/// event carries no timing, which is how a replayed turn's reconstructed
+/// `TurnComplete` arrives.
+fn turn_stats_line(turn: &TurnCompleteEvent) -> Option<String> {
+    if turn.timing.elapsed_ms == 0 {
+        return None;
+    }
+    let usage = &turn.usage;
+    let elapsed_secs = (turn.timing.elapsed_ms as f64 / 1000.0).max(0.001);
+    let tps = (usage.output as f64 / elapsed_secs).round() as u64;
+    let total_input = usage.total_input();
+    let cache = (usage.cache_read as u64 * 100)
+        .checked_div(total_input.max(1) as u64)
+        .unwrap_or(0);
+    let ttft = turn
+        .timing
+        .ttft_ms
+        .map_or_else(String::new, |ms| format!(" · TTFT {} avg", fmt_secs(ms)));
+    Some(format!(
+        "Turn took {} · thought for {} · ↑{} ↓{} · {} tok/s avg{} · cache {}% avg",
+        fmt_secs(turn.timing.elapsed_ms),
+        fmt_secs(turn.timing.thinking_ms),
+        format_tokens(total_input),
+        format_tokens(usage.output),
+        tps,
+        ttft,
+        cache,
+    ))
+}
+
+/// `0s`, `4.5s`, `10s`, `1m30s`.
+fn fmt_secs(ms: u64) -> String {
+    if ms == 0 {
+        return "0s".into();
+    }
+    if ms >= 60_000 {
+        format!("{}m{}s", ms / 60_000, ms % 60_000 / 1_000)
+    } else if ms >= 10_000 {
+        format!("{}s", (ms + 500) / 1_000)
+    } else {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::components::IMAGE_PLACEHOLDER;
-    use maki_agent::{AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
+    use maki_agent::{
+        AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent, TurnTiming,
+    };
     use maki_config::UiConfig;
-    use maki_providers::ImageMediaType;
+    use maki_providers::{ImageMediaType, TokenUsage};
     use test_case::test_case;
 
     const IMAGE_DATA: &str = "dGVzdA==";
@@ -939,6 +991,67 @@ mod tests {
 
     fn image() -> ImageSource {
         ImageSource::new(ImageMediaType::Png, Arc::from(IMAGE_DATA))
+    }
+
+    #[test]
+    fn turn_stats_line_reads_timing_and_usage() {
+        let turn = TurnCompleteEvent {
+            message: Message::default(),
+            usage: TokenUsage {
+                input: 200,
+                output: 725,
+                cache_creation: 0,
+                cache_read: 6_200,
+                ..Default::default()
+            },
+            model: String::new(),
+            cost: None,
+            subsidised_list_cost: None,
+            context_size: None,
+            context_window: 0,
+            timing: TurnTiming {
+                elapsed_ms: 10_800,
+                ttft_ms: Some(4_500),
+                thinking_ms: 0,
+            },
+        };
+        assert_eq!(
+            turn_stats_line(&turn).unwrap(),
+            "Turn took 11s · thought for 0s · ↑6.4k ↓725 · 67 tok/s avg · TTFT 4.5s avg · cache 96% avg"
+        );
+    }
+
+    #[test]
+    fn turn_stats_line_skips_timingless_events() {
+        assert!(
+            turn_stats_line(&TurnCompleteEvent {
+                timing: TurnTiming::default(),
+                ..turn_event()
+            })
+            .is_none()
+        );
+    }
+
+    fn turn_event() -> TurnCompleteEvent {
+        TurnCompleteEvent {
+            message: Message::default(),
+            usage: TokenUsage::default(),
+            model: String::new(),
+            cost: None,
+            subsidised_list_cost: None,
+            context_size: None,
+            context_window: 0,
+            timing: TurnTiming::default(),
+        }
+    }
+
+    #[test_case(0, "0s" ; "zero")]
+    #[test_case(500, "0.5s" ; "sub_second")]
+    #[test_case(4_500, "4.5s" ; "fractional")]
+    #[test_case(10_800, "11s" ; "whole_seconds")]
+    #[test_case(65_000, "1m5s" ; "minutes")]
+    fn fmt_secs_display(ms: u64, expected: &str) {
+        assert_eq!(fmt_secs(ms), expected);
     }
 
     #[test_case(USER_TEXT, USER_TEXT ; "captioned")]
@@ -1028,6 +1141,7 @@ mod tests {
                 subsidised_list_cost: None,
                 context_size: None,
                 context_window: 0,
+                timing: Default::default(),
             })),
             None,
         );

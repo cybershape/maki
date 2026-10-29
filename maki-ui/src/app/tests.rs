@@ -445,6 +445,7 @@ fn turn_complete(usage: TokenUsage, model: &str, cost: Option<f64>) -> AgentEven
         subsidised_list_cost: None,
         context_size: None,
         context_window: 0,
+        timing: Default::default(),
     }))
 }
 

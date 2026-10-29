@@ -2128,6 +2128,7 @@ mod tests {
             subsidised_list_cost: None,
             context_size: None,
             context_window: 0,
+            timing: Default::default(),
         }))
     }
 

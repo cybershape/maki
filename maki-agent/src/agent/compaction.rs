@@ -4,8 +4,7 @@ use std::env;
 use maki_config::AgentConfig;
 use maki_providers::retry::RetryPolicy;
 use maki_providers::{
-    ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
-    StreamResponse, TokenUsage,
+    ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role, TokenUsage,
 };
 use serde_json::{Value, json};
 use tracing::info;
@@ -13,7 +12,9 @@ use tracing::info;
 use super::frame::{RunContext, fit_frame};
 use super::history::{History, remove_orphaned_tool_results, strip_thinking};
 use super::hook::{AgentHooks, AgentSlot};
-use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry};
+use super::streaming::{
+    StreamError, StreamRequest, StreamedResponse, min_output, stream_with_retry,
+};
 use crate::mcp::McpSession;
 use crate::prompt::COMPACTION_USER;
 use crate::tools::hook::Verdict;
@@ -234,12 +235,12 @@ pub(super) async fn compact_history(
         )
         .await
         {
-            Ok(response) => {
+            Ok(streamed) => {
                 if attempt > 0 {
                     info!(attempt, "compaction succeeded after pruning history");
                 }
                 return finish_compact(
-                    response,
+                    streamed,
                     history,
                     summarized,
                     event_tx,
@@ -265,13 +266,14 @@ pub(super) async fn compact_history(
 }
 
 fn finish_compact(
-    response: StreamResponse,
+    streamed: StreamedResponse,
     history: &mut History,
     summarized: usize,
     event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
 ) -> Result<Compacted, AgentError> {
+    let response = streamed.response;
     let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
         message: response.message.clone(),
         usage: response.usage,
@@ -280,6 +282,7 @@ fn finish_compact(
         subsidised_list_cost: model.subsidised_list_cost(&response.usage, false),
         context_size: Some(response.usage.output),
         context_window: model.context_window,
+        timing: streamed.timing,
     })));
 
     // Swapping the history for a summary the model never wrote would throw the
