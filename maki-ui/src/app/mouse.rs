@@ -303,7 +303,13 @@ impl App {
             .find(SelectionZone::Messages)
             .map(|z| {
                 let a = z.area;
-                Rect::new(a.x, a.y, a.width.saturating_sub(1), a.height)
+                let pad_left = u16::from(a.width >= 2);
+                Rect::new(
+                    a.x + pad_left,
+                    a.y,
+                    a.width.saturating_sub(1 + pad_left),
+                    a.height,
+                )
             })
             .unwrap_or_default()
     }

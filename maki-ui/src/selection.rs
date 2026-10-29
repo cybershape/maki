@@ -15,9 +15,9 @@
 //! While a selection is active, `has_selection` freezes auto-scroll in the
 //! messages panel so the viewport stays put while the user drags.
 //!
-//! The rightmost column of each area is reserved for the scrollbar, so
-//! `highlight_area()` / `msg_area()` are 1 column narrower than the full
-//! area and all column math uses `width - 1`.
+//! The rightmost column of each area is reserved for the scrollbar, and the
+//! leftmost column of the messages area has 1 column of padding, so
+//! `highlight_area()` / `msg_area()` are narrower than the full area.
 
 use std::cmp::Ordering;
 use std::ops::Range;
@@ -198,12 +198,15 @@ impl Selection {
 
     pub fn highlight_area(&self) -> Rect {
         match self.zone {
-            SelectionZone::Messages => Rect::new(
-                self.area.x,
-                self.area.y,
-                self.area.width.saturating_sub(1),
-                self.area.height,
-            ),
+            SelectionZone::Messages => {
+                let pad_left = u16::from(self.area.width >= 2);
+                Rect::new(
+                    self.area.x + pad_left,
+                    self.area.y,
+                    self.area.width.saturating_sub(1 + pad_left),
+                    self.area.height,
+                )
+            }
             _ => self.area,
         }
     }
@@ -1200,5 +1203,12 @@ mod tests {
             &mut RowCarry::default(),
         );
         assert_eq!(out, "好");
+    }
+
+    #[test]
+    fn messages_highlight_area_excludes_both_scrollbar_and_left_padding() {
+        let area = Rect::new(0, 0, 80, 24);
+        let sel = Selection::start(DocPos::flat(0, 0), area, SelectionZone::Messages);
+        assert_eq!(sel.highlight_area(), Rect::new(1, 0, 78, 24));
     }
 }

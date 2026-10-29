@@ -141,7 +141,7 @@ impl MessagesPanel {
             scroll: ScrollPos::default(),
             auto_scroll: true,
             viewport_height: 24,
-            viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(1)),
+            viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(2)),
             cache: SegmentCache::new(),
             hl_worker: RenderWorker::new(),
             image_picker: terminal_image::picker(ui_config.inline_images),
@@ -1239,7 +1239,8 @@ impl MessagesPanel {
         lua_commands: &[LuaCommandInfo],
     ) {
         self.viewport_height = area.height;
-        let width = area.width.saturating_sub(1);
+        let pad_left = u16::from(area.width >= 2);
+        let width = area.width.saturating_sub(1 + pad_left);
         let theme_gen = theme::generation();
         let theme_changed = self.theme_generation != theme_gen;
         let needs_reflow = self.viewport_width != width || theme_changed;
@@ -1303,7 +1304,7 @@ impl MessagesPanel {
         self.reflow_viewport(width);
         self.resolve_scroll(has_selection);
 
-        let viewport = Rect::new(area.x, area.y, width, area.height);
+        let viewport = Rect::new(area.x + pad_left, area.y, width, area.height);
         let mut cursor = RenderCursor::new(self.scroll.row, viewport);
 
         let mut last_drawn = self.scroll.seg;
@@ -1334,7 +1335,7 @@ impl MessagesPanel {
             let label = " Processing ";
             let label_width = label.len() as u16;
             let total_width = label_width + bar_width;
-            let bar_x = area.x + width.saturating_sub(total_width);
+            let bar_x = viewport.x + width.saturating_sub(total_width);
             let bar_y = area.y + area.height.saturating_sub(1);
             let bar_area = Rect::new(bar_x, bar_y, total_width, 1);
             crate::components::progress_bar::render(

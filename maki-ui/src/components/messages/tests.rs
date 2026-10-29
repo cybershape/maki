@@ -3119,7 +3119,7 @@ fn resize_reflows_sealed_groups(tools: usize, thinking: usize) {
             .rev()
             .take(tools + thinking)
         {
-            assert_eq!(line.width(), usize::from(to - 1));
+            assert_eq!(line.width(), usize::from(to - 2));
             assert!(
                 line.to_string().ends_with(GROUP_RESIZE_DURATION_TEXT)
                     || line.to_string().ends_with(GROUP_RESIZE_TOKENS_TEXT)
@@ -3722,4 +3722,20 @@ fn compact_tools_header_snapshot_updates_group_entry_summary() {
             .to_string()
             .contains(HEADER_TEXT)
     );
+}
+
+const LEFT_PAD_MSG: &str = "leftmost column must be blank padding";
+const MESSAGE_START_CHAR: &str = "y";
+
+#[test]
+fn messages_panel_renders_with_left_padding() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
+    let terminal = render(&mut panel, 80, 10);
+    let buf = terminal.backend().buffer();
+
+    for y in 0..buf.area.height {
+        assert_eq!(buf[(0, y)].symbol(), " ", "{LEFT_PAD_MSG}");
+    }
+    assert_eq!(buf[(1, 0)].symbol(), MESSAGE_START_CHAR);
 }
