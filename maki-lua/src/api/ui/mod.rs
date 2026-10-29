@@ -1577,6 +1577,8 @@ fn span_style_to_lua(lua: &Lua, span: &maki_markdown::render::Span) -> LuaResult
             mlua::Value::Table(tbl)
         }
         StyleToken::CodeBar => mlua::Value::String(lua.create_string("code_gutter")?),
+        StyleToken::MathBar => mlua::Value::String(lua.create_string("math_gutter")?),
+        StyleToken::Math => mlua::Value::String(lua.create_string("math")?),
         StyleToken::Heading => mlua::Value::String(lua.create_string("heading")?),
         StyleToken::ListMarker => mlua::Value::String(lua.create_string("list_marker")?),
         StyleToken::TableBorder => mlua::Value::String(lua.create_string("table_border")?),

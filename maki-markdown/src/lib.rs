@@ -4,6 +4,7 @@
 //! `Emphasis` (bold, italic, strike). They compose freely, so `***x***` is
 //! bold+italic, and code inside bold keeps both.
 
+pub mod math;
 pub mod render;
 
 const BULLET: &str = "• ";
@@ -69,6 +70,7 @@ impl Emphasis {
 pub enum SpanKind {
     Text,
     Code,
+    Math,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,6 +93,14 @@ impl InlineSpan {
         Self {
             text: text.into(),
             kind: SpanKind::Code,
+            emphasis,
+        }
+    }
+
+    pub fn math(text: impl Into<String>, emphasis: Emphasis) -> Self {
+        Self {
+            text: text.into(),
+            kind: SpanKind::Math,
             emphasis,
         }
     }
@@ -124,6 +134,9 @@ pub enum Block {
         rows: Vec<Vec<String>>,
         header_end: usize,
     },
+    Math {
+        source: String,
+    },
 }
 
 pub fn parse(text: &str) -> Vec<Block> {
@@ -134,10 +147,16 @@ pub fn parse(text: &str) -> Vec<Block> {
         if !before.is_empty() {
             blocks.extend(split_normal_blocks(before));
         }
-        blocks.push(Block::Code {
-            lang: fence.lang.to_owned(),
-            code: fence.code.to_owned(),
-        });
+        if fence.lang.eq_ignore_ascii_case("math") || fence.lang.eq_ignore_ascii_case("latex") {
+            blocks.push(Block::Math {
+                source: fence.code.to_owned(),
+            });
+        } else {
+            blocks.push(Block::Code {
+                lang: fence.lang.to_owned(),
+                code: fence.code.to_owned(),
+            });
+        }
     }
     let rest = &text[fences.pos..];
     if !rest.is_empty() {
@@ -197,6 +216,101 @@ fn split_normal_blocks(text: &str) -> Vec<Block> {
 
     while i < lines_with_offsets.len() {
         let (_, line) = lines_with_offsets[i];
+        let trimmed = line.trim();
+
+        let is_single_line_math =
+            (trimmed.starts_with("$$") && trimmed.ends_with("$$") && trimmed.len() > 4)
+                || (trimmed.starts_with("\\[") && trimmed.ends_with("\\]") && trimmed.len() > 4);
+        if is_single_line_math {
+            if let Some(ns) = normal_start.take() {
+                let start = lines_with_offsets[ns].0;
+                let end = lines_with_offsets[i].0;
+                let slice = text[start..end].trim_matches('\n');
+                if !slice.is_empty() {
+                    blocks.push(Block::Lines(lines_to_blocks(slice)));
+                }
+            }
+            blocks.push(Block::Math {
+                source: trimmed.to_owned(),
+            });
+            i += 1;
+            continue;
+        }
+
+        if trimmed == "$$" || (trimmed.starts_with("$$") && !trimmed[2..].contains("$$")) {
+            if let Some(ns) = normal_start.take() {
+                let start = lines_with_offsets[ns].0;
+                let end = lines_with_offsets[i].0;
+                let slice = text[start..end].trim_matches('\n');
+                if !slice.is_empty() {
+                    blocks.push(Block::Lines(lines_to_blocks(slice)));
+                }
+            }
+            let mut j = i + 1;
+            let mut closed = false;
+            while j < lines_with_offsets.len() {
+                let t = lines_with_offsets[j].1.trim();
+                if t == "$$" || t.ends_with("$$") {
+                    closed = true;
+                    break;
+                }
+                j += 1;
+            }
+            let end_idx = if closed {
+                j
+            } else {
+                lines_with_offsets.len() - 1
+            };
+            let start = lines_with_offsets[i].0;
+            let end = lines_with_offsets[end_idx].0 + lines_with_offsets[end_idx].1.len();
+            blocks.push(Block::Math {
+                source: text[start..end].to_owned(),
+            });
+            i = if closed {
+                j + 1
+            } else {
+                lines_with_offsets.len()
+            };
+            continue;
+        }
+
+        if trimmed == "\\[" || (trimmed.starts_with("\\[") && !trimmed[2..].contains("\\]")) {
+            if let Some(ns) = normal_start.take() {
+                let start = lines_with_offsets[ns].0;
+                let end = lines_with_offsets[i].0;
+                let slice = text[start..end].trim_matches('\n');
+                if !slice.is_empty() {
+                    blocks.push(Block::Lines(lines_to_blocks(slice)));
+                }
+            }
+            let mut j = i + 1;
+            let mut closed = false;
+            while j < lines_with_offsets.len() {
+                let t = lines_with_offsets[j].1.trim();
+                if t == "\\]" || t.ends_with("\\]") {
+                    closed = true;
+                    break;
+                }
+                j += 1;
+            }
+            let end_idx = if closed {
+                j
+            } else {
+                lines_with_offsets.len() - 1
+            };
+            let start = lines_with_offsets[i].0;
+            let end = lines_with_offsets[end_idx].0 + lines_with_offsets[end_idx].1.len();
+            blocks.push(Block::Math {
+                source: text[start..end].to_owned(),
+            });
+            i = if closed {
+                j + 1
+            } else {
+                lines_with_offsets.len()
+            };
+            continue;
+        }
+
         if is_table_row(line) {
             let table_start = i;
             let header_cols = parse_table_cells(line).len();
@@ -550,6 +664,30 @@ fn parse_inline_impl(text: &str, base: Emphasis, mode: ParseMode) -> Vec<InlineS
             }
             pos += run_len;
             continue;
+        }
+
+        if mode == ParseMode::WithCode
+            && bytes[pos] == b'$'
+            && pos + 1 < bytes.len()
+            && bytes[pos + 1] != b'$'
+            && bytes[pos + 1] != b' '
+            && !bytes[pos + 1].is_ascii_digit()
+            && let Some(close_rel) = bytes[pos + 1..].iter().position(|&b| b == b'$')
+        {
+            let close = pos + 1 + close_rel;
+            if close > pos + 1 && bytes[close - 1] != b' ' {
+                let content = &text[pos + 1..close];
+                if !content.is_empty() {
+                    flush_plain(&mut spans, &text[plain_start..pos], base, mode);
+                    spans.push(InlineSpan::math(
+                        crate::math::linearize_latex(content),
+                        base,
+                    ));
+                    pos = close + 1;
+                    plain_start = pos;
+                    continue;
+                }
+            }
         }
 
         let outcome = match bytes[pos] {
@@ -1261,5 +1399,53 @@ mod tests {
         let strip =
             |s: &str| -> String { s.chars().filter(|c| !STRIP_DELIMS.contains(c)).collect() };
         assert_eq!(strip(&visible), strip(input));
+    }
+
+    #[test]
+    fn parse_single_line_display_math() {
+        let input = "$$\\text{Cache Hit Rate} = \\frac{a}{b}$$";
+        let blocks = parse(input);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0],
+            Block::Math {
+                source: input.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_multi_line_display_math() {
+        let input = "$$\n\\text{Cache Hit Rate} = \\frac{a}{b}\n$$";
+        let blocks = parse(input);
+        assert_eq!(blocks.len(), 1);
+        let Block::Math { source } = &blocks[0] else {
+            panic!("expected Math block");
+        };
+        assert!(source.contains("\\frac{a}{b}"));
+    }
+
+    #[test]
+    fn parse_code_fence_math() {
+        let input = "```math\n\\text{Cache Hit Rate} = \\frac{a}{b}\n```";
+        let blocks = parse(input);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0],
+            Block::Math {
+                source: "\\text{Cache Hit Rate} = \\frac{a}{b}".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_inline_math() {
+        let input = "formula $E = mc^2$ in text";
+        let spans = parse_inline(input);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].text, "formula ");
+        assert_eq!(spans[1].kind, SpanKind::Math);
+        assert_eq!(spans[1].text, "E = mc^2");
+        assert_eq!(spans[2].text, " in text");
     }
 }

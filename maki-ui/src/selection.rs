@@ -454,7 +454,10 @@ pub(crate) fn strip_code_bar_prefix(
     out: &mut String,
     line_start: usize,
 ) -> usize {
-    if cell.style().fg != theme::current().code_gutter.fg || cell.symbol() != "│" {
+    let gutter_fg = theme::current().code_gutter.fg;
+    let math_gutter_fg = theme::current().math_gutter.fg;
+    if (cell.style().fg != gutter_fg && cell.style().fg != math_gutter_fg) || cell.symbol() != "│"
+    {
         return 0;
     }
     let line = &out[line_start..];

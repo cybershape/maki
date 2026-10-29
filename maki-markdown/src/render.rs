@@ -31,6 +31,7 @@ const LONG_LINE_SUFFIX: &str = "...";
 pub enum StyleToken {
     Text,
     InlineCode,
+    Math,
     /// Syntax-highlighted token. Carries the resolved color + modifiers so the
     /// consumer doesn't need to know the language.
     Highlight {
@@ -40,6 +41,7 @@ pub enum StyleToken {
         underline: bool,
     },
     CodeBar,
+    MathBar,
     Heading,
     ListMarker,
     TableBorder,
@@ -77,6 +79,7 @@ pub enum LineKind {
     Heading,
     ListItem,
     Code,
+    Math,
     TableBorder,
     TableRow,
     HorizontalRule,
@@ -301,6 +304,24 @@ fn render_block(
             ensure_blank_line(lines);
             state.table_idx += 1;
         }
+        Block::Math { source } => {
+            ensure_blank_line(lines);
+            let available_width = if ctx.width > 2 {
+                (ctx.width - 2) as usize
+            } else {
+                ctx.width as usize
+            };
+            let math_lines = crate::math::render_math_lines(source, available_width);
+            for ml in math_lines {
+                let mut spans = vec![Span::new(CODE_BAR, StyleToken::MathBar)];
+                spans.push(Span::new(ml, StyleToken::Math));
+                lines.push(Line {
+                    kind: LineKind::Math,
+                    spans,
+                });
+            }
+            ensure_blank_line(lines);
+        }
     }
 }
 
@@ -335,6 +356,8 @@ fn render_line_block(lb: &LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
         // code colours on top. The Lua bridge collapses to one name per span.
         let style = if sk == SpanKind::Code {
             StyleToken::InlineCode
+        } else if sk == SpanKind::Math {
+            StyleToken::Math
         } else if is_heading {
             StyleToken::Heading
         } else {
@@ -648,6 +671,8 @@ fn cell_spans(cell: &str, header: bool) -> Vec<Span> {
                 }
                 let style = if kind == SpanKind::Code {
                     StyleToken::InlineCode
+                } else if kind == SpanKind::Math {
+                    StyleToken::Math
                 } else {
                     StyleToken::Text
                 };
@@ -1453,5 +1478,15 @@ mod tests {
             trunc.iter().any(|l| l.kind == LineKind::TableBorder),
             "table detection survives truncation (parser is lenient about missing closing |)"
         );
+    }
+
+    #[test]
+    fn render_display_math_block_emits_math_lines() {
+        let text = "$$\\text{Cache Hit Rate} = \\frac{\\text{cache\\_read}}{\\text{total\\_input}} = \\frac{\\text{cache\\_read}}{\\text{input} + \\text{cache\\_read} + \\text{cache\\_creation}}$$";
+        let lines = render(text, 120);
+        let math_lines: Vec<_> = lines.iter().filter(|l| l.kind == LineKind::Math).collect();
+        assert_eq!(math_lines.len(), 3);
+        assert_eq!(math_lines[0].spans[0].style, StyleToken::MathBar);
+        assert_eq!(math_lines[0].spans[1].style, StyleToken::Math);
     }
 }
