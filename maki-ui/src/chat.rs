@@ -20,11 +20,13 @@ use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_N
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
     AgentEvent, BufferSnapshot, DisplayItem, SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput,
-    ToolStartEvent, TurnCompleteEvent, display_order,
+    ToolStartEvent, TurnCompleteEvent, TurnTiming, display_order,
 };
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::{LuaCommandInfo, WinView};
-use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role, format_tokens};
+use maki_providers::{
+    ContentBlock, ImageSource, Message, RequestOptions, Role, TokenUsage, format_tokens,
+};
 use maki_storage::id::MakiId;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -235,7 +237,8 @@ impl Chat {
             }
             AgentEvent::Error { message, .. } => {
                 self.messages_panel.flush();
-                self.push_turn_stats_line(&self.pending_turn_stats.usage);
+                let usage = self.pending_turn_stats.usage;
+                self.push_turn_stats_line(&usage);
                 return ChatEventResult::Error(message);
             }
             AgentEvent::PermissionRequest {
@@ -1108,19 +1111,6 @@ mod tests {
             .filter(|m| matches!(m.role, DisplayRole::Notice))
             .map(|m| m.text.as_str())
             .collect()
-    }
-
-    fn turn_event() -> TurnCompleteEvent {
-        TurnCompleteEvent {
-            message: Message::default(),
-            usage: TokenUsage::default(),
-            model: String::new(),
-            cost: None,
-            subsidised_list_cost: None,
-            context_size: None,
-            context_window: 0,
-            timing: TurnTiming::default(),
-        }
     }
 
     #[test_case(0, "0s" ; "zero")]
