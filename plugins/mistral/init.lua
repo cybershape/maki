@@ -4,6 +4,29 @@ local parse = require("maki.provider_parse")
 
 local MODELS_PATH = "/models"
 
+-- Rows whose cards publish an effort ladder wider than the provider default,
+-- as the API answers when asked: medium is refused outside Large 4, and the
+-- GLM rows split between a full and a low/high/max ladder. The /models
+-- listing says nothing about effort, so the knowledge rides on the row and
+-- narrows `openai.thinking` for that model at request time; adaptive keeps
+-- the dialect's high. Longest prefix first.
+local LADDERS = {
+  { "mistral-large-4", { supported = { "low", "medium", "high" } } },
+  { "zai-glm-5-2", { supported = { "low", "medium", "high", "xhigh", "max" } } },
+  { "glm-5-2", { supported = { "low", "medium", "high", "xhigh", "max" } } },
+  { "zai-glm-5", { supported = { "low", "high", "max" } } },
+  { "zai-glm-latest", { supported = { "low", "high", "max" } } },
+  { "deepseek-", { supported = { "low", "high", "xhigh", "max" } } },
+}
+
+local function effort_ladder(id)
+  for _, ladder in ipairs(LADDERS) do
+    if id:sub(1, #ladder[1]) == ladder[1] then
+      return ladder[2]
+    end
+  end
+end
+
 -- Mistral takes reasoning back as a `thinking` part at the front of the
 -- assistant turn's `content`, not as the `reasoning_content` the codec writes.
 -- A non-string `reasoning_content` is dropped.
@@ -39,6 +62,7 @@ local function parse_model(m)
     context_window = parse.as_u32(m.max_context_length),
     supports_thinking = parse.as_bool(capabilities.reasoning),
     supports_vision = capabilities.vision == true,
+    effort = effort_ladder(m.id),
   }
 end
 
