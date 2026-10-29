@@ -4,7 +4,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::app::tasks::{TaskOutcome, TaskStatus};
 use crate::components::input::Draft;
@@ -594,19 +593,6 @@ pub fn history_to_display(
         }) = display.last_mut()
         {
             g.sealed = true;
-            if g.duration.is_none() {
-                let sum: Duration = g
-                    .entries
-                    .iter()
-                    .filter_map(|e| match e {
-                        GroupEntry::Tool(t) => t.duration,
-                        _ => None,
-                    })
-                    .sum();
-                if !sum.is_zero() {
-                    g.duration = Some(sum);
-                }
-            }
         }
     };
 
@@ -624,7 +610,6 @@ pub fn history_to_display(
         }
         match msg.role {
             Role::User => {
-                seal_last_group(&mut display);
                 // An empty `display_text` marks a message the transcript never
                 // shows, so its attachments must not sneak in either.
                 if msg.display_text.as_deref() == Some("") {
@@ -633,6 +618,7 @@ pub fn history_to_display(
                 let images = user_images(msg);
                 let text = msg.user_text();
                 if text.is_some() || !images.is_empty() {
+                    seal_last_group(&mut display);
                     display.push(DisplayMessage::with_images(
                         DisplayRole::User,
                         text.unwrap_or_default().to_owned(),
@@ -764,7 +750,7 @@ pub fn history_to_display(
                                     status,
                                     receiving_args: false,
                                     started_at: None,
-                                    duration: None,
+                                    duration: stored.and_then(|o| o.duration()),
                                 };
                                 if let Some(DisplayMessage {
                                     role: DisplayRole::ToolGroup(g),
@@ -1664,16 +1650,26 @@ mod tests {
                         "bash",
                         serde_json::json!({"command": "cargo test"}),
                     ),
-                    ContentBlock::tool_use("t2", "read", serde_json::json!({"path": "src/lib.rs"})),
                 ],
                 ..Default::default()
             },
             Message {
                 role: Role::User,
-                content: vec![
-                    ContentBlock::tool_result("t1", "ok", false),
-                    ContentBlock::tool_result("t2", "code", false),
-                ],
+                content: vec![ContentBlock::tool_result("t1", "ok", false)],
+                ..Default::default()
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    "t2",
+                    "read",
+                    serde_json::json!({"path": "src/lib.rs"}),
+                )],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result("t2", "code", false)],
                 ..Default::default()
             },
             Message {
@@ -1684,8 +1680,15 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let display =
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), true).0;
+        let mut out1 = ToolOutput::Plain("ok".into());
+        out1.set_duration(std::time::Duration::from_millis(120));
+        let mut out2 = ToolOutput::Plain("code".into());
+        out2.set_duration(std::time::Duration::from_millis(30));
+        let outputs = HashMap::from([
+            ("t1".to_owned(), Arc::new(out1)),
+            ("t2".to_owned(), Arc::new(out2)),
+        ]);
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true).0;
         assert_eq!(display.len(), 3);
         assert_eq!(display[0].role, DisplayRole::User);
         let DisplayRole::ToolGroup(g) = &display[1].role else {
@@ -1694,8 +1697,13 @@ mod tests {
         assert!(g.sealed);
         assert_eq!(g.entries.len(), 3);
         assert!(matches!(&g.entries[0], GroupEntry::Thinking(th) if th.text == "thinking step"));
-        assert!(matches!(&g.entries[1], GroupEntry::Tool(t) if t.name.as_ref() == "bash"));
-        assert!(matches!(&g.entries[2], GroupEntry::Tool(t) if t.name.as_ref() == "read"));
+        assert!(
+            matches!(&g.entries[1], GroupEntry::Tool(t) if t.name.as_ref() == "bash" && t.duration == Some(std::time::Duration::from_millis(120)))
+        );
+        assert!(
+            matches!(&g.entries[2], GroupEntry::Tool(t) if t.name.as_ref() == "read" && t.duration == Some(std::time::Duration::from_millis(30)))
+        );
+        assert_eq!(g.total_duration(), std::time::Duration::from_millis(150));
         assert_eq!(display[2].role, DisplayRole::Assistant);
         assert_eq!(display[2].text, "all passed");
     }

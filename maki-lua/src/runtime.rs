@@ -3754,7 +3754,7 @@ async fn compute_header(
 }
 
 async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Option<RestoreReply> {
-    let (func, plugin_name) = {
+    let (func, plugin_name, has_header) = {
         let plugins = plugins.borrow();
         let (pname, tk) = plugins.iter().find_map(|(pname, owner)| {
             owner
@@ -3762,8 +3762,24 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
                 .get(&*item.tool)
                 .map(|keys| (pname.clone(), keys))
         })?;
-        let key = tk.restore.as_ref()?;
-        (lua.registry_value::<Function>(key).ok()?, pname)
+        let func = tk
+            .restore
+            .as_ref()
+            .and_then(|key| lua.registry_value::<Function>(key).ok());
+        (func, pname, tk.header.is_some())
+    };
+    let Some(func) = func else {
+        if !has_header {
+            return None;
+        }
+        return Some(RestoreReply {
+            body: None,
+            header: Some(
+                compute_header(lua, plugins, &plugin_name, &item.tool, item.input)
+                    .await
+                    .into_snapshot(),
+            ),
+        });
     };
     let input_lua = json_to_lua(lua, &item.input).ok()?;
     let thread = lua.create_thread(func).ok()?;

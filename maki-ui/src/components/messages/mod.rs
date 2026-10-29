@@ -1616,19 +1616,25 @@ impl MessagesPanel {
         if theme_gen.is_some() {
             self.stop_watching(tool_id);
         }
-        if self.compact_tools && !is_header {
+        if self.compact_tools {
             let group_id = self.messages.iter_mut().rev().find_map(|msg| {
                 let DisplayRole::ToolGroup(group) = &mut msg.role else {
                     return None;
                 };
                 let entry = group.entries.iter_mut().find_map(|entry| match entry {
-                    GroupEntry::Tool(tool)
-                        if tool.id == tool_id && tool.name.as_ref() == tool_group::BATCH_TOOL =>
-                    {
-                        Some(tool)
-                    }
+                    GroupEntry::Tool(tool) if tool.id == tool_id => Some(tool),
                     _ => None,
                 })?;
+                if is_header {
+                    let header = snapshot.first_line_text();
+                    if !header.is_empty() {
+                        entry.summary = header;
+                    }
+                    return Some(group.id.clone());
+                }
+                if entry.name.as_ref() != tool_group::BATCH_TOOL {
+                    return Some(group.id.clone());
+                }
                 let mut children = tool_group::batch_children(&snapshot);
                 for (index, child) in children.iter_mut().enumerate() {
                     let previous = entry
@@ -1652,6 +1658,9 @@ impl MessagesPanel {
                     }
                 }
                 if !children.is_empty() {
+                    if entry.duration.is_none() && entry.status != ToolStatus::InProgress {
+                        entry.duration = children.iter().filter_map(|child| child.duration).max();
+                    }
                     entry.children = children;
                     entry.summary = format!("{} tools", entry.children.len());
                 }

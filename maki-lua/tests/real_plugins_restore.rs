@@ -580,3 +580,24 @@ fn batch_child_restore_sees_the_chat_and_reason() {
         );
     }
 }
+
+const VIEW_IMAGE_SRC: &str = include_str!("../../plugins/view_image/init.lua");
+const IMAGE_PATH: &str = "/tmp/diagram.png";
+
+#[test]
+fn header_only_tool_emits_header_snapshot_on_restore() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("view_image", VIEW_IMAGE_SRC).unwrap();
+
+    let r = restore(
+        &host,
+        "view_image",
+        json!({ "path": IMAGE_PATH }),
+        "",
+        None,
+        Vec::new(),
+    );
+
+    assert!(r.body.is_empty());
+    assert_eq!(r.header, IMAGE_PATH);
+}

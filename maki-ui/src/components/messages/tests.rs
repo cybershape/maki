@@ -3370,6 +3370,16 @@ fn compact_batch_children_follow_snapshots(restored: bool, cancelled: bool) {
     };
     let live = Arc::new(SharedBuf::new());
     if restored {
+        panel.tool_done(done(TOOL_ID));
+        panel.seal_open_group();
+        if let DisplayRole::ToolGroup(group) = &mut panel.messages[0].role {
+            group.started_at = None;
+            group.duration = None;
+            if let GroupEntry::Tool(batch) = &mut group.entries[0] {
+                batch.started_at = None;
+                batch.duration = None;
+            }
+        }
         panel.tool_snapshot(TOOL_ID, snapshot("tool_success"), Some(1));
     } else {
         live.set_lines(snapshot("spinner").lines.as_ref().clone());
@@ -3378,12 +3388,12 @@ fn compact_batch_children_follow_snapshots(restored: bool, cancelled: bool) {
         if !cancelled {
             live.set_lines(snapshot("tool_success").lines.as_ref().clone());
         }
-    }
-    if cancelled {
-        panel.cancel_in_progress();
-    } else {
-        panel.tool_done(done(TOOL_ID));
-        panel.seal_open_group();
+        if cancelled {
+            panel.cancel_in_progress();
+        } else {
+            panel.tool_done(done(TOOL_ID));
+            panel.seal_open_group();
+        }
     }
     let DisplayRole::ToolGroup(group) = &panel.messages[0].role else {
         panic!()
@@ -3399,6 +3409,10 @@ fn compact_batch_children_follow_snapshots(restored: bool, cancelled: bool) {
         batch.children[0].duration,
         Some(Duration::from_millis(1234))
     );
+    if restored {
+        assert_eq!(batch.duration, Some(Duration::from_millis(1234)));
+        assert_eq!(group.total_duration(), Duration::from_millis(1234));
+    }
     let rows = tool_group::build_tool_group_lines(group, VIEW_WIDTH, 0);
     assert!(rows.lines[1].to_string().ends_with("(1.23s)"));
     assert_eq!(
@@ -3668,4 +3682,44 @@ fn compact_tools_cancel_in_progress_drops_empty_waiting_group() {
 
     panel.cancel_in_progress();
     assert_eq!(panel.messages.len(), 0);
+}
+
+#[test]
+fn compact_tools_header_snapshot_updates_group_entry_summary() {
+    const TOOL_ID: &str = "index-1";
+    const HEADER_TEXT: &str = "~/src/agents/maki/README.md (16 lines)";
+
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            compact_tools: true,
+            ..Default::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel.tool_start(ToolStartEvent {
+        summary: "index".into(),
+        ..start(TOOL_ID, "index")
+    });
+    panel.tool_done(done(TOOL_ID));
+    panel.seal_open_group();
+    panel.rebuild_line_cache();
+
+    panel.tool_header_snapshot(
+        TOOL_ID,
+        BufferSnapshot::plain_text(HEADER_TEXT.into()),
+        Some(1),
+    );
+
+    let DisplayRole::ToolGroup(group) = &panel.messages[0].role else {
+        panic!("expected ToolGroup");
+    };
+    let GroupEntry::Tool(entry) = &group.entries[0] else {
+        panic!("expected GroupEntry::Tool");
+    };
+    assert_eq!(entry.summary, HEADER_TEXT);
+    assert!(
+        panel.cache.segments()[0].lines()[0]
+            .to_string()
+            .contains(HEADER_TEXT)
+    );
 }

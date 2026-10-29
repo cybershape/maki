@@ -186,6 +186,7 @@ pub async fn run(
     if let Some(source) = source {
         report(&done, name, &source, &input, took);
     }
+    Arc::make_mut(&mut done.output).set_duration(took);
     done.call = Some(Box::new(CallRecord {
         input: input.into_owned(),
         duration: took,

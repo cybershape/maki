@@ -151,6 +151,8 @@ pub struct TextOutput {
     /// [`ContentBlock::ToolResult`] for providers to expand.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub loaded_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 impl From<String> for TextOutput {
@@ -160,6 +162,7 @@ impl From<String> for TextOutput {
             instructions: None,
             state: None,
             loaded_tools: Vec::new(),
+            duration_ms: None,
         }
     }
 }
@@ -184,6 +187,8 @@ impl<'de> Deserialize<'de> for TextOutput {
                 state: Option<serde_json::Value>,
                 #[serde(default)]
                 loaded_tools: Vec<String>,
+                #[serde(default)]
+                duration_ms: Option<u64>,
             },
         }
         match Raw::deserialize(deserializer)? {
@@ -193,11 +198,13 @@ impl<'de> Deserialize<'de> for TextOutput {
                 instructions,
                 state,
                 loaded_tools,
+                duration_ms,
             } => Ok(Self {
                 text,
                 instructions,
                 state,
                 loaded_tools,
+                duration_ms,
             }),
         }
     }
@@ -335,6 +342,21 @@ impl ToolOutput {
         match self {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.state.as_ref(),
             _ => None,
+        }
+    }
+
+    pub fn duration(&self) -> Option<Duration> {
+        match self {
+            Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => {
+                t.duration_ms.map(Duration::from_millis)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn set_duration(&mut self, duration: Duration) {
+        if let Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) = self {
+            t.duration_ms = Some(duration.as_millis() as u64);
         }
     }
 
@@ -1316,6 +1338,7 @@ mod tests {
             instructions: None,
             state: Some(serde_json::json!({ "text": FILTERABLE_TEXT })),
             loaded_tools: Vec::new(),
+            duration_ms: None,
         }
     }
 
@@ -1783,6 +1806,7 @@ mod tests {
             instructions: Some(blocks),
             state: None,
             loaded_tools: Vec::new(),
+            duration_ms: Some(42),
         });
         let json = serde_json::to_string(&output).unwrap();
         let parsed: ToolOutput = serde_json::from_str(&json).unwrap();
@@ -1793,6 +1817,7 @@ mod tests {
                 assert_eq!(inst.len(), 1, "{MSG}");
                 assert_eq!(inst[0].path, "AGENTS.md", "{MSG}");
                 assert_eq!(inst[0].content, "be nice", "{MSG}");
+                assert_eq!(t.duration_ms, Some(42), "{MSG}");
             }
             _ => panic!("wrong variant"),
         }
@@ -1842,6 +1867,7 @@ mod tests {
             }]),
             state: None,
             loaded_tools: Vec::new(),
+            duration_ms: None,
         });
         let text = output.as_text();
         assert!(text.contains("fn main()"), "{INCLUDES_MSG}");
