@@ -13,7 +13,7 @@ local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
 local MAX_SCRIPT_LINES = 2000
 local OPEN_READ_CHECK_LINES = 1
 local READ_INPUT_SLOTS = { "tool.read.input", "tool.*.input" }
-local LIST_INPUT_SLOTS = { "tool.list_dir.input", "tool.list.input", "tool.*.input" }
+local LIST_INPUT_SLOTS = { "tool.list_dir.input", "tool.*.input" }
 local OPEN_READ_HOOKED_ERR = "open() cannot read while a plugin hooks the read tool, call read() instead"
 local INSPECT_HOOKED_ERR = "os and pathlib cannot look at files while a plugin hooks the list_dir tool, call list_dir() instead"
 local MKDIR_BASH_HINT = ", create the directory with the bash tool instead"
@@ -294,7 +294,7 @@ end
 -- installed we refuse rather than read the path it steered away from.
 -- A replacement write tool without `append` would drop the flag and overwrite
 -- the file, so appends are refused there.
--- Metadata and listings follow the list tool the same way, minus the call,
+-- Metadata and listings follow the list_dir tool the same way, minus the call,
 -- since it never prompts and a walk would make one call per directory. mkdir
 -- has no tool of its own, so it only goes where the write tool would go
 -- without asking. The sandbox looks before it creates, so mkdir also needs
@@ -329,7 +329,7 @@ local function file_access(tools, schemas, ctx)
       return maki.fs.mkdir(path, { parents = parents })
     end
   end
-  if tools.list_dir or tools.list then
+  if tools.list_dir then
     files.inspect = function()
       if hooked(LIST_INPUT_SLOTS) then
         return nil, INSPECT_HOOKED_ERR

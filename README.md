@@ -3,7 +3,7 @@
 **Changes in this fork (vs [tontinton/maki](https://github.com/tontinton/maki) `main`):**
 
 - **Providers:** Built-in and bundled provider plugins are trimmed to the OpenAI **Responses API** path only (upstream’s multi-vendor built-ins and provider Lua plugins are removed). The Responses integration adds fuller `/models` discovery parsing and reasoning-effort / thinking-level handling for OpenAI-family models; CLI auth is aligned with that stack.
-- **Tools:** The built-in directory listing tool is renamed from `list` to `list_dir` (with a `list` alias where the Python sandbox still needs it).
+- **Tools:** The built-in directory listing tool is renamed from `list` to `list_dir`.
 - **ACP server:** On-disk model cache with wait-for-discovery on first run; session `thought_level` (and aliases) for reasoning effort; `usage_update` on session load, model changes, refresh, and compaction; model display names in config options; question-tool and model-metadata fixes.
 - **TUI & config:** `show_cost`, `prefer_model_name`, `compact_tools`, and `max_width`; context-window usage as a status-bar progress bar; per-turn stats line when a turn completes; compact grouped tool/thinking view (including batch child tools and related layout/reflow fixes); chat text wraps at display column boundaries.
 - **Instructions:** Per-agent and global switches for which third-party instruction files (e.g. `CLAUDE.md`, `.cursorrules`) are loaded.
