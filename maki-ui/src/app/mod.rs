@@ -2213,6 +2213,7 @@ impl App {
         for chat in self.chats.iter_mut().filter(|c| c.plugin.is_none()) {
             chat.flush();
             chat.cancel_in_progress();
+            chat.reset_turn_stats();
         }
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
