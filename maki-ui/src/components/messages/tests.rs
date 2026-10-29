@@ -3290,6 +3290,45 @@ fn compact_tools_cancel_in_progress() {
     assert_eq!(t.status, ToolStatus::Error);
 }
 
+#[test_case(true; "compact_uses_dots")]
+#[test_case(false; "expanded_uses_spinner")]
+fn spinner_updates_preserve_display_mode(compact: bool) {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            compact_tools: compact,
+            ..Default::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel.tool_start(start("batch-1", "batch"));
+    if let DisplayRole::ToolGroup(group) = &mut panel.messages[0].role {
+        let GroupEntry::Tool(batch) = &mut group.entries[0] else {
+            panic!()
+        };
+        let mut child = batch.clone();
+        child.name = "read".into();
+        batch.children.push(child);
+    }
+    panel.rebuild_line_cache();
+    panel.update_spinners();
+    let mut indicators = 0;
+    for segment in panel.cache.segments() {
+        for &(line, span) in &segment.spinner_lines {
+            let indicator = &segment.lines()[line].spans[span];
+            if compact {
+                assert!(["· ", "• ", "● "].contains(&indicator.content.as_ref()));
+            } else {
+                assert!(
+                    ["⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ "]
+                        .contains(&indicator.content.as_ref())
+                );
+            }
+            indicators += 1;
+        }
+    }
+    assert_eq!(indicators, if compact { 3 } else { 1 });
+}
+
 #[test_case(false, false; "live")]
 #[test_case(true, false; "restored")]
 #[test_case(false, true; "cancelled")]

@@ -5,7 +5,6 @@ use maki_agent::{BufferSnapshot, SpanStyle};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::animation::spinner_frame;
 use crate::theme;
 
 use super::code_view::SectionFlags;
@@ -26,13 +25,13 @@ const CHILD_DURATION_STYLE: &str = "batch_duration_ms";
 const CHILD_DURATION_PREFIX: &str = " (";
 const CHILD_DURATION_SUFFIX: &str = "ms)";
 
-const THINKING_FRAMES: [&str; 4] = ["·", "•", "●", "•"];
-const THINKING_INTERVAL_MS: u128 = 140;
+const BUSY_FRAMES: [&str; 4] = ["·", "•", "●", "•"];
+const BUSY_INTERVAL_MS: u128 = 140;
 
-pub fn thinking_spinner_frame(elapsed_ms: u128) -> (&'static str, Style) {
+pub fn busy_spinner_frame(elapsed_ms: u128) -> (&'static str, Style) {
     let theme = theme::current();
-    let idx = ((elapsed_ms / THINKING_INTERVAL_MS) % 4) as usize;
-    let frame = THINKING_FRAMES[idx];
+    let idx = ((elapsed_ms / BUSY_INTERVAL_MS) % 4) as usize;
+    let frame = BUSY_FRAMES[idx];
     let style = match idx {
         0 => theme.tool_dim,
         1 | 3 => theme.status_dim,
@@ -176,7 +175,7 @@ fn push_tool_rows(
     spinner_lines: &mut Vec<(usize, usize)>,
     tool: &GroupToolEntry,
     rail: &str,
-    frame: char,
+    frame: (&str, Style),
     width: u16,
     is_dim: bool,
 ) {
@@ -215,7 +214,7 @@ fn push_tool_rows(
 fn render_tool_row(
     rail: &str,
     tool: &GroupToolEntry,
-    spinner_frame_char: char,
+    frame: (&str, Style),
     width: u16,
     is_dim: bool,
     spinner_lines: &mut Vec<(usize, usize)>,
@@ -224,7 +223,7 @@ fn render_tool_row(
     let theme = theme::current();
     let is_in_progress = tool.status == ToolStatus::InProgress;
     let (icon, icon_style) = match tool.status {
-        ToolStatus::InProgress => (format!("{spinner_frame_char} "), theme.spinner),
+        ToolStatus::InProgress => (format!("{} ", frame.0), frame.1),
         ToolStatus::Success => (
             "✓ ".to_string(),
             if is_dim {
@@ -324,7 +323,7 @@ fn render_thinking_row(
 ) -> Line<'static> {
     let theme = theme::current();
     let (icon, icon_style) = if thinking.active {
-        let (f, s) = thinking_spinner_frame(spinner_millis);
+        let (f, s) = busy_spinner_frame(spinner_millis);
         (format!("{f} "), s)
     } else {
         (
@@ -419,7 +418,7 @@ pub fn build_tool_group_lines(
 ) -> ToolLines {
     let mut lines = Vec::new();
     let mut spinner_lines = Vec::new();
-    let frame_char = spinner_frame(spinner_millis);
+    let frame = busy_spinner_frame(spinner_millis);
 
     let pending_tools: Vec<&GroupToolEntry> = group
         .entries
@@ -453,15 +452,9 @@ pub fn build_tool_group_lines(
     if group.sealed && group.entries.len() == 1 {
         let entry = &group.entries[0];
         match entry {
-            GroupEntry::Tool(t) => push_tool_rows(
-                &mut lines,
-                &mut spinner_lines,
-                t,
-                "",
-                frame_char,
-                width,
-                false,
-            ),
+            GroupEntry::Tool(t) => {
+                push_tool_rows(&mut lines, &mut spinner_lines, t, "", frame, width, false)
+            }
             GroupEntry::Thinking(th) => {
                 lines.push(render_thinking_row("", th, spinner_millis, width, false, 0))
             }
@@ -498,13 +491,8 @@ pub fn build_tool_group_lines(
         )
     };
 
-    let (left_icon, left_style) = if has_pending_tool {
-        (format!("{frame_char} "), theme.accent)
-    } else if is_thinking {
-        let (frame, style) = thinking_spinner_frame(spinner_millis);
-        (format!("{frame} "), style)
-    } else if working {
-        (format!("{frame_char} "), theme.thinking)
+    let (left_icon, left_style) = if has_pending_tool || working {
+        (format!("{} ", frame.0), frame.1)
     } else {
         ("✓ ".to_string(), theme.tool_success)
     };
@@ -544,7 +532,7 @@ pub fn build_tool_group_lines(
                 &mut spinner_lines,
                 t,
                 rail,
-                frame_char,
+                frame,
                 width,
                 is_dim,
             ),
@@ -651,11 +639,11 @@ mod tests {
     }
 
     #[test]
-    fn thinking_spinner_frames_and_styles() {
-        assert_eq!(thinking_spinner_frame(0).0, "·");
-        assert_eq!(thinking_spinner_frame(140).0, "•");
-        assert_eq!(thinking_spinner_frame(280).0, "●");
-        assert_eq!(thinking_spinner_frame(420).0, "•");
+    fn busy_spinner_frames_and_styles() {
+        assert_eq!(busy_spinner_frame(0).0, "·");
+        assert_eq!(busy_spinner_frame(140).0, "•");
+        assert_eq!(busy_spinner_frame(280).0, "●");
+        assert_eq!(busy_spinner_frame(420).0, "•");
     }
 
     #[test]
@@ -1022,13 +1010,14 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(
-            busy_line.contains("⠋ bash"),
+            busy_line.contains("· bash"),
             "busy row should have 1 space: {busy_line}"
         );
-        assert!(!busy_line.contains("⠋  bash"));
+        assert!(!busy_line.contains("·  bash"));
 
         // When updated by update_spinners
-        let spinner_span = Span::styled("⠙ ", theme::current().spinner);
+        let (frame, style) = busy_spinner_frame(BUSY_INTERVAL_MS);
+        let spinner_span = Span::styled(format!("{frame} "), style);
         for &(line_idx, span_idx) in &tl.spinner_lines {
             if let Some(line) = tl.lines.get_mut(line_idx)
                 && line.spans.len() > span_idx
@@ -1042,10 +1031,10 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(
-            updated_busy_line.contains("⠙ bash"),
+            updated_busy_line.contains("• bash"),
             "updated busy row should still have 1 space: {updated_busy_line}"
         );
-        assert!(!updated_busy_line.contains("⠙  bash"));
+        assert!(!updated_busy_line.contains("•  bash"));
     }
 
     #[test]

@@ -1783,12 +1783,20 @@ impl MessagesPanel {
     }
 
     fn update_spinners(&mut self) {
-        let spinner_span = Span::styled(
-            spinner_str(self.started_at.elapsed().as_millis()),
-            theme::current().spinner,
-        );
+        let elapsed = self.started_at.elapsed().as_millis();
+        let spinner_span = Span::styled(spinner_str(elapsed), theme::current().spinner);
+        let (frame, style) = tool_group::busy_spinner_frame(elapsed);
+        let group_spinner_span = Span::styled(format!("{frame} "), style);
         for seg in self.cache.segments_mut() {
-            seg.update_spinners(&spinner_span);
+            let is_group = seg
+                .msg_index
+                .and_then(|index| self.messages.get(index))
+                .is_some_and(|msg| matches!(&msg.role, DisplayRole::ToolGroup(_)));
+            seg.update_spinners(if is_group {
+                &group_spinner_span
+            } else {
+                &spinner_span
+            });
         }
     }
 
@@ -1908,6 +1916,7 @@ impl MessagesPanel {
                 let id = g.id.clone();
                 self.cache.push_spacer_if_needed();
                 let mut seg = Segment::with_tool(id);
+                seg.msg_index = Some(i);
                 seg.apply_highlight(tl, &self.hl_worker);
                 self.cache.push(seg);
             } else {
