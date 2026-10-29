@@ -84,6 +84,9 @@ pub struct Chat {
     /// Parked while another chat is in front, see `App::set_active_chat`.
     pub(crate) draft: Draft,
     pending_turn_usage: Option<String>,
+    /// Wall-clock and token counters for the current user turn, filled from
+    /// each live `TurnComplete` and rendered once on `Done`/`Error`.
+    pending_turn_stats: PendingTurnStats,
     messages_panel: MessagesPanel,
     /// The ending and the index of the bubble announcing it, so a later, better
     /// informed outcome can fix that bubble instead of appending a second one.
@@ -115,9 +118,14 @@ impl Chat {
             inbox: None,
             draft: Draft::default(),
             pending_turn_usage: None,
+            pending_turn_stats: PendingTurnStats::default(),
             messages_panel,
             finish: None,
         }
+    }
+
+    pub(crate) fn reset_turn_stats(&mut self) {
+        self.pending_turn_stats = PendingTurnStats::default();
     }
 
     /// The handle `maki.task` addresses a task by, see `app::tasks`.
@@ -188,7 +196,7 @@ impl Chat {
                 }
             }
             AgentEvent::TurnComplete(turn) => {
-                let stats = turn_stats_line(&turn);
+                self.pending_turn_stats.observe(&turn);
                 for block in turn.message.content {
                     if let ContentBlock::Image { source } = block {
                         self.messages_panel.flush();
@@ -198,11 +206,6 @@ impl Chat {
                             vec![source],
                         ));
                     }
-                }
-                if let Some(line) = stats {
-                    self.messages_panel.flush();
-                    self.messages_panel
-                        .push(DisplayMessage::new(DisplayRole::Notice, line));
                 }
             }
             AgentEvent::ToolResultsSubmitted { .. } => {
@@ -225,12 +228,14 @@ impl Chat {
             }
             AgentEvent::QueueDrained => {}
             AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
-            AgentEvent::Done { .. } => {
+            AgentEvent::Done { usage, .. } => {
                 self.messages_panel.flush();
+                self.push_turn_stats_line(&usage);
                 return ChatEventResult::Done;
             }
             AgentEvent::Error { message, .. } => {
                 self.messages_panel.flush();
+                self.push_turn_stats_line(&self.pending_turn_stats.usage);
                 return ChatEventResult::Error(message);
             }
             AgentEvent::PermissionRequest {
@@ -427,6 +432,14 @@ impl Chat {
 
     pub fn stream_reset(&mut self) {
         self.messages_panel.stream_reset();
+    }
+
+    fn push_turn_stats_line(&mut self, usage: &TokenUsage) {
+        if let Some(line) = turn_stats_line(usage, self.pending_turn_stats.timing()) {
+            self.messages_panel
+                .push(DisplayMessage::new(DisplayRole::Notice, line));
+        }
+        self.reset_turn_stats();
     }
 
     pub fn flush(&mut self) {
@@ -918,28 +931,60 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
     map
 }
 
+/// Timing summed across every model round in one user turn.
+#[derive(Default)]
+struct PendingTurnStats {
+    elapsed_ms: u64,
+    thinking_ms: u64,
+    ttft_sum_ms: u64,
+    ttft_samples: u32,
+    usage: TokenUsage,
+}
+
+impl PendingTurnStats {
+    fn observe(&mut self, turn: &TurnCompleteEvent) {
+        if turn.timing.elapsed_ms == 0 {
+            return;
+        }
+        self.elapsed_ms += turn.timing.elapsed_ms;
+        self.thinking_ms += turn.timing.thinking_ms;
+        if let Some(ms) = turn.timing.ttft_ms {
+            self.ttft_sum_ms += ms;
+            self.ttft_samples += 1;
+        }
+        self.usage += turn.usage;
+    }
+
+    fn timing(&self) -> TurnTiming {
+        TurnTiming {
+            elapsed_ms: self.elapsed_ms,
+            thinking_ms: self.thinking_ms,
+            ttft_ms: (self.ttft_samples > 0)
+                .then(|| self.ttft_sum_ms / u64::from(self.ttft_samples)),
+        }
+    }
+}
+
 /// The one-line timing and token readout a turn ends with. `None` when the
 /// event carries no timing, which is how a replayed turn's reconstructed
 /// `TurnComplete` arrives.
-fn turn_stats_line(turn: &TurnCompleteEvent) -> Option<String> {
-    if turn.timing.elapsed_ms == 0 {
+fn turn_stats_line(usage: &TokenUsage, timing: TurnTiming) -> Option<String> {
+    if timing.elapsed_ms == 0 {
         return None;
     }
-    let usage = &turn.usage;
-    let elapsed_secs = (turn.timing.elapsed_ms as f64 / 1000.0).max(0.001);
+    let elapsed_secs = (timing.elapsed_ms as f64 / 1000.0).max(0.001);
     let tps = (usage.output as f64 / elapsed_secs).round() as u64;
     let total_input = usage.total_input();
     let cache = (usage.cache_read as u64 * 100)
         .checked_div(total_input.max(1) as u64)
         .unwrap_or(0);
-    let ttft = turn
-        .timing
+    let ttft = timing
         .ttft_ms
         .map_or_else(String::new, |ms| format!(" · TTFT {} avg", fmt_secs(ms)));
     Some(format!(
         "Turn took {} · thought for {} · ↑{} ↓{} · {} tok/s avg{} · cache {}% avg",
-        fmt_secs(turn.timing.elapsed_ms),
-        fmt_secs(turn.timing.thinking_ms),
+        fmt_secs(timing.elapsed_ms),
+        fmt_secs(timing.thinking_ms),
         format_tokens(total_input),
         format_tokens(usage.output),
         tps,
@@ -982,41 +1027,87 @@ mod tests {
 
     #[test]
     fn turn_stats_line_reads_timing_and_usage() {
-        let turn = TurnCompleteEvent {
-            message: Message::default(),
-            usage: TokenUsage {
-                input: 200,
-                output: 725,
-                cache_creation: 0,
-                cache_read: 6_200,
-                ..Default::default()
-            },
-            model: String::new(),
-            cost: None,
-            subsidised_list_cost: None,
-            context_size: None,
-            context_window: 0,
-            timing: TurnTiming {
-                elapsed_ms: 10_800,
-                ttft_ms: Some(4_500),
-                thinking_ms: 0,
-            },
+        let usage = TokenUsage {
+            input: 200,
+            output: 725,
+            cache_creation: 0,
+            cache_read: 6_200,
+            ..Default::default()
+        };
+        let timing = TurnTiming {
+            elapsed_ms: 10_800,
+            ttft_ms: Some(4_500),
+            thinking_ms: 0,
         };
         assert_eq!(
-            turn_stats_line(&turn).unwrap(),
+            turn_stats_line(&usage, timing).unwrap(),
             "Turn took 11s · thought for 0s · ↑6.4k ↓725 · 67 tok/s avg · TTFT 4.5s avg · cache 96% avg"
         );
     }
 
     #[test]
     fn turn_stats_line_skips_timingless_events() {
-        assert!(
-            turn_stats_line(&TurnCompleteEvent {
-                timing: TurnTiming::default(),
-                ..turn_event()
-            })
-            .is_none()
+        assert!(turn_stats_line(&TokenUsage::default(), TurnTiming::default()).is_none());
+    }
+
+    #[test]
+    fn user_turn_stats_line_shown_once_when_run_finishes() {
+        use maki_agent::DoneReason;
+
+        let mut chat = chat();
+        let round = |elapsed_ms, input, output| {
+            AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+                message: Message::default(),
+                usage: TokenUsage {
+                    input,
+                    output,
+                    ..Default::default()
+                },
+                model: String::new(),
+                cost: None,
+                subsidised_list_cost: None,
+                context_size: None,
+                context_window: 0,
+                timing: TurnTiming {
+                    elapsed_ms,
+                    ttft_ms: Some(1_000),
+                    thinking_ms: 100,
+                },
+            }))
+        };
+        chat.handle_event(round(5_000, 100, 50), None);
+        chat.handle_event(round(4_000, 200, 75), None);
+        assert!(notice_lines(&chat).is_empty());
+        chat.handle_event(
+            AgentEvent::Done {
+                usage: TokenUsage {
+                    input: 300,
+                    output: 125,
+                    ..Default::default()
+                },
+                cost: None,
+                list_cost: None,
+                context_size: 0,
+                context_window: 0,
+                num_turns: 2,
+                reason: DoneReason::EndTurn,
+            },
+            None,
         );
+        let notices = notice_lines(&chat);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(
+            notices[0],
+            "Turn took 9.0s · thought for 0.2s · ↑300 ↓125 · 14 tok/s avg · TTFT 1.0s avg · cache 0% avg"
+        );
+    }
+
+    fn notice_lines(chat: &Chat) -> Vec<&str> {
+        (0..chat.message_count())
+            .filter_map(|i| chat.message_at(i))
+            .filter(|m| matches!(m.role, DisplayRole::Notice))
+            .map(|m| m.text.as_str())
+            .collect()
     }
 
     fn turn_event() -> TurnCompleteEvent {
