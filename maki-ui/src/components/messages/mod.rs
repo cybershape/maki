@@ -264,6 +264,9 @@ impl MessagesPanel {
             for entry in &mut g.entries {
                 if let GroupEntry::Thinking(th) = entry {
                     th.active = false;
+                    if th.duration.is_none() {
+                        th.duration = th.started_at.map(|st| st.elapsed());
+                    }
                 }
             }
             let group_id = g.id.clone();
@@ -320,6 +323,8 @@ impl MessagesPanel {
                             text: text.to_string(),
                             tokens: text.len().div_ceil(4),
                             active: true,
+                            started_at: Some(Instant::now()),
+                            duration: None,
                         }));
                     }
                 } else {
@@ -328,6 +333,8 @@ impl MessagesPanel {
                         text: text.to_string(),
                         tokens: text.len().div_ceil(4),
                         active: true,
+                        started_at: Some(Instant::now()),
+                        duration: None,
                     }));
                 }
             }
@@ -344,6 +351,8 @@ impl MessagesPanel {
                         text: text.to_string(),
                         tokens: text.len().div_ceil(4),
                         active: true,
+                        started_at: Some(Instant::now()),
+                        duration: None,
                     })],
                     started_at: Some(Instant::now()),
                     duration: None,
@@ -379,6 +388,9 @@ impl MessagesPanel {
                 g.waiting_since = None;
                 if let Some(GroupEntry::Thinking(th)) = g.entries.last_mut() {
                     th.active = false;
+                    if th.duration.is_none() {
+                        th.duration = th.started_at.map(|st| st.elapsed());
+                    }
                 }
                 if let Some(entry) = g.entries.iter_mut().find_map(|e| match e {
                     GroupEntry::Tool(t) if t.id == id => Some(t),
@@ -474,6 +486,9 @@ impl MessagesPanel {
                 g.waiting_since = None;
                 if let Some(GroupEntry::Thinking(th)) = g.entries.last_mut() {
                     th.active = false;
+                    if th.duration.is_none() {
+                        th.duration = th.started_at.map(|st| st.elapsed());
+                    }
                 }
                 g.entries.push(GroupEntry::Tool(GroupToolEntry {
                     id: event.id,
@@ -831,6 +846,9 @@ impl MessagesPanel {
                             }
                             GroupEntry::Thinking(th) if th.active => {
                                 th.active = false;
+                                if th.duration.is_none() {
+                                    th.duration = th.started_at.map(|st| st.elapsed());
+                                }
                                 changed = true;
                             }
                             _ => {}

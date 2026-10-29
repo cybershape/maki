@@ -3059,6 +3059,8 @@ fn panel_with_sealed_groups(tools: usize, thinking: usize, groups: usize) -> Mes
                     text: GROUP_RESIZE_TEXT.into(),
                     tokens: GROUP_RESIZE_TOKENS,
                     active: false,
+                    started_at: None,
+                    duration: Some(GROUP_RESIZE_DURATION),
                 })
             })
             .chain((0..tools).map(|id| {
@@ -3445,7 +3447,7 @@ fn compact_tools_state_text_transitions() {
         .iter()
         .map(|s| s.content.as_ref())
         .collect();
-    assert!(h1.contains("tool call receiving..."));
+    assert!(h1.contains("Tool call receiving..."));
 
     // 2. Start: calling
     panel.tool_start(start("call-1", "edit"));
@@ -3458,7 +3460,7 @@ fn compact_tools_state_text_transitions() {
         .iter()
         .map(|s| s.content.as_ref())
         .collect();
-    assert!(h2.contains("tool calling..."));
+    assert!(h2.contains("Tool calling..."));
 
     // 3. Done: single completed tool renders single line
     panel.tool_done(done("call-1"));
@@ -3505,7 +3507,7 @@ fn compact_tools_state_text_transitions() {
         .iter()
         .map(|s| s.content.as_ref())
         .collect();
-    assert!(h4.contains("worked for 300ms"));
+    assert!(h4.contains("Worked for 300ms"));
 
     // 5. Mixed with thinking: worked for
     group2.entries.insert(
@@ -3515,6 +3517,8 @@ fn compact_tools_state_text_transitions() {
             text: "think".into(),
             tokens: 10,
             active: false,
+            started_at: None,
+            duration: None,
         }),
     );
     let tl5 = tool_group::build_tool_group_lines(&group2, 80, 0);
@@ -3523,7 +3527,7 @@ fn compact_tools_state_text_transitions() {
         .iter()
         .map(|s| s.content.as_ref())
         .collect();
-    assert!(h5.contains("worked for 300ms"));
+    assert!(h5.contains("Worked for 300ms"));
 }
 
 #[test]
@@ -3545,7 +3549,7 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         .iter()
         .map(|s| s.content.as_ref())
         .collect();
-    assert!(h.contains("waiting for response..."));
+    assert!(h.contains("Waiting for response..."));
 
     // Tool finishes but group unsealed -> waiting for response...
     panel.tool_pending("c1".into(), "edit");
@@ -3562,8 +3566,8 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         .iter()
         .map(|s| s.content.as_ref())
         .collect();
-    assert!(h2.contains("waiting for response..."));
-    assert!(!h2.contains("worked for"));
+    assert!(h2.contains("Waiting for response..."));
+    assert!(!h2.contains("Worked for"));
 
     // Next tool arrives
     panel.tool_pending("c2".into(), "bash");
@@ -3577,7 +3581,7 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         .iter()
         .map(|s| s.content.as_ref())
         .collect();
-    assert!(h3.contains("tool call receiving..."));
+    assert!(h3.contains("Tool call receiving..."));
 
     // Sealed via text delta
     panel.tool_start(start("c2", "bash"));
@@ -3594,7 +3598,7 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         .iter()
         .map(|s| s.content.as_ref())
         .collect();
-    assert!(h4.contains("worked for"));
+    assert!(h4.contains("Worked for"));
 }
 
 #[test]

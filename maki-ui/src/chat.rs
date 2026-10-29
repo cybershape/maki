@@ -670,6 +670,8 @@ pub fn history_to_display(
                                     text: thinking.clone(),
                                     tokens: thinking.len().div_ceil(4),
                                     active: false,
+                                    started_at: None,
+                                    duration: None,
                                 };
                                 if let Some(DisplayMessage {
                                     role: DisplayRole::ToolGroup(g),

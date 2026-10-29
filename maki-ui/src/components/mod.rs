@@ -418,6 +418,8 @@ pub struct GroupThinkingEntry {
     pub text: String,
     pub tokens: usize,
     pub active: bool,
+    pub started_at: Option<Instant>,
+    pub duration: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -446,7 +448,9 @@ impl ToolGroupRole {
             .iter()
             .filter_map(|e| match e {
                 GroupEntry::Tool(t) => t.duration.or_else(|| t.started_at.map(|st| st.elapsed())),
-                _ => None,
+                GroupEntry::Thinking(th) => {
+                    th.duration.or_else(|| th.started_at.map(|st| st.elapsed()))
+                }
             })
             .sum();
         if !tool_sum.is_zero() {

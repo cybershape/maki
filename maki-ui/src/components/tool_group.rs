@@ -349,12 +349,12 @@ fn render_thinking_row(
     let preview = single_line(&thinking.text.replace(['*', '_', '#', '`', '>'], ""));
     let label = if preview.is_empty() {
         if thinking.active {
-            "thinking..."
+            "Thinking..."
         } else {
-            "thinking"
+            "Thinking"
         }
     } else {
-        "thinking"
+        "Thinking"
     };
 
     let label_style = if is_dim {
@@ -364,10 +364,16 @@ fn render_thinking_row(
     };
     spans.push(Span::styled(label.to_string(), label_style));
 
-    let right_str = if thinking.tokens > 0 {
-        format_thinking_tokens(thinking.tokens)
-    } else {
-        String::new()
+    let duration_str = thinking
+        .duration
+        .or_else(|| thinking.started_at.map(|st| st.elapsed()))
+        .map(|d| format!("({})", format_tool_duration(d)));
+    let tokens_str = (thinking.tokens > 0).then(|| format_thinking_tokens(thinking.tokens));
+    let right_str = match (tokens_str, duration_str) {
+        (Some(tok), Some(dur)) => format!("{tok} {dur}"),
+        (Some(tok), None) => tok,
+        (None, Some(dur)) => dur,
+        (None, None) => String::new(),
     };
     let right_len = right_str.width();
     let right_style = if is_dim {
@@ -472,21 +478,21 @@ pub fn build_tool_group_lines(
     let theme = theme::current();
     let state_text = if has_pending_tool {
         if receiving_tool_args {
-            "tool call receiving...".to_string()
+            "Tool call receiving...".to_string()
         } else {
-            "tool calling...".to_string()
+            "Tool calling...".to_string()
         }
     } else if is_thinking {
-        "thinking...".to_string()
+        "Thinking...".to_string()
     } else if working {
         let timer = group
             .waiting_duration()
             .map(|dur| format!(" ({})", format_tool_duration(dur)))
             .unwrap_or_default();
-        format!("waiting for response...{timer}")
+        format!("Waiting for response...{timer}")
     } else {
         format!(
-            "worked for {}",
+            "Worked for {}",
             format_group_duration(group.total_duration())
         )
     };
@@ -722,7 +728,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(header_text.contains("waiting for response..."));
+        assert!(header_text.contains("Waiting for response..."));
     }
 
     #[test]
@@ -751,8 +757,8 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(header_text.contains("waiting for response..."));
-        assert!(!header_text.contains("worked for"));
+        assert!(header_text.contains("Waiting for response..."));
+        assert!(!header_text.contains("Worked for"));
     }
 
     #[test]
@@ -772,7 +778,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(header_text.contains("waiting for response... (1.52s)"));
+        assert!(header_text.contains("Waiting for response... (1.52s)"));
     }
 
     #[test]
@@ -803,7 +809,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(header_text.contains("tool calling..."));
+        assert!(header_text.contains("Tool calling..."));
     }
 
     #[test]
@@ -832,7 +838,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(header_text.contains("tool call receiving..."));
+        assert!(header_text.contains("Tool call receiving..."));
     }
 
     #[test]
@@ -845,6 +851,8 @@ mod tests {
                 text: String::new(),
                 tokens: 0,
                 active: true,
+                started_at: None,
+                duration: None,
             })],
             started_at: None,
             duration: None,
@@ -857,7 +865,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(header_text.contains("thinking..."));
+        assert!(header_text.contains("Thinking..."));
         assert!(!header_text.contains("waiting for"));
     }
 
@@ -901,7 +909,7 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(header_text.starts_with(" "));
-        assert!(header_text.contains("worked for 23s"));
+        assert!(header_text.contains("Worked for 23s"));
 
         let row1: String = tl.lines[1]
             .spans
@@ -1059,7 +1067,7 @@ mod tests {
 
         let tl = build_tool_group_lines(&group, 80, 0);
         let title_span = &tl.lines[0].spans[2];
-        assert_eq!(title_span.content.as_ref(), "tool calling...");
+        assert_eq!(title_span.content.as_ref(), "Tool calling...");
         assert_eq!(title_span.style, Style::default());
     }
 
@@ -1073,6 +1081,8 @@ mod tests {
                 text: "analyzing requirements".into(),
                 tokens: 10,
                 active: false,
+                started_at: None,
+                duration: None,
             })],
             started_at: None,
             duration: None,
@@ -1118,6 +1128,29 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(header.contains("worked for 1m35s (12 hidden)"));
+        assert!(header.contains("Worked for 1m35s (12 hidden)"));
+    }
+
+    #[test]
+    fn thinking_row_displays_duration_on_the_right() {
+        let group = ToolGroupRole {
+            id: "group-1".into(),
+            sealed: true,
+            entries: vec![GroupEntry::Thinking(GroupThinkingEntry {
+                id: 0,
+                text: "thinking about something".into(),
+                tokens: 350,
+                active: false,
+                started_at: None,
+                duration: Some(Duration::from_millis(1500)),
+            })],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
+        };
+
+        let tl = build_tool_group_lines(&group, 80, 0);
+        let thinking_line = tl.lines[0].to_string();
+        assert!(thinking_line.contains("(350t) (1.50s)"));
     }
 }
