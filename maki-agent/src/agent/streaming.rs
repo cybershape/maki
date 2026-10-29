@@ -11,6 +11,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::cancel::CancelToken;
+use crate::types::TurnTiming;
 use crate::{AgentError, AgentEvent, EventSender};
 
 const FUNCTIONS_PREFIX: &str = "functions.";
@@ -42,22 +43,54 @@ fn canonicalize_tool_names(message: &mut Message) {
     }
 }
 
+/// What the forwarder saw: the text the cancel path replays, plus the timing
+/// a per-turn stats line reads. `ttft` starts at the request, so it includes
+/// prompt processing; `thinking` sums every thinking span, which is what an
+/// interleaved-thinking dialect needs.
+struct ForwardedEvents {
+    streamed: String,
+    ttft: Option<Duration>,
+    thinking: Duration,
+}
+
+fn end_thinking_span(span: &mut Option<Instant>, thinking: &mut Duration) {
+    if let Some(start) = span.take() {
+        *thinking += start.elapsed();
+    }
+}
+
 async fn forward_provider_events(
     prx: flume::Receiver<ProviderEvent>,
     event_tx: &EventSender,
-) -> String {
+    started: Instant,
+) -> ForwardedEvents {
     let mut streamed = String::new();
+    let mut ttft = None;
+    let mut thinking = Duration::ZERO;
+    let mut thinking_span = None;
     while let Ok(pe) = prx.recv_async().await {
         let ae = match pe {
             ProviderEvent::TextDelta { text } => {
+                end_thinking_span(&mut thinking_span, &mut thinking);
+                ttft.get_or_insert_with(|| started.elapsed());
                 streamed.push_str(&text);
                 AgentEvent::TextDelta { text }
             }
-            ProviderEvent::ThinkingDelta { text } => AgentEvent::ThinkingDelta { text },
-            ProviderEvent::ToolUseStart { id, name } => AgentEvent::ToolPending {
-                id,
-                name: canonical_tool_name(&name).to_owned(),
-            },
+            ProviderEvent::ThinkingDelta { text } => {
+                thinking_span.get_or_insert_with(Instant::now);
+                ttft.get_or_insert_with(|| started.elapsed());
+                AgentEvent::ThinkingDelta { text }
+            }
+            ProviderEvent::ToolUseStart { id, name } => {
+                end_thinking_span(&mut thinking_span, &mut thinking);
+                ttft.get_or_insert_with(|| started.elapsed());
+                AgentEvent::ToolPending {
+                    id,
+                    name: canonical_tool_name(&name).to_owned(),
+                }
+            }
+            // Progress is the prompt still being read, so it is neither a token
+            // for `ttft` nor the end of a thinking span.
             ProviderEvent::PromptProgress {
                 processed,
                 total,
@@ -72,7 +105,12 @@ async fn forward_provider_events(
             break;
         }
     }
-    streamed
+    end_thinking_span(&mut thinking_span, &mut thinking);
+    ForwardedEvents {
+        streamed,
+        ttft,
+        thinking,
+    }
 }
 
 /// Cancelling mid-stream carries the text the user still sees on screen,
@@ -183,12 +221,21 @@ pub(crate) struct StreamRequest<'a> {
 /// `gauge` is `None` for a request whose messages are not the session's, as
 /// compaction's stripped and collapsed rewrite is: neither its size nor the
 /// count it comes back with says anything about the session.
+/// A response plus the wall-clock metrics of the request that produced it.
+/// `timing` covers the whole call — retries included — while `ttft` and
+/// `thinking` describe only the attempt that answered, the one whose stream
+/// the user saw.
+pub(crate) struct StreamedResponse {
+    pub response: StreamResponse,
+    pub timing: TurnTiming,
+}
+
 pub(crate) async fn stream_with_retry(
     req: StreamRequest<'_>,
     mut gauge: Option<&mut ContextGauge>,
     event_tx: &EventSender,
     cancel: &CancelToken,
-) -> Result<StreamResponse, StreamError> {
+) -> Result<StreamedResponse, StreamError> {
     let StreamRequest {
         provider,
         model,
@@ -201,6 +248,9 @@ pub(crate) async fn stream_with_retry(
         retry,
     } = req;
     let opts = opts.clamped(model);
+    // Covers image adaptation and every attempt, so it reads as the turn's
+    // wall-clock wait rather than the winning request's alone.
+    let call_started = Instant::now();
     // The session's own size wins where it is larger, being a count a provider
     // made rather than a byte estimate.
     let measured = gauge.as_deref().map_or(0, ContextGauge::size);
@@ -234,7 +284,7 @@ pub(crate) async fn stream_with_retry(
         let (ptx, prx) = flume::unbounded();
         let forwarder = smol::spawn({
             let event_tx = event_tx.clone();
-            async move { forward_provider_events(prx, &event_tx).await }
+            async move { forward_provider_events(prx, &event_tx, started).await }
         });
         // `race` checks the token before it polls, so a run cancelled while a
         // retry slept on a server `Retry-After` never pays for the attempt it
@@ -244,7 +294,7 @@ pub(crate) async fn stream_with_retry(
             .await
             .unwrap_or(Err(AgentError::Cancelled));
         drop(ptx);
-        let streamed = forwarder.await;
+        let forwarded = forwarder.await;
         match result {
             Ok(mut r) => {
                 canonicalize_tool_names(&mut r.message);
@@ -252,9 +302,20 @@ pub(crate) async fn stream_with_retry(
                 if let Some(gauge) = gauge.as_deref_mut() {
                     gauge.record(r.usage.total_input());
                 }
-                return Ok(r);
+                return Ok(StreamedResponse {
+                    response: r,
+                    timing: TurnTiming {
+                        elapsed_ms: call_started.elapsed().as_millis() as u64,
+                        ttft_ms: forwarded.ttft.map(|d| d.as_millis() as u64),
+                        thinking_ms: forwarded.thinking.as_millis() as u64,
+                    },
+                });
             }
-            Err(AgentError::Cancelled) => return Err(StreamError::Cancelled { streamed }),
+            Err(AgentError::Cancelled) => {
+                return Err(StreamError::Cancelled {
+                    streamed: forwarded.streamed,
+                });
+            }
             Err(e) => {
                 attempt += 1;
                 emit_api_error(model, &e, attempt, started.elapsed());
@@ -655,7 +716,7 @@ mod tests {
         model: &Model,
         gauge: Option<&mut ContextGauge>,
         retry: RetryPolicy,
-    ) -> (Result<StreamResponse, StreamError>, Vec<AgentEvent>) {
+    ) -> (Result<StreamedResponse, StreamError>, Vec<AgentEvent>) {
         let (tx, rx) = flume::unbounded();
         let result = stream_with_retry(
             StreamRequest {
@@ -801,7 +862,7 @@ mod tests {
             );
             assert_eq!(
                 gauge.size(),
-                response.usage.input,
+                response.response.usage.input,
                 "the session keeps the server's count, not the estimate under it"
             );
         });
@@ -902,7 +963,7 @@ mod tests {
     /// view for every rotation it took: a `Retry` event at all, so the failed
     /// attempt's half printed text is dropped instead of appended to, and a
     /// zero delay, because a fresh key waits for nothing.
-    async fn send_pooled(server: &PooledServer) -> Result<StreamResponse, StreamError> {
+    async fn send_pooled(server: &PooledServer) -> Result<StreamedResponse, StreamError> {
         let (result, events) = send(server, &strict_model(STRICT_WINDOW), None, no_budget()).await;
 
         let retries = retries_of(&events);
