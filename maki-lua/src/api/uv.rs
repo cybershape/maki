@@ -1,5 +1,6 @@
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult};
+use std::{sync::OnceLock, time::Instant};
 
 use crate::plugin_permissions::PluginPermissions;
 
@@ -38,6 +39,14 @@ fn os_getenv(_lua: &Lua, name: String) -> LuaResult<Option<String>> {
     Ok(std::env::var(&name).ok())
 }
 
+#[doc = "Returns a monotonic timestamp in nanoseconds, like `vim.uv.hrtime`."]
+#[doc = "@return (integer) Nanoseconds from an arbitrary origin, for measuring elapsed time."]
+#[lua_fn]
+fn hrtime(_lua: &Lua) -> LuaResult<u64> {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    Ok(ORIGIN.get_or_init(Instant::now).elapsed().as_nanos() as u64)
+}
+
 lua_table! {
     /// System and environment utilities, modelled after `vim.uv`.
     ///
@@ -52,6 +61,6 @@ lua_table! {
     /// local home = maki.uv.os_homedir()
     /// ```
     "maki.uv" => pub(crate) fn create_uv_table(perms: &PluginPermissions), DOCS [
-        cwd(perms), os_homedir(perms), os_getenv(perms),
+        cwd(perms), os_homedir(perms), os_getenv(perms), hrtime,
     ]
 }

@@ -3066,6 +3066,7 @@ fn panel_with_sealed_groups(tools: usize, thinking: usize, groups: usize) -> Mes
                     id: format!("tool-{group}-{id}"),
                     name: BASH_TOOL_NAME.into(),
                     summary: GROUP_RESIZE_TEXT.into(),
+                    children: Vec::new(),
                     status: ToolStatus::Success,
                     receiving_args: false,
                     started_at: None,
@@ -3289,6 +3290,89 @@ fn compact_tools_cancel_in_progress() {
     assert_eq!(t.status, ToolStatus::Error);
 }
 
+#[test_case(false, false; "live")]
+#[test_case(true, false; "restored")]
+#[test_case(false, true; "cancelled")]
+fn compact_batch_children_follow_snapshots(restored: bool, cancelled: bool) {
+    const TOOL_ID: &str = "batch-1";
+    const CHILD_SUMMARY: &str = "src/main.rs";
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            compact_tools: true,
+            ..Default::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel.tool_start(start(TOOL_ID, "batch"));
+    let snapshot = |style: &str| {
+        BufferSnapshot::from_arc(Arc::new(vec![
+            SnapshotLine {
+                spans: vec![
+                    SnapshotSpan {
+                        text: "● ".into(),
+                        style: SpanStyle::Named(style.into()),
+                    },
+                    SnapshotSpan {
+                        text: "read> ".into(),
+                        style: SpanStyle::Named("tool_prefix".into()),
+                    },
+                    SnapshotSpan {
+                        text: CHILD_SUMMARY.into(),
+                        style: SpanStyle::Default,
+                    },
+                    SnapshotSpan {
+                        text: " (1234ms)".into(),
+                        style: SpanStyle::Named("batch_duration_ms".into()),
+                    },
+                ],
+            },
+            snap_line("  output body"),
+        ]))
+    };
+    let live = Arc::new(SharedBuf::new());
+    if restored {
+        panel.tool_snapshot(TOOL_ID, snapshot("tool_success"), Some(1));
+    } else {
+        live.set_lines(snapshot("spinner").lines.as_ref().clone());
+        panel.register_live_buf(TOOL_ID.into(), Arc::clone(&live));
+        let _ = panel.poll_live_bufs();
+        if !cancelled {
+            live.set_lines(snapshot("tool_success").lines.as_ref().clone());
+        }
+    }
+    if cancelled {
+        panel.cancel_in_progress();
+    } else {
+        panel.tool_done(done(TOOL_ID));
+        panel.seal_open_group();
+    }
+    let DisplayRole::ToolGroup(group) = &panel.messages[0].role else {
+        panic!()
+    };
+    let GroupEntry::Tool(batch) = &group.entries[0] else {
+        panic!()
+    };
+    assert_eq!(batch.summary, "1 tools");
+    assert_eq!(batch.children.len(), 1);
+    assert_eq!(batch.children[0].name.as_ref(), "read");
+    assert_eq!(batch.children[0].summary, CHILD_SUMMARY);
+    assert_eq!(
+        batch.children[0].duration,
+        Some(Duration::from_millis(1234))
+    );
+    let rows = tool_group::build_tool_group_lines(group, VIEW_WIDTH, 0);
+    assert!(rows.lines[1].to_string().ends_with("(1.23s)"));
+    assert_eq!(
+        batch.children[0].status,
+        if cancelled {
+            ToolStatus::Error
+        } else {
+            ToolStatus::Success
+        }
+    );
+    assert!(!panel.live_bufs.contains_key(TOOL_ID));
+}
+
 #[test]
 fn compact_tools_state_text_transitions() {
     let ui_cfg = UiConfig {
@@ -3341,6 +3425,7 @@ fn compact_tools_state_text_transitions() {
                 id: "c1".into(),
                 name: Arc::from("edit"),
                 summary: "a.rs".into(),
+                children: Vec::new(),
                 status: ToolStatus::Success,
                 receiving_args: false,
                 started_at: None,
@@ -3350,6 +3435,7 @@ fn compact_tools_state_text_transitions() {
                 id: "c2".into(),
                 name: Arc::from("bash"),
                 summary: "test".into(),
+                children: Vec::new(),
                 status: ToolStatus::Success,
                 receiving_args: false,
                 started_at: None,

@@ -1,6 +1,7 @@
 use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use maki_agent::{BufferSnapshot, SpanStyle};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -15,6 +16,15 @@ pub const MAX_COMPACT_ENTRIES: usize = 10;
 const GROUP_PADDING: &str = " ";
 const RAIL_CONTINUE: &str = "│  ";
 const RAIL_LAST: &str = "└  ";
+const CHILD_RAIL_CONTINUE: &str = "├  ";
+const CHILD_INDENT: &str = "   ";
+pub(super) const BATCH_TOOL: &str = "batch";
+const CHILD_PREFIX_STYLE: &str = "tool_prefix";
+const CHILD_SUCCESS_STYLE: &str = "tool_success";
+const CHILD_ERROR_STYLE: &str = "tool_error";
+const CHILD_DURATION_STYLE: &str = "batch_duration_ms";
+const CHILD_DURATION_PREFIX: &str = " (";
+const CHILD_DURATION_SUFFIX: &str = "ms)";
 
 const THINKING_FRAMES: [&str; 4] = ["·", "•", "●", "•"];
 const THINKING_INTERVAL_MS: u128 = 140;
@@ -119,6 +129,87 @@ fn truncate_to_width(s: &str, max_w: usize) -> String {
         end_idx = idx + ch.len_utf8();
     }
     format!("{}...", &s[..end_idx])
+}
+
+pub(super) fn batch_children(snapshot: &BufferSnapshot) -> Vec<GroupToolEntry> {
+    snapshot
+        .lines
+        .iter()
+        .filter_map(|line| {
+            let [indicator, prefix, header @ ..] = line.spans.as_slice() else {
+                return None;
+            };
+            if !matches!(&prefix.style, SpanStyle::Named(style) if style == CHILD_PREFIX_STYLE) {
+                return None;
+            }
+            let name = prefix.text.strip_suffix("> ")?;
+            let status = match &indicator.style {
+                SpanStyle::Named(style) if style == CHILD_SUCCESS_STYLE => ToolStatus::Success,
+                SpanStyle::Named(style) if style == CHILD_ERROR_STYLE => ToolStatus::Error,
+                _ => ToolStatus::InProgress,
+            };
+            let is_duration = |style: &SpanStyle| {
+                matches!(style, SpanStyle::Named(name) if name == CHILD_DURATION_STYLE)
+            };
+            let duration = header.iter().find(|span| is_duration(&span.style))
+                .and_then(|span| span.text.strip_prefix(CHILD_DURATION_PREFIX))
+                .and_then(|text| text.strip_suffix(CHILD_DURATION_SUFFIX))
+                .and_then(|text| text.parse().ok())
+                .map(Duration::from_millis);
+            Some(GroupToolEntry {
+                id: String::new(),
+                name: name.into(),
+                summary: header.iter().filter(|span| !is_duration(&span.style))
+                    .map(|span| span.text.as_str()).collect(),
+                children: Vec::new(),
+                status,
+                receiving_args: false,
+                started_at: None,
+                duration,
+            })
+        })
+        .collect()
+}
+
+fn push_tool_rows(
+    lines: &mut Vec<Line<'static>>,
+    spinner_lines: &mut Vec<(usize, usize)>,
+    tool: &GroupToolEntry,
+    rail: &str,
+    frame: char,
+    width: u16,
+    is_dim: bool,
+) {
+    lines.push(render_tool_row(
+        rail,
+        tool,
+        frame,
+        width,
+        is_dim,
+        spinner_lines,
+        lines.len(),
+    ));
+    let parent_rail = match rail {
+        RAIL_LAST => CHILD_INDENT,
+        _ => rail,
+    };
+    for (idx, child) in tool.children.iter().enumerate() {
+        let branch = if idx + 1 == tool.children.len() {
+            RAIL_LAST
+        } else {
+            CHILD_RAIL_CONTINUE
+        };
+        let child_rail = format!("{parent_rail}{branch}");
+        lines.push(render_tool_row(
+            &child_rail,
+            child,
+            frame,
+            width,
+            is_dim,
+            spinner_lines,
+            lines.len(),
+        ));
+    }
 }
 
 fn render_tool_row(
@@ -361,15 +452,20 @@ pub fn build_tool_group_lines(
 
     if group.sealed && group.entries.len() == 1 {
         let entry = &group.entries[0];
-        let line = match entry {
-            GroupEntry::Tool(t) => {
-                render_tool_row("", t, frame_char, width, false, &mut spinner_lines, 0)
-            }
+        match entry {
+            GroupEntry::Tool(t) => push_tool_rows(
+                &mut lines,
+                &mut spinner_lines,
+                t,
+                "",
+                frame_char,
+                width,
+                false,
+            ),
             GroupEntry::Thinking(th) => {
-                render_thinking_row("", th, spinner_millis, width, false, 0)
+                lines.push(render_thinking_row("", th, spinner_millis, width, false, 0))
             }
-        };
-        lines.push(line);
+        }
         return ToolLines {
             lines,
             highlight: None,
@@ -442,21 +538,25 @@ pub fn build_tool_group_lines(
         let is_dim = hidden_count > 0 && idx == 0;
         let line_idx = lines.len();
 
-        let line = match entry {
-            GroupEntry::Tool(t) => render_tool_row(
-                rail,
+        match entry {
+            GroupEntry::Tool(t) => push_tool_rows(
+                &mut lines,
+                &mut spinner_lines,
                 t,
+                rail,
                 frame_char,
                 width,
                 is_dim,
-                &mut spinner_lines,
-                line_idx,
             ),
-            GroupEntry::Thinking(th) => {
-                render_thinking_row(rail, th, spinner_millis, width, is_dim, line_idx)
-            }
-        };
-        lines.push(line);
+            GroupEntry::Thinking(th) => lines.push(render_thinking_row(
+                rail,
+                th,
+                spinner_millis,
+                width,
+                is_dim,
+                line_idx,
+            )),
+        }
     }
 
     ToolLines {
@@ -474,6 +574,67 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::time::Instant;
+    use test_case::test_case;
+
+    #[test_case(false, false; "single_batch")]
+    #[test_case(true, false; "batch_followed_by_tool")]
+    #[test_case(false, true; "batch_last_in_group")]
+    fn batch_renders_child_tree(followed_by_tool: bool, preceded_by_tool: bool) {
+        let child = GroupToolEntry {
+            id: String::new(),
+            name: Arc::from("read"),
+            summary: "src/main.rs".into(),
+            children: Vec::new(),
+            status: ToolStatus::Success,
+            receiving_args: false,
+            started_at: None,
+            duration: None,
+        };
+        let mut batch = child.clone();
+        batch.name = Arc::from(BATCH_TOOL);
+        batch.summary = "2 tools".into();
+        batch.duration = Some(Duration::from_secs(1));
+        batch.children = vec![child.clone(), child.clone()];
+        batch.children[1].name = Arc::from("bash");
+        batch.children[1].summary = "cargo check".into();
+        batch.children[1].status = ToolStatus::Error;
+        let mut group = ToolGroupRole {
+            id: "group".into(),
+            sealed: true,
+            entries: vec![GroupEntry::Tool(batch)],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
+        };
+        if followed_by_tool {
+            group.entries.push(GroupEntry::Tool(child.clone()));
+        }
+        if preceded_by_tool {
+            group.entries.insert(0, GroupEntry::Tool(child));
+        }
+        let rendered = build_tool_group_lines(&group, 60, 0);
+        let parent_idx =
+            usize::from(followed_by_tool || preceded_by_tool) + usize::from(preceded_by_tool);
+        let parent = rendered.lines[parent_idx].to_string();
+        assert!(parent.contains("batch 2 tools"), "{parent}");
+        assert!(parent.ends_with("(1.00s)"), "{parent}");
+        let rail = if followed_by_tool {
+            RAIL_CONTINUE
+        } else if preceded_by_tool {
+            CHILD_INDENT
+        } else {
+            ""
+        };
+        assert_eq!(
+            rendered.lines[parent_idx + 1].to_string().trim_end(),
+            format!(" {rail}├  ✓ read src/main.rs")
+        );
+        assert_eq!(
+            rendered.lines[parent_idx + 2].to_string().trim_end(),
+            format!(" {rail}└  ✗ bash cargo check")
+        );
+        assert!(rendered.lines.iter().all(|line| line.width() <= 60));
+    }
 
     #[test]
     fn format_durations() {
@@ -530,6 +691,7 @@ mod tests {
                 id: "call-1".into(),
                 name: Arc::from("bash"),
                 summary: "cargo check".into(),
+                children: Vec::new(),
                 status: ToolStatus::Success,
                 receiving_args: false,
                 started_at: None,
@@ -584,6 +746,7 @@ mod tests {
                 id: "call-1".into(),
                 name: Arc::from("bash"),
                 summary: "ls".into(),
+                children: Vec::new(),
                 status: ToolStatus::Success,
                 receiving_args: false,
                 started_at: None,
@@ -633,6 +796,7 @@ mod tests {
                 id: "call-1".into(),
                 name: Arc::from("bash"),
                 summary: "cargo check".into(),
+                children: Vec::new(),
                 status: ToolStatus::InProgress,
                 receiving_args: false,
                 started_at: None,
@@ -663,6 +827,7 @@ mod tests {
                 id: "call-1".into(),
                 name: Arc::from("bash"),
                 summary: String::new(),
+                children: Vec::new(),
                 status: ToolStatus::InProgress,
                 receiving_args: true,
                 started_at: None,
@@ -718,6 +883,7 @@ mod tests {
                     id: "call-1".into(),
                     name: Arc::from("edit"),
                     summary: "foo.rs".into(),
+                    children: Vec::new(),
                     status: ToolStatus::Success,
                     receiving_args: false,
                     started_at: None,
@@ -727,6 +893,7 @@ mod tests {
                     id: "call-2".into(),
                     name: Arc::from("bash"),
                     summary: "cargo test".into(),
+                    children: Vec::new(),
                     status: ToolStatus::Error,
                     receiving_args: false,
                     started_at: None,
@@ -778,6 +945,7 @@ mod tests {
                 id: format!("call-{i}"),
                 name: Arc::from("read"),
                 summary: format!("file_{i}.rs"),
+                children: Vec::new(),
                 status: ToolStatus::Success,
                 receiving_args: false,
                 started_at: None,
@@ -814,6 +982,7 @@ mod tests {
                     id: "call-1".into(),
                     name: Arc::from("bash"),
                     summary: "git status".into(),
+                    children: Vec::new(),
                     status: ToolStatus::Success,
                     receiving_args: false,
                     started_at: None,
@@ -823,6 +992,7 @@ mod tests {
                     id: "call-2".into(),
                     name: Arc::from("bash"),
                     summary: "Run compact_test".into(),
+                    children: Vec::new(),
                     status: ToolStatus::InProgress,
                     receiving_args: false,
                     started_at: None,
@@ -887,6 +1057,7 @@ mod tests {
                 id: "call-1".into(),
                 name: Arc::from("bash"),
                 summary: "ls".into(),
+                children: Vec::new(),
                 status: ToolStatus::InProgress,
                 receiving_args: false,
                 started_at: None,
@@ -936,6 +1107,7 @@ mod tests {
                 id: format!("c{i}"),
                 name: Arc::from("tool"),
                 summary: format!("op {i}"),
+                children: Vec::new(),
                 status: ToolStatus::Success,
                 receiving_args: false,
                 started_at: None,

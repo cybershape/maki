@@ -8392,6 +8392,18 @@ Requires the `env` [plugin permission](#plugin-permissions).
 local editor = maki.uv.os_getenv("EDITOR") or "vi"
 ```
 
+---
+
+### `maki.uv.hrtime()` {#maki-uv-hrtime}
+
+```lua
+maki.uv.hrtime()
+```
+
+Returns a monotonic timestamp in nanoseconds, like `vim.uv.hrtime`.
+
+**Returns:** (`integer`) Nanoseconds from an arbitrary origin, for measuring elapsed time.
+
 
 ## maki.yaml {#maki-yaml}
 

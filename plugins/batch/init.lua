@@ -25,6 +25,8 @@ local CANCELLED_ERROR = "cancelled"
 local DISCARDED_ERROR = string.format("maximum of %d tools per batch", MAX_BATCH_SIZE)
 local SECTION_FMT = "## %s\n"
 local SECTION_PAT = "^## (.+)$"
+local NANOS_PER_MILLISECOND = 1000000
+local DURATION_STYLE = "batch_duration_ms"
 
 -- Anchored pattern matching exactly what a `%d`-only format produces, so
 -- the no-state parser can never drift from the render formats below.
@@ -228,6 +230,9 @@ local function child_header_line(c)
   for _, s in ipairs(c.header or {}) do
     spans[#spans + 1] = s
   end
+  if c.duration_ms then
+    spans[#spans + 1] = { " (" .. c.duration_ms .. "ms)", DURATION_STYLE }
+  end
   if c.annotation then
     spans[#spans + 1] = { " (" .. c.annotation .. ")", "tool_annotation" }
   end
@@ -304,6 +309,7 @@ local function to_state(children)
       output = c.output,
       annotation = c.annotation,
       usage = c.usage,
+      duration_ms = c.duration_ms,
     }
   end
   return { children = out }
@@ -456,6 +462,9 @@ function Batch:settle(c, status, output)
     error(string.format(RESETTLE_FMT, tostring(c.tool), c.status, status))
   end
   c.swept = nil
+  if c.started_at and not c.duration_ms then
+    c.duration_ms = math.floor((maki.uv.hrtime() - c.started_at) / NANOS_PER_MILLISECOND)
+  end
   c.status = status
   c.output = output
   self:attach_body(c)
@@ -469,6 +478,7 @@ function Batch:run_child(c, ctx)
     return
   end
   c.status = STATUS.RUNNING
+  c.started_at = maki.uv.hrtime()
   self:rerender()
   local text, err = maki.agent.call_tool(ctx, c.tool, c.params, {
     output_mode = ctx:output_mode(),
@@ -602,6 +612,7 @@ local function restore(input, output, _is_error, rctx)
       c.status = TERMINAL[sc.status] and sc.status or STATUS.ERROR
       c.output, c.annotation = sc.output, sc.annotation
       c.usage = sc.usage
+      c.duration_ms = sc.duration_ms
     end
     return Batch.new(children, cctx).buf
   end

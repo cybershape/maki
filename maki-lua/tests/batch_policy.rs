@@ -836,6 +836,28 @@ fn restore_child_body_equals_child_restore_view() {
     );
 }
 
+#[test_case::test_case(OK_TOOL, STATUS_SUCCESS; "success")]
+#[test_case::test_case(BOOM_TOOL, STATUS_ERROR; "error")]
+fn child_duration_is_saved_and_restored(tool: &str, status: &str) {
+    const DURATION_STYLE: &str = "batch_duration_ms";
+    let (reg, host) = load_batch_host();
+    let input = json!([{ "tool": tool, "parameters": { "tag": "a" } }]);
+    let (state, snapshots) = exec_batch_live(&host, &reg, input.clone());
+    let duration = state["children"][0]["duration_ms"]
+        .as_u64()
+        .expect("child duration");
+    assert_eq!(state["children"][0]["status"], status);
+    let expected = format!(" ({duration}ms)");
+    let has_duration = |lines: &[Vec<(String, SpanStyle)>]| {
+        lines[0].iter().any(|(text, style)| {
+            text == &expected && *style == SpanStyle::Named(DURATION_STYLE.into())
+        })
+    };
+    assert!(has_duration(&snapshot_lines(snapshots.last().unwrap())));
+    let restored = restore_snapshot_lines(&host, batch_input(input), "", Some(state));
+    assert!(has_duration(&restored));
+}
+
 #[test]
 fn usage_renders_inline_on_matching_child() {
     let (reg, host) = load_batch_host();

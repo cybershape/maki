@@ -754,6 +754,7 @@ pub fn history_to_display(
                                     id: id.clone(),
                                     name: Arc::from(static_name),
                                     summary,
+                                    children: Vec::new(),
                                     status,
                                     receiving_args: false,
                                     started_at: None,

@@ -405,6 +405,7 @@ pub struct GroupToolEntry {
     pub id: String,
     pub name: Arc<str>,
     pub summary: String,
+    pub children: Vec<GroupToolEntry>,
     pub status: ToolStatus,
     pub receiving_args: bool,
     pub started_at: Option<Instant>,

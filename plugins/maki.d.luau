@@ -222,6 +222,7 @@ declare maki: {
     cwd: @checked () -> (string?),
     os_homedir: @checked () -> (string?),
     os_getenv: @checked (name: string) -> (string?),
+    hrtime: @checked () -> (number),
   },
   yaml: {
     encode: @checked (value: any) -> (string?, string?),

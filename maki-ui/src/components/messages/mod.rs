@@ -391,6 +391,7 @@ impl MessagesPanel {
                         id: id.clone(),
                         name: Arc::from(name),
                         summary: String::new(),
+                        children: Vec::new(),
                         status: ToolStatus::InProgress,
                         receiving_args: true,
                         started_at: Some(Instant::now()),
@@ -410,6 +411,7 @@ impl MessagesPanel {
                     id,
                     name: Arc::from(name),
                     summary: String::new(),
+                    children: Vec::new(),
                     status: ToolStatus::InProgress,
                     receiving_args: true,
                     started_at: Some(Instant::now()),
@@ -477,6 +479,7 @@ impl MessagesPanel {
                     id: event.id,
                     name: Arc::clone(&event.tool),
                     summary: event.summary,
+                    children: Vec::new(),
                     status: ToolStatus::InProgress,
                     receiving_args: false,
                     started_at: Some(Instant::now()),
@@ -495,6 +498,7 @@ impl MessagesPanel {
                     id: event.id,
                     name: Arc::clone(&event.tool),
                     summary: event.summary,
+                    children: Vec::new(),
                     status: ToolStatus::InProgress,
                     receiving_args: false,
                     started_at: Some(Instant::now()),
@@ -593,6 +597,7 @@ impl MessagesPanel {
                 }
             }
             if let Some(gid) = found_group {
+                self.retire_live_buf(&event.id);
                 self.rebuild_tool_group_segment(&gid);
                 return;
             }
@@ -805,6 +810,7 @@ impl MessagesPanel {
                 self.cache.clear();
             }
             let mut affected_groups = Vec::new();
+            let mut cancelled_tools = Vec::new();
             for msg in &mut self.messages {
                 if let DisplayRole::ToolGroup(g) = &mut msg.role {
                     let mut changed = false;
@@ -812,6 +818,15 @@ impl MessagesPanel {
                         match entry {
                             GroupEntry::Tool(t) if t.status == ToolStatus::InProgress => {
                                 t.status = ToolStatus::Error;
+                                for child in &mut t.children {
+                                    if child.status == ToolStatus::InProgress {
+                                        child.status = ToolStatus::Error;
+                                        child.duration = child.duration.or_else(|| {
+                                            child.started_at.map(|start| start.elapsed())
+                                        });
+                                    }
+                                }
+                                cancelled_tools.push(t.id.clone());
                                 changed = true;
                             }
                             GroupEntry::Thinking(th) if th.active => {
@@ -833,6 +848,9 @@ impl MessagesPanel {
                         affected_groups.push(g.id.clone());
                     }
                 }
+            }
+            for id in cancelled_tools {
+                self.retire_live_buf(&id);
             }
             for gid in affected_groups {
                 self.rebuild_tool_group_segment(&gid);
@@ -1596,10 +1614,53 @@ impl MessagesPanel {
         theme_gen: Option<u64>,
     ) {
         if theme_gen.is_some() {
-            // A generation only comes with restore replies. The restore
-            // superseded the old live view (and evicted the runtime's
-            // warm handle), so its buf must not overwrite this snapshot.
             self.stop_watching(tool_id);
+        }
+        if self.compact_tools && !is_header {
+            let group_id = self.messages.iter_mut().rev().find_map(|msg| {
+                let DisplayRole::ToolGroup(group) = &mut msg.role else {
+                    return None;
+                };
+                let entry = group.entries.iter_mut().find_map(|entry| match entry {
+                    GroupEntry::Tool(tool)
+                        if tool.id == tool_id && tool.name.as_ref() == tool_group::BATCH_TOOL =>
+                    {
+                        Some(tool)
+                    }
+                    _ => None,
+                })?;
+                let mut children = tool_group::batch_children(&snapshot);
+                for (index, child) in children.iter_mut().enumerate() {
+                    let previous = entry
+                        .children
+                        .get(index)
+                        .filter(|old| old.name == child.name);
+                    child.started_at = previous.and_then(|old| old.started_at);
+                    if child.status == ToolStatus::InProgress {
+                        child.started_at.get_or_insert_with(Instant::now);
+                    } else if child.duration.is_none() {
+                        child.duration = previous
+                            .and_then(|old| old.duration)
+                            .or_else(|| child.started_at.map(|start| start.elapsed()));
+                    }
+                }
+                if entry.status == ToolStatus::Error {
+                    for child in &mut children {
+                        if child.status == ToolStatus::InProgress {
+                            child.status = ToolStatus::Error;
+                        }
+                    }
+                }
+                if !children.is_empty() {
+                    entry.children = children;
+                    entry.summary = format!("{} tools", entry.children.len());
+                }
+                Some(group.id.clone())
+            });
+            if let Some(group_id) = group_id {
+                self.rebuild_tool_group_segment(&group_id);
+                return;
+            }
         }
         let Some(applied_gen) = self.resolve_snapshot_gen(tool_id, theme_gen) else {
             return;
