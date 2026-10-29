@@ -10,16 +10,16 @@
 - **上游跟踪分支**: `upstream/main`
 - **当前本地分支**: `main`（跟踪 `origin/main`: `git@github.com:cybershape/maki.git`）
 - **最新同步的上游 Commit**:
-  - **Commit SHA**: `08793b9f1972f38aa59148f7d98d99caaf7e5a98`
-  - **Commit 日期**: `Mon Oct 26 13:49:17 2026 +0100`
+  - **Commit SHA**: `ec1c1a6286f2e59696468a9e28b2c56b67529639`
+  - **Commit 日期**: `Wed Oct 28 21:45:14 2026 +0100`
   - **Commit 作者**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
-  - **Commit 信息**: `refactor(otel): export through the official OpenTelemetry SDK`
+  - **Commit 信息**: `perf(websearch): list kagi results as a numbered list`
 - **初始分叉点 (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit 日期**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit 信息**: `chore(deps): move monty to crates.io 1.x`
 
-> 本次已成功合并 `upstream/main`（至 commit `08793b9f`）。
+> 本次已成功合并 `upstream/main`（至 commit `ec1c1a62`）。
 
 ---
 
@@ -45,6 +45,24 @@
 | `9fbeeaff` | `fix(code_execution): clarify description to discourage proxying single tool calls` | 明确 code_execution 提示词，避免代理单次工具调用 |
 | `5e429368` | `feat(ui): add show_cost configuration to hide cost and pricing in UI` | 新增 `show_cost` 配置项，允许隐藏 UI 中的全部开销与定价 |
 | `c206adff` | `Merge branch 'upstream/main' into main` | 合并上游提交（至 `08793b9f`），包含官方 OTel SDK 导出、输入多行/语法高亮重构、代码沙箱文件系统访问等 |
+| `341da1ef` | `docs: update upstream tracking record to 08793b9f` | 更新上游跟踪记录文档至 `08793b9f` |
+| `546567d2` | `feat(ui): add compact_tools mode for grouped tool and thinking view` | UI 支持紧凑工具与思考视图分组模式 |
+| `ce9f9fc7` | `fix(ui): align compact tool group header, status text and thinking animation with pi-my-compact-ui` | 对齐紧凑工具组头部、状态文字及思考动画样式 |
+| `e50c81e1` | `fix(ui): add waiting states for compact tool groups and support late tool names` | 紧凑工具组等待状态完善及 late tool name 支持 |
+| `0b3b7569` | `fix(ui): remove redundant space after in-progress spinner in compact tool rows` | 移除紧凑工具行中运行 spinner 后的多余空格 |
+| `5effe64b` | `fix(ui): separate compact tool groups by text output and discard empty groups` | 紧凑工具组按文本输出切分并丢弃空工具组 |
+| `42732f86` | `feat(config): control agent compatibility sources with per-agent and all switches` | 支持配置 agent 兼容源控制（per-agent 及 all 开关） |
+| `58af112a` | `fix(ui): reflow compact tool and thinking groups on resize` | 终端大小调整时重新排版紧凑工具和思考组 |
+| `7896ade1` | `fix(ui): wrap chat text at display column boundaries` | 聊天文本严格按显示列边界折行 |
+| `d32d13cb` | `feat(ui): add max_width config and cli option to center UI` | 新增 `max_width` 配置项与 CLI 选项以居中显示 UI |
+| `2897baf9` | `feat(ui): refine compact tool group styles and waiting state titles` | 精炼紧凑工具组样式与等待状态标题 |
+| `44cc5ef8` | `feat(acp): return model display names in config options` | ACP 配置项中返回模型友好展示名称 |
+| `45ed00a4` | `fix(acp): include enum values and map header to title for question tool` | ACP 协议修复问题工具枚举值与标题映射 |
+| `4df8ab3d` | `feat(acp): emit usage_update on session/new and session/load` | ACP 会话新建与加载时触发 `usage_update` |
+| `cf98b38d` | `feat(acp): emit usage_update on model switch, model refresh, and compaction` | ACP 模型切换、刷新和压缩时触发 `usage_update` |
+| `1a6f0151` | `fix(ui): re-open plan form after refinement and queue implement while streaming` | 修复计划表单优化后重开及流式状态排队执行 |
+| `26d5a75b` | `fix(acp): cache model metadata and push updates on display name resolution` | ACP 缓存模型元数据并在解析展示名时推送更新 |
+| `401b5406` | `Merge branch 'upstream/main' into main` | 合并上游提交（至 `ec1c1a62`），包含 model tier override 优先规则、Release fat LTO 构建优化、Websearch Kagi 搜索结果编号列表优化 |
 
 ---
 
