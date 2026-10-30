@@ -59,7 +59,7 @@ impl RunContext {
         model: &Model,
         tools: RequestTools,
     ) -> Self {
-        let system = build_system_prompt(vars, instructions, slots, model);
+        let system = build_system_prompt(vars, instructions, slots, model, &tools);
         Self {
             system,
             tools,

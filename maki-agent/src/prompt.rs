@@ -4,6 +4,7 @@ use std::sync::Arc;
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 
 use crate::template::Vars;
+use crate::tools::is_builtin_tool;
 
 pub trait ValidNames: IntoEnumIterator + std::fmt::Display {
     fn valid_names() -> String {
@@ -214,6 +215,16 @@ impl ResolvedPrompts {
     /// Expand only the template's variables and insertion points. Inserted
     /// plugin text and project instructions are never recursively rendered.
     pub fn render(&self, prompt: PromptId, vars: &Vars, instructions: &str) -> String {
+        self.render_with_tools(prompt, vars, instructions, &|_| true)
+    }
+
+    pub fn render_with_tools(
+        &self,
+        prompt: PromptId,
+        vars: &Vars,
+        instructions: &str,
+        is_tool_enabled: &impl Fn(&str) -> bool,
+    ) -> String {
         let mut remaining = self.template(prompt);
         let mut out = String::with_capacity(remaining.len());
         while let Some(open) = remaining.find("{{") {
@@ -228,7 +239,7 @@ impl ResolvedPrompts {
             if name == INSTRUCTIONS_MARKER {
                 out.push_str(instructions);
             } else if let Ok(slot) = name.parse::<Slot>() {
-                let content = self.section(prompt, slot);
+                let content = self.section_with_tools(prompt, slot, is_tool_enabled);
                 out.push_str(&content);
                 if content.is_empty() {
                     remaining = remaining.strip_prefix('\n').unwrap_or(remaining);
@@ -243,6 +254,15 @@ impl ResolvedPrompts {
 
     /// Effective section content, including its default and contributions.
     pub fn section(&self, prompt: PromptId, slot: Slot) -> String {
+        self.section_with_tools(prompt, slot, &|_| true)
+    }
+
+    pub fn section_with_tools(
+        &self,
+        prompt: PromptId,
+        slot: Slot,
+        is_tool_enabled: &impl Fn(&str) -> bool,
+    ) -> String {
         let entries = self.get(prompt, slot);
         if slot.kind() == SlotKind::Singleton {
             return entries
@@ -252,22 +272,130 @@ impl ResolvedPrompts {
                 .to_string();
         }
         let replacement = self.sections.get(&(prompt, slot));
-        let default = replacement
-            .map(String::as_str)
-            .unwrap_or_else(|| prompt.default_section(slot));
-        if slot == Slot::EfficientTools && replacement.is_none() && !entries.is_empty() {
-            let extras = entries
+        if slot == Slot::EfficientTools {
+            if let Some(r) = replacement {
+                return std::iter::once(r.as_str())
+                    .chain(entries.iter().map(|entry| entry.content.as_str()))
+                    .filter(|content| !content.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            let candidates = ["batch", "code_execution", "task"];
+            let mut efficient: Vec<&str> = candidates
                 .iter()
-                .map(|entry| entry.content.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return format!("{}, {extras}.", default.trim_end_matches('.'));
+                .copied()
+                .filter(|&t| is_tool_enabled(t))
+                .collect();
+            for entry in entries {
+                let name = entry.content.trim();
+                if !name.is_empty() && is_tool_enabled(name) && !efficient.contains(&name) {
+                    efficient.push(name);
+                }
+            }
+            if efficient.is_empty() {
+                return String::new();
+            }
+            return format!("Most efficient tools: {}.", efficient.join(", "));
         }
-        std::iter::once(default)
-            .chain(entries.iter().map(|entry| entry.content.as_str()))
-            .filter(|content| !content.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
+        let default = if let Some(r) = replacement {
+            r.clone()
+        } else if slot == Slot::ToolUsage {
+            default_tool_usage(prompt, is_tool_enabled)
+        } else {
+            prompt.default_section(slot).to_string()
+        };
+        let mut out = Vec::new();
+        if !default.is_empty() {
+            out.push(default);
+        }
+        for entry in entries {
+            if slot == Slot::ToolUsage
+                && is_builtin_tool(&entry.plugin)
+                && !is_tool_enabled(&entry.plugin)
+            {
+                continue;
+            }
+            if slot == Slot::ToolUsage
+                && entry.plugin.as_ref() == "bash"
+                && !is_tool_enabled("batch")
+            {
+                let adjusted = entry
+                    .content
+                    .replace(". Use batch for independent ones.", ".");
+                if !adjusted.is_empty() {
+                    out.push(adjusted);
+                }
+            } else if !entry.content.is_empty() {
+                out.push(entry.content.clone());
+            }
+        }
+        out.join("\n")
+    }
+}
+
+fn default_tool_usage(prompt: PromptId, is_tool_enabled: &impl Fn(&str) -> bool) -> String {
+    match prompt {
+        PromptId::System => {
+            let batch = is_tool_enabled("batch");
+            let code_execution = is_tool_enabled("code_execution");
+            let task = is_tool_enabled("task");
+
+            let mut lines = Vec::new();
+            lines.push("- Every tool result grows your context. Minimize use of verbose tool calls, prefer compact results.".to_string());
+
+            let mut parts = Vec::new();
+            if batch {
+                parts.push("**batch** for parallel calls");
+            }
+            if code_execution {
+                parts.push("**code_execution** for chained/filtered calls");
+            }
+            if task {
+                parts.push("**task** for delegation");
+            }
+            if !parts.is_empty() {
+                lines.push(format!("- Use {}.", parts.join(", ")));
+            }
+            if batch && task {
+                lines.push("- Combine **batch** and **task**: launch multiple tasks in a batch to parallelize research or implementation.".to_string());
+            }
+            lines.push("- Read files before editing them. Match surrounding context, conventions, and imports.".to_string());
+            lines.push("- Prefer edits over full file writes.".to_string());
+            lines.join("\n")
+        }
+        PromptId::Research => {
+            let batch = is_tool_enabled("batch");
+            let code_execution = is_tool_enabled("code_execution");
+            let mut lines = Vec::new();
+            lines.push("- Every tool result grows your context. Minimize use of verbose tool calls, prefer compact results.");
+            if batch {
+                lines.push("- **Use batch** for 2+ independent reads, greps, or globs. Never call them one at a time sequentially.");
+            }
+            if code_execution {
+                lines.push("- **Use code_execution** for dependent/chained calls (e.g. glob then read matches) or filtering large tool outputs.");
+            }
+            lines.join("\n")
+        }
+        PromptId::General => {
+            let batch = is_tool_enabled("batch");
+            let code_execution = is_tool_enabled("code_execution");
+            let mut lines = Vec::new();
+            lines.push("- Every tool result grows your context. Minimize use of verbose tool calls, prefer compact results.");
+            if batch && code_execution {
+                lines.push("- **Use batch** for 2+ independent parallel calls, **code_execution** for dependent/chained calls or filtering/processing results.");
+            } else if batch {
+                lines.push("- **Use batch** for 2+ independent parallel calls.");
+            } else if code_execution {
+                lines.push("- **Use code_execution** for dependent/chained calls or filtering/processing results.");
+            }
+            lines.push("- Read files before editing them. Look at surrounding context and imports to match conventions.");
+            lines.push("- Prefer edit/multiedit over write; targeted edits use far fewer tokens.");
+            lines.push(
+                "- NEVER create files unless absolutely necessary. Prefer editing existing files.",
+            );
+            lines.join("\n")
+        }
+        _ => String::new(),
     }
 }
 
@@ -663,5 +791,209 @@ mod tests {
             prompts.render(PromptId::System, &vars, ""),
             format!("{ENVIRONMENT}\nSelected identity")
         );
+    }
+
+    #[test]
+    fn system_tool_usage_all_enabled() {
+        let p = ResolvedPrompts::default();
+        let out = p.render_with_tools(PromptId::System, &Vars::default(), "", &|_| true);
+        assert!(out.contains("- Use **batch** for parallel calls, **code_execution** for chained/filtered calls, **task** for delegation."));
+        assert!(out.contains("- Combine **batch** and **task**: launch multiple tasks in a batch to parallelize research or implementation."));
+        assert!(out.contains("Most efficient tools: batch, code_execution, task."));
+    }
+
+    #[test]
+    fn system_tool_usage_task_disabled() {
+        let p = ResolvedPrompts::default();
+        let is_enabled = |name: &str| name != "task";
+        let out = p.render_with_tools(PromptId::System, &Vars::default(), "", &is_enabled);
+        assert!(out.contains(
+            "- Use **batch** for parallel calls, **code_execution** for chained/filtered calls."
+        ));
+        assert!(!out.contains("Combine **batch** and **task**"));
+        assert!(!out.contains("**task** for delegation"));
+        assert!(out.contains("Most efficient tools: batch, code_execution."));
+    }
+
+    #[test]
+    fn system_tool_usage_batch_disabled() {
+        let p = ResolvedPrompts::default();
+        let is_enabled = |name: &str| name != "batch";
+        let out = p.render_with_tools(PromptId::System, &Vars::default(), "", &is_enabled);
+        assert!(out.contains(
+            "- Use **code_execution** for chained/filtered calls, **task** for delegation."
+        ));
+        assert!(!out.contains("Combine **batch** and **task**"));
+        assert!(!out.contains("**batch** for parallel calls"));
+        assert!(out.contains("Most efficient tools: code_execution, task."));
+    }
+
+    #[test]
+    fn system_tool_usage_code_execution_disabled() {
+        let p = ResolvedPrompts::default();
+        let is_enabled = |name: &str| name != "code_execution";
+        let out = p.render_with_tools(PromptId::System, &Vars::default(), "", &is_enabled);
+        assert!(out.contains("- Use **batch** for parallel calls, **task** for delegation."));
+        assert!(out.contains("- Combine **batch** and **task**: launch multiple tasks in a batch to parallelize research or implementation."));
+        assert!(!out.contains("**code_execution**"));
+        assert!(out.contains("Most efficient tools: batch, task."));
+    }
+
+    #[test]
+    fn system_tool_usage_only_task_enabled() {
+        let p = ResolvedPrompts::default();
+        let is_enabled = |name: &str| name == "task";
+        let out = p.render_with_tools(PromptId::System, &Vars::default(), "", &is_enabled);
+        assert!(out.contains("- Use **task** for delegation."));
+        assert!(!out.contains("Combine **batch** and **task**"));
+        assert!(!out.contains("**batch**"));
+        assert!(!out.contains("**code_execution**"));
+        assert!(out.contains("Most efficient tools: task."));
+    }
+
+    #[test]
+    fn system_tool_usage_only_code_execution_enabled() {
+        let p = ResolvedPrompts::default();
+        let is_enabled = |name: &str| name == "code_execution";
+        let out = p.render_with_tools(PromptId::System, &Vars::default(), "", &is_enabled);
+        assert!(out.contains("- Use **code_execution** for chained/filtered calls."));
+        assert!(!out.contains("Combine **batch** and **task**"));
+        assert!(!out.contains("**batch**"));
+        assert!(!out.contains("**task**"));
+        assert!(out.contains("Most efficient tools: code_execution."));
+    }
+
+    #[test]
+    fn system_tool_usage_only_batch_enabled() {
+        let p = ResolvedPrompts::default();
+        let is_enabled = |name: &str| name == "batch";
+        let out = p.render_with_tools(PromptId::System, &Vars::default(), "", &is_enabled);
+        assert!(out.contains("- Use **batch** for parallel calls."));
+        assert!(!out.contains("Combine **batch** and **task**"));
+        assert!(!out.contains("**code_execution**"));
+        assert!(!out.contains("**task**"));
+        assert!(out.contains("Most efficient tools: batch."));
+    }
+
+    #[test]
+    fn system_tool_usage_all_three_disabled() {
+        let p = ResolvedPrompts::default();
+        let is_enabled = |name: &str| name != "batch" && name != "code_execution" && name != "task";
+        let out = p.render_with_tools(PromptId::System, &Vars::default(), "", &is_enabled);
+        assert!(!out.contains("- Use **"));
+        assert!(!out.contains("Combine **batch** and **task**"));
+        assert!(!out.contains("Most efficient tools:"));
+        assert!(out.contains("- Every tool result grows your context. Minimize use of verbose tool calls, prefer compact results."));
+        assert!(out.contains(
+            "- Read files before editing them. Match surrounding context, conventions, and imports."
+        ));
+        assert!(out.contains("- Prefer edits over full file writes."));
+    }
+
+    #[test]
+    fn bash_tool_usage_adjusts_for_batch_disabled() {
+        let mut s = ResolvedPrompts::default();
+        s.insert(
+            PromptId::System,
+            Slot::ToolUsage,
+            SlotEntry {
+                plugin: Arc::from("bash"),
+                content: "- Chain dependent commands with `&&`. Use batch for independent ones."
+                    .into(),
+            },
+        );
+        let out_enabled = s.render_with_tools(PromptId::System, &Vars::default(), "", &|_| true);
+        assert!(
+            out_enabled
+                .contains("- Chain dependent commands with `&&`. Use batch for independent ones.")
+        );
+
+        let out_disabled =
+            s.render_with_tools(PromptId::System, &Vars::default(), "", &|n| n != "batch");
+        assert!(out_disabled.contains("- Chain dependent commands with `&&`."));
+        assert!(!out_disabled.contains("Use batch for independent ones"));
+    }
+
+    #[test]
+    fn disabled_tool_plugin_hints_are_skipped() {
+        let mut s = ResolvedPrompts::default();
+        s.insert(
+            PromptId::System,
+            Slot::ToolUsage,
+            SlotEntry {
+                plugin: Arc::from("grep"),
+                content: "- Use the **grep** tool when searching.".into(),
+            },
+        );
+        let out_enabled = s.render_with_tools(PromptId::System, &Vars::default(), "", &|_| true);
+        assert!(out_enabled.contains("- Use the **grep** tool when searching."));
+
+        let out_disabled =
+            s.render_with_tools(PromptId::System, &Vars::default(), "", &|n| n != "grep");
+        assert!(!out_disabled.contains("- Use the **grep** tool when searching."));
+    }
+
+    #[test]
+    fn research_tool_usage_with_disabled_tools() {
+        let p = ResolvedPrompts::default();
+        let out_batch_disabled =
+            p.render_with_tools(PromptId::Research, &Vars::default(), "", &|n| n != "batch");
+        assert!(!out_batch_disabled.contains("**Use batch**"));
+        assert!(out_batch_disabled.contains("**Use code_execution**"));
+
+        let out_both_disabled =
+            p.render_with_tools(PromptId::Research, &Vars::default(), "", &|n| {
+                n != "batch" && n != "code_execution"
+            });
+        assert!(!out_both_disabled.contains("**Use batch**"));
+        assert!(!out_both_disabled.contains("**Use code_execution**"));
+    }
+
+    #[test]
+    fn general_tool_usage_with_disabled_tools() {
+        let p = ResolvedPrompts::default();
+        let out_batch_disabled =
+            p.render_with_tools(PromptId::General, &Vars::default(), "", &|n| n != "batch");
+        assert!(!out_batch_disabled.contains("**Use batch**"));
+        assert!(out_batch_disabled.contains(
+            "- **Use code_execution** for dependent/chained calls or filtering/processing results."
+        ));
+
+        let out_code_disabled =
+            p.render_with_tools(PromptId::General, &Vars::default(), "", &|n| {
+                n != "code_execution"
+            });
+        assert!(!out_code_disabled.contains("**code_execution**"));
+        assert!(out_code_disabled.contains("- **Use batch** for 2+ independent parallel calls."));
+
+        let out_both_disabled =
+            p.render_with_tools(PromptId::General, &Vars::default(), "", &|n| {
+                n != "batch" && n != "code_execution"
+            });
+        assert!(!out_both_disabled.contains("- **Use batch**"));
+        assert!(!out_both_disabled.contains("- **Use code_execution**"));
+    }
+
+    #[test]
+    fn efficient_tools_deduplicates_extras() {
+        let mut s = ResolvedPrompts::default();
+        s.insert(
+            PromptId::System,
+            Slot::EfficientTools,
+            SlotEntry {
+                plugin: Arc::from("code_execution"),
+                content: "code_execution".into(),
+            },
+        );
+        s.insert(
+            PromptId::System,
+            Slot::EfficientTools,
+            SlotEntry {
+                plugin: Arc::from("index"),
+                content: "index".into(),
+            },
+        );
+        let out = s.render_with_tools(PromptId::System, &Vars::default(), "", &|_| true);
+        assert!(out.contains("Most efficient tools: batch, code_execution, task, index."));
     }
 }

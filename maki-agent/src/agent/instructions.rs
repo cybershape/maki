@@ -7,6 +7,7 @@ use crate::InstructionBlock;
 use crate::command::{git_remote_urls, project_ancestor_dirs};
 use crate::prompt::{PromptId, ResolvedPrompts};
 use crate::template::Vars;
+use crate::tools::RequestTools;
 use maki_config::{InstructionsConfig, project};
 use maki_providers::model::Model;
 
@@ -103,15 +104,17 @@ pub fn build_system_prompt(
     instructions: &str,
     slots: &ResolvedPrompts,
     model: &Model,
+    tools: &RequestTools,
 ) -> String {
     let vars = vars.clone().set("{model}", model.spec());
+    let is_enabled = |name: &str| tools.is_enabled(name);
     if slots.has_template(PromptId::System) {
-        return slots.render(PromptId::System, &vars, instructions);
+        return slots.render_with_tools(PromptId::System, &vars, instructions, &is_enabled);
     }
     let env = vars.apply("\n\n{environment}");
     let env = format!("{env}\n- Model: {}", model.spec());
     let instructions = format!("{env}{instructions}");
-    slots.render(PromptId::System, &vars, &instructions)
+    slots.render_with_tools(PromptId::System, &vars, &instructions, &is_enabled)
 }
 
 fn read_unseen(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf, String)> {
@@ -329,6 +332,7 @@ mod tests {
             &format!("\n{INSTR}"),
             &slots,
             &Model::from_spec("responses/default").unwrap(),
+            &RequestTools::default(),
         );
         assert!(prompt.find(INSTR).unwrap() < prompt.find(EXTRA).unwrap());
     }

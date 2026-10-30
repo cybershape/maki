@@ -394,11 +394,13 @@ async fn system_prompt(
     ctx: mlua::UserDataRef<LuaCtx>,
     opts: Table,
 ) -> LuaResult<Pair<String>> {
-    let (slots, instructions_config) = {
+    let (slots, instructions_config, disabled_tools, tool_filter) = {
         let agent_ctx = try_pair!(dispatch_ctx(&ctx, "system_prompt"));
         (
             Arc::clone(&agent_ctx.prompt_slots),
             agent_ctx.config.instructions.clone(),
+            agent_ctx.config.disabled_tools.clone(),
+            Arc::clone(&agent_ctx.tool_filter),
         )
     };
     // Nothing may hold the ctx borrow across the wait: a cancel hook firing
@@ -427,7 +429,16 @@ async fn system_prompt(
         _ => return Err(mlua::Error::runtime("instructions must be bool or string")),
     };
 
-    Ok((Some(slots.render(prompt_id, &vars, &instructions)), None))
+    let is_enabled = |name: &str| {
+        if prompt_id != maki_agent::prompt::PromptId::System && name == "task" {
+            return false;
+        }
+        maki_agent::tools::is_tool_enabled(&disabled_tools, name) && tool_filter.matches(name)
+    };
+    Ok((
+        Some(slots.render_with_tools(prompt_id, &vars, &instructions, &is_enabled)),
+        None,
+    ))
 }
 
 /// Get the list of tool definitions for a given audience. Pass the result

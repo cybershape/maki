@@ -251,6 +251,17 @@ impl RequestTools {
     pub fn filter(&self) -> &Arc<ToolFilter> {
         &self.filter
     }
+
+    pub fn is_enabled(&self, name: &str) -> bool {
+        if let Some(defs) = self.definitions.as_array()
+            && !defs.is_empty()
+        {
+            return defs
+                .iter()
+                .any(|d| d[TOOL_NAME_FIELD].as_str() == Some(name));
+        }
+        self.filter.matches(name)
+    }
 }
 
 /// One gate for every definitions builder (main loop, headless, Lua): a model

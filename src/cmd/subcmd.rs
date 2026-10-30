@@ -548,7 +548,9 @@ pub fn prompt(
     use maki_agent::agent::{build_system_prompt, load_instruction_text, plan_mode_update};
     use maki_agent::prompt::PromptId;
     use maki_agent::template;
-    use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
+    use maki_agent::tools::{
+        DescriptionContext, RequestTools, ToolAudience, ToolFilter, ToolRegistry,
+    };
     use maki_providers::Model;
 
     if plan && !matches!(variant, PromptVariant::System) {
@@ -600,7 +602,8 @@ pub fn prompt(
                 .as_deref()
                 .unwrap_or(default_spec);
             let model = Model::from_spec(model_spec).context("invalid default model")?;
-            let prompt = build_system_prompt(&vars, &instructions, &slots, &model);
+            let tools = RequestTools::build(reg, &vars, &model, &config.agent, &[], false, false);
+            let prompt = build_system_prompt(&vars, &instructions, &slots, &model, &tools);
             // Plan mode reaches the model as a context update after the
             // prompt, so this shows that message too.
             if plan {
@@ -612,8 +615,20 @@ pub fn prompt(
                 prompt
             }
         }
-        PromptVariant::Research => slots.render(PromptId::Research, &vars, &instructions),
-        PromptVariant::General => slots.render(PromptId::General, &vars, &instructions),
+        PromptVariant::Research => {
+            let model = Model::from_spec("responses/default").unwrap();
+            let filter = ToolFilter::from_config(&config.agent, &model, &["task"]);
+            slots.render_with_tools(PromptId::Research, &vars, &instructions, &|name| {
+                filter.matches(name)
+            })
+        }
+        PromptVariant::General => {
+            let model = Model::from_spec("responses/default").unwrap();
+            let filter = ToolFilter::from_config(&config.agent, &model, &["task"]);
+            slots.render_with_tools(PromptId::General, &vars, &instructions, &|name| {
+                filter.matches(name)
+            })
+        }
     };
 
     print!("{output}");
