@@ -2497,7 +2497,10 @@ mod tests {
     #[test]
     fn sanitize_task_id_cases() {
         assert_eq!(sanitize_task_id("call_123"), "task/call_123");
-        assert_eq!(sanitize_task_id(&"a".repeat(40)), format!("task/{}", "a".repeat(32)));
+        assert_eq!(
+            sanitize_task_id(&"a".repeat(40)),
+            format!("task/{}", "a".repeat(32))
+        );
         assert_eq!(sanitize_task_id("weird $#@! chars"), "task/weirdchars");
         assert_eq!(sanitize_task_id("@#$!"), "task");
     }

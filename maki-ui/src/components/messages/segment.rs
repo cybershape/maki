@@ -61,6 +61,7 @@ pub(super) struct Segment {
     /// the click finds its message. It looks unused; delete it and the
     /// thinking_lines toggle breaks.
     pub msg_index: Option<usize>,
+    pub is_user: bool,
     /// What a click can expand. On thinking, `output` means it is drawn
     /// collapsed: the click answers what the reader sees, not the config.
     pub truncation: SectionFlags,

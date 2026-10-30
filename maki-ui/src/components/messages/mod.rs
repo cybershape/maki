@@ -1367,7 +1367,12 @@ impl MessagesPanel {
                 break;
             }
             let highlight = self.highlight_segment == Some(i);
-            cursor.render_segment(seg, None, highlight, frame);
+            let style = if seg.is_user {
+                Some(theme::current().user_bg)
+            } else {
+                None
+            };
+            cursor.render_segment(seg, style, highlight, frame);
             for image in &mut seg.images {
                 cursor.render_image(image, self.image_picker.as_ref(), images_visible, frame);
             }
@@ -1982,6 +1987,7 @@ impl MessagesPanel {
                     message_view(msg, self.thinking_lines, self.viewport_width);
                 self.cache.push_spacer_if_needed();
                 let mut seg = Segment::with_lines(lines, Some(i));
+                seg.is_user = matches!(msg.role, DisplayRole::User);
                 seg.truncation.output = truncated;
                 seg.set_images(message_images(msg));
                 self.cache.push(seg);
@@ -2121,8 +2127,8 @@ fn message_prefix(msg: &DisplayMessage, style: &RoleStyle) -> &'static str {
     }
 }
 
-/// Carries the role prefix so a query can hit either the prose or the "you>"
-/// and "thinking>" markers the reader sees. Collapsed thinking needs no case of
+/// Carries the role prefix so a query can hit either the prose or the role
+/// prefix markers the reader sees. Collapsed thinking needs no case of
 /// its own: its indicator is drawn from the same prefix.
 fn message_search_text(msg: &DisplayMessage) -> String {
     let style = message_style(&msg.role);

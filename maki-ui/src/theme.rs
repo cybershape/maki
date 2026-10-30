@@ -443,6 +443,8 @@ named_styles!(t => {
     "item_selected" | "selected" => t.item_selected,
     "item_match" | "match" => t.item_match,
     "item_match_selected" | "match_selected" => t.item_match_selected,
+    "user" => t.user,
+    "user_bg" => t.user_bg,
     "cursor" => t.cursor,
     "cursor_unfocused" => t.cursor_unfocused,
     "background" => Style::new().bg(t.background),
@@ -465,6 +467,7 @@ pub struct Theme {
     pub foreground: Color,
 
     pub user: Style,
+    pub user_bg: Style,
     pub assistant: Style,
     pub assistant_prefix: Style,
     pub thinking: Style,
@@ -872,6 +875,7 @@ impl Theme {
             foreground: color("foreground"),
 
             user: style("user"),
+            user_bg: style_or("user_bg", "tool_bg"),
             assistant: style("assistant"),
             assistant_prefix: style("assistant_prefix"),
             thinking: brighten_toward(
@@ -1456,6 +1460,8 @@ diff_new_line_nr = { fg = "red" }
         assert_eq!(style_by_name("match"), t.item_match);
         assert_eq!(style_by_name("match_selected"), t.item_match_selected);
         assert_eq!(style_by_name("thinking"), t.thinking);
+        assert_eq!(style_by_name("user"), t.user);
+        assert_eq!(style_by_name("user_bg"), t.user_bg);
     }
 
     #[test_case("nonexistent_style")]

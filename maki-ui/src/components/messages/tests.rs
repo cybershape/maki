@@ -297,7 +297,7 @@ fn a_flush_leaves_one_copy_of_the_text() {
 #[test_case(18 ; "odd_content_width")]
 fn chinese_wrapping_survives_flush_resize_and_copy(width: u16) {
     const BODY: &str = "我会新增 `progress.md`，在 `AGENTS.md` 中加入修改前回顾决策、提交时记录决策的要求，并补记本次扫码登录调整，然后一起提交并推送当前改动。";
-    const VISIBLE: &str = "maki> 我会新增 progress.md，在 AGENTS.md 中加入修改前回顾决策、提交时记录决策的要求，并补记本次扫码登录调整，然后一起提交并推送当前改动。";
+    const VISIBLE: &str = "我会新增 progress.md，在 AGENTS.md 中加入修改前回顾决策、提交时记录决策的要求，并补记本次扫码登录调整，然后一起提交并推送当前改动。";
     const HEIGHT: u16 = 24;
 
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
@@ -848,9 +848,41 @@ fn search_text_includes_role_prefix() {
     panel.push(DisplayMessage::new(DisplayRole::Thinking, "hmm".into()));
     rebuild(&mut panel);
     let texts = panel.segment_search_texts();
-    assert_eq!(texts[0], "you> hello");
-    assert_eq!(texts[2], format!("maki> {md}"));
+    assert_eq!(texts[0], "❯ hello");
+    assert_eq!(texts[2], md);
     assert_eq!(texts[4], "thinking> hmm");
+}
+
+#[test]
+fn user_message_renders_with_user_bg_and_chevron() {
+    crate::theme::set(crate::theme::load_by_name("dracula").unwrap());
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, "my query".into()));
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "answer".into()));
+    let terminal = render(&mut panel, 80, 24);
+    let buf = terminal.backend().buffer();
+
+    let user_bg = crate::theme::current().user_bg.bg;
+    assert!(user_bg.is_some(), "user_bg should have a background color");
+
+    assert!(panel.cache.get(0).unwrap().is_user);
+
+    let chevron_cell = buf.cell((1, 0)).unwrap();
+    assert_eq!(chevron_cell.symbol(), "❯");
+    assert_eq!(chevron_cell.style().bg, user_bg);
+
+    let text_cell = buf.cell((3, 0)).unwrap();
+    assert_eq!(text_cell.symbol(), "m");
+    assert_eq!(text_cell.style().bg, user_bg);
+
+    let trailing_cell = buf.cell((50, 0)).unwrap();
+    assert_eq!(trailing_cell.style().bg, user_bg);
+
+    let spacer_cell = buf.cell((1, 1)).unwrap();
+    assert_ne!(spacer_cell.style().bg, user_bg);
+
+    let assistant_cell = buf.cell((1, 2)).unwrap();
+    assert_ne!(assistant_cell.style().bg, user_bg);
 }
 
 #[test]
@@ -3805,7 +3837,7 @@ fn compact_tools_direct_tool_call_includes_waiting_time() {
 }
 
 const LEFT_PAD_MSG: &str = "leftmost column must be blank padding";
-const MESSAGE_START_CHAR: &str = "y";
+const MESSAGE_START_CHAR: &str = "❯";
 const COMPACT_GROUP_START_CHAR: &str = "✓";
 
 #[test]
