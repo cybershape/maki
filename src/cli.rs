@@ -5,6 +5,7 @@ use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
+use maki_config::MaxWidth;
 
 use crate::print::OutputFormat;
 
@@ -120,9 +121,9 @@ pub struct Cli {
     #[arg(long)]
     pub max_turns: Option<u32>,
 
-    /// Maximum width of the UI in terminal columns (centers UI if terminal is wider)
-    #[arg(long, value_name = "COLUMNS")]
-    pub max_width: Option<u16>,
+    /// Maximum width of the UI in terminal columns, fraction (e.g. 0.8), or negative offset (e.g. -10)
+    #[arg(long, allow_hyphen_values = true, value_name = "WIDTH")]
+    pub max_width: Option<MaxWidth>,
 
     /// System prompt override
     #[arg(long)]

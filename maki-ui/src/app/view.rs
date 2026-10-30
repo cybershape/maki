@@ -10,6 +10,7 @@ use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
+use maki_config::MaxWidth;
 use maki_lua::Split;
 use maki_providers::RequestOptions;
 use ratatui::Frame;
@@ -19,18 +20,23 @@ use ratatui::widgets::{Block, Borders, Widget};
 
 use super::{App, Mode, Status};
 
-pub fn center_rect(area: Rect, max_width: Option<u16>) -> Rect {
+pub fn center_rect(area: Rect, max_width: Option<MaxWidth>) -> Rect {
     match max_width {
-        Some(max_w) if max_w > 0 && area.width > max_w => {
-            let x_offset = (area.width - max_w) / 2;
-            Rect {
-                x: area.x + x_offset,
-                y: area.y,
-                width: max_w,
-                height: area.height,
+        Some(max_w) => {
+            let target_w = max_w.resolve(area.width);
+            if target_w > 0 && area.width > target_w {
+                let x_offset = (area.width - target_w) / 2;
+                Rect {
+                    x: area.x + x_offset,
+                    y: area.y,
+                    width: target_w,
+                    height: area.height,
+                }
+            } else {
+                area
             }
         }
-        _ => area,
+        None => area,
     }
 }
 

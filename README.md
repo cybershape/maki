@@ -12,7 +12,7 @@
   - Markdown LaTeX math expression rendering via `txm`.
   - OSC 7501 Program Status Protocol support for terminal status reporting; inline image rendering for Rex (`TERM_PROGRAM=rex`).
   - Stylized user messages with chevron prefix and background tint.
-  - Layout and display options: `show_cost`, `prefer_model_name`, `max_width` centering, and column-boundary text wrapping.
+  - Layout and display options: `show_cost`, `prefer_model_name`, `max_width` centering (supporting column counts, viewport ratios like `0.8`, and negative offsets like `-10`), and column-boundary text wrapping.
 - **ACP server:** On-disk model cache with wait-for-discovery on first run; session `thought_level` (and aliases) for reasoning effort; `usage_update` on session load, model changes, refresh, and compaction; model display names in config options; question-tool and model-metadata fixes.
 - **Storage & history:** Timestamps recorded on session log records (`MessageRecord`, `ContentBlockRecord`); duration tracking for individual thinking blocks.
 - **Instructions:** Per-agent and global switches for which third-party instruction files (e.g. `CLAUDE.md`, `.cursorrules`) are loaded.

@@ -20,7 +20,7 @@ use maki_agent::{
     TurnCompleteEvent,
 };
 use maki_config::{
-    AlwaysThinking, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission, PluginsConfig,
+    AlwaysThinking, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, MaxWidth, Permission, PluginsConfig,
     ThinkingLines, ToolKey, ToolOutputLines,
 };
 use maki_lua::{
@@ -3665,7 +3665,7 @@ fn setup_all_sections_at_once() {
                 always_yolo = true,
                 always_fast = true,
                 always_thinking = "adaptive",
-                ui = { splash_animation = false, mouse_scroll_lines = 5 },
+                ui = { splash_animation = false, mouse_scroll_lines = 5, max_width = 0.8 },
                 agent = {
                     max_output_lines = 9000,
                     compaction_instructions = "Note plan.md",
@@ -3689,6 +3689,7 @@ fn setup_all_sections_at_once() {
     );
     assert_eq!(raw.ui.splash_animation, Some(false));
     assert_eq!(raw.ui.mouse_scroll_lines, Some(5));
+    assert_eq!(raw.ui.max_width, Some(MaxWidth::Ratio(0.8)));
     assert_eq!(raw.agent.max_output_lines, Some(9000));
     assert_eq!(
         raw.agent.compaction_instructions.as_deref(),
@@ -3709,6 +3710,24 @@ fn setup_all_sections_at_once() {
         serde_json::json!(180)
     );
     assert_eq!(raw.plugins["websearch"].enabled, Some(false));
+}
+
+#[test]
+fn setup_ui_max_width_supports_ratio_and_offset() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            r#"maki.setup({
+                ui = { max_width = -10 },
+            })"#
+            .to_owned(),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap()
+        .expect("expected Some(RawConfig)");
+    assert_eq!(raw.ui.max_width, Some(MaxWidth::Offset(-10)));
 }
 
 const OPTS_PROBE_PLUGIN: &str = r#"

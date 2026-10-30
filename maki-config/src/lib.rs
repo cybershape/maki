@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::fs;
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 use globset::{GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
@@ -36,6 +38,8 @@ pub const DEFAULT_THINKING_LINES: usize = 3;
 const NEVER_COLLAPSE_THINKING: i64 = -1;
 const THINKING_LINES_RANGE: &str =
     "thinking_lines must be -1 (never collapse), 0 (header only) or a row count";
+const MAX_WIDTH_EXPECTED: &str =
+    "column count (e.g. 120), fraction of viewport (e.g. 0.8), or negative offset (e.g. -10)";
 
 pub const MIN_MAX_INPUT_LINES: u32 = 1;
 
@@ -669,7 +673,7 @@ pub struct UiFileConfig {
     pub prefer_model_name: Option<bool>,
     pub show_cost: Option<bool>,
     pub compact_tools: Option<bool>,
-    pub max_width: Option<u16>,
+    pub max_width: Option<MaxWidth>,
 }
 
 impl UiFileConfig {
@@ -719,6 +723,173 @@ impl<'de> Deserialize<'de> for ThinkingLines {
                 .map(Self::Tail)
                 .map_err(|_| D::Error::custom(THINKING_LINES_RANGE)),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MaxWidth {
+    Fixed(u16),
+    Ratio(f64),
+    Offset(i16),
+}
+
+impl MaxWidth {
+    pub fn resolve(self, viewport_width: u16) -> u16 {
+        match self {
+            Self::Fixed(cols) => cols,
+            Self::Ratio(fraction) => {
+                if fraction <= 0.0 {
+                    0
+                } else {
+                    let w = (f64::from(viewport_width) * fraction).round();
+                    w.clamp(0.0, f64::from(u16::MAX)) as u16
+                }
+            }
+            Self::Offset(offset) => {
+                if offset < 0 {
+                    viewport_width.saturating_sub(offset.unsigned_abs())
+                } else {
+                    viewport_width.saturating_sub(offset as u16)
+                }
+            }
+        }
+    }
+}
+
+impl From<u16> for MaxWidth {
+    fn from(w: u16) -> Self {
+        Self::Fixed(w)
+    }
+}
+
+impl fmt::Display for MaxWidth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Fixed(w) => write!(f, "{w}"),
+            Self::Ratio(r) => write!(f, "{r}"),
+            Self::Offset(o) => write!(f, "{o}"),
+        }
+    }
+}
+
+impl FromStr for MaxWidth {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        if let Some(percent_str) = trimmed.strip_suffix('%') {
+            let p: f64 = percent_str
+                .trim()
+                .parse()
+                .map_err(|_| format!("invalid max_width percentage {trimmed:?}"))?;
+            if !(0.0..=100.0).contains(&p) {
+                return Err(format!(
+                    "max_width percentage must be between 0% and 100%, got {trimmed:?}"
+                ));
+            }
+            return Ok(Self::Ratio(p / 100.0));
+        }
+        if let Ok(i) = trimmed.parse::<i64>() {
+            if i < 0 {
+                let offset = i16::try_from(i)
+                    .map_err(|_| format!("max_width offset {trimmed:?} is out of range"))?;
+                return Ok(Self::Offset(offset));
+            }
+            let cols = u16::try_from(i)
+                .map_err(|_| format!("max_width columns {trimmed:?} is out of range"))?;
+            return Ok(Self::Fixed(cols));
+        }
+        if let Ok(f) = trimmed.parse::<f64>() {
+            if f.is_nan() || f.is_infinite() {
+                return Err(format!("invalid max_width float {trimmed:?}"));
+            }
+            if (0.0..=1.0).contains(&f) {
+                return Ok(Self::Ratio(f));
+            }
+            if f.fract() == 0.0 {
+                if f < 0.0 {
+                    let offset = i16::try_from(f as i64)
+                        .map_err(|_| format!("max_width offset {trimmed:?} is out of range"))?;
+                    return Ok(Self::Offset(offset));
+                }
+                let cols = u16::try_from(f as u64)
+                    .map_err(|_| format!("max_width columns {trimmed:?} is out of range"))?;
+                return Ok(Self::Fixed(cols));
+            }
+        }
+        Err(format!(
+            "invalid max_width {trimmed:?}: expected {MAX_WIDTH_EXPECTED}"
+        ))
+    }
+}
+
+impl Serialize for MaxWidth {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match *self {
+            Self::Fixed(w) => serializer.serialize_u16(w),
+            Self::Ratio(r) => serializer.serialize_f64(r),
+            Self::Offset(o) => serializer.serialize_i16(o),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MaxWidth {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MaxWidthVisitor;
+
+        impl serde::de::Visitor<'_> for MaxWidthVisitor {
+            type Value = MaxWidth;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(MAX_WIDTH_EXPECTED)
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                if v < 0 {
+                    i16::try_from(v)
+                        .map(MaxWidth::Offset)
+                        .map_err(|_| E::custom(format!("max_width offset {v} is out of range")))
+                } else {
+                    u16::try_from(v)
+                        .map(MaxWidth::Fixed)
+                        .map_err(|_| E::custom(format!("max_width columns {v} is out of range")))
+                }
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                u16::try_from(v)
+                    .map(MaxWidth::Fixed)
+                    .map_err(|_| E::custom(format!("max_width columns {v} is out of range")))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                if v.is_nan() || v.is_infinite() {
+                    return Err(E::custom(format!("invalid max_width float {v}")));
+                }
+                if (0.0..=1.0).contains(&v) {
+                    return Ok(MaxWidth::Ratio(v));
+                }
+                if v.fract() == 0.0 {
+                    if v < 0.0 {
+                        return i16::try_from(v as i64).map(MaxWidth::Offset).map_err(|_| {
+                            E::custom(format!("max_width offset {v} is out of range"))
+                        });
+                    }
+                    return u16::try_from(v as u64)
+                        .map(MaxWidth::Fixed)
+                        .map_err(|_| E::custom(format!("max_width columns {v} is out of range")));
+                }
+                Err(E::custom(format!(
+                    "invalid max_width float {v}: expected fraction between 0.0 and 1.0, or whole columns"
+                )))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
+                s.parse::<MaxWidth>().map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(MaxWidthVisitor)
     }
 }
 
@@ -1391,11 +1562,11 @@ pub struct UiConfig {
 
     #[config(
         default = None,
-        ty = "integer",
+        ty = "integer | float",
         default_doc = "none",
-        desc = "Maximum width of the UI in terminal columns, centered horizontally when terminal is wider"
+        desc = "Maximum width of the UI: column count (e.g. 120), fraction of viewport (e.g. 0.8), or negative offset from viewport (e.g. -10), centered horizontally when terminal is wider"
     )]
-    pub max_width: Option<u16>,
+    pub max_width: Option<MaxWidth>,
 }
 
 impl UiConfig {
@@ -5251,12 +5422,54 @@ mod tests {
 
         let parsed: RawConfig = toml::from_str("[ui]\nmax_width = 120\n").unwrap();
         let cfg = UiConfig::from_file(parsed.ui);
-        assert_eq!(cfg.max_width, Some(120));
+        assert_eq!(cfg.max_width, Some(MaxWidth::Fixed(120)));
 
         let mut base: UiFileConfig = toml::from_str("max_width = 120\n").unwrap();
         let overlay: UiFileConfig = toml::from_str("max_width = 80\n").unwrap();
         base.merge(overlay);
-        assert_eq!(base.max_width, Some(80));
+        assert_eq!(base.max_width, Some(MaxWidth::Fixed(80)));
+    }
+
+    #[test]
+    fn max_width_supports_ratio_and_offset_and_percentage() {
+        let parsed_ratio: RawConfig = toml::from_str("[ui]\nmax_width = 0.8\n").unwrap();
+        assert_eq!(parsed_ratio.ui.max_width, Some(MaxWidth::Ratio(0.8)));
+
+        let parsed_offset: RawConfig = toml::from_str("[ui]\nmax_width = -10\n").unwrap();
+        assert_eq!(parsed_offset.ui.max_width, Some(MaxWidth::Offset(-10)));
+
+        let parsed_pct: RawConfig = toml::from_str("[ui]\nmax_width = \"80%\"\n").unwrap();
+        assert_eq!(parsed_pct.ui.max_width, Some(MaxWidth::Ratio(0.8)));
+
+        let parsed_str_offset: RawConfig = toml::from_str("[ui]\nmax_width = \"-10\"\n").unwrap();
+        assert_eq!(parsed_str_offset.ui.max_width, Some(MaxWidth::Offset(-10)));
+
+        let parsed_str_ratio: RawConfig = toml::from_str("[ui]\nmax_width = \"0.8\"\n").unwrap();
+        assert_eq!(parsed_str_ratio.ui.max_width, Some(MaxWidth::Ratio(0.8)));
+    }
+
+    #[test]
+    fn max_width_resolves_viewport_geometry() {
+        assert_eq!(MaxWidth::Fixed(120).resolve(200), 120);
+        assert_eq!(MaxWidth::Fixed(120).resolve(100), 120);
+
+        assert_eq!(MaxWidth::Ratio(0.8).resolve(100), 80);
+        assert_eq!(MaxWidth::Ratio(0.8).resolve(200), 160);
+        assert_eq!(MaxWidth::Ratio(0.8).resolve(101), 81);
+        assert_eq!(MaxWidth::Ratio(0.0).resolve(100), 0);
+
+        assert_eq!(MaxWidth::Offset(-10).resolve(100), 90);
+        assert_eq!(MaxWidth::Offset(-10).resolve(200), 190);
+        assert_eq!(MaxWidth::Offset(-10).resolve(10), 0);
+        assert_eq!(MaxWidth::Offset(-10).resolve(8), 0);
+    }
+
+    #[test]
+    fn max_width_rejects_invalid_values() {
+        assert!(toml::from_str::<RawConfig>("[ui]\nmax_width = 1.5\n").is_err());
+        assert!(toml::from_str::<RawConfig>("[ui]\nmax_width = -0.5\n").is_err());
+        assert!(toml::from_str::<RawConfig>("[ui]\nmax_width = \"invalid\"\n").is_err());
+        assert!(toml::from_str::<RawConfig>("[ui]\nmax_width = \"120%\"\n").is_err());
     }
 
     #[test]

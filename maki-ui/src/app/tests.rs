@@ -33,7 +33,8 @@ use maki_agent::{
     TurnCompleteEvent,
 };
 use maki_config::{
-    Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey, UiConfig,
+    Effect, MaxWidth, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey,
+    UiConfig,
 };
 use maki_lua::test_support::{
     HintWriterHandle, RequestProbe, TestBinding, hint_writer_pair, keymap_reader_from,
@@ -11261,28 +11262,60 @@ fn center_rect_handles_bounds() {
     let full = Rect::new(0, 0, 200, 50);
 
     assert_eq!(center_rect(full, None), full);
-    assert_eq!(center_rect(full, Some(0)), full);
-    assert_eq!(center_rect(full, Some(200)), full);
-    assert_eq!(center_rect(full, Some(220)), full);
+    assert_eq!(center_rect(full, Some(MaxWidth::Fixed(0))), full);
+    assert_eq!(center_rect(full, Some(MaxWidth::Fixed(200))), full);
+    assert_eq!(center_rect(full, Some(MaxWidth::Fixed(220))), full);
 
-    let centered = center_rect(full, Some(120));
+    let centered = center_rect(full, Some(MaxWidth::Fixed(120)));
     assert_eq!(centered, Rect::new(40, 0, 120, 50));
 
     let odd = Rect::new(0, 0, 201, 50);
-    let centered_odd = center_rect(odd, Some(120));
+    let centered_odd = center_rect(odd, Some(MaxWidth::Fixed(120)));
     assert_eq!(centered_odd, Rect::new(40, 0, 120, 50));
 
     let offset_area = Rect::new(10, 5, 200, 50);
     assert_eq!(
-        center_rect(offset_area, Some(120)),
+        center_rect(offset_area, Some(MaxWidth::Fixed(120))),
         Rect::new(50, 5, 120, 50)
+    );
+
+    // Ratio 0.8: viewport 200 -> 160 width, x_offset = 20
+    assert_eq!(
+        center_rect(full, Some(MaxWidth::Ratio(0.8))),
+        Rect::new(20, 0, 160, 50)
+    );
+    // Ratio 0.8: odd viewport 201 -> (201 * 0.8).round() = 161, x_offset = 20
+    assert_eq!(
+        center_rect(odd, Some(MaxWidth::Ratio(0.8))),
+        Rect::new(20, 0, 161, 50)
+    );
+    // Ratio 1.0 -> full width unchanged
+    assert_eq!(center_rect(full, Some(MaxWidth::Ratio(1.0))), full);
+
+    // Offset -10: viewport 200 -> 190 width, x_offset = 5
+    assert_eq!(
+        center_rect(full, Some(MaxWidth::Offset(-10))),
+        Rect::new(5, 0, 190, 50)
+    );
+    // Offset -10: odd viewport 201 -> 191 width, x_offset = 5
+    assert_eq!(
+        center_rect(odd, Some(MaxWidth::Offset(-10))),
+        Rect::new(5, 0, 191, 50)
+    );
+    // Small viewport where offset exceeds or equals width -> returns full area unmodified
+    let tiny = Rect::new(0, 0, 10, 20);
+    assert_eq!(center_rect(tiny, Some(MaxWidth::Offset(-10))), tiny);
+    let very_tiny = Rect::new(0, 0, 8, 20);
+    assert_eq!(
+        center_rect(very_tiny, Some(MaxWidth::Offset(-10))),
+        very_tiny
     );
 }
 
 #[test]
 fn max_width_constrains_and_centers_layout() {
     let mut app = test_app();
-    app.ui_config.max_width = Some(100);
+    app.ui_config.max_width = Some(MaxWidth::Fixed(100));
 
     let area = Rect::new(0, 0, 160, 40);
     let (msg, _bottom, status, input, splits) = app.layout_geometry(area);
@@ -11308,4 +11341,28 @@ fn max_width_constrains_and_centers_layout() {
     assert_eq!(input_small.width, 80);
     assert_eq!(splits_small.inner.x, 0);
     assert_eq!(splits_small.inner.width, 80);
+
+    // Ratio 0.8: area 160 -> width 128, x = 16
+    app.ui_config.max_width = Some(MaxWidth::Ratio(0.8));
+    let (msg_ratio, _, status_ratio, input_ratio, splits_ratio) = app.layout_geometry(area);
+    assert_eq!(status_ratio.x, 16);
+    assert_eq!(status_ratio.width, 128);
+    assert_eq!(msg_ratio.x, 16);
+    assert_eq!(msg_ratio.width, 128);
+    assert_eq!(input_ratio.x, 16);
+    assert_eq!(input_ratio.width, 128);
+    assert_eq!(splits_ratio.inner.x, 16);
+    assert_eq!(splits_ratio.inner.width, 128);
+
+    // Offset -10: area 160 -> width 150, x = 5
+    app.ui_config.max_width = Some(MaxWidth::Offset(-10));
+    let (msg_offset, _, status_offset, input_offset, splits_offset) = app.layout_geometry(area);
+    assert_eq!(status_offset.x, 5);
+    assert_eq!(status_offset.width, 150);
+    assert_eq!(msg_offset.x, 5);
+    assert_eq!(msg_offset.width, 150);
+    assert_eq!(input_offset.x, 5);
+    assert_eq!(input_offset.width, 150);
+    assert_eq!(splits_offset.inner.x, 5);
+    assert_eq!(splits_offset.inner.width, 150);
 }

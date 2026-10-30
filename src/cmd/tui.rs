@@ -584,7 +584,7 @@ mod tests {
     use clap::Parser;
     use color_eyre::eyre::eyre;
     use maki_agent::tools::ToolRegistry;
-    use maki_config::RawConfig;
+    use maki_config::{MaxWidth, RawConfig};
     use maki_providers::Message;
     use maki_storage::sessions::SessionClaim;
     use maki_ui::AppSession;
@@ -815,7 +815,7 @@ mod tests {
     fn cli_max_width_overrides_ui_config() {
         let dir = tempdir().expect("tempdir");
         let cli = Cli::parse_from(["maki", "--max-width", "100"]);
-        assert_eq!(cli.max_width, Some(100));
+        assert_eq!(cli.max_width, Some(MaxWidth::Fixed(100)));
 
         let plugin_host = PluginHost::new(Arc::new(ToolRegistry::new())).expect("live host boots");
 
@@ -829,6 +829,12 @@ mod tests {
         )
         .expect("load config");
 
-        assert_eq!(config.ui.max_width, Some(100));
+        assert_eq!(config.ui.max_width, Some(MaxWidth::Fixed(100)));
+
+        let cli_ratio = Cli::parse_from(["maki", "--max-width", "0.8"]);
+        assert_eq!(cli_ratio.max_width, Some(MaxWidth::Ratio(0.8)));
+
+        let cli_offset = Cli::parse_from(["maki", "--max-width", "-10"]);
+        assert_eq!(cli_offset.max_width, Some(MaxWidth::Offset(-10)));
     }
 }
