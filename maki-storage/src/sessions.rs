@@ -28,7 +28,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::lock::{Lock, LockError};
-use crate::{StateDir, StorageError, atomic_write, now_epoch, plans};
+use crate::{StateDir, StorageError, atomic_write, now_epoch, now_millis, plans};
 
 const SESSION_VERSION: u32 = 1;
 /// 3: messages write `kind` as a bare tag with `facts` beside it, records a
@@ -458,6 +458,16 @@ pub struct Session<M, U, T> {
     frame: Option<Arc<StoredFrame>>,
     pub created_at: u64,
     pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    message_timestamps: Vec<Option<u64>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    tool_output_timestamps: HashMap<String, u64>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    subagent_message_timestamps: HashMap<String, Vec<Option<u64>>>,
+    #[serde(skip)]
+    header_timestamp: Option<u64>,
+    #[serde(skip)]
+    meta_timestamp: u64,
     /// Bumped by every mutation, so a checkpoint knows if there is anything
     /// to write.
     #[serde(skip)]
@@ -756,16 +766,36 @@ enum LogRecord<M, U, T> {
         model: String,
         cwd: String,
         created_at: u64,
+        #[serde(default, alias = "ts", skip_serializing_if = "Option::is_none")]
+        timestamp: Option<u64>,
     },
     #[serde(rename = "msg")]
-    Msg { d: M },
+    Msg {
+        #[serde(default, alias = "ts", skip_serializing_if = "Option::is_none")]
+        timestamp: Option<u64>,
+        d: M,
+    },
     #[serde(rename = "out")]
-    Out { id: String, d: T },
+    Out {
+        id: String,
+        #[serde(default, alias = "ts", skip_serializing_if = "Option::is_none")]
+        timestamp: Option<u64>,
+        d: T,
+    },
     #[serde(rename = "sub_msg")]
-    SubMsg { sub: String, d: M },
+    SubMsg {
+        sub: String,
+        #[serde(default, alias = "ts", skip_serializing_if = "Option::is_none")]
+        timestamp: Option<u64>,
+        d: M,
+    },
     /// Written only when the frame changes. The last one wins on load.
     #[serde(rename = "frame")]
-    Frame { d: Arc<StoredFrame> },
+    Frame {
+        #[serde(default, alias = "ts", skip_serializing_if = "Option::is_none")]
+        timestamp: Option<u64>,
+        d: Arc<StoredFrame>,
+    },
     #[serde(rename = "meta")]
     Meta {
         title: String,
@@ -777,6 +807,8 @@ enum LogRecord<M, U, T> {
         usage_by_model: HashMap<String, StoredTokenUsage>,
         #[serde(flatten)]
         meta: SessionMeta,
+        #[serde(default, alias = "ts", skip_serializing_if = "Option::is_none")]
+        timestamp: Option<u64>,
     },
 }
 
@@ -1045,18 +1077,38 @@ impl SessionLog {
         let mut buf = Vec::new();
         let mut new_msg_count = self.saved_msg_count;
         let mut new_tool_ids = Vec::new();
+        let now_ms = now_millis();
 
-        for msg in &session.messages[self.saved_msg_count..] {
-            append_record(&mut buf, &LogRecord::<&M, &U, &T>::Msg { d: msg })?;
+        for (i, msg) in session.messages[self.saved_msg_count..].iter().enumerate() {
+            let idx = self.saved_msg_count + i;
+            let ts = session
+                .message_timestamps
+                .get(idx)
+                .copied()
+                .flatten()
+                .or(Some(now_ms));
+            append_record(
+                &mut buf,
+                &LogRecord::<&M, &U, &T>::Msg {
+                    timestamp: ts,
+                    d: msg,
+                },
+            )?;
             new_msg_count += 1;
         }
 
         for (id, output) in &session.tool_outputs {
             if !self.saved_tool_ids.contains(id) {
+                let ts = session
+                    .tool_output_timestamps
+                    .get(id)
+                    .copied()
+                    .or(Some(now_ms));
                 append_record(
                     &mut buf,
                     &LogRecord::<&M, &U, &T>::Out {
                         id: id.clone(),
+                        timestamp: ts,
                         d: output,
                     },
                 )?;
@@ -1067,11 +1119,19 @@ impl SessionLog {
         let mut new_sub_counts: Vec<(String, usize)> = Vec::new();
         for (sub_id, msgs) in &session.subagent_messages {
             let saved = self.saved_sub_msg_counts.get(sub_id).copied().unwrap_or(0);
-            for msg in &msgs[saved..] {
+            for (i, msg) in msgs[saved..].iter().enumerate() {
+                let ts = session
+                    .subagent_message_timestamps
+                    .get(sub_id)
+                    .and_then(|v| v.get(saved + i))
+                    .copied()
+                    .flatten()
+                    .or(Some(now_ms));
                 append_record(
                     &mut buf,
                     &LogRecord::<&M, &U, &T>::SubMsg {
                         sub: sub_id.clone(),
+                        timestamp: ts,
                         d: msg,
                     },
                 )?;
@@ -1083,7 +1143,7 @@ impl SessionLog {
 
         let frame_changed = session.frame != self.saved_frame;
         if frame_changed && let Some(frame) = &session.frame {
-            append_frame::<M, U, T>(&mut buf, frame)?;
+            append_frame::<M, U, T>(&mut buf, frame, Some(now_ms))?;
         }
 
         let meta = meta_record(session)?;
@@ -1190,7 +1250,11 @@ impl SessionLog {
     }
 }
 
-fn append_frame<M, U, T>(buf: &mut Vec<u8>, frame: &Arc<StoredFrame>) -> Result<(), SessionError>
+fn append_frame<M, U, T>(
+    buf: &mut Vec<u8>,
+    frame: &Arc<StoredFrame>,
+    timestamp: Option<u64>,
+) -> Result<(), SessionError>
 where
     M: Serialize,
     U: Serialize,
@@ -1199,6 +1263,7 @@ where
     append_record(
         buf,
         &LogRecord::<&M, &U, &T>::Frame {
+            timestamp,
             d: Arc::clone(frame),
         },
     )
@@ -1220,6 +1285,7 @@ where
             subagents: session.subagents.clone(),
             usage_by_model: session.usage_by_model.clone(),
             meta: session.meta.clone(),
+            timestamp: Some(session.meta_timestamp),
         },
     )?;
     Ok(buf)
@@ -1235,6 +1301,8 @@ where
     T: Serialize,
 {
     let mut buf = Vec::new();
+    let now_ms = now_millis();
+    let header_ts = session.header_timestamp.or(Some(now_ms));
     append_record(
         &mut buf,
         &LogRecord::<&M, &U, &T>::Header {
@@ -1243,33 +1311,60 @@ where
             model: session.model.clone(),
             cwd: session.cwd.clone(),
             created_at: session.created_at,
+            timestamp: header_ts,
         },
     )?;
-    for msg in session.messages.iter() {
-        append_record(&mut buf, &LogRecord::<&M, &U, &T>::Msg { d: msg })?;
+    for (i, msg) in session.messages.iter().enumerate() {
+        let ts = session
+            .message_timestamps
+            .get(i)
+            .copied()
+            .flatten()
+            .or(Some(now_ms));
+        append_record(
+            &mut buf,
+            &LogRecord::<&M, &U, &T>::Msg {
+                timestamp: ts,
+                d: msg,
+            },
+        )?;
     }
     for (id, output) in &session.tool_outputs {
+        let ts = session
+            .tool_output_timestamps
+            .get(id)
+            .copied()
+            .or(Some(now_ms));
         append_record(
             &mut buf,
             &LogRecord::<&M, &U, &T>::Out {
                 id: id.clone(),
+                timestamp: ts,
                 d: output,
             },
         )?;
     }
     for (sub_id, msgs) in &session.subagent_messages {
-        for msg in msgs.iter() {
+        for (i, msg) in msgs.iter().enumerate() {
+            let ts = session
+                .subagent_message_timestamps
+                .get(sub_id)
+                .and_then(|v| v.get(i))
+                .copied()
+                .flatten()
+                .or(Some(now_ms));
             append_record(
                 &mut buf,
                 &LogRecord::<&M, &U, &T>::SubMsg {
                     sub: sub_id.clone(),
+                    timestamp: ts,
                     d: msg,
                 },
             )?;
         }
     }
     if let Some(frame) = &session.frame {
-        append_frame::<M, U, T>(&mut buf, frame)?;
+        append_frame::<M, U, T>(&mut buf, frame, Some(now_ms))?;
     }
     buf.extend_from_slice(&meta_record(session)?);
     file.write_all(&buf).map_err(StorageError::from)?;
@@ -1323,8 +1418,13 @@ where
     let mut cwd = String::new();
     let mut created_at = 0u64;
     let mut messages: Vec<M> = Vec::new();
+    let mut message_timestamps: Vec<Option<u64>> = Vec::new();
     let mut tool_outputs = HashMap::new();
+    let mut tool_output_timestamps: HashMap<String, u64> = HashMap::new();
     let mut subagent_messages: HashMap<String, Vec<M>> = HashMap::new();
+    let mut subagent_message_timestamps: HashMap<String, Vec<Option<u64>>> = HashMap::new();
+    let mut header_timestamp = None;
+    let mut meta_timestamp = 0u64;
     let mut title = DEFAULT_TITLE.to_string();
     let mut token_usage = U::default();
     let mut updated_at = 0u64;
@@ -1368,22 +1468,38 @@ where
                 model: h_model,
                 cwd: h_cwd,
                 created_at: h_created,
+                timestamp: h_timestamp,
             } => {
                 check_log_format(v)?;
                 id = Some(h_id);
                 model = h_model;
                 cwd = h_cwd;
                 created_at = h_created;
+                header_timestamp = h_timestamp;
                 got_header = true;
             }
-            LogRecord::Msg { d } => messages.push(d),
-            LogRecord::Out { id: out_id, d } => {
-                tool_outputs.insert(out_id, Arc::new(d));
+            LogRecord::Msg { d, timestamp } => {
+                messages.push(d);
+                message_timestamps.push(timestamp);
             }
-            LogRecord::SubMsg { sub, d } => {
-                subagent_messages.entry(sub).or_default().push(d);
+            LogRecord::Out {
+                id: out_id,
+                d,
+                timestamp,
+            } => {
+                tool_outputs.insert(out_id.clone(), Arc::new(d));
+                if let Some(ts) = timestamp {
+                    tool_output_timestamps.insert(out_id, ts);
+                }
             }
-            LogRecord::Frame { d } => frame = Some(d),
+            LogRecord::SubMsg { sub, d, timestamp } => {
+                subagent_messages.entry(sub.clone()).or_default().push(d);
+                subagent_message_timestamps
+                    .entry(sub)
+                    .or_default()
+                    .push(timestamp);
+            }
+            LogRecord::Frame { d, .. } => frame = Some(d),
             LogRecord::Meta {
                 title: m_title,
                 token_usage: m_usage,
@@ -1391,6 +1507,7 @@ where
                 subagents: m_subagents,
                 usage_by_model: m_usage_by_model,
                 meta: m_meta,
+                timestamp: m_timestamp,
             } => {
                 title = m_title;
                 token_usage = m_usage;
@@ -1398,6 +1515,7 @@ where
                 subagents = m_subagents;
                 usage_by_model = m_usage_by_model;
                 meta = m_meta;
+                meta_timestamp = m_timestamp.unwrap_or_else(|| m_updated.saturating_mul(1000));
             }
         }
     }
@@ -1432,6 +1550,11 @@ where
         content_revision: 0,
         epoch: next_epoch(),
         rewrites: 0,
+        message_timestamps,
+        tool_output_timestamps,
+        subagent_message_timestamps,
+        header_timestamp,
+        meta_timestamp,
     })
 }
 
@@ -1826,6 +1949,7 @@ where
 {
     pub fn new(model: &str, cwd: &str) -> Self {
         let now = now_epoch();
+        let now_ms = now_millis();
         Self {
             version: SESSION_VERSION,
             id: MakiId::generate(),
@@ -1845,6 +1969,11 @@ where
             frame: None,
             created_at: now,
             updated_at: now,
+            message_timestamps: Vec::new(),
+            tool_output_timestamps: HashMap::new(),
+            subagent_message_timestamps: HashMap::new(),
+            header_timestamp: Some(now_ms),
+            meta_timestamp: now_ms,
             revision: 0,
             content_revision: 0,
             epoch: next_epoch(),
@@ -1870,6 +1999,7 @@ where
     /// that runs on the messages and later writes back into the session, which
     /// would otherwise have to copy every message to hold both.
     pub fn drain_messages(&mut self) -> Vec<M> {
+        self.message_timestamps.clear();
         Arc::unwrap_or_clone(std::mem::take(&mut self.messages))
     }
 
@@ -1913,6 +2043,7 @@ where
     /// new mutator gets by not thinking about it.
     fn touch_soft(&mut self) {
         self.updated_at = now_epoch();
+        self.meta_timestamp = now_millis();
         self.revision += 1;
     }
 
@@ -1964,16 +2095,28 @@ where
         self.token_usage = U::default();
         self.usage_by_model.clear();
         self.created_at = now_epoch();
+        let now_ms = now_millis();
+        self.header_timestamp = Some(now_ms);
+        self.meta_timestamp = now_ms;
         self.rewrite_messages();
         Ok(self)
     }
 
     pub fn push_message(&mut self, msg: M) {
         Arc::make_mut(&mut self.messages).push(msg);
+        self.message_timestamps.push(Some(now_millis()));
+        self.touch();
+    }
+
+    pub fn push_message_with_timestamp(&mut self, msg: M, timestamp: Option<u64>) {
+        Arc::make_mut(&mut self.messages).push(msg);
+        self.message_timestamps
+            .push(timestamp.or_else(|| Some(now_millis())));
         self.touch();
     }
 
     pub fn replace_messages(&mut self, messages: Vec<M>) {
+        self.message_timestamps = vec![Some(now_millis()); messages.len()];
         self.messages = Arc::new(messages);
         self.rewrite_messages();
     }
@@ -1983,12 +2126,19 @@ where
             return;
         }
         Arc::make_mut(&mut self.messages).truncate(len);
+        self.message_timestamps.truncate(len);
         self.rewrite_messages();
     }
 
     /// Adopting a producer's snapshot inherits its run token, so the log's
     /// cursors survive exactly when the snapshot was an append.
     fn set_history(&mut self, snapshot: &HistorySnapshot<M>) {
+        if snapshot.messages.len() < self.messages.len() {
+            self.message_timestamps.truncate(snapshot.messages.len());
+        }
+        while self.message_timestamps.len() < snapshot.messages.len() {
+            self.message_timestamps.push(Some(now_millis()));
+        }
         self.messages = Arc::clone(&snapshot.messages);
         self.frame = snapshot.frame.clone();
         self.epoch = snapshot.epoch;
@@ -2030,6 +2180,9 @@ where
     /// A change under an existing id is not expressible as an append, so it
     /// voids the cursors; a new id is a pure append.
     pub fn insert_tool_output(&mut self, id: String, output: Arc<T>) {
+        self.tool_output_timestamps
+            .entry(id.clone())
+            .or_insert_with(now_millis);
         if self.tool_outputs.insert(id, output).is_some() {
             self.rewrite();
         } else {
@@ -2055,8 +2208,35 @@ where
             Some(_) => false,
             None => true,
         };
+        let ts_vec = self
+            .subagent_message_timestamps
+            .entry(id.clone())
+            .or_default();
+        if grew {
+            while ts_vec.len() < msgs.len() {
+                ts_vec.push(Some(now_millis()));
+            }
+        } else {
+            *ts_vec = vec![Some(now_millis()); msgs.len()];
+        }
         self.subagent_messages.insert(id, Arc::new(msgs));
         if grew { self.touch() } else { self.rewrite() }
+    }
+
+    pub fn message_timestamps(&self) -> &[Option<u64>] {
+        &self.message_timestamps
+    }
+
+    pub fn tool_output_timestamps(&self) -> &HashMap<String, u64> {
+        &self.tool_output_timestamps
+    }
+
+    pub fn header_timestamp(&self) -> Option<u64> {
+        self.header_timestamp
+    }
+
+    pub fn meta_timestamp(&self) -> u64 {
+        self.meta_timestamp
     }
 
     fn set_token_usage(&mut self, usage: U)
@@ -2794,6 +2974,37 @@ mod tests {
         assert!(loaded.tool_outputs().contains_key("tool-1"));
         assert_eq!(loaded.subagent_messages["sub-1"].len(), 2);
         assert_eq!(loaded.subagent_messages["sub-2"].len(), 1);
+        assert_eq!(loaded.message_timestamps().len(), 3);
+        assert!(loaded.tool_output_timestamps().contains_key("tool-1"));
+    }
+
+    #[test]
+    fn jsonl_records_include_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("hello"));
+        session.insert_tool_output(
+            "tool-1".into(),
+            Arc::new(serde_json::json!({"status": "ok"})),
+        );
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        let raw = fs::read_to_string(jsonl_path(dir, session.id)).unwrap();
+        let records: Vec<Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(
+            records
+                .iter()
+                .all(|r| r.get("timestamp").and_then(Value::as_u64).is_some())
+        );
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.message_timestamps().len(), 1);
+        assert!(loaded.message_timestamps()[0].is_some());
+        assert!(loaded.tool_output_timestamps().contains_key("tool-1"));
     }
 
     /// The mirror re-adopts the run's snapshot on every checkpoint; that must

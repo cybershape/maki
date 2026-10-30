@@ -167,6 +167,13 @@ pub fn now_epoch() -> u64 {
         .as_secs()
 }
 
+pub fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
