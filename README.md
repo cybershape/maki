@@ -3,11 +3,20 @@
 **Changes in this fork (vs [tontinton/maki](https://github.com/tontinton/maki) `main`):**
 
 - **Providers:** Built-in and bundled provider plugins are trimmed to the OpenAI **Responses API** path only (upstream’s multi-vendor built-ins and provider Lua plugins are removed). The Responses integration adds fuller `/models` discovery parsing and reasoning-effort / thinking-level handling for OpenAI-family models; CLI auth is aligned with that stack.
-- **Tools:** The built-in directory listing tool is renamed from `list` to `list_dir`.
+- **Tool call reasons (`toolcall_reason`):** Injects an optional `toolcall_reason` parameter into every tool schema, prompting models to provide a concise, intent-focused reason (omitting redundant file names) for invoking the tool. The reason is displayed directly on the tool header / row title in the TUI (e.g. `reading main entry point · src/main.rs:10-29`) and stripped before execution so tool handlers receive clean arguments.
+- **Tools & prompts:** Built-in directory listing tool is renamed from `list` to `list_dir`. System prompt hints dynamically adapt when `batch`, `code_execution`, or `task` are disabled.
+- **TUI & interaction:**
+  - `compact_tools` mode grouping tools and thinking blocks with durations, waiting animations, child tool summaries, and full preservation across session restore.
+  - Prompt queue with steer shortcut (Shift-Enter) to steer a running turn, plus recall editing for queued and previous prompts.
+  - Context-window usage progress bar in status bar using theme colors; per-turn stats line upon completion.
+  - Markdown LaTeX math expression rendering via `txm`.
+  - OSC 7501 Program Status Protocol support for terminal status reporting.
+  - Stylized user messages with chevron prefix and background tint.
+  - Layout and display options: `show_cost`, `prefer_model_name`, `max_width` centering, and column-boundary text wrapping.
 - **ACP server:** On-disk model cache with wait-for-discovery on first run; session `thought_level` (and aliases) for reasoning effort; `usage_update` on session load, model changes, refresh, and compaction; model display names in config options; question-tool and model-metadata fixes.
-- **TUI & config:** `show_cost`, `prefer_model_name`, `compact_tools`, and `max_width`; context-window usage as a status-bar progress bar; per-turn stats line when a turn completes; compact grouped tool/thinking view (including batch child tools and related layout/reflow fixes); chat text wraps at display column boundaries.
+- **Storage & history:** Timestamps recorded on session log records (`MessageRecord`, `ContentBlockRecord`); duration tracking for individual thinking blocks.
 - **Instructions:** Per-agent and global switches for which third-party instruction files (e.g. `CLAUDE.md`, `.cursorrules`) are loaded.
-- **CI / releases:** Release builds run only on git tags, for Windows, Linux, and macOS arm64 (no NetBSD and similar upstream targets).
+- **CI & build:** Release builds run only on git tags for Windows, Linux, and macOS arm64 (no NetBSD and similar upstream targets); LTO disabled for non-release builds.
 
 <img src="./banner.png">
 
