@@ -3734,6 +3734,76 @@ fn compact_tools_header_snapshot_updates_group_entry_summary() {
     );
 }
 
+#[test]
+fn compact_tools_thinking_and_tool_include_waiting_time() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+    panel.ensure_active_group();
+
+    // 1. Simulate 2s wait before thinking arrives
+    if let DisplayRole::ToolGroup(g) = &mut panel.messages[0].role {
+        g.waiting_since = Some(Instant::now() - Duration::from_millis(2000));
+    }
+    panel.thinking_delta("deep thought");
+    panel.tool_pending("c1".into(), "bash");
+
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!()
+    };
+    let GroupEntry::Thinking(th) = &g.entries[0] else {
+        panic!()
+    };
+    assert!(th.duration.unwrap() >= Duration::from_millis(2000));
+
+    // 2. Tool 1 finishes, starts waiting for response
+    panel.tool_start(start("c1", "bash"));
+    panel.tool_done(done("c1"));
+
+    // 3. Simulate 1.5s wait before second thinking arrives mid-group
+    if let DisplayRole::ToolGroup(g) = &mut panel.messages[0].role {
+        g.waiting_since = Some(Instant::now() - Duration::from_millis(1500));
+    }
+    panel.thinking_delta("another thought");
+    panel.seal_open_group();
+
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!()
+    };
+    let GroupEntry::Thinking(th2) = &g.entries[2] else {
+        panic!()
+    };
+    assert!(th2.duration.unwrap() >= Duration::from_millis(1500));
+}
+
+#[test]
+fn compact_tools_direct_tool_call_includes_waiting_time() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+    panel.ensure_active_group();
+
+    // Simulate 3s wait before direct tool call arrives without thinking
+    if let DisplayRole::ToolGroup(g) = &mut panel.messages[0].role {
+        g.waiting_since = Some(Instant::now() - Duration::from_millis(3000));
+    }
+    panel.tool_pending("c1".into(), "read");
+    panel.tool_start(start("c1", "read"));
+    panel.tool_done(done("c1"));
+
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!()
+    };
+    let GroupEntry::Tool(t) = &g.entries[0] else {
+        panic!()
+    };
+    assert!(t.duration.unwrap() >= Duration::from_millis(3000));
+}
+
 const LEFT_PAD_MSG: &str = "leftmost column must be blank padding";
 const MESSAGE_START_CHAR: &str = "y";
 const COMPACT_GROUP_START_CHAR: &str = "✓";

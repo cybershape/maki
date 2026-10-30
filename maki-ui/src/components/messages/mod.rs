@@ -36,7 +36,7 @@ use ratatui_image::picker::Picker;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::scrollbar::{self, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
@@ -312,28 +312,32 @@ impl MessagesPanel {
                 && !g.sealed
             {
                 group_id = Some(g.id.clone());
-                g.waiting_since = None;
+                let wait_start = g.waiting_since.take();
                 if let Some(GroupEntry::Thinking(th)) = g.entries.last_mut() {
                     if th.active {
                         th.text.push_str(text);
                         th.tokens = th.text.len().div_ceil(4);
                     } else {
+                        let start_time = wait_start
+                            .or_else(|| (g.entries.len() <= 1).then_some(g.started_at).flatten())
+                            .unwrap_or_else(Instant::now);
                         g.entries.push(GroupEntry::Thinking(GroupThinkingEntry {
                             id: g.entries.len(),
                             text: text.to_string(),
                             tokens: text.len().div_ceil(4),
                             active: true,
-                            started_at: Some(Instant::now()),
+                            started_at: Some(start_time),
                             duration: None,
                         }));
                     }
                 } else {
+                    let start_time = wait_start.or(g.started_at).unwrap_or_else(Instant::now);
                     g.entries.push(GroupEntry::Thinking(GroupThinkingEntry {
                         id: g.entries.len(),
                         text: text.to_string(),
                         tokens: text.len().div_ceil(4),
                         active: true,
-                        started_at: Some(Instant::now()),
+                        started_at: Some(start_time),
                         duration: None,
                     }));
                 }
@@ -385,20 +389,31 @@ impl MessagesPanel {
             }) = self.messages.last_mut()
                 && !g.sealed
             {
-                g.waiting_since = None;
+                let wait_start = g.waiting_since.take();
                 if let Some(GroupEntry::Thinking(th)) = g.entries.last_mut() {
                     th.active = false;
                     if th.duration.is_none() {
                         th.duration = th.started_at.map(|st| st.elapsed());
                     }
                 }
+                let entries_count = g.entries.len();
+                let g_started = g.started_at;
                 if let Some(entry) = g.entries.iter_mut().find_map(|e| match e {
                     GroupEntry::Tool(t) if t.id == id => Some(t),
                     _ => None,
                 }) {
                     entry.name = Arc::from(name);
                     entry.receiving_args = true;
+                    if entry.started_at.is_none() {
+                        let start_time = wait_start
+                            .or_else(|| (entries_count <= 1).then_some(g_started).flatten())
+                            .unwrap_or_else(Instant::now);
+                        entry.started_at = Some(start_time);
+                    }
                 } else {
+                    let start_time = wait_start
+                        .or_else(|| g.entries.is_empty().then_some(g.started_at).flatten())
+                        .unwrap_or_else(Instant::now);
                     g.entries.push(GroupEntry::Tool(GroupToolEntry {
                         id: id.clone(),
                         name: Arc::from(name),
@@ -406,7 +421,7 @@ impl MessagesPanel {
                         children: Vec::new(),
                         status: ToolStatus::InProgress,
                         receiving_args: true,
-                        started_at: Some(Instant::now()),
+                        started_at: Some(start_time),
                         duration: None,
                     }));
                 }
@@ -454,20 +469,29 @@ impl MessagesPanel {
         if self.compact_tools {
             let mut found_group = None;
             for msg in self.messages.iter_mut().rev() {
-                if let DisplayRole::ToolGroup(g) = &mut msg.role
-                    && let Some(entry) = g.entries.iter_mut().find_map(|e| match e {
+                if let DisplayRole::ToolGroup(g) = &mut msg.role {
+                    let entries_count = g.entries.len();
+                    let g_started = g.started_at;
+                    if let Some(entry) = g.entries.iter_mut().find_map(|e| match e {
                         GroupEntry::Tool(t) if t.id == event.id => Some(t),
                         _ => None,
-                    })
-                {
-                    entry.name = Arc::clone(&event.tool);
-                    entry.summary = event.summary.clone();
-                    entry.receiving_args = false;
-                    if entry.started_at.is_none() {
-                        entry.started_at = Some(Instant::now());
+                    }) {
+                        entry.name = Arc::clone(&event.tool);
+                        entry.summary = event.summary.clone();
+                        entry.receiving_args = false;
+                        if entry.started_at.is_none() {
+                            let wait_start = g.waiting_since.take();
+                            let start_time = wait_start
+                                .or_else(|| (entries_count <= 1).then_some(g_started).flatten())
+                                .unwrap_or_else(Instant::now);
+                            entry.started_at = Some(start_time);
+                        }
+                        found_group = Some(g.id.clone());
                     }
-                    found_group = Some(g.id.clone());
-                    break;
+                    if found_group.is_some() {
+                        g.waiting_since = None;
+                        break;
+                    }
                 }
             }
             if let Some(gid) = found_group {
@@ -483,13 +507,16 @@ impl MessagesPanel {
             }) = self.messages.last_mut()
                 && !g.sealed
             {
-                g.waiting_since = None;
+                let wait_start = g.waiting_since.take();
                 if let Some(GroupEntry::Thinking(th)) = g.entries.last_mut() {
                     th.active = false;
                     if th.duration.is_none() {
                         th.duration = th.started_at.map(|st| st.elapsed());
                     }
                 }
+                let start_time = wait_start
+                    .or_else(|| g.entries.is_empty().then_some(g.started_at).flatten())
+                    .unwrap_or_else(Instant::now);
                 g.entries.push(GroupEntry::Tool(GroupToolEntry {
                     id: event.id,
                     name: Arc::clone(&event.tool),
@@ -497,7 +524,7 @@ impl MessagesPanel {
                     children: Vec::new(),
                     status: ToolStatus::InProgress,
                     receiving_args: false,
-                    started_at: Some(Instant::now()),
+                    started_at: Some(start_time),
                     duration: None,
                 }));
                 let gid = g.id.clone();
@@ -597,7 +624,10 @@ impl MessagesPanel {
                     let dur = event
                         .call
                         .as_ref()
-                        .map(|c| c.duration)
+                        .map(|c| {
+                            c.duration
+                                .max(entry.started_at.map_or(Duration::ZERO, |st| st.elapsed()))
+                        })
                         .or_else(|| entry.started_at.map(|st| st.elapsed()));
                     entry.duration = dur;
                     let all_done = g.entries.iter().all(|e| match e {
