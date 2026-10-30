@@ -950,6 +950,7 @@ pub(crate) async fn parse_sse(
         content_blocks.push(ContentBlock::Thinking {
             thinking: reasoning_text,
             signature: None,
+            duration_ms: None,
         });
     }
 

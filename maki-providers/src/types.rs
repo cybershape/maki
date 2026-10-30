@@ -310,6 +310,11 @@ pub enum ContentBlock {
         thinking: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
+        /// How long this span streamed. Display only: a provider never sees
+        /// it, and a block written before the field existed reads back as
+        /// `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     RedactedThinking {
         data: String,
@@ -2607,9 +2612,24 @@ mod tests {
         let block = ContentBlock::Thinking {
             thinking: "x".into(),
             signature: None,
+            duration_ms: None,
         };
         let json = serde_json::to_value(&block).unwrap();
         assert!(json.get("signature").is_none());
+        assert!(json.get("duration_ms").is_none());
+    }
+
+    #[test]
+    fn thinking_without_duration_reads_back_as_none() {
+        let block: ContentBlock =
+            serde_json::from_value(json!({"type": "thinking", "thinking": "x"})).unwrap();
+        assert!(matches!(
+            block,
+            ContentBlock::Thinking {
+                duration_ms: None,
+                ..
+            }
+        ));
     }
 
     const USAGE_LABEL: &str = "Spend";

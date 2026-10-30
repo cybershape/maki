@@ -768,6 +768,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: GO.into(),
                     signature: Some(SIGNATURE.into()),
+                    duration_ms: None,
                 },
             );
         }

@@ -625,7 +625,9 @@ mod tests {
         assert!(
             defs[0]["input_schema"]["properties"]
                 .as_object()
-                .is_some_and(|props| props.contains_key(crate::tools::schema::TOOLCALL_REASON_FIELD)),
+                .is_some_and(
+                    |props| props.contains_key(crate::tools::schema::TOOLCALL_REASON_FIELD)
+                ),
             "every schema gains a reason field"
         );
     }

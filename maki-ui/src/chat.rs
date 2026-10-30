@@ -664,7 +664,11 @@ pub fn history_to_display(
                                 vec![source.clone()],
                             ));
                         }
-                        ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                        ContentBlock::Thinking {
+                            thinking,
+                            duration_ms,
+                            ..
+                        } if !thinking.is_empty() => {
                             if compact_tools {
                                 let entry = GroupThinkingEntry {
                                     id: display
@@ -678,7 +682,7 @@ pub fn history_to_display(
                                     tokens: thinking.len().div_ceil(4),
                                     active: false,
                                     started_at: None,
-                                    duration: None,
+                                    duration: duration_ms.map(std::time::Duration::from_millis),
                                 };
                                 if let Some(DisplayMessage {
                                     role: DisplayRole::ToolGroup(g),
@@ -1664,6 +1668,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "reasoning".into(),
                     signature: None,
+                    duration_ms: None,
                 },
                 ContentBlock::Text {
                     text: "answer".into(),
@@ -1743,6 +1748,7 @@ mod tests {
                     ContentBlock::Thinking {
                         thinking: "thinking step".into(),
                         signature: None,
+                        duration_ms: None,
                     },
                     ContentBlock::tool_use(
                         "t1",
@@ -1795,7 +1801,10 @@ mod tests {
         };
         assert!(g.sealed);
         assert_eq!(g.entries.len(), 3);
-        assert!(matches!(&g.entries[0], GroupEntry::Thinking(th) if th.text == "thinking step"));
+        assert!(matches!(
+            &g.entries[0],
+            GroupEntry::Thinking(th) if th.text == "thinking step" && th.duration.is_none()
+        ));
         assert!(
             matches!(&g.entries[1], GroupEntry::Tool(t) if t.name.as_ref() == "bash" && t.duration == Some(std::time::Duration::from_millis(120)))
         );

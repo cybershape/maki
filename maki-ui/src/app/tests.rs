@@ -10440,6 +10440,7 @@ fn turn_response_normalizes_text_and_truncates_unicode() {
             ContentBlock::Thinking {
                 thinking: "ignored".into(),
                 signature: None,
+                duration_ms: None,
             },
             ContentBlock::Text { text: long },
         ],

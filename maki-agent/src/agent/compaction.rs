@@ -1297,6 +1297,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "hmm".into(),
                     signature: Some("sig".into()),
+                    duration_ms: None,
                 },
                 ContentBlock::Text {
                     text: "hello".into(),

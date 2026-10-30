@@ -51,11 +51,36 @@ struct ForwardedEvents {
     streamed: String,
     ttft: Option<Duration>,
     thinking: Duration,
+    /// One entry per thinking span, in the order the blocks were streamed.
+    /// The response carries the text but not how long it took, so this is
+    /// what gets written onto each block before it is stored.
+    spans: Vec<Duration>,
 }
 
-fn end_thinking_span(span: &mut Option<Instant>, thinking: &mut Duration) {
+/// Writes each measured span onto the thinking block it belongs to.
+///
+/// Spans and blocks are counted in the same order: a span ends when text or
+/// a tool call starts, which is also where the provider closes the block.
+/// A block past the spans keeps `None`, the same as one loaded from a
+/// session written before the field existed.
+fn stamp_thinking(message: &mut Message, spans: &[Duration]) {
+    let mut spans = spans.iter();
+    for block in &mut message.content {
+        if let ContentBlock::Thinking { duration_ms, .. } = block {
+            *duration_ms = spans.next().map(|span| span.as_millis() as u64);
+        }
+    }
+}
+
+fn end_thinking_span(
+    span: &mut Option<Instant>,
+    thinking: &mut Duration,
+    spans: &mut Vec<Duration>,
+) {
     if let Some(start) = span.take() {
-        *thinking += start.elapsed();
+        let took = start.elapsed();
+        *thinking += took;
+        spans.push(took);
     }
 }
 
@@ -68,10 +93,11 @@ async fn forward_provider_events(
     let mut ttft = None;
     let mut thinking = Duration::ZERO;
     let mut thinking_span = None;
+    let mut spans = Vec::new();
     while let Ok(pe) = prx.recv_async().await {
         let ae = match pe {
             ProviderEvent::TextDelta { text } => {
-                end_thinking_span(&mut thinking_span, &mut thinking);
+                end_thinking_span(&mut thinking_span, &mut thinking, &mut spans);
                 ttft.get_or_insert_with(|| started.elapsed());
                 streamed.push_str(&text);
                 AgentEvent::TextDelta { text }
@@ -82,7 +108,7 @@ async fn forward_provider_events(
                 AgentEvent::ThinkingDelta { text }
             }
             ProviderEvent::ToolUseStart { id, name } => {
-                end_thinking_span(&mut thinking_span, &mut thinking);
+                end_thinking_span(&mut thinking_span, &mut thinking, &mut spans);
                 ttft.get_or_insert_with(|| started.elapsed());
                 AgentEvent::ToolPending {
                     id,
@@ -105,11 +131,12 @@ async fn forward_provider_events(
             break;
         }
     }
-    end_thinking_span(&mut thinking_span, &mut thinking);
+    end_thinking_span(&mut thinking_span, &mut thinking, &mut spans);
     ForwardedEvents {
         streamed,
         ttft,
         thinking,
+        spans,
     }
 }
 
@@ -302,6 +329,7 @@ pub(crate) async fn stream_with_retry(
                 if let Some(gauge) = gauge.as_deref_mut() {
                     gauge.record(r.usage.total_input());
                 }
+                stamp_thinking(&mut r.message, &forwarded.spans);
                 return Ok(StreamedResponse {
                     response: r,
                     timing: TurnTiming {
@@ -450,6 +478,62 @@ mod tests {
     use super::*;
 
     const SECRET_BODY: &str = "messages.0.content: \"my private prompt\", key sk-abc";
+    const FIRST_SPAN_MS: u64 = 1500;
+    const SECOND_SPAN_MS: u64 = 250;
+
+    fn thinking(text: &str) -> ContentBlock {
+        ContentBlock::Thinking {
+            thinking: text.into(),
+            signature: None,
+            duration_ms: None,
+        }
+    }
+
+    #[test]
+    fn stamp_thinking_writes_each_span_onto_its_block() {
+        let mut message = Message {
+            role: Role::Assistant,
+            content: vec![
+                thinking("first"),
+                ContentBlock::Text { text: "mid".into() },
+                thinking("second"),
+            ],
+            ..Default::default()
+        };
+        stamp_thinking(
+            &mut message,
+            &[
+                Duration::from_millis(FIRST_SPAN_MS),
+                Duration::from_millis(SECOND_SPAN_MS),
+            ],
+        );
+        let stamped: Vec<_> = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Thinking { duration_ms, .. } => Some(*duration_ms),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stamped, vec![Some(FIRST_SPAN_MS), Some(SECOND_SPAN_MS)]);
+    }
+
+    #[test]
+    fn stamp_thinking_leaves_a_block_without_a_measured_span() {
+        let mut message = Message {
+            role: Role::Assistant,
+            content: vec![thinking("only")],
+            ..Default::default()
+        };
+        stamp_thinking(&mut message, &[]);
+        assert!(matches!(
+            &message.content[0],
+            ContentBlock::Thinking {
+                duration_ms: None,
+                ..
+            }
+        ));
+    }
     const WINDOW: u32 = 262_144;
     /// The shape that started all this: the declared output cap is the whole
     /// window, so "ask for what fits" asks for everything.

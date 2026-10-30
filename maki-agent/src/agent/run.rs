@@ -1396,6 +1396,7 @@ mod tests {
         assistant_response(vec![ContentBlock::Thinking {
             thinking: "stalled".into(),
             signature: None,
+            duration_ms: None,
         }])
     }
 
@@ -3390,6 +3391,7 @@ mod tests {
                         ContentBlock::Thinking {
                             thinking: "hmm".into(),
                             signature: Some("sig".into()),
+                            duration_ms: None,
                         },
                         ContentBlock::Text {
                             text: "done".into(),
