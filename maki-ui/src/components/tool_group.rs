@@ -1,9 +1,12 @@
+use std::path::Path;
 use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use maki_agent::tools::schema::TOOLCALL_REASON_FIELD;
 use maki_agent::{BufferSnapshot, SpanStyle};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use serde_json::Value;
 
 use crate::theme;
 
@@ -23,6 +26,7 @@ const CHILD_ERROR_STYLE: &str = "tool_error";
 const CHILD_DURATION_STYLE: &str = "batch_duration_ms";
 const CHILD_DURATION_PREFIX: &str = " (";
 const CHILD_DURATION_SUFFIX: &str = "ms)";
+const REASON_SEP: &str = " · ";
 
 const BUSY_FRAMES: [&str; 4] = ["·", "•", "●", "•"];
 const BUSY_INTERVAL_MS: u128 = 140;
@@ -133,6 +137,167 @@ fn truncate_to_width(s: &str, max_w: usize) -> String {
         end_idx = idx + ch.len_utf8();
     }
     format!("{}...", &s[..end_idx])
+}
+
+fn shorten_path(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    let normalized = path.replace('\\', "/");
+    let p = Path::new(&normalized);
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd_norm = cwd.to_string_lossy().replace('\\', "/");
+        if let Ok(rel) = p.strip_prefix(Path::new(&cwd_norm)) {
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            return if rel_str.is_empty() {
+                ".".to_string()
+            } else {
+                rel_str
+            };
+        }
+    }
+    if let Some(home) = maki_storage::paths::home() {
+        let home_norm = home.to_string_lossy().replace('\\', "/");
+        if let Ok(rel) = p.strip_prefix(Path::new(&home_norm)) {
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            return if rel_str.is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{rel_str}")
+            };
+        }
+    }
+    normalized
+}
+
+pub fn format_compact_summary(
+    tool_name: &str,
+    raw_input: Option<&Value>,
+    default_summary: &str,
+) -> String {
+    let reason = raw_input
+        .and_then(|v| v.get(TOOLCALL_REASON_FIELD))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let Some(reason) = reason else {
+        return default_summary.to_string();
+    };
+
+    let Some(input) = raw_input else {
+        return reason.to_string();
+    };
+
+    match tool_name {
+        "read" => {
+            let path = input.get("path").and_then(Value::as_str).map(shorten_path);
+            if let Some(p) = path.filter(|s| !s.is_empty()) {
+                let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(1);
+                let orig_summary = if let Some(limit) = input
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .filter(|&l| l > 0)
+                {
+                    format!("{p}:{offset}-{}", offset + limit - 1)
+                } else {
+                    format!("{p}:{offset}")
+                };
+                format!("{reason}{REASON_SEP}{orig_summary}")
+            } else if !default_summary.is_empty() && default_summary != reason {
+                format!("{reason}{REASON_SEP}{default_summary}")
+            } else {
+                reason.to_string()
+            }
+        }
+        "write" => {
+            let path = input.get("path").and_then(Value::as_str).map(shorten_path);
+            if let Some(p) = path.filter(|s| !s.is_empty()) {
+                format!("{reason}{REASON_SEP}{p}")
+            } else {
+                reason.to_string()
+            }
+        }
+        "edit" | "multiedit" | "edit_lines" | "insert_lines" => {
+            let path = input.get("path").and_then(Value::as_str).map(shorten_path);
+            if let Some(p) = path.filter(|s| !s.is_empty()) {
+                format!("{reason}{REASON_SEP}{p}")
+            } else {
+                reason.to_string()
+            }
+        }
+        "index" => {
+            let path = input.get("path").and_then(Value::as_str).map(shorten_path);
+            if let Some(p) = path.filter(|s| !s.is_empty()) {
+                format!("{reason}{REASON_SEP}{p}")
+            } else {
+                reason.to_string()
+            }
+        }
+        "grep" => {
+            let path = input.get("path").and_then(Value::as_str).map(shorten_path);
+            if let Some(p) = path.filter(|s| !s.is_empty() && s != ".") {
+                format!("{reason}{REASON_SEP}{p}")
+            } else {
+                reason.to_string()
+            }
+        }
+        "glob" => {
+            let pattern = input.get("pattern").and_then(Value::as_str).map(str::trim);
+            if let Some(p) = pattern.filter(|s| !s.is_empty()) {
+                format!("{reason}{REASON_SEP}{p}")
+            } else {
+                reason.to_string()
+            }
+        }
+        "list_dir" => {
+            let path = input.get("path").and_then(Value::as_str).map(shorten_path);
+            if let Some(p) = path.filter(|s| !s.is_empty()) {
+                format!("{reason}{REASON_SEP}{p}")
+            } else {
+                reason.to_string()
+            }
+        }
+        "view_image" => {
+            let path = input
+                .get("path")
+                .or_else(|| input.get("file_path"))
+                .and_then(Value::as_str)
+                .map(shorten_path);
+            if let Some(p) = path.filter(|s| !s.is_empty()) {
+                format!("{reason}{REASON_SEP}{p}")
+            } else {
+                reason.to_string()
+            }
+        }
+        "batch" => {
+            let count = input
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map(|arr| arr.len());
+            if let Some(n) = count {
+                format!("{reason}{REASON_SEP}{n} tools")
+            } else {
+                reason.to_string()
+            }
+        }
+        "websearch" => {
+            let query = input.get("query").and_then(Value::as_str).map(str::trim);
+            if let Some(q) = query.filter(|s| !s.is_empty()) {
+                format!("{reason}{REASON_SEP}{q}")
+            } else {
+                reason.to_string()
+            }
+        }
+        _ => reason.to_string(),
+    }
+}
+
+pub fn update_batch_compact_summary(current_summary: &str, count: usize) -> String {
+    match current_summary.split_once(REASON_SEP) {
+        Some((reason, _)) => format!("{reason}{REASON_SEP}{count} tools"),
+        None => format!("{count} tools"),
+    }
 }
 
 pub(super) fn batch_children(snapshot: &BufferSnapshot) -> Vec<GroupToolEntry> {
@@ -1201,5 +1366,45 @@ mod tests {
         let thinking_line = tl.lines[1].to_string();
         assert!(thinking_line.contains("(1.50s)"));
         assert!(!thinking_line.contains("350t"));
+    }
+
+    #[test_case("read", Some(serde_json::json!({"path": "src/main.rs", "offset": 10, "limit": 20, "toolcall_reason": "reading main"})), "fallback", "reading main · src/main.rs:10-29" ; "read_with_offset_and_limit")]
+    #[test_case("read", Some(serde_json::json!({"path": "src/main.rs", "offset": 5, "toolcall_reason": "reading main"})), "fallback", "reading main · src/main.rs:5" ; "read_with_offset_only")]
+    #[test_case("write", Some(serde_json::json!({"path": "src/lib.rs", "toolcall_reason": "writing lib"})), "fallback", "writing lib · src/lib.rs" ; "write_with_path")]
+    #[test_case("edit", Some(serde_json::json!({"path": "src/app.rs", "toolcall_reason": "editing app"})), "fallback", "editing app · src/app.rs" ; "edit_with_path")]
+    #[test_case("multiedit", Some(serde_json::json!({"path": "src/app.rs", "toolcall_reason": "multiediting app"})), "fallback", "multiediting app · src/app.rs" ; "multiedit_with_path")]
+    #[test_case("index", Some(serde_json::json!({"path": "src/lib.rs", "toolcall_reason": "indexing lib"})), "fallback", "indexing lib · src/lib.rs" ; "index_with_path")]
+    #[test_case("grep", Some(serde_json::json!({"path": "src", "pattern": "TODO", "toolcall_reason": "searching todo"})), "fallback", "searching todo · src" ; "grep_with_path")]
+    #[test_case("grep", Some(serde_json::json!({"pattern": "TODO", "toolcall_reason": "searching todo"})), "fallback", "searching todo" ; "grep_without_path")]
+    #[test_case("glob", Some(serde_json::json!({"pattern": "**/*.rs", "toolcall_reason": "finding files"})), "fallback", "finding files · **/*.rs" ; "glob_with_pattern")]
+    #[test_case("list_dir", Some(serde_json::json!({"path": "src", "toolcall_reason": "listing dir"})), "fallback", "listing dir · src" ; "list_dir_with_path")]
+    #[test_case("view_image", Some(serde_json::json!({"path": "logo.png", "toolcall_reason": "inspecting logo"})), "fallback", "inspecting logo · logo.png" ; "view_image_with_path")]
+    #[test_case("view_image", Some(serde_json::json!({"file_path": "logo.png", "toolcall_reason": "inspecting logo"})), "fallback", "inspecting logo · logo.png" ; "view_image_with_file_path")]
+    #[test_case("bash", Some(serde_json::json!({"command": "cargo test", "toolcall_reason": "running tests"})), "fallback", "running tests" ; "bash_reason_only")]
+    #[test_case("code_execution", Some(serde_json::json!({"code": "print(1)", "toolcall_reason": "running script"})), "fallback", "running script" ; "code_execution_reason_only")]
+    #[test_case("batch", Some(serde_json::json!({"tool_calls": [{}, {}], "toolcall_reason": "running batch"})), "fallback", "running batch · 2 tools" ; "batch_with_tool_calls")]
+    #[test_case("task", Some(serde_json::json!({"description": "subtask", "toolcall_reason": "starting subtask"})), "fallback", "starting subtask" ; "task_reason_only")]
+    #[test_case("websearch", Some(serde_json::json!({"query": "rust tokio", "toolcall_reason": "searching web"})), "fallback", "searching web · rust tokio" ; "websearch_with_query")]
+    #[test_case("webfetch", Some(serde_json::json!({"url": "https://example.com", "toolcall_reason": "fetching page"})), "fallback", "fetching page" ; "webfetch_reason_only")]
+    #[test_case("question", Some(serde_json::json!({"questions": [], "toolcall_reason": "asking question"})), "fallback", "asking question" ; "question_reason_only")]
+    #[test_case("memory", Some(serde_json::json!({"path": "notes.md", "toolcall_reason": "saving memory"})), "fallback", "saving memory" ; "memory_reason_only")]
+    #[test_case("todo_write", Some(serde_json::json!({"todos": [], "toolcall_reason": "updating todos"})), "fallback", "updating todos" ; "todo_write_reason_only")]
+    #[test_case("read", Some(serde_json::json!({"path": "src/main.rs"})), "default summary", "default summary" ; "fallback_when_no_reason")]
+    #[test_case("read", Some(serde_json::json!({"path": "src/main.rs", "toolcall_reason": "   "})), "default summary", "default summary" ; "fallback_when_empty_reason")]
+    #[test_case("read", None, "default summary", "default summary" ; "fallback_when_no_input")]
+    fn compact_summary_formatting(
+        tool: &str,
+        input: Option<serde_json::Value>,
+        default_summary: &str,
+        expected: &str,
+    ) {
+        let actual = format_compact_summary(tool, input.as_ref(), default_summary);
+        assert_eq!(actual, expected);
+    }
+
+    #[test_case("running batch · 2 tools", 3, "running batch · 3 tools" ; "preserves_reason_prefix")]
+    #[test_case("2 tools", 3, "3 tools" ; "plain_count_without_reason")]
+    fn update_batch_summary(current: &str, count: usize, expected: &str) {
+        assert_eq!(update_batch_compact_summary(current, count), expected);
     }
 }

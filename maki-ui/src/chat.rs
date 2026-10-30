@@ -780,6 +780,11 @@ pub fn history_to_display(
                                 });
                             }
                             if compact_tools {
+                                let summary = crate::components::tool_group::format_compact_summary(
+                                    static_name,
+                                    Some(input),
+                                    &summary,
+                                );
                                 let entry = GroupToolEntry {
                                     id: id.clone(),
                                     name: Arc::from(static_name),
@@ -1814,6 +1819,42 @@ mod tests {
         assert_eq!(g.total_duration(), std::time::Duration::from_millis(150));
         assert_eq!(display[2].role, DisplayRole::Assistant);
         assert_eq!(display[2].text, "all passed");
+    }
+
+    #[test]
+    fn history_compact_tools_formats_calling_reason() {
+        let msgs = vec![
+            Message::user("inspect code".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    "t1",
+                    "read",
+                    serde_json::json!({
+                        "path": "src/main.rs",
+                        "offset": 1,
+                        "limit": 50,
+                        "toolcall_reason": "checking entry point"
+                    }),
+                )],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result("t1", "fn main() {}", false)],
+                ..Default::default()
+            },
+        ];
+        let outputs = HashMap::new();
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true).0;
+        assert_eq!(display.len(), 2);
+        let DisplayRole::ToolGroup(g) = &display[1].role else {
+            panic!("expected ToolGroup in display[1]");
+        };
+        let GroupEntry::Tool(t) = &g.entries[0] else {
+            panic!("expected GroupEntry::Tool");
+        };
+        assert_eq!(t.summary, "checking entry point · src/main.rs:1-50");
     }
 
     #[test]

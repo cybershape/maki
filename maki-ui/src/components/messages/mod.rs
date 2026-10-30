@@ -467,6 +467,11 @@ impl MessagesPanel {
 
     pub fn tool_start(&mut self, event: ToolStartEvent) {
         if self.compact_tools {
+            let summary = tool_group::format_compact_summary(
+                &event.tool,
+                event.raw_input.as_ref(),
+                &event.summary,
+            );
             let mut found_group = None;
             for msg in self.messages.iter_mut().rev() {
                 if let DisplayRole::ToolGroup(g) = &mut msg.role {
@@ -477,7 +482,7 @@ impl MessagesPanel {
                         _ => None,
                     }) {
                         entry.name = Arc::clone(&event.tool);
-                        entry.summary = event.summary.clone();
+                        entry.summary = summary.clone();
                         entry.receiving_args = false;
                         if entry.started_at.is_none() {
                             let wait_start = g.waiting_since.take();
@@ -520,7 +525,7 @@ impl MessagesPanel {
                 g.entries.push(GroupEntry::Tool(GroupToolEntry {
                     id: event.id,
                     name: Arc::clone(&event.tool),
-                    summary: event.summary,
+                    summary: summary.clone(),
                     children: Vec::new(),
                     status: ToolStatus::InProgress,
                     receiving_args: false,
@@ -539,7 +544,7 @@ impl MessagesPanel {
                 entries: vec![GroupEntry::Tool(GroupToolEntry {
                     id: event.id,
                     name: Arc::clone(&event.tool),
-                    summary: event.summary,
+                    summary,
                     children: Vec::new(),
                     status: ToolStatus::InProgress,
                     receiving_args: false,
@@ -1716,7 +1721,10 @@ impl MessagesPanel {
                         entry.duration = children.iter().filter_map(|child| child.duration).max();
                     }
                     entry.children = children;
-                    entry.summary = format!("{} tools", entry.children.len());
+                    entry.summary = tool_group::update_batch_compact_summary(
+                        &entry.summary,
+                        entry.children.len(),
+                    );
                 }
                 Some(group.id.clone())
             });
