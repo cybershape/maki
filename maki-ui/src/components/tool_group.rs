@@ -300,7 +300,28 @@ pub fn update_batch_compact_summary(current_summary: &str, count: usize) -> Stri
     }
 }
 
-pub(super) fn batch_children(snapshot: &BufferSnapshot) -> Vec<GroupToolEntry> {
+pub fn extract_batch_child_input(batch_raw_input: &Value, index: usize) -> Option<Value> {
+    let tool_calls = batch_raw_input.get("tool_calls")?.as_array()?;
+    let entry = tool_calls.get(index)?.as_object()?;
+    let mut map = serde_json::Map::new();
+    if let Some(nested) = entry.get("parameters").and_then(Value::as_object) {
+        for (k, v) in nested {
+            map.insert(k.clone(), v.clone());
+        }
+    }
+    for (k, v) in entry {
+        if k != "tool" && k != "parameters" {
+            map.insert(k.clone(), v.clone());
+        }
+    }
+    Some(Value::Object(map))
+}
+
+pub(super) fn batch_children(
+    snapshot: &BufferSnapshot,
+    batch_raw_input: Option<&Value>,
+) -> Vec<GroupToolEntry> {
+    let mut child_idx = 0;
     snapshot
         .lines
         .iter()
@@ -320,16 +341,28 @@ pub(super) fn batch_children(snapshot: &BufferSnapshot) -> Vec<GroupToolEntry> {
             let is_duration = |style: &SpanStyle| {
                 matches!(style, SpanStyle::Named(name) if name == CHILD_DURATION_STYLE)
             };
-            let duration = header.iter().find(|span| is_duration(&span.style))
+            let duration = header
+                .iter()
+                .find(|span| is_duration(&span.style))
                 .and_then(|span| span.text.strip_prefix(CHILD_DURATION_PREFIX))
                 .and_then(|text| text.strip_suffix(CHILD_DURATION_SUFFIX))
                 .and_then(|text| text.parse().ok())
                 .map(Duration::from_millis);
+            let idx = child_idx;
+            child_idx += 1;
+            let default_summary: String = header
+                .iter()
+                .filter(|span| !is_duration(&span.style))
+                .map(|span| span.text.as_str())
+                .collect();
+            let child_input =
+                batch_raw_input.and_then(|input| extract_batch_child_input(input, idx));
+            let summary = format_compact_summary(name, child_input.as_ref(), &default_summary);
             Some(GroupToolEntry {
                 id: String::new(),
                 name: name.into(),
-                summary: header.iter().filter(|span| !is_duration(&span.style))
-                    .map(|span| span.text.as_str()).collect(),
+                summary,
+                raw_input: child_input,
                 children: Vec::new(),
                 status,
                 receiving_args: false,
@@ -672,6 +705,7 @@ mod tests {
             id: String::new(),
             name: Arc::from("read"),
             summary: "src/main.rs".into(),
+            raw_input: None,
             children: Vec::new(),
             status: ToolStatus::Success,
             receiving_args: false,
@@ -769,6 +803,7 @@ mod tests {
                 id: "call-1".into(),
                 name: Arc::from("bash"),
                 summary: "cargo check".into(),
+                raw_input: None,
                 children: Vec::new(),
                 status: ToolStatus::Success,
                 receiving_args: false,
@@ -830,6 +865,7 @@ mod tests {
                 id: "call-1".into(),
                 name: Arc::from("bash"),
                 summary: "ls".into(),
+                raw_input: None,
                 children: Vec::new(),
                 status: ToolStatus::Success,
                 receiving_args: false,
@@ -880,6 +916,7 @@ mod tests {
                 id: "call-1".into(),
                 name: Arc::from("bash"),
                 summary: "cargo check".into(),
+                raw_input: None,
                 children: Vec::new(),
                 status: ToolStatus::InProgress,
                 receiving_args: false,
@@ -911,6 +948,7 @@ mod tests {
                 id: "call-1".into(),
                 name: Arc::from("bash"),
                 summary: String::new(),
+                raw_input: None,
                 children: Vec::new(),
                 status: ToolStatus::InProgress,
                 receiving_args: true,
@@ -969,6 +1007,7 @@ mod tests {
                     id: "call-1".into(),
                     name: Arc::from("edit"),
                     summary: "foo.rs".into(),
+                    raw_input: None,
                     children: Vec::new(),
                     status: ToolStatus::Success,
                     receiving_args: false,
@@ -979,6 +1018,7 @@ mod tests {
                     id: "call-2".into(),
                     name: Arc::from("bash"),
                     summary: "cargo test".into(),
+                    raw_input: None,
                     children: Vec::new(),
                     status: ToolStatus::Error,
                     receiving_args: false,
@@ -1029,6 +1069,7 @@ mod tests {
                 id: format!("call-{i}"),
                 name: Arc::from("read"),
                 summary: format!("file_{i}.rs"),
+                raw_input: None,
                 children: Vec::new(),
                 status: ToolStatus::Success,
                 receiving_args: false,
@@ -1072,6 +1113,7 @@ mod tests {
                     id: "call-1".into(),
                     name: Arc::from("bash"),
                     summary: "git status".into(),
+                    raw_input: None,
                     children: Vec::new(),
                     status: ToolStatus::Success,
                     receiving_args: false,
@@ -1082,6 +1124,7 @@ mod tests {
                     id: "call-2".into(),
                     name: Arc::from("bash"),
                     summary: "Run compact_test".into(),
+                    raw_input: None,
                     children: Vec::new(),
                     status: ToolStatus::InProgress,
                     receiving_args: false,
@@ -1148,6 +1191,7 @@ mod tests {
                 id: "call-1".into(),
                 name: Arc::from("bash"),
                 summary: "ls".into(),
+                raw_input: None,
                 children: Vec::new(),
                 status: ToolStatus::InProgress,
                 receiving_args: false,
@@ -1213,6 +1257,7 @@ mod tests {
                 id: "t0".into(),
                 name: Arc::from("tool"),
                 summary: "op 0".into(),
+                raw_input: None,
                 children: Vec::new(),
                 status: ToolStatus::Success,
                 receiving_args: false,
@@ -1255,6 +1300,7 @@ mod tests {
                 id: format!("c{i}"),
                 name: Arc::from("tool"),
                 summary: format!("op {i}"),
+                raw_input: None,
                 children: Vec::new(),
                 status: ToolStatus::Success,
                 receiving_args: false,
@@ -1295,6 +1341,7 @@ mod tests {
                 id: format!("t{i}"),
                 name: Arc::from("tool"),
                 summary: format!("op {i}"),
+                raw_input: None,
                 children: Vec::new(),
                 status: ToolStatus::Success,
                 receiving_args: false,
@@ -1406,5 +1453,106 @@ mod tests {
     #[test_case("2 tools", 3, "3 tools" ; "plain_count_without_reason")]
     fn update_batch_summary(current: &str, count: usize, expected: &str) {
         assert_eq!(update_batch_compact_summary(current, count), expected);
+    }
+
+    #[test]
+    fn batch_children_formats_toolcall_reason_like_top_level() {
+        let snapshot = BufferSnapshot::from_arc(std::sync::Arc::new(vec![
+            maki_agent::SnapshotLine {
+                spans: vec![
+                    maki_agent::SnapshotSpan {
+                        text: "● ".into(),
+                        style: SpanStyle::Named("tool_success".into()),
+                    },
+                    maki_agent::SnapshotSpan {
+                        text: "read> ".into(),
+                        style: SpanStyle::Named("tool_prefix".into()),
+                    },
+                    maki_agent::SnapshotSpan {
+                        text: "src/main.rs:1-50".into(),
+                        style: SpanStyle::Default,
+                    },
+                    maki_agent::SnapshotSpan {
+                        text: " (120ms)".into(),
+                        style: SpanStyle::Named("batch_duration_ms".into()),
+                    },
+                ],
+            },
+            maki_agent::SnapshotLine {
+                spans: vec![
+                    maki_agent::SnapshotSpan {
+                        text: "● ".into(),
+                        style: SpanStyle::Named("tool_success".into()),
+                    },
+                    maki_agent::SnapshotSpan {
+                        text: "grep> ".into(),
+                        style: SpanStyle::Named("tool_prefix".into()),
+                    },
+                    maki_agent::SnapshotSpan {
+                        text: "TODO (src)".into(),
+                        style: SpanStyle::Default,
+                    },
+                ],
+            },
+            maki_agent::SnapshotLine {
+                spans: vec![
+                    maki_agent::SnapshotSpan {
+                        text: "● ".into(),
+                        style: SpanStyle::Named("tool_success".into()),
+                    },
+                    maki_agent::SnapshotSpan {
+                        text: "write> ".into(),
+                        style: SpanStyle::Named("tool_prefix".into()),
+                    },
+                    maki_agent::SnapshotSpan {
+                        text: "src/lib.rs".into(),
+                        style: SpanStyle::Default,
+                    },
+                ],
+            },
+        ]));
+
+        let batch_input = serde_json::json!({
+            "tool_calls": [
+                {
+                    "tool": "read",
+                    "parameters": {
+                        "path": "src/main.rs",
+                        "offset": 1,
+                        "limit": 50,
+                        "toolcall_reason": "reading entry point"
+                    }
+                },
+                {
+                    "tool": "grep",
+                    "path": "src",
+                    "pattern": "TODO",
+                    "toolcall_reason": "searching todo items"
+                },
+                {
+                    "tool": "write",
+                    "parameters": {
+                        "path": "src/lib.rs",
+                        "content": "pub fn foo() {}"
+                    }
+                }
+            ],
+            "toolcall_reason": "inspecting and updating code"
+        });
+
+        let children = batch_children(&snapshot, Some(&batch_input));
+        assert_eq!(children.len(), 3);
+        assert_eq!(children[0].name.as_ref(), "read");
+        assert_eq!(
+            children[0].summary,
+            "reading entry point · src/main.rs:1-50"
+        );
+        assert_eq!(children[0].duration, Some(Duration::from_millis(120)));
+
+        assert_eq!(children[1].name.as_ref(), "grep");
+        assert_eq!(children[1].summary, "searching todo items · src");
+
+        assert_eq!(children[2].name.as_ref(), "write");
+        assert_eq!(children[2].summary, "src/lib.rs");
     }
 }

@@ -3100,6 +3100,7 @@ fn panel_with_sealed_groups(tools: usize, thinking: usize, groups: usize) -> Mes
                     id: format!("tool-{group}-{id}"),
                     name: BASH_TOOL_NAME.into(),
                     summary: GROUP_RESIZE_TEXT.into(),
+                    raw_input: None,
                     children: Vec::new(),
                     status: ToolStatus::Success,
                     receiving_args: false,
@@ -3461,6 +3462,64 @@ fn compact_batch_children_follow_snapshots(restored: bool, cancelled: bool) {
 }
 
 #[test]
+fn compact_batch_children_formats_toolcall_reason() {
+    const TOOL_ID: &str = "batch-1";
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            compact_tools: true,
+            ..Default::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    let mut start_ev = start(TOOL_ID, "batch");
+    start_ev.raw_input = Some(serde_json::json!({
+        "tool_calls": [
+            {
+                "tool": "read",
+                "parameters": {
+                    "path": "src/main.rs",
+                    "offset": 10,
+                    "limit": 20,
+                    "toolcall_reason": "reading main"
+                }
+            }
+        ],
+        "toolcall_reason": "batch read"
+    }));
+    panel.tool_start(start_ev);
+    let snapshot = BufferSnapshot::from_arc(Arc::new(vec![SnapshotLine {
+        spans: vec![
+            SnapshotSpan {
+                text: "● ".into(),
+                style: SpanStyle::Named("tool_success".into()),
+            },
+            SnapshotSpan {
+                text: "read> ".into(),
+                style: SpanStyle::Named("tool_prefix".into()),
+            },
+            SnapshotSpan {
+                text: "src/main.rs:10-29".into(),
+                style: SpanStyle::Default,
+            },
+        ],
+    }]));
+    panel.tool_snapshot(TOOL_ID, snapshot, Some(1));
+    let DisplayRole::ToolGroup(group) = &panel.messages[0].role else {
+        panic!("expected ToolGroup");
+    };
+    let GroupEntry::Tool(batch) = &group.entries[0] else {
+        panic!("expected GroupEntry::Tool");
+    };
+    assert_eq!(batch.summary, "batch read · 1 tools");
+    assert_eq!(batch.children.len(), 1);
+    assert_eq!(batch.children[0].name.as_ref(), "read");
+    assert_eq!(
+        batch.children[0].summary,
+        "reading main · src/main.rs:10-29"
+    );
+}
+
+#[test]
 fn compact_tools_state_text_transitions() {
     let ui_cfg = UiConfig {
         compact_tools: true,
@@ -3518,6 +3577,7 @@ fn compact_tools_state_text_transitions() {
                 id: "c1".into(),
                 name: Arc::from("edit"),
                 summary: "a.rs".into(),
+                raw_input: None,
                 children: Vec::new(),
                 status: ToolStatus::Success,
                 receiving_args: false,
@@ -3528,6 +3588,7 @@ fn compact_tools_state_text_transitions() {
                 id: "c2".into(),
                 name: Arc::from("bash"),
                 summary: "test".into(),
+                raw_input: None,
                 children: Vec::new(),
                 status: ToolStatus::Success,
                 receiving_args: false,
@@ -3867,6 +3928,7 @@ fn compact_tool_group_renders_aligned_with_panel_left_padding() {
             id: "call-1".into(),
             name: Arc::from("bash"),
             summary: "ls".into(),
+            raw_input: None,
             children: Vec::new(),
             status: ToolStatus::Success,
             receiving_args: false,

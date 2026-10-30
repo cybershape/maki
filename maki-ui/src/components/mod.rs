@@ -40,6 +40,7 @@ use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
 use maki_lua::{PackCommand, PackPlan};
 use maki_providers::{ImageSource, Message, ModelTier};
 use ratatui::text::{Line, Span};
+use serde_json::Value;
 
 use crate::OpenSession;
 
@@ -405,6 +406,7 @@ pub struct GroupToolEntry {
     pub id: String,
     pub name: Arc<str>,
     pub summary: String,
+    pub raw_input: Option<Value>,
     pub children: Vec<GroupToolEntry>,
     pub status: ToolStatus,
     pub receiving_args: bool,

@@ -789,6 +789,7 @@ pub fn history_to_display(
                                     id: id.clone(),
                                     name: Arc::from(static_name),
                                     summary,
+                                    raw_input: Some(input.clone()),
                                     children: Vec::new(),
                                     status,
                                     receiving_args: false,
@@ -1855,6 +1856,47 @@ mod tests {
             panic!("expected GroupEntry::Tool");
         };
         assert_eq!(t.summary, "checking entry point · src/main.rs:1-50");
+    }
+
+    #[test]
+    fn history_compact_tools_stores_batch_raw_input() {
+        let batch_input = serde_json::json!({
+            "tool_calls": [
+                {
+                    "tool": "read",
+                    "parameters": {
+                        "path": "src/main.rs",
+                        "offset": 1,
+                        "limit": 50,
+                        "toolcall_reason": "checking entry point"
+                    }
+                }
+            ],
+            "toolcall_reason": "batching tools"
+        });
+        let msgs = vec![
+            Message::user("inspect code".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use("t1", "batch", batch_input.clone())],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result("t1", "done", false)],
+                ..Default::default()
+            },
+        ];
+        let outputs = HashMap::new();
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true).0;
+        let DisplayRole::ToolGroup(g) = &display[1].role else {
+            panic!("expected ToolGroup in display[1]");
+        };
+        let GroupEntry::Tool(t) = &g.entries[0] else {
+            panic!("expected GroupEntry::Tool");
+        };
+        assert_eq!(t.summary, "batching tools · 1 tools");
+        assert_eq!(t.raw_input.as_ref(), Some(&batch_input));
     }
 
     #[test]

@@ -418,6 +418,7 @@ impl MessagesPanel {
                         id: id.clone(),
                         name: Arc::from(name),
                         summary: String::new(),
+                        raw_input: None,
                         children: Vec::new(),
                         status: ToolStatus::InProgress,
                         receiving_args: true,
@@ -438,6 +439,7 @@ impl MessagesPanel {
                     id,
                     name: Arc::from(name),
                     summary: String::new(),
+                    raw_input: None,
                     children: Vec::new(),
                     status: ToolStatus::InProgress,
                     receiving_args: true,
@@ -483,6 +485,7 @@ impl MessagesPanel {
                     }) {
                         entry.name = Arc::clone(&event.tool);
                         entry.summary = summary.clone();
+                        entry.raw_input = event.raw_input.clone();
                         entry.receiving_args = false;
                         if entry.started_at.is_none() {
                             let wait_start = g.waiting_since.take();
@@ -526,6 +529,7 @@ impl MessagesPanel {
                     id: event.id,
                     name: Arc::clone(&event.tool),
                     summary: summary.clone(),
+                    raw_input: event.raw_input.clone(),
                     children: Vec::new(),
                     status: ToolStatus::InProgress,
                     receiving_args: false,
@@ -545,6 +549,7 @@ impl MessagesPanel {
                     id: event.id,
                     name: Arc::clone(&event.tool),
                     summary,
+                    raw_input: event.raw_input,
                     children: Vec::new(),
                     status: ToolStatus::InProgress,
                     receiving_args: false,
@@ -1694,7 +1699,7 @@ impl MessagesPanel {
                 if entry.name.as_ref() != tool_group::BATCH_TOOL {
                     return Some(group.id.clone());
                 }
-                let mut children = tool_group::batch_children(&snapshot);
+                let mut children = tool_group::batch_children(&snapshot, entry.raw_input.as_ref());
                 for (index, child) in children.iter_mut().enumerate() {
                     let previous = entry
                         .children
