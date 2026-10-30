@@ -77,6 +77,25 @@ pub fn format_group_duration(dur: Duration) -> String {
     }
 }
 
+pub fn format_group_summary(tools: usize, thoughts: usize) -> String {
+    let tool_part = match tools {
+        0 => None,
+        1 => Some("calling one tool".to_string()),
+        n => Some(format!("calling {n} tools")),
+    };
+    let thought_part = match thoughts {
+        0 => None,
+        1 => Some("thought once".to_string()),
+        n => Some(format!("thought {n} times")),
+    };
+    match (tool_part, thought_part) {
+        (Some(tool), Some(thought)) => format!(" ({tool}, {thought})"),
+        (Some(tool), None) => format!(" ({tool})"),
+        (None, Some(thought)) => format!(" ({thought})"),
+        (None, None) => String::new(),
+    }
+}
+
 fn single_line(s: &str) -> String {
     let trimmed = s.trim();
     let mut result = String::with_capacity(trimmed.len());
@@ -163,14 +182,12 @@ fn push_tool_rows(
     rail: &str,
     frame: (&str, Style),
     width: u16,
-    is_dim: bool,
 ) {
     lines.push(render_tool_row(
         rail,
         tool,
         frame,
         width,
-        is_dim,
         spinner_lines,
         lines.len(),
     ));
@@ -190,7 +207,6 @@ fn push_tool_rows(
             child,
             frame,
             width,
-            is_dim,
             spinner_lines,
             lines.len(),
         ));
@@ -202,7 +218,6 @@ fn render_tool_row(
     tool: &GroupToolEntry,
     frame: (&str, Style),
     width: u16,
-    is_dim: bool,
     spinner_lines: &mut Vec<(usize, usize)>,
     line_idx: usize,
 ) -> Line<'static> {
@@ -210,22 +225,8 @@ fn render_tool_row(
     let is_in_progress = tool.status == ToolStatus::InProgress;
     let (icon, icon_style) = match tool.status {
         ToolStatus::InProgress => (format!("{} ", frame.0), frame.1),
-        ToolStatus::Success => (
-            "✓ ".to_string(),
-            if is_dim {
-                theme.tool_dim
-            } else {
-                theme.tool_success
-            },
-        ),
-        ToolStatus::Error => (
-            "✗ ".to_string(),
-            if is_dim {
-                theme.tool_dim
-            } else {
-                theme.tool_error
-            },
-        ),
+        ToolStatus::Success => ("✓ ".to_string(), theme.tool_success),
+        ToolStatus::Error => ("✗ ".to_string(), theme.tool_error),
     };
 
     let mut spans = Vec::new();
@@ -242,11 +243,7 @@ fn render_tool_row(
     let icon_width = icon.width();
     spans.push(Span::styled(icon, icon_style));
 
-    let name_style = if is_dim {
-        theme.tool_dim
-    } else {
-        theme.tool.add_modifier(Modifier::BOLD)
-    };
+    let name_style = theme.tool.add_modifier(Modifier::BOLD);
     spans.push(Span::styled(tool.name.to_string(), name_style));
 
     let duration_str = tool
@@ -256,11 +253,7 @@ fn render_tool_row(
 
     let right_str = duration_str.unwrap_or_default();
     let right_len = right_str.width();
-    let right_style = if is_dim {
-        theme.tool_dim
-    } else {
-        theme.status_dim
-    };
+    let right_style = theme.status_dim;
 
     let left_len = rail.width() + icon_width + tool.name.width();
     let summary_clean = single_line(&tool.summary);
@@ -270,11 +263,7 @@ fn render_tool_row(
         if max_summary_len > 3 {
             let truncated = truncate_to_width(&summary_clean, max_summary_len);
             let trunc_w = truncated.width();
-            let summary_style = if is_dim {
-                theme.tool_dim
-            } else {
-                theme.status_dim
-            };
+            let summary_style = theme.status_dim;
             spans.push(Span::raw(" "));
             spans.push(Span::styled(truncated, summary_style));
 
@@ -303,7 +292,6 @@ fn render_thinking_row(
     thinking: &GroupThinkingEntry,
     spinner_millis: u128,
     width: u16,
-    is_dim: bool,
     _line_idx: usize,
 ) -> Line<'static> {
     let theme = theme::current();
@@ -311,14 +299,7 @@ fn render_thinking_row(
         let (f, s) = busy_spinner_frame(spinner_millis);
         (format!("{f} "), s)
     } else {
-        (
-            "✓ ".to_string(),
-            if is_dim {
-                theme.tool_dim
-            } else {
-                theme.tool_success
-            },
-        )
+        ("✓ ".to_string(), theme.tool_success)
     };
 
     let mut spans = Vec::new();
@@ -341,11 +322,7 @@ fn render_thinking_row(
         "thinking"
     };
 
-    let label_style = if is_dim {
-        theme.tool_dim
-    } else {
-        theme.tool.add_modifier(Modifier::BOLD)
-    };
+    let label_style = theme.tool.add_modifier(Modifier::BOLD);
     spans.push(Span::styled(label.to_string(), label_style));
 
     let duration_str = thinking
@@ -354,11 +331,7 @@ fn render_thinking_row(
         .map(|d| format!("({})", format_tool_duration(d)));
     let right_str = duration_str.unwrap_or_default();
     let right_len = right_str.width();
-    let right_style = if is_dim {
-        theme.tool_dim
-    } else {
-        theme.status_dim
-    };
+    let right_style = theme.status_dim;
 
     let left_len = rail.width() + icon_width + label.width();
 
@@ -367,11 +340,7 @@ fn render_thinking_row(
         if max_preview_len > 3 {
             let truncated = truncate_to_width(&preview, max_preview_len);
             let trunc_w = truncated.width();
-            let content_style = if is_dim {
-                theme.tool_dim
-            } else {
-                theme.thinking.remove_modifier(Modifier::ITALIC)
-            };
+            let content_style = theme.thinking.remove_modifier(Modifier::ITALIC);
             spans.push(Span::raw(" "));
             spans.push(Span::styled(truncated, content_style));
 
@@ -461,12 +430,15 @@ pub fn build_tool_group_lines(
         ("✓ ".to_string(), theme.tool_success)
     };
 
-    let hidden_count = group.entries.len().saturating_sub(MAX_COMPACT_ENTRIES);
-    let hidden_suffix = if hidden_count > 0 {
-        format!(" ({hidden_count} hidden)")
-    } else {
-        String::new()
-    };
+    let mut total_tools = 0;
+    let mut total_thoughts = 0;
+    for entry in &group.entries {
+        match entry {
+            GroupEntry::Tool(_) => total_tools += 1,
+            GroupEntry::Thinking(_) => total_thoughts += 1,
+        }
+    }
+    let summary_suffix = format_group_summary(total_tools, total_thoughts);
 
     let mut header_spans = Vec::new();
     header_spans.push(Span::styled(left_icon, left_style));
@@ -474,10 +446,18 @@ pub fn build_tool_group_lines(
         spinner_lines.push((0, 0));
     }
     header_spans.push(Span::styled(state_text, Style::default()));
-    if !hidden_suffix.is_empty() {
-        header_spans.push(Span::styled(hidden_suffix, theme.status_dim));
+    if !summary_suffix.is_empty() {
+        header_spans.push(Span::styled(summary_suffix, theme.status_dim));
     }
     lines.push(Line::from(header_spans));
+
+    let hidden_count = group.entries.len().saturating_sub(MAX_COMPACT_ENTRIES);
+    if hidden_count > 0 {
+        lines.push(Line::from(vec![
+            Span::styled(RAIL_CONTINUE, theme.tool_dim),
+            Span::styled(format!("... ({hidden_count} hidden)"), theme.tool_dim),
+        ]));
+    }
 
     let visible_start = if hidden_count > 0 { hidden_count } else { 0 };
     let visible_entries = &group.entries[visible_start..];
@@ -486,25 +466,17 @@ pub fn build_tool_group_lines(
     for (idx, entry) in visible_entries.iter().enumerate() {
         let is_last = idx == total_visible - 1;
         let rail = if is_last { RAIL_LAST } else { RAIL_CONTINUE };
-        let is_dim = hidden_count > 0 && idx == 0;
         let line_idx = lines.len();
 
         match entry {
-            GroupEntry::Tool(t) => push_tool_rows(
-                &mut lines,
-                &mut spinner_lines,
-                t,
-                rail,
-                frame,
-                width,
-                is_dim,
-            ),
+            GroupEntry::Tool(t) => {
+                push_tool_rows(&mut lines, &mut spinner_lines, t, rail, frame, width)
+            }
             GroupEntry::Thinking(th) => lines.push(render_thinking_row(
                 rail,
                 th,
                 spinner_millis,
                 width,
-                is_dim,
                 line_idx,
             )),
         }
@@ -910,13 +882,19 @@ mod tests {
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
-        assert_eq!(tl.lines.len(), 11);
+        assert_eq!(tl.lines.len(), 12);
         let header_text: String = tl.lines[0]
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(header_text.contains("(5 hidden)"));
+        assert!(header_text.contains("(calling 15 tools)"));
+        let hidden_line: String = tl.lines[1]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(hidden_line.contains("... (5 hidden)"));
     }
 
     #[test]
@@ -1049,6 +1027,61 @@ mod tests {
         assert!(!preview_span.style.add_modifier.contains(Modifier::ITALIC));
     }
 
+    #[test_case(1, 0 => " (calling one tool)".to_string() ; "one_tool")]
+    #[test_case(2, 0 => " (calling 2 tools)".to_string() ; "two_tools")]
+    #[test_case(10, 0 => " (calling 10 tools)".to_string() ; "ten_tools")]
+    #[test_case(0, 1 => " (thought once)".to_string() ; "one_thought")]
+    #[test_case(0, 2 => " (thought 2 times)".to_string() ; "two_thoughts")]
+    #[test_case(1, 1 => " (calling one tool, thought once)".to_string() ; "one_tool_one_thought")]
+    #[test_case(10, 2 => " (calling 10 tools, thought 2 times)".to_string() ; "ten_tools_two_thoughts")]
+    #[test_case(1, 2 => " (calling one tool, thought 2 times)".to_string() ; "one_tool_two_thoughts")]
+    #[test_case(10, 1 => " (calling 10 tools, thought once)".to_string() ; "ten_tools_one_thought")]
+    #[test_case(0, 0 => "".to_string() ; "empty")]
+    fn group_summary_formatting(tools: usize, thoughts: usize) -> String {
+        format_group_summary(tools, thoughts)
+    }
+
+    #[test]
+    fn group_summary_shows_all_entries() {
+        let entries = vec![
+            GroupEntry::Tool(GroupToolEntry {
+                id: "t0".into(),
+                name: Arc::from("tool"),
+                summary: "op 0".into(),
+                children: Vec::new(),
+                status: ToolStatus::Success,
+                receiving_args: false,
+                started_at: None,
+                duration: None,
+            }),
+            GroupEntry::Thinking(GroupThinkingEntry {
+                id: 0,
+                text: "thinking".into(),
+                tokens: 50,
+                active: false,
+                started_at: None,
+                duration: None,
+            }),
+        ];
+        let group = ToolGroupRole {
+            id: "group-small".into(),
+            sealed: true,
+            entries,
+            started_at: None,
+            duration: Some(Duration::from_secs(10)),
+            waiting_since: None,
+        };
+
+        let tl = build_tool_group_lines(&group, 80, 0);
+        assert_eq!(tl.lines.len(), 3);
+        let header: String = tl.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(header.contains("(calling one tool, thought once)"));
+    }
+
     #[test]
     fn sealed_group_title_shows_worked_for_and_hidden() {
         let mut entries = Vec::new();
@@ -1074,12 +1107,69 @@ mod tests {
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
+        assert_eq!(tl.lines.len(), 12);
         let header: String = tl.lines[0]
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(header.contains("Worked for 1m35s (12 hidden)"));
+        assert!(header.contains("Worked for 1m35s (calling 22 tools)"));
+        let hidden_line: String = tl.lines[1]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(hidden_line.contains("... (12 hidden)"));
+    }
+
+    #[test]
+    fn sealed_group_title_shows_tools_and_thoughts_hidden() {
+        let mut entries = Vec::new();
+        for i in 0..10 {
+            entries.push(GroupEntry::Tool(GroupToolEntry {
+                id: format!("t{i}"),
+                name: Arc::from("tool"),
+                summary: format!("op {i}"),
+                children: Vec::new(),
+                status: ToolStatus::Success,
+                receiving_args: false,
+                started_at: None,
+                duration: None,
+            }));
+        }
+        for i in 0..2 {
+            entries.push(GroupEntry::Thinking(GroupThinkingEntry {
+                id: i,
+                text: "thinking".into(),
+                tokens: 50,
+                active: false,
+                started_at: None,
+                duration: None,
+            }));
+        }
+        let group = ToolGroupRole {
+            id: "group-mixed".into(),
+            sealed: true,
+            entries,
+            started_at: None,
+            duration: Some(Duration::from_secs(10)),
+            waiting_since: None,
+        };
+
+        let tl = build_tool_group_lines(&group, 80, 0);
+        assert_eq!(tl.lines.len(), 12);
+        let header: String = tl.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(header.contains("(calling 10 tools, thought 2 times)"));
+        let hidden_line: String = tl.lines[1]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(hidden_line.contains("... (2 hidden)"));
     }
 
     #[test]
