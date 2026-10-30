@@ -47,7 +47,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
-    adaptive_effort,
+    sends_thinking,
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(100_000),
@@ -783,18 +783,20 @@ fn effort_dialect(info: &CopilotModelInfo) -> EffortDialect<'_> {
     }
 }
 
-fn adaptive_effort(model: &Model) -> Option<Effort> {
+fn sends_thinking(model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
     model_registry::provider_info::<CopilotModelInfo>(SLUG, &model.id)
-        .and_then(|info| listed_adaptive_effort(&info))
+        .map_or(choice, |info| listed_sends_thinking(&info, choice))
 }
 
-/// Only the responses endpoint renders `adaptive` through the dialect. The
+/// Only the responses endpoint renders thinking through the dialect. The
 /// messages endpoint spells it natively and chat completions carries no
 /// reasoning at all.
-fn listed_adaptive_effort(info: &CopilotModelInfo) -> Option<Effort> {
-    (info.endpoint == Endpoint::Responses)
-        .then(|| effort_dialect(info).adaptive_effort())
-        .flatten()
+fn listed_sends_thinking(info: &CopilotModelInfo, choice: ThinkingConfig) -> ThinkingConfig {
+    if info.endpoint == Endpoint::Responses {
+        effort_dialect(info).sends(choice)
+    } else {
+        choice
+    }
 }
 
 fn guess_endpoint(model_id: &str) -> Endpoint {
@@ -1009,7 +1011,10 @@ mod tests {
             "capabilities": {"type": "chat", "supports": supports}
         }))
         .unwrap();
-        assert_eq!(listed_adaptive_effort(&listed.reasoning_info()), expected);
+        assert_eq!(
+            listed_sends_thinking(&listed.reasoning_info(), ThinkingConfig::Adaptive).level(),
+            expected
+        );
     }
 
     #[test_case(RESPONSES_PATH, true; "responses honors reasoning")]

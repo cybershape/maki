@@ -922,6 +922,27 @@ impl EffortDialect<'_> {
     pub fn adaptive_effort(&self) -> Option<Effort> {
         self.adaptive.map(|level| level.snap(self.supported))
     }
+
+    /// Mirrors [`ThinkingConfig::effort_str`], so the badge can name what the
+    /// request will carry.
+    pub fn sends(&self, choice: ThinkingConfig) -> ThinkingConfig {
+        match choice {
+            ThinkingConfig::Adaptive => self
+                .adaptive_effort()
+                .map_or(choice, ThinkingConfig::Effort),
+            ThinkingConfig::Effort(level) => ThinkingConfig::Effort(level.snap(self.supported)),
+            ThinkingConfig::Off | ThinkingConfig::Budget(_) => choice,
+        }
+    }
+
+    /// Discovery may list other levels than the dialect knows. The wire and
+    /// the badge both read them through here, so the two never disagree.
+    fn as_discovered<R>(&self, model: &Model, render: impl FnOnce(&EffortDialect) -> R) -> R {
+        match model.discovered_effort() {
+            Some(effort) => render(&effort.refine(self)),
+            None => render(self),
+        }
+    }
 }
 
 /// The model's own spelling of each thinking mode, parsed and validated by
@@ -953,16 +974,19 @@ pub enum ThinkingFallback {
 }
 
 impl ThinkingFallback {
-    /// The level [`ThinkingConfig::apply_thinking`] sends for `Adaptive` on
-    /// `model`. `None` where the model spells the mode itself, or where the
-    /// endpoint is left to decide.
-    pub(crate) fn adaptive_effort(self, model: &Model) -> Option<Effort> {
-        let spelled = model
-            .effective_thinking_fields()
-            .is_some_and(|(fields, _)| fields.adaptive.is_some());
+    /// What [`ThinkingConfig::apply_thinking`] sends `choice` as on `model`.
+    /// A model that spells `Adaptive` itself keeps it, and an endpoint left
+    /// to decide gets every choice as it is.
+    pub(crate) fn sends(self, model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
+        let spelled = choice == ThinkingConfig::Adaptive
+            && model
+                .effective_thinking_fields()
+                .is_some_and(|(fields, _)| fields.adaptive.is_some());
         match self {
-            Self::Dialect(dialect) if !spelled => dialect.adaptive_effort(),
-            Self::None | Self::Dialect(_) | Self::BudgetField => None,
+            Self::Dialect(dialect) if !spelled => {
+                dialect.as_discovered(model, |dialect| dialect.sends(choice))
+            }
+            Self::None | Self::Dialect(_) | Self::BudgetField => choice,
         }
     }
 }
@@ -1322,7 +1346,9 @@ impl ThinkingConfig {
             ThinkingFallback::None => {}
             ThinkingFallback::Dialect(dialect) => {
                 if model.supports_thinking() {
-                    self.apply_reasoning_effort(body, dialect, model);
+                    dialect.as_discovered(model, |dialect| {
+                        self.apply_reasoning_effort(body, dialect, model);
+                    });
                 }
             }
             // The model has no way to spell this mode, so the budget field
@@ -1441,7 +1467,8 @@ impl ThinkingConfig {
     }
 
     /// The picker and badge follow the wire while stored intent keeps its
-    /// delegation ceiling. Declared fields keep `Adaptive` separate because
+    /// delegation ceiling, so a level the model does not take shows as the
+    /// one it goes out as. Declared fields keep `Adaptive` separate because
     /// their level fragments can differ from the provider fallback.
     pub fn shown(self, model: &Model) -> Self {
         let fields = model.effective_thinking_fields();
@@ -1450,10 +1477,17 @@ impl ThinkingConfig {
         {
             return shown;
         }
-        if self == Self::Adaptive && fields.is_none_or(|(fields, _)| fields.levels.is_empty()) {
-            return model.adaptive_effort().map_or(self, Self::Effort);
+        if self == Self::Adaptive && fields.is_some_and(|(fields, _)| !fields.levels.is_empty()) {
+            return self;
         }
-        self
+        model.thinking_sent(self)
+    }
+
+    pub fn level(self) -> Option<Effort> {
+        match self {
+            Self::Effort(level) => Some(level),
+            Self::Off | Self::Adaptive | Self::Budget(_) => None,
+        }
     }
 
     pub fn status_label(self) -> Option<Cow<'static, str>> {
@@ -2334,6 +2368,53 @@ mod tests {
         assert_eq!(body, expected);
     }
 
+    fn discovered_ollama(model_id: &str, supported: &[Effort], send_off: bool) -> Model {
+        use crate::model::{ModelEffort, ModelInfo};
+
+        crate::model_registry::set_known_models(
+            "ollama",
+            vec![ModelInfo {
+                supports_thinking: Some(true),
+                effort: Some(ModelEffort {
+                    supported: supported.to_vec(),
+                    send_off: Some(send_off),
+                }),
+                ..ModelInfo::id_only(model_id.into())
+            }],
+        );
+        Model::from_spec(&format!("ollama/{model_id}")).unwrap()
+    }
+
+    /// The badge has to name what goes out, or a level the model does not
+    /// take would show as itself while another one is sent.
+    #[test_case(&[Low, Medium, High, XHigh] ; "named_levels")]
+    #[test_case(&[Medium] ; "toggle")]
+    fn ollama_shows_the_level_on_the_wire(supported: &[Effort]) {
+        let model = discovered_ollama("badge", supported, true);
+
+        for choice in Effort::ALL
+            .map(ThinkingConfig::Effort)
+            .into_iter()
+            .chain([ThinkingConfig::Adaptive])
+        {
+            let mut body = json!({});
+            choice.apply_thinking(&mut body, &model, DIALECT);
+            let shown = choice.shown(&model).level().map(Effort::as_str);
+            assert_eq!(body["reasoning_effort"].as_str(), shown, "{choice:?}");
+        }
+    }
+
+    /// A model that cannot stop thinking gets nothing for off, rather than a
+    /// "none" it would ignore.
+    #[test_case(true, json!({"reasoning_effort": "none"}) ; "can_turn_off")]
+    #[test_case(false, json!({}) ; "cannot_turn_off")]
+    fn ollama_off_follows_discovery(send_off: bool, expected: Value) {
+        let model = discovered_ollama("off", &[Low, Medium, High], send_off);
+        let mut body = json!({});
+        ThinkingConfig::Off.apply_thinking(&mut body, &model, DIALECT);
+        assert_eq!(body, expected);
+    }
+
     /// The badge reads as whatever the session is set to, and stays quiet when
     /// thinking is off.
     #[test_case(ThinkingConfig::Off, None ; "off_shows_no_badge")]
@@ -2681,8 +2762,10 @@ mod tests {
     ) {
         let mut model = native_thinking_model("partial", fields);
         model.provider = Arc::from(provider);
-        assert_eq!(DIALECT.adaptive_effort(&model), expected);
-        assert_eq!(ThinkingFallback::None.adaptive_effort(&model), None);
+        let adaptive =
+            |fallback: ThinkingFallback| fallback.sends(&model, ThinkingConfig::Adaptive).level();
+        assert_eq!(adaptive(DIALECT), expected);
+        assert_eq!(adaptive(ThinkingFallback::None), None);
     }
 
     #[test_case(None,                           ThinkingConfig::Off      ; "absent_means_off")]

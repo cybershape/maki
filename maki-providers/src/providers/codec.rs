@@ -23,7 +23,8 @@ use crate::provider::{BoxFuture, Provider};
 use crate::spec::ProviderSpec;
 use crate::types::{EffortDialect, ThinkingFallback, dialect, merge_body};
 use crate::{
-    AgentError, Effort, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    ThinkingConfig,
 };
 
 /// Where effort goes when a declaration names a dialect and no field: the
@@ -234,8 +235,12 @@ impl ThinkingWire {
         }
     }
 
-    pub(crate) fn adaptive_effort(&self, discovered: Option<&ModelInfo>) -> Option<Effort> {
-        self.dialect_for(discovered).adaptive_effort()
+    pub(crate) fn sends(
+        &self,
+        discovered: Option<&ModelInfo>,
+        choice: ThinkingConfig,
+    ) -> ThinkingConfig {
+        self.dialect_for(discovered).sends(choice)
     }
 
     /// The declared dialect, narrowed by what discovery listed for the model,

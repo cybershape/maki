@@ -8,13 +8,13 @@ use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::catalog::{
     CatalogMeta, CatalogTransport, EndpointType, FreeTier, ProviderQuirks,
-    adaptive_effort_if_available, init_shared_catalog_if_needed,
+    init_shared_catalog_if_needed, sends_if_available,
 };
 use crate::spec::{
     AuthDoc, Build, CatalogDoc, GENERIC_DISCOVERY_NOTE, GeneratedDocs, NO_CURATED_MODELS, Native,
     ProviderSpec,
 };
-use crate::{AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 
 use super::{ResolvedAuth, Timeouts, with_prefix};
 
@@ -50,7 +50,7 @@ pub(crate) const ZEN_SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Generic,
     supports_thinking: true,
     supports_deferred_tools: false,
-    adaptive_effort,
+    sends_thinking,
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(128_000),
@@ -79,7 +79,7 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
-    adaptive_effort: |_| adaptive_effort_if_available(GO_SLUG),
+    sends_thinking: |_, choice| sends_if_available(GO_SLUG, choice),
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(64_000),
@@ -100,12 +100,12 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
 
 /// Zen ids name the sub-provider that serves them, as
 /// [`Opencode::stream_message`] reads them.
-fn adaptive_effort(model: &Model) -> Option<Effort> {
+fn sends_thinking(model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
     let sub_provider = model
         .id
         .split_once('/')
         .map_or(ZEN_SLUG, |(sub_provider, _)| sub_provider);
-    adaptive_effort_if_available(sub_provider)
+    sends_if_available(sub_provider, choice)
 }
 
 fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {

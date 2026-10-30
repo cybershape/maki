@@ -138,7 +138,7 @@ impl ModelEffort {
     }
 
     /// What [`Self::supported`] keeps of the names a provider listed.
-    fn known_levels(listed: &[Value]) -> Vec<Effort> {
+    pub(crate) fn known_levels(listed: &[Value]) -> Vec<Effort> {
         let mut efforts: Vec<Effort> = listed
             .iter()
             .filter_map(|raw| {
@@ -517,6 +517,9 @@ pub struct ThinkingOption {
     /// Absent on rows that are not a token budget.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<u32>,
+    /// The row this one goes out as. A level the model does not take is
+    /// sent as its nearest neighbour, and the picker shows which.
+    pub sends: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -680,17 +683,29 @@ impl Model {
         self.thinking_override == Some(ThinkingSupport::Required)
     }
 
+    /// Discovery files its rows under the builtin slug, so a slug that
+    /// borrows a native row still finds them.
+    pub(crate) fn discovered_effort(&self) -> Option<ModelEffort> {
+        let spec = ProviderRegistry::for_slug(&self.provider)?;
+        model_registry::discovered(spec.slug, &self.id)?.effort
+    }
+
     /// The level `adaptive` is sent as for this model, or `None` where the
     /// API picks the depth itself. Such a level is all `adaptive` is here, so
-    /// the ladder leaves the row out. Every provider answers on its spec row.
-    /// A `providers.toml` slug borrows a native row for its protocol but not
-    /// its dialect: its codec sends nothing for a mode the model does not
-    /// spell. An id only models.dev knows goes by the wire it is served on.
+    /// the ladder leaves the row out.
     pub fn adaptive_effort(&self) -> Option<Effort> {
+        self.thinking_sent(ThinkingConfig::Adaptive).level()
+    }
+
+    /// What the request carries for `choice`. Every provider answers on its
+    /// spec row. A `providers.toml` slug borrows a native row for its
+    /// protocol but not its dialect, so its codec sends the choice as it is.
+    /// An id only models.dev knows goes by the wire it is served on.
+    pub(crate) fn thinking_sent(&self, choice: ThinkingConfig) -> ThinkingConfig {
         match ProviderRegistry::get(&self.provider) {
-            Some(spec) => (spec.adaptive_effort)(self),
-            None if custom::is_declared(&self.provider) => None,
-            None => catalog::adaptive_effort_if_available(&self.provider),
+            Some(spec) => (spec.sends_thinking)(self, choice),
+            None if custom::is_declared(&self.provider) => choice,
+            None => catalog::sends_if_available(&self.provider, choice),
         }
     }
 
@@ -748,7 +763,9 @@ impl Model {
 
     /// Named thinking choices, cheapest first. Explicit wire-level names take
     /// precedence over the generic budget ladder and carry no invented token
-    /// counts. Empty exactly when the model has no thinking support.
+    /// counts. Empty exactly when the model has no thinking support. A level
+    /// the model does not take stays listed, because the session keeps it as
+    /// a ceiling for subagents, which may run on a model that does take it.
     pub fn thinking_options(&self) -> Vec<ThinkingOption> {
         if !self.supports_thinking() {
             return Vec::new();
@@ -767,7 +784,11 @@ impl Model {
                 (ThinkingConfig::Adaptive.shown(self) == ThinkingConfig::Adaptive)
                     .then_some(THINKING_ADAPTIVE),
             )
-            .map(|name| ThinkingOption { name, tokens: None })
+            .map(|name| ThinkingOption {
+                name,
+                tokens: None,
+                sends: name,
+            })
             .chain(
                 Effort::ALL
                     .into_iter()
@@ -775,6 +796,11 @@ impl Model {
                     .map(|level| ThinkingOption {
                         name: level.as_str(),
                         tokens: declared.is_none().then(|| level.budget(max)),
+                        sends: ThinkingConfig::Effort(level)
+                            .shown(self)
+                            .level()
+                            .unwrap_or(level)
+                            .as_str(),
                     }),
             )
             .collect()
@@ -1805,6 +1831,26 @@ mod tests {
     }
 
     #[test]
+    fn discovered_thinking_flows_into_ollama_model() {
+        use crate::model::ModelInfo;
+
+        model_registry::set_known_models(
+            "ollama",
+            vec![
+                ModelInfo {
+                    supports_thinking: Some(true),
+                    ..ModelInfo::id_only("test-thinker".into())
+                },
+                ModelInfo::id_only("test-thinkless".into()),
+            ],
+        );
+
+        let thinking = |id| Model::from_spec(id).unwrap().supports_thinking();
+        assert!(thinking("ollama/test-thinker"));
+        assert!(!thinking("ollama/test-thinkless"));
+    }
+
+    #[test]
     fn discovered_context_window_flows_into_from_base_for_unknown_model() {
         use crate::model::ModelInfo;
 
@@ -2036,6 +2082,49 @@ mod tests {
         let names: Vec<&str> = options.iter().map(|option| option.name).collect();
         assert_eq!(names, expected);
         assert!(options.iter().all(|option| option.tokens.is_none()));
+    }
+
+    #[test]
+    fn thinking_options_name_the_row_each_level_sends() {
+        model_registry::set_known_models(
+            "ollama",
+            vec![ModelInfo {
+                supports_thinking: Some(true),
+                effort: Some(ModelEffort {
+                    supported: vec![Effort::Low, Effort::Medium],
+                    send_off: Some(true),
+                }),
+                ..ModelInfo::id_only("two-levels".into())
+            }],
+        );
+        let options = Model::from_spec("ollama/two-levels")
+            .unwrap()
+            .thinking_options();
+        let rows: Vec<(&str, &str)> = options.iter().map(|o| (o.name, o.sends)).collect();
+        assert_eq!(
+            rows,
+            [
+                ("off", "off"),
+                ("minimal", "low"),
+                ("low", "low"),
+                ("medium", "medium"),
+                ("high", "medium"),
+                ("xhigh", "medium"),
+                ("max", "medium"),
+            ]
+        );
+    }
+
+    /// The badge follows a provider's fixed dialect too, not only discovery.
+    #[test_case("zai/glm-5.3", Effort::Low, Effort::High ; "below_the_lowest_takes_the_lowest")]
+    #[test_case("zai/glm-5.3", Effort::Max, Effort::XHigh ; "above_the_top_takes_the_top")]
+    #[test_case("anthropic/claude-sonnet-4-5", Effort::Low, Effort::Low ; "an_api_that_takes_it_keeps_it")]
+    fn shown_is_the_level_the_provider_sends(spec: &str, picked: Effort, sent: Effort) {
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(
+            ThinkingConfig::Effort(picked).shown(&model),
+            ThinkingConfig::Effort(sent)
+        );
     }
 
     #[test_case(json!({}) ; "empty_fields")]

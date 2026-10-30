@@ -10,17 +10,20 @@ use tracing::{debug, warn};
 
 use maki_config::providers::{Protocol, ProvidersConfig};
 
-use crate::model::{Model, ModelInfo, ModelPricing};
+use crate::model::{Model, ModelEffort, ModelInfo, ModelPricing};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
 use crate::types::ThinkingFallback;
-use crate::{AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{
+    AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
+};
 
 use super::openai::responses;
 use super::openai_compat::{DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 
 const OLLAMA_DEFAULT_TAG: &str = "latest";
+const OLLAMA_THINKING_CAPABILITY: &str = "thinking";
 
 pub(crate) struct LocalEndpointConfig {
     pub slug: &'static str,
@@ -36,8 +39,8 @@ pub(crate) struct LocalEndpointConfig {
 }
 
 impl LocalEndpointConfig {
-    pub(crate) fn adaptive_effort(&self, model: &Model) -> Option<Effort> {
-        self.thinking_fallback.adaptive_effort(model)
+    pub(crate) fn sends_thinking(&self, model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
+        self.thinking_fallback.sends(model, choice)
     }
 
     pub(crate) fn fields_fallback(&self) -> Option<ThinkingFallback> {
@@ -426,12 +429,30 @@ struct OllamaShowResponse {
     /// e.g. `["completion", "vision", "tools"]`; absent on older Ollama servers.
     #[serde(default)]
     capabilities: Option<Vec<String>>,
+    /// What `think` takes, absent on models without the metadata.
+    #[serde(default)]
+    thinking: Option<OllamaThinking>,
+}
+
+/// `false` turns thinking off, `true` on, and a name picks a level.
+#[derive(Deserialize)]
+struct OllamaThinking {
+    #[serde(default)]
+    values: Vec<Value>,
+}
+
+impl OllamaThinking {
+    fn takes(&self, toggle: bool) -> bool {
+        self.values.contains(&Value::Bool(toggle))
+    }
 }
 
 #[derive(Default)]
 struct OllamaModelDetails {
     context_window: Option<u32>,
     supports_vision: Option<bool>,
+    supports_thinking: Option<bool>,
+    effort: Option<ModelEffort>,
 }
 
 impl LocalEndpoint {
@@ -473,12 +494,12 @@ impl LocalEndpoint {
                 id: m.id,
                 max_output_tokens: None,
                 pricing: Some(ModelPricing::ZERO),
-                supports_thinking: None,
+                supports_thinking: d.supports_thinking,
                 supports_vision: d.supports_vision,
                 tier: None,
                 provider_info: None,
                 extra: None,
-                effort: None,
+                effort: d.effort,
             })
             .collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -532,6 +553,41 @@ fn ollama_model_details(show: &OllamaShowResponse) -> OllamaModelDetails {
     OllamaModelDetails {
         context_window,
         supports_vision: ollama_extract_vision(show.capabilities.as_deref()),
+        supports_thinking: ollama_supports_thinking(show),
+        effort: show.thinking.as_ref().map(ollama_effort),
+    }
+}
+
+/// A model whose `thinking.values` holds only `false` cannot think. Without
+/// the metadata the capability is all there is to go by.
+fn ollama_supports_thinking(show: &OllamaShowResponse) -> Option<bool> {
+    match &show.thinking {
+        Some(thinking) => Some(thinking.values.iter().any(|v| *v != Value::Bool(false))),
+        None => show
+            .capabilities
+            .as_deref()
+            .map(|c| c.iter().any(|c| c == OLLAMA_THINKING_CAPABILITY)),
+    }
+}
+
+/// Ollama hands a level name as it is to a model that lists names. A model
+/// that only toggles reads any level as `true`, which Ollama calls medium, so
+/// medium is the one level it gets.
+fn ollama_effort(thinking: &OllamaThinking) -> ModelEffort {
+    let names: Vec<Value> = thinking
+        .values
+        .iter()
+        .filter(|v| v.is_string())
+        .cloned()
+        .collect();
+    let supported = if names.is_empty() && thinking.takes(true) {
+        vec![Effort::Medium]
+    } else {
+        ModelEffort::known_levels(&names)
+    };
+    ModelEffort {
+        supported,
+        send_off: Some(thinking.takes(false)),
     }
 }
 
@@ -1067,9 +1123,11 @@ mod tests {
         use test_case::test_case;
 
         use super::super::*;
+        use crate::model::ModelEffort;
 
         const PARSE_FAILED: &str = "failed to parse /api/show body";
         const CAPABILITIES_PLACEHOLDER: &str = "__CAPABILITIES__";
+        const THINKING_PLACEHOLDER: &str = "__THINKING__";
         const CONTEXT_LENGTH: u32 = 128_000;
         const DECLARED_NUM_CTX: u32 = 2048;
         const OVER_TRAINED_NUM_CTX: u32 = 200_000;
@@ -1095,17 +1153,63 @@ mod tests {
     "qwen25vl.embedding_length": 3584
   },
   __CAPABILITIES__
+  __THINKING__
   "modified_at": "2026-01-01T12:00:00.000000000-05:00"
 }"##;
 
-        #[test_case(r#""capabilities": ["completion", "vision"],"#, Some(true)  ; "vision_capability")]
-        #[test_case(r#""capabilities": ["completion", "tools"],"#, Some(false) ; "no_vision_capability")]
-        #[test_case("", None ; "capabilities_omitted_by_old_server")]
-        fn parses_details(capabilities_field: &str, expected_vision: Option<bool>) {
-            let body = SHOW_BODY.replace(CAPABILITIES_PLACEHOLDER, capabilities_field);
+        const THINKING_NAMED: &str = r#""thinking": {"values":[false,"low","medium","xhigh"],"default":"medium"},
+"#;
+        const THINKING_BOOLEAN: &str = r#""thinking": {"values":[false,true],"default":true},
+"#;
+        const THINKING_OFF_ONLY: &str = r#""thinking": {"values":[false],"default":false},
+"#;
+        const THINKING_NO_OFF: &str = r#""thinking": {"values":["low","high"],"default":"low"},
+"#;
+
+        fn fill(body: &str, capabilities: &str, thinking: &str) -> String {
+            body.replace(CAPABILITIES_PLACEHOLDER, capabilities)
+                .replace(THINKING_PLACEHOLDER, thinking)
+        }
+
+        fn expected(supported: Vec<Effort>, send_off: bool) -> Option<ModelEffort> {
+            Some(ModelEffort {
+                supported,
+                send_off: Some(send_off),
+            })
+        }
+
+        fn named_levels() -> Vec<Effort> {
+            vec![Effort::Low, Effort::Medium, Effort::XHigh]
+        }
+
+        const CAPS_VISION: &str = r#""capabilities": ["completion", "vision"],
+"#;
+        const CAPS_TOOLS: &str = r#""capabilities": ["completion", "tools"],
+"#;
+        const CAPS_THINKING: &str = r#""capabilities": ["completion", "thinking"],
+"#;
+
+        #[test_case("", "", None, None, None ; "old_server_says_nothing")]
+        #[test_case(CAPS_VISION, "", Some(false), None, Some(true) ; "vision_only")]
+        #[test_case(CAPS_TOOLS, "", Some(false), None, Some(false) ; "no_vision_only")]
+        #[test_case(CAPS_THINKING, "", Some(true), None, Some(false) ; "thinking_capability_without_values")]
+        #[test_case("", THINKING_NAMED, Some(true), expected(named_levels(), true), None ; "named_levels")]
+        #[test_case("", THINKING_BOOLEAN, Some(true), expected(vec![Effort::Medium], true), None ; "a_toggle_is_one_level")]
+        #[test_case("", THINKING_OFF_ONLY, Some(false), expected(Vec::new(), true), None ; "off_only_cannot_think")]
+        #[test_case("", THINKING_NO_OFF, Some(true), expected(vec![Effort::Low, Effort::High], false), None ; "no_off_sends_nothing_for_off")]
+        fn parses_details(
+            capabilities_field: &str,
+            thinking_field: &str,
+            expected_thinking: Option<bool>,
+            expected_effort: Option<ModelEffort>,
+            expected_vision: Option<bool>,
+        ) {
+            let body = fill(SHOW_BODY, capabilities_field, thinking_field);
             let show: OllamaShowResponse = serde_json::from_str(&body).expect(PARSE_FAILED);
 
             let details = ollama_model_details(&show);
+            assert_eq!(details.supports_thinking, expected_thinking);
+            assert_eq!(details.effort, expected_effort);
             assert_eq!(details.supports_vision, expected_vision);
             assert_eq!(details.context_window, Some(DECLARED_NUM_CTX));
         }

@@ -37,6 +37,13 @@ const CONTEXT_WINDOW_NOTE: &str = "#### Context window\n\n\
      or a Modelfile `num_ctx`. maki does not set it per request, because a larger window reloads \
      the model and can run out of VRAM mid-session.";
 
+const THINKING_NOTE: &str = "#### Thinking\n\n\
+     maki reads from `/api/show` whether each model thinks and which levels it takes. \
+     `/thinking` lists every level, and a level the model does not take is dimmed and names the \
+     level it sends instead: the closest one below, or else the lowest. A model that can only turn \
+     thinking on or off shows `medium`, the level Ollama reads any request as. `adaptive` sends \
+     `medium`, snapped the same way, and `off` sends `none` to a model that can turn thinking off.";
+
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     slug: OLLAMA.slug,
     display_name: OLLAMA.display_name,
@@ -44,7 +51,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
-    adaptive_effort: |model| OLLAMA.adaptive_effort(model),
+    sends_thinking: |model, choice| OLLAMA.sends_thinking(model, choice),
     thinking_fields_fallback: |_| OLLAMA.fields_fallback(),
     accepts_arbitrary_models: true,
     fallback_max_output: Some(16_384),
@@ -73,7 +80,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         features: Some(FEATURES),
         auth: AuthDoc::Custom(AUTH_DOC),
         catalog: CatalogDoc::Discovered(DISCOVERY_NOTE),
-        trailing_notes: &[CONTEXT_WINDOW_NOTE],
+        trailing_notes: &[CONTEXT_WINDOW_NOTE, THINKING_NOTE],
     },
 };
 

@@ -35,8 +35,8 @@ use crate::providers::openai_compat::{
 use crate::providers::{ResolvedAuth, Timeouts, http_client, opencode, plugin, user_agent};
 use crate::spec::ProviderRegistry;
 use crate::{
-    AgentError, Effort, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
-    dialect,
+    AgentError, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
+    ThinkingConfig, dialect,
 };
 
 const MESSAGES_PATH: &str = "/messages";
@@ -519,14 +519,14 @@ fn with_provider_if_available<T>(slug: &str, f: impl FnOnce(&ProviderData) -> T)
     guard.providers.get(slug).map(f)
 }
 
-/// The level a catalog provider's wire sends for `adaptive`. The messages
-/// wire spells thinking its own way, and a cold catalog gives nothing.
-pub(crate) fn adaptive_effort_if_available(slug: &str) -> Option<Effort> {
+/// What a catalog provider's wire sends for `choice`. The messages wire
+/// spells thinking its own way, and a cold catalog leaves it as it is.
+pub(crate) fn sends_if_available(slug: &str, choice: ThinkingConfig) -> ThinkingConfig {
     with_provider_if_available(slug, |data| match data.api_format {
-        EndpointType::ChatCompletions => CHAT_DIALECT.adaptive_effort(),
-        EndpointType::Messages => None,
+        EndpointType::ChatCompletions => CHAT_DIALECT.sends(choice),
+        EndpointType::Messages => choice,
     })
-    .flatten()
+    .unwrap_or(choice)
 }
 
 /// The env var each catalog provider reads its key from, if one is set. A cold

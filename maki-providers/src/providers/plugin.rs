@@ -22,8 +22,8 @@ use crate::provider::{BoxFuture, Provider};
 use crate::spec::{BASES, ProviderRegistry, ProviderSpec};
 use crate::types::ThinkingFallback;
 use crate::{
-    AgentError, Effort, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
-    model_registry,
+    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    ThinkingConfig, model_registry,
 };
 
 use super::catalog;
@@ -1494,13 +1494,17 @@ pub fn effective_authority(slug: &str) -> Option<String> {
     ))
 }
 
-/// What a codec declaration sends for `adaptive`. One that names no
+/// What a codec declaration sends for `choice`. One that names no
 /// `openai.thinking` dialect leaves the mode to the model's own fields, which
 /// send nothing for a mode they do not spell.
-fn declared_adaptive_effort(model: &Model) -> Option<Effort> {
-    let entry = entry(&model.provider)?;
-    let wire = entry.decl.openai.as_ref()?.thinking.as_ref()?;
-    wire.adaptive_effort(model_registry::discovered(&model.provider, &model.id).as_ref())
+fn declared_sends_thinking(model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
+    let sent = || {
+        let entry = entry(&model.provider)?;
+        let wire = entry.decl.openai.as_ref()?.thinking.as_ref()?;
+        let discovered = model_registry::discovered(&model.provider, &model.id);
+        Some(wire.sends(discovered.as_ref(), choice))
+    };
+    sent().unwrap_or(choice)
 }
 
 pub fn spec(slug: &str) -> Option<&'static ProviderSpec> {
@@ -1646,12 +1650,12 @@ mod tests {
 
     use super::spec::{UNKNOWN_MODEL_CONTEXT_WINDOW, UNKNOWN_MODEL_MAX_OUTPUT};
     use super::*;
-    use crate::ThinkingConfig;
     use crate::model::ModelTier;
     use crate::model_registry;
     use crate::retry::RetryKind;
     use crate::test_support::{Canned, serve};
     use crate::types::dialect;
+    use crate::{Effort, ThinkingConfig};
 
     const AUTH_HEADER: &str = "authorization";
     const CONSTANT_TOKEN: &str = "Bearer constant";

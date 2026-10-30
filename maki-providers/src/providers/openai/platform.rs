@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use crate::ThinkingConfig;
 use crate::model::{FastSupport, Model, ModelInfo};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
@@ -554,11 +555,11 @@ fn plan_effort_dialect<'a>(
         .or_else(|| is_codex_model(model_id).then(|| plan_dialect(model_id).clone()))
 }
 
-pub(super) fn adaptive_effort(model: &Model) -> Option<Effort> {
+pub(super) fn sends_thinking(model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
     let discovered = model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
     match plan_effort_dialect(&model.id, discovered.as_deref()) {
-        Some(dialect) => dialect.adaptive_effort(),
-        None => CHAT_THINKING.adaptive_effort(model),
+        Some(dialect) => dialect.sends(choice),
+        None => CHAT_THINKING.sends(model, choice),
     }
 }
 

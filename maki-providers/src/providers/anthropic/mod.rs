@@ -23,7 +23,7 @@ use crate::provider::{BoxFuture, Provider};
 use crate::providers::aperture::NO_PATH_PREFIX;
 use crate::spec::{
     ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
-    api_decides,
+    sends_as_chosen,
 };
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
@@ -79,7 +79,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Claude,
     supports_thinking: true,
     supports_deferred_tools: true,
-    adaptive_effort: api_decides,
+    sends_thinking: sends_as_chosen,
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(128_000),
