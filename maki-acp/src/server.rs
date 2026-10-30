@@ -824,10 +824,7 @@ async fn close_session(srv: &mut Server, reason: SessionEndReason) {
     // has to be answered here or the client waits on it forever.
     if let Some(id) = state.pending.lock().unwrap().prompt.take() {
         let resp = PromptResponse::new(StopReason::Cancelled);
-        send(
-            &srv.out_tx,
-            Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
-        );
+        srv.respond(id, Ok(AgentResponse::PromptResponse(resp)));
     }
     state.handle.task.cancel().await;
     if let Some(mcp) = state.mcp {
@@ -1315,7 +1312,10 @@ fn start_event_pump(
                         let resp = PromptResponse::new(translate::map_done_reason(reason));
                         send(
                             &out_tx,
-                            Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
+                            Response::<AgentResponse>::new(
+                                id,
+                                Ok(AgentResponse::PromptResponse(resp)),
+                            ),
                         );
                     }
                     continue;
