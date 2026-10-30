@@ -956,6 +956,7 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
 /// crate can build a `ToolContext` that carries MCP.
 pub mod test_support {
     use std::collections::HashMap;
+    use std::convert::Infallible;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -1029,6 +1030,54 @@ pub mod test_support {
                 ready_rx: flume::bounded(0).1,
             },
             &[],
+        )
+    }
+
+    pub fn pending_stub_session(tools: &[(&str, &str)]) -> (McpSession, flume::Sender<Infallible>) {
+        let (ready_tx, ready_rx) = flume::bounded(0);
+        let mut server_map: HashMap<&str, Vec<McpToolDef>> = HashMap::new();
+        for (qualified, description) in tools {
+            let (server, raw) = qualified
+                .split_once(SEPARATOR)
+                .unwrap_or(("stub", *qualified));
+            server_map.entry(server).or_default().push(McpToolDef {
+                qualified_name: Arc::from(*qualified),
+                raw_name: raw.into(),
+                description: (*description).into(),
+                input_schema: json!({}),
+            });
+        }
+        let entries = server_map
+            .into_iter()
+            .map(|(server, tools)| ServerEntry {
+                name: server.into(),
+                config: None,
+                transport_kind: "stub",
+                origin: PathBuf::new(),
+                status: McpServerStatus::Running,
+                transport: Some(Arc::new(StubTransport(Arc::from(server)))),
+                tools,
+                prompts: Vec::new(),
+            })
+            .collect();
+        let inner = McpManagerInner {
+            entries,
+            generation: 0,
+        };
+        let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
+        let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
+        publish(&inner, &index, &snapshot);
+        (
+            McpSession::new(
+                McpHandle {
+                    cmd_tx: flume::unbounded().0,
+                    index,
+                    snapshot,
+                    ready_rx,
+                },
+                &[],
+            ),
+            ready_tx,
         )
     }
 

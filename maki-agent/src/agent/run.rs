@@ -328,6 +328,11 @@ impl<'h> Agent<'h> {
             // A burst dropped whole sends nothing, so it must not rebuild the
             // frame either. The next run sees the same change.
             if kept.is_some() && prompt.is_none() {
+                if let Some(mcp) = &self.mcp
+                    && self.cancel.race(mcp.ready()).await.is_err()
+                {
+                    return self.finish(Err(AgentError::Cancelled));
+                }
                 self.refresh_frame()?;
             }
             let kept = kept.map(|text| {
@@ -1202,7 +1207,7 @@ mod tests {
     use crate::agent::Transcript;
     use crate::agent::frame::RunContext;
     use crate::agent::hook::testing::{Seen, script};
-    use crate::mcp::test_support::stub_session;
+    use crate::mcp::test_support::{pending_stub_session, stub_session};
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
     use crate::prompt::{PromptId, Slot, SlotEntry};
@@ -2037,6 +2042,66 @@ mod tests {
                 !names.contains(&"tool_search"),
                 "tool_search must not enter wire tools"
             );
+        });
+    }
+
+    #[test]
+    fn waits_for_mcp_ready_before_building_frame_tools() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) =
+                make_agent_with(Arc::new(provider), default_model(), &mut history);
+
+            let (session, ready_tx) =
+                pending_stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
+
+            let ready_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ready_observed_clone = Arc::clone(&ready_observed);
+            let session_clone = session.fresh();
+
+            agent.context = Arc::new(move |_, _| {
+                assert!(
+                    ready_observed_clone.load(std::sync::atomic::Ordering::SeqCst),
+                    "MCP must be ready before context (and frame tools) are evaluated"
+                );
+                RunContext::fixed("system".into(), RequestTools::default())
+            });
+
+            smol::spawn(async move {
+                smol::Timer::after(std::time::Duration::from_millis(20)).await;
+                ready_observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                drop(ready_tx);
+            })
+            .detach();
+
+            let mut agent = agent.with_mcp(Some(session_clone));
+            agent.run(default_input()).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn cancelling_while_waiting_for_mcp_aborts_cleanly() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) =
+                make_agent_with(Arc::new(provider), default_model(), &mut history);
+
+            let (session, _ready_tx) =
+                pending_stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
+
+            let (trigger, cancel) = CancelToken::new();
+            let mut agent = agent.with_cancel(cancel).with_mcp(Some(session));
+
+            smol::spawn(async move {
+                smol::Timer::after(std::time::Duration::from_millis(10)).await;
+                trigger.cancel();
+            })
+            .detach();
+
+            let outcome = agent.run(default_input()).await.unwrap();
+            assert_eq!(outcome, DoneReason::Cancelled);
         });
     }
 

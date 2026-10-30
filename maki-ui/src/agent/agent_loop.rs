@@ -194,12 +194,14 @@ impl AgentLoop {
         }
 
         if let Some(ref mcp) = self.seed.mcp {
-            // The queue is drained right after this, and a prompt typed during
-            // startup must still carry the MCP tools.
-            if teardown.race(mcp.ready()).await.is_err() {
-                return false;
-            }
-            spawn_oauth_for_needs_auth(mcp);
+            let mcp_clone = mcp.clone();
+            let teardown_clone = teardown.clone();
+            smol::spawn(async move {
+                if teardown_clone.race(mcp_clone.ready()).await.is_ok() {
+                    spawn_oauth_for_needs_auth(&mcp_clone);
+                }
+            })
+            .detach();
         }
         !teardown.is_cancelled()
     }
@@ -232,6 +234,11 @@ impl AgentLoop {
         compaction: &Compaction,
         cancel: &CancelToken,
     ) -> Result<DoneReason, AgentError> {
+        if let Some(ref mcp) = self.seed.mcp
+            && cancel.race(mcp.ready()).await.is_err()
+        {
+            return Ok(DoneReason::Cancelled);
+        }
         let (context, _) = self.context_builder().await;
         let slot = self.seed.model_slot.load();
         let (provider, model) = agent::resolve_compaction_model(
@@ -274,6 +281,11 @@ impl AgentLoop {
         event_tx: EventSender,
         cancel: &CancelToken,
     ) -> Result<DoneReason, AgentError> {
+        if let Some(ref mcp) = self.seed.mcp
+            && cancel.race(mcp.ready()).await.is_err()
+        {
+            return Ok(DoneReason::Cancelled);
+        }
         let (context, prompt_slots) = self.context_builder().await;
 
         if let Some(ref prompt_ref) = input.prompt {
