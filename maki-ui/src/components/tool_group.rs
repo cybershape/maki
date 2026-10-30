@@ -85,8 +85,8 @@ pub fn format_group_summary(tools: usize, thoughts: usize) -> String {
     };
     let thought_part = match thoughts {
         0 => None,
-        1 => Some("thought once".to_string()),
-        n => Some(format!("thought {n} times")),
+        1 => Some("thinking once".to_string()),
+        n => Some(format!("thinking {n} times")),
     };
     match (tool_part, thought_part) {
         (Some(tool), Some(thought)) => format!(" ({tool}, {thought})"),
@@ -1030,12 +1030,12 @@ mod tests {
     #[test_case(1, 0 => " (calling one tool)".to_string() ; "one_tool")]
     #[test_case(2, 0 => " (calling 2 tools)".to_string() ; "two_tools")]
     #[test_case(10, 0 => " (calling 10 tools)".to_string() ; "ten_tools")]
-    #[test_case(0, 1 => " (thought once)".to_string() ; "one_thought")]
-    #[test_case(0, 2 => " (thought 2 times)".to_string() ; "two_thoughts")]
-    #[test_case(1, 1 => " (calling one tool, thought once)".to_string() ; "one_tool_one_thought")]
-    #[test_case(10, 2 => " (calling 10 tools, thought 2 times)".to_string() ; "ten_tools_two_thoughts")]
-    #[test_case(1, 2 => " (calling one tool, thought 2 times)".to_string() ; "one_tool_two_thoughts")]
-    #[test_case(10, 1 => " (calling 10 tools, thought once)".to_string() ; "ten_tools_one_thought")]
+    #[test_case(0, 1 => " (thinking once)".to_string() ; "one_thinking")]
+    #[test_case(0, 2 => " (thinking 2 times)".to_string() ; "two_thinking")]
+    #[test_case(1, 1 => " (calling one tool, thinking once)".to_string() ; "one_tool_one_thinking")]
+    #[test_case(10, 2 => " (calling 10 tools, thinking 2 times)".to_string() ; "ten_tools_two_thinking")]
+    #[test_case(1, 2 => " (calling one tool, thinking 2 times)".to_string() ; "one_tool_two_thinking")]
+    #[test_case(10, 1 => " (calling 10 tools, thinking once)".to_string() ; "ten_tools_one_thinking")]
     #[test_case(0, 0 => "".to_string() ; "empty")]
     fn group_summary_formatting(tools: usize, thoughts: usize) -> String {
         format_group_summary(tools, thoughts)
@@ -1079,7 +1079,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(header.contains("(calling one tool, thought once)"));
+        assert!(header.contains("(calling one tool, thinking once)"));
     }
 
     #[test]
@@ -1163,7 +1163,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(header.contains("(calling 10 tools, thought 2 times)"));
+        assert!(header.contains("(calling 10 tools, thinking 2 times)"));
         let hidden_line: String = tl.lines[1]
             .spans
             .iter()
