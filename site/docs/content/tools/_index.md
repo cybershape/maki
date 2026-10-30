@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 21 built-in tools in this reference (20 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 22 built-in tools in this reference (21 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -223,3 +223,14 @@ Search the web for real-time information using Exa AI.
 |-----------|------|----------|---------|-------------|
 | `num_results` | integer | no | 8 | Number of results to return |
 | `query` | string | yes |  | Search query |
+
+## Additional tools
+
+### `library_help` {#library_help}
+
+Retrieve the Python function signature, parameter types, and docstring documentation for an external library function before calling it in code_execution.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `function_name` | string | yes | The function name to inspect (e.g. "create_issue"). |
+| `library_name` | string | yes | The external library name (e.g. "github"). |
