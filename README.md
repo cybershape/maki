@@ -10,7 +10,7 @@
   - Prompt queue with steer shortcut (Shift-Enter) to steer a running turn, plus recall editing for queued and previous prompts.
   - Context-window usage progress bar in status bar using theme colors; per-turn stats line upon completion.
   - Markdown LaTeX math expression rendering via `txm`.
-  - OSC 7501 Program Status Protocol support for terminal status reporting.
+  - OSC 7501 Program Status Protocol support for terminal status reporting; inline image rendering for Rex (`TERM_PROGRAM=rex`).
   - Stylized user messages with chevron prefix and background tint.
   - Layout and display options: `show_cost`, `prefer_model_name`, `max_width` centering, and column-boundary text wrapping.
 - **ACP server:** On-disk model cache with wait-for-discovery on first run; session `thought_level` (and aliases) for reasoning effort; `usage_update` on session load, model changes, refresh, and compaction; model display names in config options; question-tool and model-metadata fixes.
