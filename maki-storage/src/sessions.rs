@@ -1998,9 +1998,15 @@ where
     /// Takes the transcript and leaves the session empty. It is for a caller
     /// that runs on the messages and later writes back into the session, which
     /// would otherwise have to copy every message to hold both.
-    pub fn drain_messages(&mut self) -> Vec<M> {
-        self.message_timestamps.clear();
-        Arc::unwrap_or_clone(std::mem::take(&mut self.messages))
+    ///
+    /// Each message leaves with the time it was written. [`Self::replace_messages`]
+    /// keeps that time for every message still present, so a resume that drops
+    /// or appends messages does not restamp the ones it kept.
+    pub fn drain_messages(&mut self) -> Vec<(M, Option<u64>)> {
+        let messages = Arc::unwrap_or_clone(std::mem::take(&mut self.messages));
+        let mut timestamps = std::mem::take(&mut self.message_timestamps);
+        timestamps.resize(messages.len(), None);
+        messages.into_iter().zip(timestamps).collect()
     }
 
     pub fn tool_outputs(&self) -> &HashMap<String, Arc<T>> {
@@ -2115,8 +2121,18 @@ where
         self.touch();
     }
 
+    /// Replaces the transcript and stamps every message now.
     pub fn replace_messages(&mut self, messages: Vec<M>) {
         self.message_timestamps = vec![Some(now_millis()); messages.len()];
+        self.messages = Arc::new(messages);
+        self.rewrite_messages();
+    }
+
+    /// [`Self::replace_messages`] that keeps a time the caller already has.
+    /// `None` stays unset. The log stamps it when the record is written.
+    pub fn replace_messages_with_timestamps(&mut self, messages: Vec<(M, Option<u64>)>) {
+        let (messages, timestamps) = messages.into_iter().unzip();
+        self.message_timestamps = timestamps;
         self.messages = Arc::new(messages);
         self.rewrite_messages();
     }
@@ -3005,6 +3021,65 @@ mod tests {
         assert_eq!(loaded.message_timestamps().len(), 1);
         assert!(loaded.message_timestamps()[0].is_some());
         assert!(loaded.tool_output_timestamps().contains_key("tool-1"));
+    }
+
+    /// A resumed headless run drains the messages and later writes the whole
+    /// transcript back. The prefix it still holds keeps the times it was saved
+    /// with; only messages past that prefix are stamped now.
+    #[test]
+    fn replace_after_drain_keeps_prefix_timestamps() {
+        const FIRST_TS: u64 = 1_700_000_000_000;
+        const SECOND_TS: u64 = 1_700_000_111_000;
+        const KEPT: &str = "a drained prefix keeps the time it was written with";
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message_with_timestamp(user_message("first"), Some(FIRST_TS));
+        session.push_message_with_timestamp(user_message("second"), Some(SECOND_TS));
+        assert_eq!(
+            session.message_timestamps(),
+            &[Some(FIRST_TS), Some(SECOND_TS)]
+        );
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        let mut resumed = TestSession::load_from(session.id, dir).unwrap();
+        let mut messages = resumed.drain_messages();
+        messages.push((user_message("third"), None));
+        resumed.replace_messages_with_timestamps(messages);
+        resumed.save_to(&claim_for(dir, &resumed), dir).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        let stamps = loaded.message_timestamps();
+        assert_eq!(stamps.len(), 3);
+        assert_eq!(stamps[0], Some(FIRST_TS), "{KEPT}");
+        assert_eq!(stamps[1], Some(SECOND_TS), "{KEPT}");
+        assert!(stamps[2].is_some_and(|ts| ts != FIRST_TS && ts != SECOND_TS));
+    }
+
+    /// Dropping a message from the drained transcript drops its time with it.
+    /// The message that follows keeps its own.
+    #[test]
+    fn replace_after_drain_drops_a_removed_messages_timestamp() {
+        const FIRST_TS: u64 = 1_700_000_000_000;
+        const SECOND_TS: u64 = 1_700_000_111_000;
+        const THIRD_TS: u64 = 1_700_000_222_000;
+        const KEPT: &str = "a message kept after a removal keeps its own time";
+
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message_with_timestamp(user_message("first"), Some(FIRST_TS));
+        session.push_message_with_timestamp(user_message("second"), Some(SECOND_TS));
+        session.push_message_with_timestamp(user_message("third"), Some(THIRD_TS));
+
+        let mut drained = session.drain_messages();
+        drained.remove(1);
+        session.replace_messages_with_timestamps(drained);
+
+        assert_eq!(
+            session.message_timestamps(),
+            &[Some(FIRST_TS), Some(THIRD_TS)],
+            "{KEPT}"
+        );
     }
 
     /// The mirror re-adopts the run's snapshot on every checkpoint; that must

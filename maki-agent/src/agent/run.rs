@@ -2634,7 +2634,9 @@ mod tests {
         }
         .into_session(StoredSession::new("", HERE_CWD))
         .unwrap();
-        History::restored(session.drain_messages()).with_frame(session.frame().cloned())
+        let (messages, timestamps) = session.drain_messages().into_iter().unzip();
+        History::restored_with_timestamps(messages, timestamps)
+            .with_frame(session.frame().cloned())
     }
 
     /// The imported facts are older than the update after them, so the model

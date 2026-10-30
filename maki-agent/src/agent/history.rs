@@ -93,6 +93,10 @@ pub struct History {
     /// because messages only make sense under the prefix they were sent with,
     /// and every frontend already keeps a `History` for the whole session.
     live: Option<LiveFrame>,
+    /// Parallel to `snapshot.messages` when this transcript was loaded from a
+    /// session log. A `None` slot, including every message appended after,
+    /// has no time yet and is stamped when the log writes it.
+    message_timestamps: Vec<Option<u64>>,
 }
 
 impl History {
@@ -102,6 +106,7 @@ impl History {
             mirror: None,
             unsaved: false,
             live: None,
+            message_timestamps: Vec::new(),
         }
     }
 
@@ -176,9 +181,37 @@ impl History {
         self.replace(messages);
     }
 
-    pub fn restored(mut messages: Vec<Message>) -> Self {
-        sanitize_restored(&mut messages);
-        Self::new(messages)
+    pub fn restored(messages: Vec<Message>) -> Self {
+        Self::restored_with_timestamps(messages, Vec::new())
+    }
+
+    /// [`Self::restored`] for a transcript drained from a session log.
+    /// `timestamps` is parallel to `messages` as stored. Sanitize drops and
+    /// appends move the times with the messages, so a removed tool result does
+    /// not leave its time on the message that slides into its place.
+    pub fn restored_with_timestamps(
+        mut messages: Vec<Message>,
+        mut timestamps: Vec<Option<u64>>,
+    ) -> Self {
+        timestamps.resize(messages.len(), None);
+        sanitize_restored_tracked(&mut messages, &mut timestamps);
+        let mut history = Self::new(messages);
+        history.message_timestamps = timestamps;
+        history
+    }
+
+    pub(crate) fn messages_with_timestamps(&self) -> Vec<(Message, Option<u64>)> {
+        self.snapshot
+            .messages
+            .iter()
+            .cloned()
+            .zip(
+                self.message_timestamps
+                    .iter()
+                    .copied()
+                    .chain(std::iter::repeat(None)),
+            )
+            .collect()
     }
 
     pub fn has_unsaved(&self) -> bool {
@@ -312,6 +345,13 @@ pub(super) fn facts_told(frame: &StoredFrame, messages: &[Message]) -> LiveFacts
 }
 
 pub(super) fn remove_orphaned_tool_results(messages: &mut Vec<Message>) -> bool {
+    remove_orphaned_tool_results_tracked(messages, &mut Vec::new())
+}
+
+fn remove_orphaned_tool_results_tracked(
+    messages: &mut Vec<Message>,
+    timestamps: &mut Vec<Option<u64>>,
+) -> bool {
     let mut changed = false;
     let mut i = 0;
     while i < messages.len() {
@@ -349,6 +389,9 @@ pub(super) fn remove_orphaned_tool_results(messages: &mut Vec<Message>) -> bool 
 
         if messages[i].content.is_empty() {
             messages.remove(i);
+            if i < timestamps.len() {
+                timestamps.remove(i);
+            }
             changed = true;
         } else {
             i += 1;
@@ -396,9 +439,18 @@ fn is_empty_marker(m: &Message) -> bool {
 /// Restored sessions can have orphaned tool_results or unclosed tool_uses
 /// (e.g. the process was killed mid-turn). The API returns 400 if it sees those.
 pub(super) fn sanitize_restored(messages: &mut Vec<Message>) {
+    let mut timestamps = Vec::new();
+    sanitize_restored_tracked(messages, &mut timestamps);
+}
+
+/// [`sanitize_restored`] that keeps `timestamps` parallel to `messages`.
+/// A dropped message takes its time with it. A message appended to close a
+/// dangling tool call has none.
+fn sanitize_restored_tracked(messages: &mut Vec<Message>, timestamps: &mut Vec<Option<u64>>) {
     let len_before = messages.len();
-    let mut changed = remove_orphaned_tool_results(messages);
+    let mut changed = remove_orphaned_tool_results_tracked(messages, timestamps);
     close_dangling_tool_calls(messages, UNAVAILABLE_RESULT);
+    timestamps.resize(messages.len(), None);
     changed |= messages.len() != len_before;
 
     if changed {

@@ -99,6 +99,9 @@ pub struct Resumed {
     /// The transcript to run on. It is moved out of [`Self::session`] when
     /// there is one, so the two never hold two copies of it.
     pub history: Vec<Message>,
+    /// Parallel to `history`, taken with it out of a stored session. Empty when
+    /// the transcript was not loaded from disk. A `None` slot never had a time.
+    pub message_timestamps: Vec<Option<u64>>,
     /// The provider's last prompt count for `history`, so a resumed run budgets
     /// from a measurement instead of an estimate.
     pub context_size: u32,
@@ -125,6 +128,7 @@ impl Resumed {
         Self {
             id,
             history: Vec::new(),
+            message_timestamps: Vec::new(),
             context_size: 0,
             frame: None,
             session: None,
@@ -133,9 +137,12 @@ impl Resumed {
 
     /// A run continuing a session the driver already loaded.
     pub fn stored(id: SessionRef, mut session: StoredSession) -> Self {
+        let drained = session.drain_messages();
+        let (history, message_timestamps) = drained.into_iter().unzip();
         Self {
             id,
-            history: session.drain_messages(),
+            history,
+            message_timestamps,
             context_size: session.meta.context_size,
             frame: session.frame().cloned(),
             session: Some(session),
@@ -174,9 +181,12 @@ impl SessionTrack {
         publish_live_session(resumed.id.id(), &mirror, &store.header);
         Self {
             store,
-            history: History::restored(resumed.history)
-                .with_frame(resumed.frame)
-                .with_mirror(mirror),
+            history: History::restored_with_timestamps(
+                resumed.history,
+                resumed.message_timestamps,
+            )
+            .with_frame(resumed.frame)
+            .with_mirror(mirror),
             gauge: ContextGauge::restored(resumed.context_size),
         }
     }
@@ -251,7 +261,11 @@ impl Drop for SessionTurn<'_> {
         } = &mut *self.track;
         store.session.token_usage += self.ledger.totals().usage;
         if history.has_unsaved() {
-            match store.record_turn(history.as_slice(), history.frame(), gauge.size()) {
+            match store.record_turn(
+                history.messages_with_timestamps(),
+                history.frame(),
+                gauge.size(),
+            ) {
                 Ok(()) => history.mark_saved(),
                 // Only headless runs save through here (the TUI has its own
                 // writer), so printing cannot tear a drawn frame.
@@ -311,14 +325,14 @@ impl SessionStore {
     /// down to nothing from replacing the copy it was restored from.
     fn record_turn(
         &mut self,
-        messages: &[Message],
+        messages: Vec<(Message, Option<u64>)>,
         frame: Option<&Arc<StoredFrame>>,
         context_size: u32,
     ) -> Result<(), SessionError> {
         if messages.is_empty() {
             return Ok(());
         }
-        self.session.replace_messages(messages.to_vec());
+        self.session.replace_messages_with_timestamps(messages);
         self.session.set_frame(frame.cloned());
         self.session.meta.context_size = context_size;
         self.session.update_title_if_default();
