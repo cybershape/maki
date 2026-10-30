@@ -76,6 +76,18 @@ pub fn set_known_models(provider: &str, models: Vec<ModelInfo>) {
     write().set_known_models(provider, models);
 }
 
+/// Subagents and new sessions build their model from here, so the window a
+/// server reported belongs here too, or each of them would learn it again.
+pub fn record_context_window(provider: &str, model_id: &str, window: u32) {
+    if let Some(info) = write()
+        .known_models
+        .get_mut(provider)
+        .and_then(|models| models.iter_mut().find(|m| m.id == model_id))
+    {
+        info.context_window = Some(window);
+    }
+}
+
 /// Tiers whose override points at `spec`, in descending tier order.
 pub fn override_tiers(spec: &str) -> Vec<ModelTier> {
     read().override_tiers(spec)

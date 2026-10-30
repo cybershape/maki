@@ -27,6 +27,16 @@ const DISCOVERY_NOTE: &str = "This provider talks the OpenAI-compatible `/v1` AP
      Just point `OLLAMA_HOST` to the right address \
      (e.g. `http://localhost:8080` for llama.cpp).";
 
+const CONTEXT_WINDOW_NOTE: &str = "#### Context window\n\n\
+     Ollama picks the context window when it loads a model, from available VRAM unless a Modelfile \
+     `num_ctx` or `OLLAMA_CONTEXT_LENGTH` sets it. That is often less than the model supports. \
+     Before every request maki reads the window from `/api/ps` and compacts to fit, so Ollama does not \
+     cut the start of a long chat. A model that is not loaded yet starts from its Modelfile `num_ctx`, \
+     or from the trained length without one.\n\n\
+     For more room, raise the window on the server, where the memory is: `OLLAMA_CONTEXT_LENGTH` \
+     or a Modelfile `num_ctx`. maki does not set it per request, because a larger window reloads \
+     the model and can run out of VRAM mid-session.";
+
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     slug: OLLAMA.slug,
     display_name: OLLAMA.display_name,
@@ -63,7 +73,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         features: Some(FEATURES),
         auth: AuthDoc::Custom(AUTH_DOC),
         catalog: CatalogDoc::Discovered(DISCOVERY_NOTE),
-        trailing_notes: &[],
+        trailing_notes: &[CONTEXT_WINDOW_NOTE],
     },
 };
 

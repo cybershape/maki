@@ -6,11 +6,12 @@ use futures::future::join_all;
 use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use maki_config::providers::{Protocol, ProvidersConfig};
 
-use crate::model::Model;
+use crate::model::{Model, ModelInfo, ModelPricing};
+use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
 use crate::types::ThinkingFallback;
 use crate::{AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse};
@@ -18,6 +19,8 @@ use crate::{AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamRe
 use super::openai::responses;
 use super::openai_compat::{DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
+
+const OLLAMA_DEFAULT_TAG: &str = "latest";
 
 pub(crate) struct LocalEndpointConfig {
     pub slug: &'static str,
@@ -186,7 +189,7 @@ impl Provider for LocalEndpoint {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
             match self.discovery_mode {
@@ -194,6 +197,22 @@ impl Provider for LocalEndpoint {
                 DiscoveryMode::LlamaCpp => self.discover_llamacpp_models(&auth).await,
                 DiscoveryMode::Ollama => self.discover_ollama_models(&auth).await,
             }
+        })
+    }
+
+    /// Ollama picks the window when it loads a model, from free VRAM unless a
+    /// Modelfile or `OLLAMA_CONTEXT_LENGTH` pins it. Only `/api/ps` tells, and
+    /// only while the model is loaded.
+    fn served_context_window<'a>(&'a self, model: &'a Model) -> BoxFuture<'a, Option<u32>> {
+        Box::pin(async move {
+            if !matches!(self.discovery_mode, DiscoveryMode::Ollama) {
+                return None;
+            }
+            let auth = self.auth.lock().unwrap().clone();
+            let loaded = ollama_loaded_models(&self.compat, &auth, self.api_root(&auth)).await;
+            let window = ollama_served_window(&loaded, &model.id)?;
+            model_registry::record_context_window(&self.compat.config().slug, &model.id, window);
+            Some(window)
         })
     }
 
@@ -265,12 +284,8 @@ impl LocalEndpoint {
     async fn discover_llamacpp_models(
         &self,
         auth: &ResolvedAuth,
-    ) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
-        let base = auth
-            .base_url
-            .as_deref()
-            .unwrap_or(&self.compat.config().base_url);
-        let root = base.strip_suffix("/v1").unwrap_or(base);
+    ) -> Result<Vec<ModelInfo>, AgentError> {
+        let root = self.api_root(auth);
 
         let props: serde_json::Value = serde_json::from_str(
             &self
@@ -300,7 +315,7 @@ impl LocalEndpoint {
 
         let props_vision = llamacpp_props_vision(&props, &mode);
 
-        let mut models: Vec<crate::model::ModelInfo> = body
+        let mut models: Vec<ModelInfo> = body
             .data
             .into_iter()
             .filter_map(|m| {
@@ -318,11 +333,11 @@ impl LocalEndpoint {
                 let supports_vision = arch
                     .map(|a| a.input_modalities.iter().any(|m| m == "image"))
                     .or(props_vision);
-                Some(crate::model::ModelInfo {
+                Some(ModelInfo {
                     id: m.id,
                     context_window: Some(context_window),
                     max_output_tokens: None,
-                    pricing: Some(crate::model::ModelPricing::ZERO),
+                    pricing: Some(ModelPricing::ZERO),
                     supports_thinking: None,
                     supports_vision,
                     tier: None,
@@ -420,15 +435,19 @@ struct OllamaModelDetails {
 }
 
 impl LocalEndpoint {
-    async fn discover_ollama_models(
-        &self,
-        auth: &ResolvedAuth,
-    ) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
+    fn api_root<'a>(&'a self, auth: &'a ResolvedAuth) -> &'a str {
         let base = auth
             .base_url
             .as_deref()
             .unwrap_or(&self.compat.config().base_url);
-        let root = base.strip_suffix("/v1").unwrap_or(base);
+        base.strip_suffix("/v1").unwrap_or(base)
+    }
+
+    async fn discover_ollama_models(
+        &self,
+        auth: &ResolvedAuth,
+    ) -> Result<Vec<ModelInfo>, AgentError> {
+        let root = self.api_root(auth);
 
         let models_text = self
             .compat
@@ -442,17 +461,18 @@ impl LocalEndpoint {
             .iter()
             .map(|m| ollama_fetch_model_details(compat, auth, root, &m.id))
             .collect();
-        let details = join_all(futures).await;
+        let (details, loaded) =
+            futures::join!(join_all(futures), ollama_loaded_models(compat, auth, root));
 
-        let mut models: Vec<crate::model::ModelInfo> = body
+        let mut models: Vec<ModelInfo> = body
             .data
             .into_iter()
             .zip(details)
-            .map(|(m, d)| crate::model::ModelInfo {
+            .map(|(m, d)| ModelInfo {
+                context_window: ollama_served_window(&loaded, &m.id).or(d.context_window),
                 id: m.id,
-                context_window: d.context_window,
                 max_output_tokens: None,
-                pricing: Some(crate::model::ModelPricing::ZERO),
+                pricing: Some(ModelPricing::ZERO),
                 supports_thinking: None,
                 supports_vision: d.supports_vision,
                 tier: None,
@@ -499,12 +519,15 @@ async fn ollama_fetch_model_details(
     ollama_model_details(&show)
 }
 
+/// A Modelfile's `num_ctx` is what Ollama loads with, but never past the
+/// length the model was trained on.
 fn ollama_model_details(show: &OllamaShowResponse) -> OllamaModelDetails {
-    let context_window = show
+    let trained = show
         .model_info
         .as_ref()
-        .and_then(ollama_extract_context_length)
-        .or_else(|| show.parameters.as_deref().and_then(ollama_extract_num_ctx));
+        .and_then(ollama_extract_context_length);
+    let declared = show.parameters.as_deref().and_then(ollama_extract_num_ctx);
+    let context_window = declared.into_iter().chain(trained).min();
 
     OllamaModelDetails {
         context_window,
@@ -543,6 +566,62 @@ fn ollama_extract_num_ctx(params: &str) -> Option<u32> {
         }
     }
     None
+}
+
+#[derive(Deserialize)]
+struct OllamaPsResponse {
+    #[serde(default)]
+    models: Vec<OllamaPsModel>,
+}
+
+#[derive(Deserialize)]
+struct OllamaPsModel {
+    name: String,
+    #[serde(default)]
+    context_length: u32,
+}
+
+/// Empty when nothing is loaded, or when the server has no `/api/ps`, like
+/// llama.cpp behind `OLLAMA_HOST`.
+async fn ollama_loaded_models(
+    compat: &OpenAiCompatProvider,
+    auth: &ResolvedAuth,
+    root: &str,
+) -> Vec<OllamaPsModel> {
+    let text = match compat.get_text(auth, &format!("{root}/api/ps")).await {
+        Ok(text) => text,
+        Err(e) => {
+            debug!(error = %e, "Ollama GET /api/ps failed");
+            return Vec::new();
+        }
+    };
+    match serde_json::from_str::<OllamaPsResponse>(&text) {
+        Ok(ps) => ps.models,
+        Err(e) => {
+            warn!(error = %e, "Failed to parse Ollama /api/ps response");
+            Vec::new()
+        }
+    }
+}
+
+fn ollama_served_window(loaded: &[OllamaPsModel], model_id: &str) -> Option<u32> {
+    let wanted = ollama_tagged(model_id);
+    loaded
+        .iter()
+        .find(|m| ollama_tagged(&m.name) == wanted)
+        .map(|m| m.context_length)
+        .filter(|&window| window > 0)
+}
+
+/// A name without a tag means `:latest` to Ollama. Only the last path segment
+/// can hold the tag, since a registry host may carry a port.
+fn ollama_tagged(name: &str) -> Cow<'_, str> {
+    let last_segment = name.rsplit('/').next().unwrap_or(name);
+    if last_segment.contains(':') {
+        Cow::Borrowed(name)
+    } else {
+        Cow::Owned(format!("{name}:{OLLAMA_DEFAULT_TAG}"))
+    }
 }
 
 const OLLAMA_SLUG: &str = "ollama";
@@ -992,6 +1071,8 @@ mod tests {
         const PARSE_FAILED: &str = "failed to parse /api/show body";
         const CAPABILITIES_PLACEHOLDER: &str = "__CAPABILITIES__";
         const CONTEXT_LENGTH: u32 = 128_000;
+        const DECLARED_NUM_CTX: u32 = 2048;
+        const OVER_TRAINED_NUM_CTX: u32 = 200_000;
 
         /// Shaped like a real Ollama `POST /api/show` body, so a rename or a
         /// nesting change of any field discovery reads breaks these tests.
@@ -1026,7 +1107,119 @@ mod tests {
 
             let details = ollama_model_details(&show);
             assert_eq!(details.supports_vision, expected_vision);
-            assert_eq!(details.context_window, Some(CONTEXT_LENGTH));
+            assert_eq!(details.context_window, Some(DECLARED_NUM_CTX));
+        }
+
+        #[test_case(Some(DECLARED_NUM_CTX), Some(CONTEXT_LENGTH), Some(DECLARED_NUM_CTX) ; "num_ctx_below_trained_wins")]
+        #[test_case(Some(OVER_TRAINED_NUM_CTX), Some(CONTEXT_LENGTH), Some(CONTEXT_LENGTH) ; "num_ctx_capped_at_trained")]
+        #[test_case(None, Some(CONTEXT_LENGTH), Some(CONTEXT_LENGTH) ; "trained_without_num_ctx")]
+        #[test_case(Some(DECLARED_NUM_CTX), None, Some(DECLARED_NUM_CTX) ; "num_ctx_without_trained")]
+        #[test_case(None, None, None ; "neither")]
+        fn context_window_is_num_ctx_capped_at_trained(
+            num_ctx: Option<u32>,
+            trained: Option<u32>,
+            expected: Option<u32>,
+        ) {
+            let show: OllamaShowResponse = serde_json::from_value(json!({
+                "parameters": num_ctx.map(|n| format!("num_ctx {n}")),
+                "model_info": trained.map(|n| json!({ "llama.context_length": n })),
+            }))
+            .expect(PARSE_FAILED);
+
+            assert_eq!(ollama_model_details(&show).context_window, expected);
+        }
+    }
+
+    mod ollama_served {
+        use test_case::test_case;
+
+        use super::super::*;
+        use crate::Timeouts;
+        use crate::test_support::{Canned, Requests, serve};
+
+        const PATH_PS: &str = "/api/ps";
+        const SERVED: u32 = 4096;
+        const SHOW_TRAINED: u32 = 131_072;
+        const PS_LOADED: &str = r#"{"models":[{"name":"llama3.2:latest","context_length":4096}]}"#;
+        const PS_NONE: &str = r#"{"models":[]}"#;
+        const MODELS_BODY: &str = r#"{"data":[{"id":"llama3.2:latest"}]}"#;
+        const SHOW_BODY: &str = r#"{"model_info":{"llama.context_length":131072}}"#;
+
+        fn served(names: &[&str]) -> Vec<OllamaPsModel> {
+            names
+                .iter()
+                .map(|name| OllamaPsModel {
+                    name: (*name).into(),
+                    context_length: SERVED,
+                })
+                .collect()
+        }
+
+        #[test_case(&["llama3.2:latest"], "llama3.2", Some(SERVED) ; "untagged_id_is_latest")]
+        #[test_case(&["llama3.2"], "llama3.2:latest", Some(SERVED) ; "untagged_name_is_latest")]
+        #[test_case(&["qwen3:8b"], "qwen3:32b", None ; "sibling_tag_does_not_match")]
+        #[test_case(&["host:5000/team/model"], "host:5000/team/model:latest", Some(SERVED) ; "port_is_not_a_tag")]
+        #[test_case(&[], "llama3.2", None ; "nothing_loaded")]
+        fn matches_loaded_model(loaded: &[&str], model_id: &str, expected: Option<u32>) {
+            assert_eq!(ollama_served_window(&served(loaded), model_id), expected);
+        }
+
+        fn endpoint(
+            cfg: &'static LocalEndpointConfig,
+            script: &'static [Canned],
+        ) -> (LocalEndpoint, Requests) {
+            let (base_url, requests) = serve(script);
+            let host = base_url.strip_suffix("/v1").map(str::to_owned);
+            let ep = LocalEndpoint::build(cfg, Timeouts::default(), None, host, None).unwrap();
+            (ep, requests)
+        }
+
+        const LOADED: &[Canned] = &[Canned::at(PATH_PS, Canned::json(200, PS_LOADED))];
+        const NO_PS: &[Canned] = &[Canned::at(PATH_PS, Canned::json(404, "{}"))];
+
+        #[test_case(LOADED, Some(SERVED) ; "loaded_model_reports_and_records")]
+        #[test_case(NO_PS, None ; "server_without_api_ps")]
+        fn ollama_reports_the_served_window(script: &'static [Canned], expected: Option<u32>) {
+            const ID: &str = "llama3.2";
+            model_registry::set_known_models(OLLAMA_SLUG, vec![ModelInfo::id_only(ID.into())]);
+            let (ep, _) = endpoint(&OLLAMA, script);
+            let model = Model::from_spec(&format!("ollama/{ID}")).unwrap();
+
+            assert_eq!(smol::block_on(ep.served_context_window(&model)), expected);
+            assert_eq!(
+                model_registry::discovered(OLLAMA_SLUG, ID).and_then(|info| info.context_window),
+                expected
+            );
+        }
+
+        /// A stray request on every turn would go unnoticed, so pin it.
+        #[test]
+        fn llamacpp_never_asks() {
+            let (ep, requests) = endpoint(&LLAMACPP, LOADED);
+            let model = Model::from_spec("llama-cpp/default").unwrap();
+
+            assert_eq!(smol::block_on(ep.served_context_window(&model)), None);
+            assert!(requests.lock().unwrap().is_empty());
+        }
+
+        const DISCOVERY_LOADED: &[Canned] = &[
+            Canned::at("/v1/models", Canned::json(200, MODELS_BODY)),
+            Canned::at("/api/show", Canned::json(200, SHOW_BODY)),
+            Canned::at(PATH_PS, Canned::json(200, PS_LOADED)),
+        ];
+        const DISCOVERY_UNLOADED: &[Canned] = &[
+            Canned::at("/v1/models", Canned::json(200, MODELS_BODY)),
+            Canned::at("/api/show", Canned::json(200, SHOW_BODY)),
+            Canned::at(PATH_PS, Canned::json(200, PS_NONE)),
+        ];
+
+        #[test_case(DISCOVERY_LOADED, SERVED ; "loaded_model_lists_its_served_window")]
+        #[test_case(DISCOVERY_UNLOADED, SHOW_TRAINED ; "unloaded_model_lists_its_declared_window")]
+        fn discovery_prefers_the_served_window(script: &'static [Canned], expected: u32) {
+            let (ep, _) = endpoint(&OLLAMA, script);
+            let models = smol::block_on(ep.list_models()).unwrap();
+
+            assert_eq!(models[0].context_window, Some(expected));
         }
     }
 

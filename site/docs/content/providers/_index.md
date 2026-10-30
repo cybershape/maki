@@ -178,6 +178,12 @@ Defaults: gpt-5.6-luna (weak), gpt-5.6-terra (medium), claude-opus-5 (strong)
 
 This provider talks the OpenAI-compatible `/v1` API, so it also works with llama.cpp's server, LocalAI, or anything else that speaks the same protocol. Just point `OLLAMA_HOST` to the right address (e.g. `http://localhost:8080` for llama.cpp).
 
+#### Context window
+
+Ollama picks the context window when it loads a model, from available VRAM unless a Modelfile `num_ctx` or `OLLAMA_CONTEXT_LENGTH` sets it. That is often less than the model supports. Before every request maki reads the window from `/api/ps` and compacts to fit, so Ollama does not cut the start of a long chat. A model that is not loaded yet starts from its Modelfile `num_ctx`, or from the trained length without one.
+
+For more room, raise the window on the server, where the memory is: `OLLAMA_CONTEXT_LENGTH` or a Modelfile `num_ctx`. maki does not set it per request, because a larger window reloads the model and can run out of VRAM mid-session.
+
 ### LlamaCpp
 
 - **Env var**: `LLAMA_CPP_API_KEY`

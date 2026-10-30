@@ -1348,6 +1348,10 @@ impl Provider for PluginProvider {
     fn adjust_model(&self, model: &mut Model) {
         self.inner.adjust_model(model);
     }
+
+    fn served_context_window<'a>(&'a self, model: &'a Model) -> BoxFuture<'a, Option<u32>> {
+        self.inner.served_context_window(model)
+    }
 }
 
 /// Builds from registry data alone: no hook runs here, because this is called

@@ -71,6 +71,12 @@ const MODEL_BINDING_MISMATCH: &str = "model_binding_mismatch";
 const THINKING_DROPPED: &str =
     "The prompt changed under earlier reasoning, so it was dropped to keep the session going.";
 
+fn served_window_notice(model: &str, served: u32, planned: u32) -> String {
+    format!(
+        "The server runs {model} with a {served}-token context, below the {planned} tokens maki planned for. Compacting to fit from now on. Raise the server's context length for more room."
+    )
+}
+
 pub async fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
     model: &Model,
@@ -92,6 +98,7 @@ pub async fn resolve_compaction_model(
 
 /// The model and provider a frontend is running. Shared, so a picker can swap
 /// it while a run is in flight: [`Agent`] re-reads it every turn.
+#[derive(Clone)]
 pub struct ModelSlot {
     pub model: Model,
     pub provider: Arc<dyn Provider>,
@@ -466,6 +473,7 @@ impl<'h> Agent<'h> {
             if self.turns_exhausted() {
                 return Ok(DoneReason::MaxTurns);
             }
+            self.follow_served_window().await?;
             self.try_auto_compact().await?;
             match self.turn().await? {
                 TurnOutcome::Continue => {}
@@ -543,6 +551,40 @@ impl<'h> Agent<'h> {
         self.prompt_facts = candidate.facts;
         self.provider = Arc::clone(&current.provider);
         self.model = Arc::new(current.model.clone());
+    }
+
+    /// A local server may load the model with less room than it supports, and
+    /// then it quietly cuts the oldest tokens instead of letting maki compact
+    /// them. So the budget follows what the server says it serves. The slot
+    /// learns it too, or the next `sync_model` would hand back the old window.
+    async fn follow_served_window(&mut self) -> Result<(), AgentError> {
+        let Some(served) = self.provider.served_context_window(&self.model).await else {
+            return Ok(());
+        };
+        let planned = self.model.context_window;
+        if served == planned {
+            return Ok(());
+        }
+        info!(session = ?self.session_id, model = %self.model.id, served, planned, "following the served context window");
+        if served < planned {
+            self.event_tx.send(AgentEvent::Notice {
+                text: served_window_notice(&self.model.id, served, planned),
+            })?;
+        }
+        self.model = Arc::new(Model {
+            context_window: served,
+            ..(*self.model).clone()
+        });
+        if let Some(slot) = &self.model_sync {
+            slot.rcu(|current| {
+                let mut next = ModelSlot::clone(current);
+                if next.model.provider == self.model.provider && next.model.id == self.model.id {
+                    next.model.context_window = served;
+                }
+                next
+            });
+        }
+        Ok(())
     }
 
     /// Right before every request. A compaction drops the frame, so it may
@@ -1298,6 +1340,7 @@ mod tests {
     struct MockProvider {
         responses: Mutex<Vec<StreamResponse>>,
         requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        served_window: Option<u32>,
     }
 
     impl MockProvider {
@@ -1305,6 +1348,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses),
                 requests: Arc::default(),
+                served_window: None,
             }
         }
     }
@@ -1338,6 +1382,10 @@ mod tests {
 
         fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
+        }
+
+        fn served_context_window<'a>(&'a self, _: &'a Model) -> BoxFuture<'a, Option<u32>> {
+            Box::pin(async { self.served_window })
         }
     }
 
@@ -2223,6 +2271,62 @@ mod tests {
         );
     }
 
+    #[test_case(200_000, 32_768, true ; "smaller_window_compacts_and_tells")]
+    #[test_case(32_768, 200_000, false ; "larger_window_is_silent")]
+    #[test_case(200_000, 200_000, false ; "same_window_changes_nothing")]
+    fn budget_follows_the_served_window(planned: u32, served: u32, shrinks: bool) {
+        let mut h = Harness::new(Vec::new());
+        h.model = small_context_model(planned, 8_192);
+        h.served_window = Some(served);
+        let first_turn = StreamResponse {
+            usage: TokenUsage {
+                input: 30_000,
+                ..Default::default()
+            },
+            ..tool_call_response("glob", "t1")
+        };
+        let replies = vec![
+            first_turn,
+            text_response(StopReason::EndTurn),
+            text_response(StopReason::EndTurn),
+        ];
+        let start = h.model.clone();
+        let mut slot = None;
+        let (_, events) = h.run(default_input(), replies, |agent| {
+            let shared = Arc::new(ArcSwap::from_pointee(ModelSlot {
+                model: start,
+                provider: Arc::clone(&agent.provider),
+            }));
+            agent.model_sync = Some(Arc::clone(&shared));
+            agent.auto_compact = true;
+            slot = Some(shared);
+        });
+
+        let notice = served_window_notice(&h.model.id, served, planned);
+        assert_eq!(
+            has_event(
+                &events,
+                |event| matches!(event, AgentEvent::Notice { text } if *text == notice)
+            ),
+            shrinks
+        );
+        assert_eq!(
+            has_event(&events, |event| matches!(
+                event,
+                AgentEvent::AutoCompacting { .. }
+            )),
+            shrinks
+        );
+        assert_eq!(
+            events.iter().rev().find_map(|event| match &event.event {
+                AgentEvent::TurnComplete(turn) => Some(turn.context_window),
+                _ => None,
+            }),
+            Some(served)
+        );
+        assert_eq!(slot.unwrap().load().model.context_window, served);
+    }
+
     fn small_context_model(context_window: u32, max_output_tokens: u32) -> Model {
         let mut model = default_model();
         model.context_window = context_window;
@@ -2531,6 +2635,7 @@ mod tests {
         model: Model,
         history: History,
         requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        served_window: Option<u32>,
     }
 
     impl Harness {
@@ -2540,6 +2645,7 @@ mod tests {
                 model: default_model(),
                 history: History::new(prior),
                 requests: Arc::default(),
+                served_window: None,
             }
         }
 
@@ -2552,6 +2658,7 @@ mod tests {
             smol::block_on(async {
                 let mut mock = MockProvider::new(responses);
                 mock.requests = Arc::clone(&self.requests);
+                mock.served_window = self.served_window;
                 let (mut agent, event_rx) =
                     make_agent_with(Arc::new(mock), self.model.clone(), &mut self.history);
                 agent.context = self.world.builder();

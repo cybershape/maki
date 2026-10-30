@@ -35,6 +35,13 @@ pub trait Provider: Send + Sync {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
 
+    /// The context window the server runs `model` with right now. Only a
+    /// server that sizes the window when it loads a model can differ from
+    /// discovery, so everyone else says `None`. Asked before every request.
+    fn served_context_window<'a>(&'a self, _model: &'a Model) -> BoxFuture<'a, Option<u32>> {
+        Box::pin(async { None })
+    }
+
     /// Fetch provider-side usage quota (remaining percentage / reset times).
     /// `Ok(None)` means the provider does not expose a programmatic usage endpoint.
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {

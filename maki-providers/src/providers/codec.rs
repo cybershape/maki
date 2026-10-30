@@ -654,6 +654,10 @@ impl Provider for CompatProvider {
     fn adjust_model(&self, model: &mut Model) {
         self.openai.adjust_model(model);
     }
+
+    fn served_context_window<'a>(&'a self, _model: &'a Model) -> BoxFuture<'a, Option<u32>> {
+        Box::pin(async { None })
+    }
 }
 
 #[cfg(test)]
