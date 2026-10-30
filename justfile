@@ -4,6 +4,11 @@ default:
 build *ARGS:
     cargo build {{ARGS}}
 
+# Fat LTO: UI hot paths about 8% faster, binary about 8% smaller.
+# About 2.5 minutes on an M3 Pro, so a plain release build leaves it off.
+build-lto *ARGS:
+    CARGO_PROFILE_RELEASE_LTO=true cargo build --release {{ARGS}}
+
 # Types only, no codegen, no lints. Add `-p <crate>` to make it cheaper still.
 check *ARGS:
     cargo check --workspace --all-targets --features maki-ui/bench {{ARGS}}
