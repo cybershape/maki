@@ -20,7 +20,7 @@ pub(crate) const PARAM_PREVIEW_MAX: usize = 120;
 /// reasoning trace: asking a parameter for step-by-step reasoning draws a
 /// `reasoning_extraction` refusal.
 pub const TOOLCALL_REASON_FIELD: &str = "toolcall_reason";
-pub const TOOLCALL_REASON_DESCRIPTION: &str = "One short sentence on why you are calling this tool and what you expect. Not required, but highly suggested.";
+pub const TOOLCALL_REASON_DESCRIPTION: &str = "One short sentence on why you are calling this tool and what you expect. No need to mention any file names. Not required, but highly suggested.";
 
 const PREVIEW_SUFFIX: &str = "...";
 const JSON_ENCODED_ARRAY_HINT: &str = "Pass a JSON array, not a JSON-encoded string.";
