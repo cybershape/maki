@@ -163,6 +163,7 @@ pub struct PrintParams {
     /// resolved and held for the whole run.
     pub claim: SessionClaim,
     pub storage: StateDir,
+    pub program_status: bool,
 }
 
 pub fn run(params: PrintParams) -> Result<()> {
@@ -183,6 +184,7 @@ pub fn run(params: PrintParams) -> Result<()> {
         resumed,
         claim,
         storage,
+        program_status,
     } = params;
 
     let prompt = match prompt {
@@ -277,6 +279,12 @@ pub fn run(params: PrintParams) -> Result<()> {
         || MODE_BUILD,
     );
 
+    if program_status {
+        let _ = maki_ui::program_status::emit_program_status(
+            &maki_ui::program_status::ProgramStatusReport::working(Some("Working".into())),
+        );
+    }
+
     while let Some(envelope) = smol::block_on(events.next()) {
         // Folded in first, so a plugin handling `TurnEnd` finds the finished
         // totals when it calls `maki.session.read()`.
@@ -301,9 +309,18 @@ pub fn run(params: PrintParams) -> Result<()> {
                 }
             }
             AgentEvent::ThinkingDelta { .. } => {}
-            AgentEvent::ToolPending { .. }
-            | AgentEvent::ToolStart(_)
-            | AgentEvent::ToolOutput { .. }
+            AgentEvent::ToolPending { .. } => {}
+            AgentEvent::ToolStart(inv) => {
+                if program_status && parent_tool_use_id.is_none() {
+                    let _ = maki_ui::program_status::emit_program_status(
+                        &maki_ui::program_status::ProgramStatusReport::working(Some(format!(
+                            "Running {}",
+                            inv.tool
+                        ))),
+                    );
+                }
+            }
+            AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained
@@ -387,11 +404,23 @@ pub fn run(params: PrintParams) -> Result<()> {
                 // summing the turns misses.
                 cost = (*dcost).or(cost);
                 stop_reason = Some(*reason);
+                if program_status {
+                    let _ = maki_ui::program_status::emit_program_status(
+                        &maki_ui::program_status::ProgramStatusReport::done(Some(
+                            "Task complete".into(),
+                        )),
+                    );
+                }
                 break;
             }
             AgentEvent::Error { message, .. } => {
                 is_error = true;
                 result_text = message.clone();
+                if program_status {
+                    let _ = maki_ui::program_status::emit_program_status(
+                        &maki_ui::program_status::ProgramStatusReport::error(Some(message.clone())),
+                    );
+                }
                 break;
             }
         }

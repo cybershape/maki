@@ -221,6 +221,10 @@ pub(crate) fn set_window_title(title: &str) -> std::io::Result<()> {
     write_sequence(&window_title_sequence(TerminalMux::detect(), title))
 }
 
+pub(crate) fn wrap_for_mux(sequence: String) -> String {
+    TerminalMux::detect().wrap_for_mux(sequence)
+}
+
 fn write_mux_sequence(sequence: &str) {
     let _ = write_sequence(&TerminalMux::detect().wrap_for_mux(sequence.into()));
 }
@@ -308,6 +312,10 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let started = Instant::now();
+        crate::program_status::emit_program_status(
+            &crate::program_status::ProgramStatusReport::clear(None),
+        )
+        .ok();
         pop_terminal_modes();
         ratatui::restore();
         tracing::info!(

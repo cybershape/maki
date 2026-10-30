@@ -212,6 +212,7 @@ declare maki: {
     open_win: @checked (buf: any, opts: any) -> (any),
     set_status_hint: @checked (spans: any, opts: any) -> (),
     set_window_title: @checked (title: string) -> (),
+    set_program_status: @checked (opts: any) -> (),
     input: @checked () -> (any, string?),
     input_rules: @checked (opts: any) -> (),
     input_decorate: @checked (opts: any) -> (any, string?),

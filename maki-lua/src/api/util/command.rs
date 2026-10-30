@@ -767,6 +767,17 @@ impl BuiltinAction {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomProgramStatus {
+    pub state: String,
+    pub id: Option<String>,
+    pub kind: Option<String>,
+    pub progress: Option<u8>,
+    pub app: Option<String>,
+    pub title: Option<String>,
+    pub msg: Option<String>,
+}
+
 pub enum UiAction {
     OpenWin {
         /// `None` opens it in the focused tab.
@@ -779,6 +790,7 @@ pub enum UiAction {
     },
     Flash(String),
     SetWindowTitle(String),
+    SetProgramStatus(CustomProgramStatus),
     OpenEditor {
         path: PathBuf,
         reply_tx: flume::Sender<i32>,

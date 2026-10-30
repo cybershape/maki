@@ -438,6 +438,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             resumed,
             claim,
             storage: storage.clone(),
+            program_status: stack.config.ui.program_status,
         })
         .context("run print mode")?;
         return Ok(());

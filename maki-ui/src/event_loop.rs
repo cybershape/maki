@@ -513,6 +513,8 @@ pub(crate) struct EventLoop<'t> {
     /// clones and locks.
     pack_running: bool,
     _model_fetch_task: smol::Task<()>,
+    program_status_enabled: bool,
+    last_program_status: Option<crate::program_status::ProgramStatusReport>,
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -661,6 +663,7 @@ impl<'t> EventLoop<'t> {
         let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
 
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
+        let program_status_enabled = ui_config.program_status;
         let ctx = SpawnCtx {
             storage,
             config,
@@ -717,7 +720,7 @@ impl<'t> EventLoop<'t> {
         }
 
         let (pack_tx, pack_rx) = flume::unbounded();
-        Ok(Self {
+        let mut loop_instance = Self {
             terminal,
             sessions: runtimes,
             focused,
@@ -739,7 +742,15 @@ impl<'t> EventLoop<'t> {
             pack_rx,
             pack_running: false,
             _model_fetch_task: bg.task,
-        })
+            program_status_enabled,
+            last_program_status: None,
+        };
+        if loop_instance.program_status_enabled {
+            let report = crate::program_status::ProgramStatusReport::idle();
+            let _ = crate::program_status::emit_program_status(&report);
+            loop_instance.last_program_status = Some(report);
+        }
+        Ok(loop_instance)
     }
 
     fn focused_app(&mut self) -> &mut App {
@@ -998,6 +1009,27 @@ impl<'t> EventLoop<'t> {
                     warn!(%error, "failed to set window title");
                 }
             }
+            UiAction::SetProgramStatus(custom) => {
+                if self.program_status_enabled
+                    && let Some(state) = crate::program_status::State::from_str_opt(&custom.state)
+                {
+                    let report = crate::program_status::ProgramStatusReport {
+                        state,
+                        id: custom.id,
+                        kind: custom
+                            .kind
+                            .as_deref()
+                            .and_then(crate::program_status::Kind::from_str_opt),
+                        progress: custom.progress,
+                        app: custom.app.or_else(|| Some("maki".into())),
+                        title: custom.title,
+                        msg: custom.msg,
+                    };
+                    if let Err(error) = crate::program_status::emit_program_status(&report) {
+                        warn!(%error, "failed to emit custom program status");
+                    }
+                }
+            }
             UiAction::OpenEditor { path, reply_tx } => {
                 let code = self.open_editor(self.focused, &path);
                 let _ = reply_tx.send(code);
@@ -1191,6 +1223,19 @@ impl<'t> EventLoop<'t> {
                         plugin: task.plugin.map(|plugin| &**plugin),
                     },
                 );
+                if self.program_status_enabled {
+                    let sanitized = sanitize_task_id(task.id);
+                    let state = match task.status {
+                        TaskStatus::Working => crate::program_status::State::Working,
+                        TaskStatus::Idle => crate::program_status::State::Idle,
+                        TaskStatus::Done => crate::program_status::State::Done,
+                        TaskStatus::Error => crate::program_status::State::Error,
+                    };
+                    let mut report = crate::program_status::ProgramStatusReport::new(state);
+                    report.id = Some(sanitized);
+                    report.title = Some(task.name.to_string());
+                    let _ = crate::program_status::emit_program_status(&report);
+                }
             });
         }
     }
@@ -1210,12 +1255,14 @@ impl<'t> EventLoop<'t> {
                 plugin: plugin.map(|plugin| &**plugin),
             },
         );
+        if self.program_status_enabled {
+            let sanitized = sanitize_task_id(id);
+            let report = crate::program_status::ProgramStatusReport::clear(Some(sanitized));
+            let _ = crate::program_status::emit_program_status(&report);
+        }
     }
 
     fn emit_notifications(&mut self) {
-        let Some(notifier) = &self.notifier else {
-            return;
-        };
         let mut selected = None;
         for rt in &mut self.sessions {
             let candidate = rt.notifications.reconcile(
@@ -1225,11 +1272,70 @@ impl<'t> EventLoop<'t> {
             );
             selected = select_notification(selected, candidate);
         }
-        if let Some(notification) = selected.filter(|n| self.focus.allows(n))
+        if let Some(notifier) = &self.notifier
+            && let Some(notification) = selected.as_ref().filter(|n| self.focus.allows(n))
             && let Err(error) = notifier.notify(&notification.message(), notification.reason())
         {
             warn!(notifier = ?notifier.notifier(), %error, "terminal notifications disabled after write failure");
             self.notifier = None;
+        }
+        self.emit_program_status(selected.as_ref());
+    }
+
+    fn emit_program_status(&mut self, completion: Option<&Notification>) {
+        if !self.program_status_enabled {
+            return;
+        }
+        let rt = &self.sessions[self.focused];
+        let report = match rt.app.attention() {
+            Some(Notification::PermissionRequested { tool }) => {
+                let msg = tool
+                    .map(|t| format!("Permission requested: {t}"))
+                    .unwrap_or_else(|| "Permission requested".into());
+                crate::program_status::ProgramStatusReport::blocked(
+                    crate::program_status::Kind::Permission,
+                    Some(msg),
+                )
+            }
+            Some(Notification::AuthenticationRequired) => {
+                crate::program_status::ProgramStatusReport::blocked(
+                    crate::program_status::Kind::Auth,
+                    Some("Authentication required".into()),
+                )
+            }
+            Some(Notification::QuestionRequested) => {
+                crate::program_status::ProgramStatusReport::blocked(
+                    crate::program_status::Kind::Question,
+                    Some("Question requested".into()),
+                )
+            }
+            Some(Notification::PlanReady) => crate::program_status::ProgramStatusReport::blocked(
+                crate::program_status::Kind::Permission,
+                Some("Plan ready".into()),
+            ),
+            _ => {
+                if let Some(Notification::TurnComplete { response }) = completion {
+                    crate::program_status::ProgramStatusReport::done(response.clone())
+                } else if let Some(Notification::AgentError { message }) = completion {
+                    crate::program_status::ProgramStatusReport::error(Some(message.clone()))
+                } else if rt.app.status == Status::Streaming {
+                    crate::program_status::ProgramStatusReport::working(None)
+                } else if let Some(ref last) = self.last_program_status
+                    && matches!(
+                        last.state,
+                        crate::program_status::State::Done | crate::program_status::State::Error
+                    )
+                {
+                    return;
+                } else {
+                    crate::program_status::ProgramStatusReport::idle()
+                }
+            }
+        };
+
+        if self.last_program_status.as_ref() != Some(&report) {
+            let _ = crate::program_status::emit_program_status(&report);
+            self.last_program_status = Some(report);
         }
     }
 
@@ -1265,6 +1371,7 @@ impl<'t> EventLoop<'t> {
             HostEvent::TaskFocusChanged { id: &task_id },
         );
         if switched {
+            self.last_program_status = None;
             self.focused_app().announce_input();
         }
     }
@@ -1721,6 +1828,15 @@ impl<'t> EventLoop<'t> {
     /// Handles one input event plus any leftover produced while coalescing
     /// bursts of scroll/drag events.
     fn handle_input(&mut self, raw: Event) {
+        if let Some(ref last) = self.last_program_status
+            && matches!(
+                last.state,
+                crate::program_status::State::Done | crate::program_status::State::Error
+            )
+            && matches!(raw, Event::Key(_) | Event::FocusGained)
+        {
+            self.last_program_status = None;
+        }
         let mut pending = Some(raw);
         while let Some(ev) = pending.take() {
             let (msg, leftover) = self.translate(ev);
@@ -2207,6 +2323,19 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
     }
 }
 
+fn sanitize_task_id(id: &str) -> String {
+    let sanitized: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '-'))
+        .take(32)
+        .collect();
+    if sanitized.is_empty() {
+        "task".into()
+    } else {
+        format!("task/{sanitized}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2363,5 +2492,13 @@ mod tests {
 
         let text = preamble.iter().map(Message::user_text).collect::<Vec<_>>();
         assert_eq!(text, [Some(SHELL_RESULT), Some(OBSERVATION)]);
+    }
+
+    #[test]
+    fn sanitize_task_id_cases() {
+        assert_eq!(sanitize_task_id("call_123"), "task/call_123");
+        assert_eq!(sanitize_task_id(&"a".repeat(40)), format!("task/{}", "a".repeat(32)));
+        assert_eq!(sanitize_task_id("weird $#@! chars"), "task/weirdchars");
+        assert_eq!(sanitize_task_id("@#$!"), "task");
     }
 }

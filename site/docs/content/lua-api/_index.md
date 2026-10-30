@@ -7599,6 +7599,40 @@ maki.ui.set_window_title("")
 
 ---
 
+### `maki.ui.set_program_status()` {#maki-ui-set_program_status}
+
+```lua
+maki.ui.set_program_status({opts})
+```
+
+Reports program status to the terminal via the OSC 7501 Program Status Protocol.
+
+Shares current execution state (`"idle"`, `"working"`, `"blocked"`, `"done"`,
+`"error"`, `"clear"`) with supporting terminals such as Rex.
+
+**Parameters:**
+
+- `{opts}` (`table`) Status report options:
+  - `state` (`string, required`) `"idle"`, `"working"`, `"done"`, `"blocked"`, `"error"`, or `"clear"`.
+  - `id` (`string, optional`) Record ID path, e.g. `"tests"` or `"build/lint"`.
+  - `kind` (`string, optional`) Reason when blocked: `"permission"`, `"question"`, or `"auth"`.
+  - `progress` (`number, optional`) Integer percentage 0-100 when working or blocked.
+  - `app` (`string, optional`) Application identifier (defaults to `"maki"`).
+  - `title` (`string, optional`) Short human-readable label.
+  - `msg` (`string, optional`) Status description.
+
+**Example:**
+
+```lua
+maki.ui.set_program_status({
+  state = "working",
+  msg = "Running tests",
+  progress = 42,
+})
+```
+
+---
+
 ### `maki.ui.input()` {#maki-ui-input}
 
 ```lua

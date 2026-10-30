@@ -21,6 +21,7 @@ pub use highlight::highlight_ansi;
 pub mod image;
 mod markdown;
 pub use markdown::text_to_lines;
+pub mod program_status;
 mod render_worker;
 pub mod repaint;
 mod selection;

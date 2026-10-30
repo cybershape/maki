@@ -75,6 +75,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `splash_animation` | bool | `true` | - | Show splash animation on startup |
 | `scrollbar` | bool | `true` | - | Show vertical scrollbar in scrollable areas |
 | `inline_images` | bool | `true` | - | Render inline images in terminals with graphics support, falling back to an [image] line where nothing else names the image |
+| `program_status` | bool | `true` | - | Report program status to the terminal via OSC 7501 (Program Status Protocol) |
 | `notifications` | string | `auto` | - | Notification method: auto, osc9, bell, notify, or off |
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |

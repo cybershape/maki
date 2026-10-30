@@ -12,9 +12,9 @@ use mlua::{Lua, Result as LuaResult, Table};
 use crate::api::action::run_plugin_action;
 use crate::api::keymap::{InputMode, accept_key, switch_mode};
 use crate::api::util::command::{
-    Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintEntry, HintWriter,
-    InputDecorate, InputEdit, InputMarks, InputRequest, InputSubmit, Split, TextEdit, TitlePos,
-    UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_roundtrip, ui_send,
+    Anchor, Border, BuiltinAction, CustomProgramStatus, Dimension, FloatConfig, HintEntries,
+    HintEntry, HintWriter, InputDecorate, InputEdit, InputMarks, InputRequest, InputSubmit, Split,
+    TextEdit, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_roundtrip, ui_send,
 };
 use crate::api::util::convert::{TableExt, reject_unknown_fields, required};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
@@ -470,6 +470,55 @@ fn set_window_title(
     title: String,
 ) -> LuaResult<()> {
     let _ = ui_send(tx.as_ref(), UiAction::SetWindowTitle(title));
+    Ok(())
+}
+
+/// Reports program status to the terminal via the OSC 7501 Program Status Protocol.
+///
+/// Shares current execution state (`"idle"`, `"working"`, `"blocked"`, `"done"`,
+/// `"error"`, `"clear"`) with supporting terminals such as Rex.
+///
+/// @param opts table Status report options:
+///   - `state` (string, required): `"idle"`, `"working"`, `"done"`, `"blocked"`, `"error"`, or `"clear"`.
+///   - `id` (string, optional): Record ID path, e.g. `"tests"` or `"build/lint"`.
+///   - `kind` (string, optional): Reason when blocked: `"permission"`, `"question"`, or `"auth"`.
+///   - `progress` (number, optional): Integer percentage 0-100 when working or blocked.
+///   - `app` (string, optional): Application identifier (defaults to `"maki"`).
+///   - `title` (string, optional): Short human-readable label.
+///   - `msg` (string, optional): Status description.
+/// @return
+/// @example
+/// maki.ui.set_program_status({
+///   state = "working",
+///   msg = "Running tests",
+///   progress = 42,
+/// })
+#[lua_fn]
+fn set_program_status(
+    _lua: &Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    opts: Table,
+) -> LuaResult<()> {
+    let state: String = opts.get("state")?;
+    let id: Option<String> = opts.opt("id")?;
+    let kind: Option<String> = opts.opt("kind")?;
+    let progress: Option<u8> = opts.opt("progress")?;
+    let app: Option<String> = opts.opt("app")?;
+    let title: Option<String> = opts.opt("title")?;
+    let msg: Option<String> = opts.opt("msg")?;
+
+    let _ = ui_send(
+        tx.as_ref(),
+        UiAction::SetProgramStatus(CustomProgramStatus {
+            state,
+            id,
+            kind,
+            progress,
+            app,
+            title,
+            msg,
+        }),
+    );
     Ok(())
 }
 
@@ -1383,7 +1432,7 @@ lua_table! {
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual set_mode, manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title, manual input, manual input_rules, manual input_decorate,
+        manual set_window_title, manual set_program_status, manual input, manual input_rules, manual input_decorate,
         manual input_edit, manual input_submit,
     ]
 }
@@ -1399,6 +1448,7 @@ pub(crate) fn create_ui_table(
 
     flash__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     set_window_title__register(&t, lua, ui_action_tx.clone())?;
+    set_program_status__register(&t, lua, ui_action_tx.clone())?;
     set_mode__register(&t, lua, Arc::clone(&plugin))?;
     action__register(
         &t,
@@ -2714,5 +2764,44 @@ mod tests {
         let mut granted = PluginPermissions::denied();
         granted.set(perm, true);
         assert_eq!(run(&granted), Ok(Some(true)));
+    }
+
+    #[test]
+    fn set_program_status_dispatches_ui_action() {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = Lua::new();
+        let reach = PluginReach::new(PluginPermissions::trusted());
+        let t = create_ui_table(&lua, Some(tx), Arc::from("test"), reach).unwrap();
+        lua.globals().set("ui", t).unwrap();
+
+        lua.load(
+            r#"
+            ui.set_program_status({
+                state = "working",
+                id = "build/test",
+                kind = "permission",
+                progress = 75,
+                app = "custom-app",
+                title = "Running tests",
+                msg = "3/4 passing",
+            })
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        let action = rx.try_recv().unwrap();
+        match action {
+            UiAction::SetProgramStatus(s) => {
+                assert_eq!(s.state, "working");
+                assert_eq!(s.id.as_deref(), Some("build/test"));
+                assert_eq!(s.kind.as_deref(), Some("permission"));
+                assert_eq!(s.progress, Some(75));
+                assert_eq!(s.app.as_deref(), Some("custom-app"));
+                assert_eq!(s.title.as_deref(), Some("Running tests"));
+                assert_eq!(s.msg.as_deref(), Some("3/4 passing"));
+            }
+            _ => panic!("unexpected action"),
+        }
     }
 }
