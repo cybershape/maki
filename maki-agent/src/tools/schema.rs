@@ -20,13 +20,7 @@ pub(crate) const PARAM_PREVIEW_MAX: usize = 120;
 /// reasoning trace: asking a parameter for step-by-step reasoning draws a
 /// `reasoning_extraction` refusal.
 pub const TOOLCALL_REASON_FIELD: &str = "toolcall_reason";
-pub const TOOLCALL_REASON_DESCRIPTION: &str =
-    "One short sentence on why you are calling this tool and what you expect. Not your reasoning. Not required, but highly encouraged.";
-
-/// Set on a [`TOOLCALL_REASON_FIELD`] property we added, so a consumer that
-/// shows schemas to a person (the docs) can tell it from one a tool declared.
-/// A model never reads it: unknown schema keywords are ignored.
-const TOOLCALL_REASON_INJECTED: &str = "x-maki-injected";
+pub const TOOLCALL_REASON_DESCRIPTION: &str = "One short sentence on why you are calling this tool and what you expect. Not required, but highly suggested.";
 
 const PREVIEW_SUFFIX: &str = "...";
 const JSON_ENCODED_ARRAY_HINT: &str = "Pass a JSON array, not a JSON-encoded string.";
@@ -743,7 +737,6 @@ pub fn inject_toolcall_reason(schema: &mut Value) -> bool {
         json!({
             "type": "string",
             "description": TOOLCALL_REASON_DESCRIPTION,
-            TOOLCALL_REASON_INJECTED: true,
         }),
     );
     true
@@ -772,8 +765,13 @@ pub fn strip_toolcall_reason(injected: bool, input: &mut Value) -> Option<String
 }
 
 /// Whether the published schema of `name` carries a [`TOOLCALL_REASON_FIELD`]
-/// we added. A tool whose own schema already declares the property, or one we
-/// cannot find a schema for, answers `false`: its value is not ours to take.
+/// we added.
+///
+/// The schema this sees is the one already sent to the model, so both an
+/// injected field and one the tool declared are present. They differ only in
+/// the description: ours is exactly [`TOOLCALL_REASON_DESCRIPTION`], and a tool
+/// that declares the field keeps its own. A tool we cannot find a schema for
+/// answers `false`: its value is not ours to take.
 pub fn toolcall_reason_injected(tools: &[Value], name: &str) -> bool {
     let Some(schema) = tools
         .iter()
@@ -781,9 +779,8 @@ pub fn toolcall_reason_injected(tools: &[Value], name: &str) -> bool {
     else {
         return false;
     };
-    schema["properties"][TOOLCALL_REASON_FIELD][TOOLCALL_REASON_INJECTED]
-        .as_bool()
-        .unwrap_or(false)
+    schema["properties"][TOOLCALL_REASON_FIELD]["description"].as_str()
+        == Some(TOOLCALL_REASON_DESCRIPTION)
 }
 
 /// Sanitize a tool input schema to comply with OpenAI function-calling requirements.
@@ -1454,7 +1451,6 @@ mod tests {
             json!({
                 "type": "string",
                 "description": TOOLCALL_REASON_DESCRIPTION,
-                TOOLCALL_REASON_INJECTED: true,
             })
         );
         assert!(schema.get("required").is_none());
@@ -1510,7 +1506,11 @@ mod tests {
     fn injected_is_recognized_only_by_our_description() {
         let ours = json!({
             "name": "read",
-            "input_schema": { "properties": { TOOLCALL_REASON_FIELD: { TOOLCALL_REASON_INJECTED: true } } }
+            "input_schema": {
+                "properties": {
+                    TOOLCALL_REASON_FIELD: { "description": TOOLCALL_REASON_DESCRIPTION }
+                }
+            }
         });
         let theirs = json!({
             "name": "probe",

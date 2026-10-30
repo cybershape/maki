@@ -1,5 +1,5 @@
 use maki_agent::template::Vars;
-use maki_agent::tools::schema::TOOLCALL_REASON_FIELD;
+use maki_agent::tools::schema::{TOOLCALL_REASON_DESCRIPTION, TOOLCALL_REASON_FIELD};
 use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolSource};
 use maki_config::{PluginFileConfig, PluginsConfig};
 use regex::Regex;
@@ -80,13 +80,12 @@ fn first_paragraph(desc: &str) -> &str {
     desc.split("\n\n").next().unwrap_or(desc)
 }
 
-/// Drops a `toolcall_reason` this process injected. One a tool declared
-/// itself has no marker and stays in the reference.
+/// Drops a `toolcall_reason` this process injected. A tool that declared the
+/// field itself keeps its own description, which is not ours, so it stays.
 fn documented_schema(schema: &Value) -> Value {
     let mut schema = schema.clone();
-    if schema["properties"][TOOLCALL_REASON_FIELD]["x-maki-injected"]
-        .as_bool()
-        .unwrap_or(false)
+    if schema["properties"][TOOLCALL_REASON_FIELD]["description"].as_str()
+        == Some(TOOLCALL_REASON_DESCRIPTION)
         && let Some(properties) = schema.get_mut("properties").and_then(|p| p.as_object_mut())
     {
         properties.remove(TOOLCALL_REASON_FIELD);
