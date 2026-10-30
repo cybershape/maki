@@ -289,7 +289,7 @@ maki.api.register_tool({
       workdir = { type = "string", description = "Working directory (default: cwd)" },
       toolcall_reason = {
         type = "string",
-        description = "One short sentence on why you are calling this tool and what you expect. Not your reasoning.",
+        description = "One short sentence on why you are calling this tool and what you expect. Not your reasoning. Not required, but highly encouraged.",
       },
     },
   },

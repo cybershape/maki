@@ -21,7 +21,7 @@ pub(crate) const PARAM_PREVIEW_MAX: usize = 120;
 /// `reasoning_extraction` refusal.
 pub const TOOLCALL_REASON_FIELD: &str = "toolcall_reason";
 pub const TOOLCALL_REASON_DESCRIPTION: &str =
-    "One short sentence on why you are calling this tool and what you expect. Not your reasoning.";
+    "One short sentence on why you are calling this tool and what you expect. Not your reasoning. Not required, but highly encouraged.";
 
 /// Set on a [`TOOLCALL_REASON_FIELD`] property we added, so a consumer that
 /// shows schemas to a person (the docs) can tell it from one a tool declared.
