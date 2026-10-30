@@ -10,16 +10,16 @@
 - **上游跟踪分支**: `upstream/main`
 - **当前本地分支**: `main`（跟踪 `origin/main`: `git@github.com:cybershape/maki.git`）
 - **最新同步的上游 Commit**:
-  - **Commit SHA**: `ec1c1a6286f2e59696468a9e28b2c56b67529639`
-  - **Commit 日期**: `Wed Oct 28 21:45:14 2026 +0100`
-  - **Commit 作者**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
-  - **Commit 信息**: `perf(websearch): list kagi results as a numbered list`
+  - **Commit SHA**: `1a8b897bf15d818d9b0fc399a6145eeb42b9e304`
+  - **Commit 日期**: `Thu Oct 29 21:54:56 2026 +0100`
+  - **Commit 作者**: `Luca Barbato <lu_zero@gentoo.org>`
+  - **Commit 信息**: `providers(mistral): Refresh Large 4 pricing`
 - **初始分叉点 (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit 日期**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit 信息**: `chore(deps): move monty to crates.io 1.x`
 
-> 本次已成功合并 `upstream/main`（至 commit `ec1c1a62`）。
+> 本次已成功合并 `upstream/main`（至 commit `1a8b897b`）。
 
 ---
 
@@ -63,6 +63,19 @@
 | `1a6f0151` | `fix(ui): re-open plan form after refinement and queue implement while streaming` | 修复计划表单优化后重开及流式状态排队执行 |
 | `26d5a75b` | `fix(acp): cache model metadata and push updates on display name resolution` | ACP 缓存模型元数据并在解析展示名时推送更新 |
 | `401b5406` | `Merge branch 'upstream/main' into main` | 合并上游提交（至 `ec1c1a62`），包含 model tier override 优先规则、Release fat LTO 构建优化、Websearch Kagi 搜索结果编号列表优化 |
+| `d6094fa8` | `docs: update upstream tracking record to ec1c1a62` | 更新上游跟踪记录文档至 `ec1c1a62` |
+| `2dfe0846` | `feat(ui): show batch child tools and durations in compact groups` | 紧凑工具组展示 batch 子工具及耗时 |
+| `15b7359e` | `feat(ui): unify compact group busy animations as pulsing dots` | 紧凑工具组 busy 状态动画统一为脉冲点动效 |
+| `5bcd27ee` | `feat(ui): show per-turn stats line when a turn completes (#1)` | 用户 turn 完成后显示单 turn 耗时及 token 统计行 |
+| `87dd0f13` | `docs: add personal fork notice and upstream diff summary to README (#2)` | README 增加个人 fork 说明与上游差异摘要 |
+| `3e3cc101` | `fix(ui): preserve compact tool groups, headers, and durations on session restore` | 会话恢复时保留紧凑工具组、标题与耗时 |
+| `4e5a3f45` | `fix(ui): show turn stats once when the user turn finishes (#3)` | 修复每 turn 统计仅在用户 turn 结束时展示一次 |
+| `4265d676` | `fix(ui): fix compilation errors and dead code in chat turn stats` | 修复 turn 统计中的编译错误和死代码 |
+| `0227856d` | `feat(markdown): render LaTeX math expressions using txm` | 使用 txm 库在 markdown 中渲染 LaTeX 数学公式 |
+| `f70d08c6` | `refactor(code_execution): drop legacy list tool compatibility` | 代码执行沙箱中移除旧版本 `list` 工具兼容垫片 |
+| `2bfb89fc` | `feat(ui): add left padding to chat messages panel` | 聊天消息面板增加左侧内边距 padding |
+| `b7d57572` | `feat(ui): capitalize tool group titles and show thinking duration` | 工具组标题首字母大写并展示思考耗时 |
+| `c72e8fa1` | `Merge branch 'upstream/main' into main` | 合并上游提交（至 `1a8b897b`），包含 serde-saphyr 替代弃用的 serde_yaml、agent-client-protocol-schema 升级至 1.13.0、`sess:send` 运行中子 agent 消息推送、日志记录 project 标识等 |
 
 ---
 
