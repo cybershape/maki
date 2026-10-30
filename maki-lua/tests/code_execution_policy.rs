@@ -541,10 +541,42 @@ fn agent_tools_describes_mcp_only_when_the_session_keeps_it(enabled: bool) {
 #[test_case::test_case(MCP_TOOL_QUALIFIED, MCP_TOOL_WIRE ; "deferred_tool_binds_its_wire_name")]
 #[test_case::test_case(HYPHEN_QUALIFIED, HYPHEN_ALIAS    ; "hyphenated_tool_binds_an_alias")]
 #[test_case::test_case(MCP_TOOL_QUALIFIED, "srv.fetch_issue" ; "module_object_style_call")]
+#[test_case::test_case(HYPHEN_QUALIFIED, "srv.get_docs" ; "hyphenated_module_object_style_call")]
 fn mcp_tool_is_callable_from_the_sandbox(qualified: &'static str, bound: &str) {
     let err = run_code_with(&format!("await {bound}()"), with_mcp(qualified))
         .expect_err("the stub transport fails every call");
     assert!(err.contains(MCP_REACHED_ERR), "got: {err}");
+}
+
+#[test]
+fn code_execution_description_aliases_hyphenated_functions() {
+    let (reg, _host) = setup_global();
+    let ctx = shaped_ctx(&reg, with_mcp(HYPHEN_QUALIFIED));
+    let desc = run_tool(
+        &reg,
+        &ctx,
+        TOOLS_MCP_PROBE,
+        serde_json::json!({ "mcp": true }),
+    )
+    .expect("probe must describe code_execution");
+    assert!(desc.contains("functions: get_docs"), "got: {desc}");
+}
+
+#[test]
+fn library_help_returns_docstring_for_hyphenated_function() {
+    let (reg, _host) = setup_global();
+    let ctx = shaped_ctx(&reg, with_mcp(HYPHEN_QUALIFIED));
+    let out = run_tool(
+        &reg,
+        &ctx,
+        "library_help",
+        serde_json::json!({
+            "library_name": "srv",
+            "function_name": "get_docs"
+        }),
+    )
+    .expect("library_help should succeed");
+    assert!(out.contains("async def get_docs("), "got: {out}");
 }
 
 #[test]

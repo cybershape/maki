@@ -1,5 +1,15 @@
 local ToolView = require("maki.tool_view")
 
+local PY_IDENTIFIER = "^[%a_][%w_]*$"
+
+local function identifier_alias(name)
+  if not name or #name == 0 or name:match("^%d") then
+    return nil
+  end
+  local alias = name:gsub("[^%w_]", "_")
+  return alias:match(PY_IDENTIFIER) and alias or nil
+end
+
 local PY_TYPES = {
   string = "str",
   integer = "int",
@@ -160,8 +170,9 @@ maki.api.register_tool({
     local available_libs = {}
 
     for _, lib in ipairs(libs) do
-      table.insert(available_libs, lib.name)
-      if lib.name == library_name then
+      local lib_alias = identifier_alias(lib.name) or lib.name
+      table.insert(available_libs, lib_alias)
+      if lib.name == library_name or lib_alias == library_name then
         matched_lib = lib
         break
       end
@@ -186,11 +197,14 @@ maki.api.register_tool({
     end
 
     local matched_fn = nil
+    local matched_fn_name = nil
     local available_funcs = {}
     for _, fn in ipairs(matched_lib.functions or {}) do
-      table.insert(available_funcs, fn.name)
-      if fn.name == function_name then
+      local fn_alias = identifier_alias(fn.name) or fn.name
+      table.insert(available_funcs, fn_alias)
+      if fn.name == function_name or fn_alias == function_name then
         matched_fn = fn
+        matched_fn_name = fn_alias
         break
       end
     end
@@ -210,7 +224,11 @@ maki.api.register_tool({
       }
     end
 
-    local doc = format_python_docstring(matched_fn.name, matched_fn.description, matched_fn.schema)
+    local doc = format_python_docstring(
+      matched_fn_name or matched_fn.name,
+      matched_fn.description,
+      matched_fn.schema
+    )
     return { llm_output = doc }
   end,
 })

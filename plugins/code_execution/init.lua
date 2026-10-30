@@ -65,6 +65,14 @@ local CALLABLE_TOOLS_ERR = "cannot list callable tools: "
 local PY_IDENTIFIER = "^[%a_][%w_]*$"
 local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
 
+local function identifier_alias(name)
+  if not name or #name == 0 or name:match("^%d") then
+    return nil
+  end
+  local alias = name:gsub("[^%w_]", "_")
+  return alias:match(PY_IDENTIFIER) and alias or nil
+end
+
 local opts = maki.api.register_options(output_limits.extend({
   timeout_secs = {
     default = 30,
@@ -262,9 +270,19 @@ local function describe(dctx)
       "\nExternal libraries (callable in Python via `await <library_name>.<function_name>(...)`):",
     }
     for _, lib in ipairs(dctx.mcp_libraries) do
+      local lib_name = identifier_alias(lib.name) or lib.name
       local desc = (lib.description and #lib.description > 0) and lib.description or "(no description)"
-      local fns = (lib.functions and #lib.functions > 0) and table.concat(lib.functions, ", ") or "(none)"
-      table.insert(lines, string.format("- %s: %s\n  functions: %s", lib.name, desc, fns))
+      local fn_names = {}
+      local seen = {}
+      for _, fn in ipairs(lib.functions or {}) do
+        local fn_name = identifier_alias(fn) or fn
+        if not seen[fn_name] then
+          seen[fn_name] = true
+          fn_names[#fn_names + 1] = fn_name
+        end
+      end
+      local fns = #fn_names > 0 and table.concat(fn_names, ", ") or "(none)"
+      table.insert(lines, string.format("- %s: %s\n  functions: %s", lib_name, desc, fns))
     end
     table.insert(
       lines,
@@ -425,12 +443,16 @@ local function handler(input, ctx)
       "class _McpNamespace:\n    pass\n",
     }
     for _, lib in ipairs(libs) do
-      if lib.name:match(PY_IDENTIFIER) then
-        table.insert(ns_lines, string.format("%s = _McpNamespace()\n", lib.name))
+      local lib_name = identifier_alias(lib.name)
+      if lib_name then
+        table.insert(ns_lines, string.format("%s = _McpNamespace()\n", lib_name))
         for _, fn in ipairs(lib.functions or {}) do
-          if fn.name:match(PY_IDENTIFIER) then
-            local wire = lib.name .. "__" .. fn.name
-            table.insert(ns_lines, string.format("%s.%s = %s\n", lib.name, fn.name, wire))
+          local fn_name = identifier_alias(fn.name)
+          if fn_name then
+            local wire = lib_name .. "__" .. fn_name
+            if tools[wire] then
+              table.insert(ns_lines, string.format("%s.%s = %s\n", lib_name, fn_name, wire))
+            end
           end
         end
       end
