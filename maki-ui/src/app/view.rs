@@ -41,6 +41,8 @@ pub fn center_rect(area: Rect, max_width: Option<MaxWidth>) -> Rect {
 }
 
 struct ViewLayout {
+    /// `max_width` applied once, before splits carve the chat column out of it.
+    ui: Rect,
     msg_area: Rect,
     bottom_area: Rect,
     status_area: Rect,
@@ -97,17 +99,16 @@ impl App {
     /// or a window on it would jump to the middle of the screen the moment it
     /// started reading keys.
     pub fn view(&mut self, frame: &mut Frame) -> Option<Position> {
-        let area = self.ui_area(frame.area());
-        let layout = self.compute_layout(area);
+        let layout = self.compute_layout(frame.area());
         let render_chat = self.active_chat;
 
         self.render_background(frame);
         self.render_messages(frame, &layout, render_chat);
         let caret = self.render_bottom_panel(frame, &layout);
         self.render_splits(frame, &layout);
-        let mut overlay_rect = self.render_picker_overlays(frame, &layout, area);
+        let mut overlay_rect = self.render_picker_overlays(frame, &layout, layout.ui);
         self.render_status_bar(frame, layout.status_area, render_chat);
-        overlay_rect = self.render_top_modals(frame, overlay_rect, caret, area);
+        overlay_rect = self.render_top_modals(frame, overlay_rect, caret, layout.ui);
         self.register_zones(&layout, overlay_rect);
         self.apply_selection(frame, render_chat);
         caret.filter(|_| self.input_has_keyboard())
@@ -115,6 +116,7 @@ impl App {
 
     fn compute_layout(&self, area: Rect) -> ViewLayout {
         let area = self.ui_area(area);
+        let ui = area;
         let prompt_open = self.prompt_open();
 
         // Carve the full-width status bar first so the split carving below only
@@ -187,6 +189,7 @@ impl App {
         let input_area = areas[areas.len() - 1];
 
         ViewLayout {
+            ui,
             msg_area,
             bottom_area,
             status_area,
