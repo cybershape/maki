@@ -4123,6 +4123,7 @@ fn ctrl_q_pops_front() {
     let mut app = app_with_queued_message();
     app.queue_and_notify(queued_msg("second"));
     app.update(Msg::Key(kb::POP_QUEUE.to_key_event()));
+    assert_eq!(app.input_box.buffer.value(), "queued");
     assert_eq!(app.queue.len(), 1);
     assert_eq!(app.queue.panel_entries()[0].text, "second");
     assert!(app.queue.focus().is_none(), "unfocused stays unfocused");
@@ -4130,11 +4131,95 @@ fn ctrl_q_pops_front() {
     app.queue_and_notify(queued_msg("third"));
     app.queue.set_focus_at(1);
     app.update(Msg::Key(kb::POP_QUEUE.to_key_event()));
+    assert_eq!(app.input_box.buffer.value(), "second");
     assert_eq!(
         app.queue.focus(),
         Some(0),
         "focus adjusted when item removed"
     );
+}
+
+#[test]
+fn ctrl_e_recalls_and_overwrites_draft() {
+    let mut app = app_with_queued_message();
+    app.input_box.set_input("half written draft");
+    app.update(Msg::Key(kb::POP_QUEUE.to_key_event()));
+    assert_eq!(app.input_box.buffer.value(), "queued");
+    assert!(app.queue.is_empty());
+}
+
+#[test]
+fn ctrl_e_when_queue_empty_moves_end() {
+    let mut app = test_app();
+    app.input_box.set_input("hello");
+    app.input_box.buffer.set_cursor(0, 0);
+    assert_eq!(app.input_box.buffer.cursor_byte(), 0);
+
+    app.update(Msg::Key(kb::POP_QUEUE.to_key_event()));
+    assert_eq!(app.input_box.buffer.cursor_byte(), 5);
+}
+
+#[test]
+fn ctrl_enter_steers_while_streaming() {
+    let mut app = test_app();
+    let (tx, _rx) = shared_queue::queue();
+    app.queue.set_shared(tx);
+    app.status = Status::Streaming;
+
+    app.input_box.set_input("steer instruction");
+    let actions = app.update(Msg::Key(kb::STEER.to_key_event()));
+    assert!(actions.is_empty());
+    assert_eq!(app.queue.len(), 1);
+    assert!(app.queue.panel_entries()[0].is_steer);
+    assert_eq!(app.queue.panel_entries()[0].text, "steer instruction");
+}
+
+#[test]
+fn ctrl_enter_while_idle_starts_run() {
+    let mut app = test_app();
+    app.input_box.set_input("start task");
+    let actions = app.update(Msg::Key(kb::STEER.to_key_event()));
+    assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == "start task"));
+    assert_eq!(app.status, Status::Streaming);
+}
+
+#[test]
+fn ctrl_enter_empty_input_converts_queue_to_steer() {
+    let mut app = app_with_queued_message();
+    assert!(!app.queue.panel_entries()[0].is_steer);
+
+    app.update(Msg::Key(kb::STEER.to_key_event()));
+    assert!(app.queue.panel_entries()[0].is_steer);
+}
+
+#[test]
+fn ctrl_q_converts_steer_to_queue() {
+    let mut app = test_app();
+    let (tx, _rx) = shared_queue::queue();
+    app.queue.set_shared(tx);
+    app.status = Status::Streaming;
+
+    app.input_box.set_input("steer first");
+    app.update(Msg::Key(kb::STEER.to_key_event()));
+    assert!(app.queue.panel_entries()[0].is_steer);
+
+    app.update(Msg::Key(kb::QUEUE.to_key_event()));
+    assert!(!app.queue.panel_entries()[0].is_steer);
+}
+
+#[test]
+fn enter_while_streaming_queues_message() {
+    let mut app = test_app();
+    let (tx, _rx) = shared_queue::queue();
+    app.queue.set_shared(tx);
+    app.status = Status::Streaming;
+
+    app.input_box.set_input("queued prompt");
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(actions.is_empty());
+    assert_eq!(app.queue.len(), 1);
+    assert!(!app.queue.panel_entries()[0].is_steer);
+    assert_eq!(app.queue.panel_entries()[0].text, "queued prompt");
 }
 
 #[test_case(cancel_app as fn(&mut App) ; "cancel")]
@@ -10232,6 +10317,7 @@ fn pop_queue_in_subagent_chat_drops_its_inbox_head() {
     type_and_submit(&mut app, "b");
     app.update(Msg::Key(kb::POP_QUEUE.to_key_event()));
     assert_eq!(inbox.texts(), ["b"]);
+    assert_eq!(app.input_box.buffer.value(), "a");
 }
 
 /// Nothing drains the inbox once the subagent is gone, so what was left in it

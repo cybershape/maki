@@ -93,6 +93,7 @@ impl Compaction {
 
 pub(crate) enum QueueItem {
     Message(QueuedInput),
+    Steer(QueuedInput),
     Compact(Compaction),
 }
 
@@ -123,11 +124,31 @@ impl QueueRun {
 }
 
 impl QueueItem {
+    fn into_steer(self) -> Self {
+        match self {
+            Self::Message(queued) => Self::Steer(queued),
+            other => other,
+        }
+    }
+
+    fn into_queue(self) -> Self {
+        match self {
+            Self::Steer(queued) => Self::Message(queued),
+            other => other,
+        }
+    }
+
     fn as_queue_entry(&self) -> QueueEntry<'static> {
         match self {
             Self::Message(queued) => QueueEntry {
                 text: Cow::Owned(queued.text.clone()),
                 color: theme::current().foreground,
+                is_steer: false,
+            },
+            Self::Steer(queued) => QueueEntry {
+                text: Cow::Owned(queued.text.clone()),
+                color: theme::current().foreground,
+                is_steer: true,
             },
             Self::Compact(compaction) => QueueEntry {
                 text: compaction.label(),
@@ -135,13 +156,14 @@ impl QueueItem {
                     .queue
                     .fg
                     .unwrap_or(theme::current().foreground),
+                is_steer: false,
             },
         }
     }
 
     fn batch_key(&self) -> Option<BatchKey> {
         match self {
-            Self::Message(queued) => queued.batch_key(),
+            Self::Message(queued) | Self::Steer(queued) => queued.batch_key(),
             Self::Compact(_) => None,
         }
     }
@@ -151,7 +173,7 @@ impl QueueItem {
     /// which used to make the bubble hop up by one frame.
     fn visible_in_panel(&self) -> bool {
         match self {
-            Self::Message(queued) => !queued.displayed,
+            Self::Message(queued) | Self::Steer(queued) => !queued.displayed,
             Self::Compact(_) => true,
         }
     }
@@ -207,12 +229,32 @@ impl QueueSender {
         lock(&self.items).clear();
     }
 
+    pub(crate) fn convert_to_steer(&self, index: usize) -> bool {
+        let mut items = lock(&self.items);
+        if let Some(QueueItem::Message(_)) = items.get(index) {
+            let item = items.remove(index).unwrap();
+            items.insert(index, item.into_steer());
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn convert_to_queue(&self, index: usize) -> bool {
+        let mut items = lock(&self.items);
+        if let Some(QueueItem::Steer(_)) = items.get(index) {
+            let item = items.remove(index).unwrap();
+            items.insert(index, item.into_queue());
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn text_messages(&self) -> Vec<String> {
         lock(&self.items)
             .iter()
             .filter(|item| item.visible_in_panel())
             .filter_map(|item| match item {
-                QueueItem::Message(queued) => Some(queued.text.clone()),
+                QueueItem::Message(queued) | QueueItem::Steer(queued) => Some(queued.text.clone()),
                 QueueItem::Compact(_) => None,
             })
             .collect()
@@ -241,15 +283,21 @@ impl QueueReceiver {
         let mut items = lock(&self.items);
         let first = match items.pop_front()? {
             QueueItem::Compact(compaction) => return Some(QueueRun::Compact(compaction)),
-            QueueItem::Message(first) => first,
+            QueueItem::Message(first) | QueueItem::Steer(first) => first,
         };
         let key = first.batch_key();
         let mut run = vec![first];
         while key.is_some() && items.front().and_then(QueueItem::batch_key) == key {
-            let Some(QueueItem::Message(next)) = items.pop_front() else {
+            let Some(next) = items.pop_front() else {
                 break;
             };
-            run.push(next);
+            match next {
+                QueueItem::Message(next) | QueueItem::Steer(next) => run.push(next),
+                QueueItem::Compact(compaction) => {
+                    items.push_front(QueueItem::Compact(compaction));
+                    break;
+                }
+            }
         }
         Some(QueueRun::Messages(run))
     }
@@ -270,12 +318,33 @@ impl QueueReceiver {
 
 impl InterruptSource for QueueReceiver {
     fn poll(&self) -> Option<ExtractedCommand> {
-        Some(match self.pop_run()? {
-            QueueRun::Compact(compaction) => ExtractedCommand::Compact(compaction.instructions),
-            QueueRun::Messages(run) => {
-                ExtractedCommand::Interrupt(run.into_iter().map(|queued| queued.input).collect())
-            }
-        })
+        let mut items = lock(&self.items);
+        if let Some(compact_idx) = items
+            .iter()
+            .position(|item| matches!(item, QueueItem::Compact(_)))
+        {
+            let QueueItem::Compact(compaction) = items.remove(compact_idx).unwrap() else {
+                unreachable!()
+            };
+            return Some(ExtractedCommand::Compact(compaction.instructions));
+        }
+        let steer_idx = items
+            .iter()
+            .position(|item| matches!(item, QueueItem::Steer(_)))?;
+        let QueueItem::Steer(steer) = items.remove(steer_idx).unwrap() else {
+            unreachable!()
+        };
+        let mut steers = vec![steer.input];
+        while let Some(idx) = items
+            .iter()
+            .position(|item| matches!(item, QueueItem::Steer(_)))
+        {
+            let QueueItem::Steer(next) = items.remove(idx).unwrap() else {
+                unreachable!()
+            };
+            steers.push(next.input);
+        }
+        Some(ExtractedCommand::Interrupt(steers))
     }
 }
 
@@ -337,6 +406,10 @@ mod tests {
 
     fn message(text: &str) -> QueueItem {
         QueueItem::Message(queued(text, 0))
+    }
+
+    fn steer(text: &str) -> QueueItem {
+        QueueItem::Steer(queued(text, 0))
     }
 
     fn plan_message(text: &str) -> QueueItem {
@@ -453,10 +526,49 @@ mod tests {
     }
 
     #[test]
-    fn poll_hands_the_whole_message_run_to_one_turn() {
+    fn poll_only_consumes_steer_and_compact_not_queued_messages() {
+        let (tx, rx) = queue();
+        tx.push(message(FIRST));
+        assert!(
+            rx.poll().is_none(),
+            "queued messages are not polled as interrupts"
+        );
+
+        tx.push(steer(SECOND));
+        let Some(ExtractedCommand::Interrupt(inputs)) = rx.poll() else {
+            panic!("{NOT_AN_INTERRUPT}");
+        };
+        let messages: Vec<_> = inputs.iter().map(|i| i.message.as_str()).collect();
+        assert_eq!(messages, [SECOND]);
+        assert!(rx.poll().is_none());
+
+        // The queued message is still waiting for pop_run
+        assert_eq!(runs(&rx), vec![vec![FIRST]]);
+    }
+
+    #[test]
+    fn convert_between_steer_and_queue() {
+        let (tx, rx) = queue();
+        tx.push(message(FIRST));
+        assert!(rx.poll().is_none());
+
+        assert!(tx.convert_to_steer(0));
+        let Some(ExtractedCommand::Interrupt(inputs)) = rx.poll() else {
+            panic!("{NOT_AN_INTERRUPT}");
+        };
+        assert_eq!(inputs[0].message, FIRST);
+
+        tx.push(steer(SECOND));
+        assert!(tx.convert_to_queue(0));
+        assert!(rx.poll().is_none());
+        assert_eq!(runs(&rx), vec![vec![SECOND]]);
+    }
+
+    #[test]
+    fn poll_hands_the_whole_steer_run_to_one_turn() {
         let (tx, rx) = queue();
         for text in [FIRST, SECOND, THIRD] {
-            tx.push(message(text));
+            tx.push(steer(text));
         }
 
         let Some(ExtractedCommand::Interrupt(inputs)) = rx.poll() else {

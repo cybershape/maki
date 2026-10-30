@@ -26,7 +26,8 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | Key | Action |
 |-----|--------|
 | `Enter` | Submit prompt |
-| `Shift+Enter` / `Ctrl+Enter` / `Ctrl+J` / `Alt+Enter` | Newline |
+| `Shift+Enter` / `Ctrl+J` / `Alt+Enter` | Newline |
+| `Ctrl+Enter` | Steer agent |
 | `Tab` | Switch between plan and build |
 | `/command` | Open command palette |
 | `Ctrl+W` | Delete word backward |
@@ -39,7 +40,8 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+E` | Jump to end of line |
 | `Ctrl+G` | Scroll to top |
 | `Ctrl+Alt+G` | Scroll to bottom |
-| `Ctrl+Q` | Pop queue |
+| `Ctrl+E` | Edit queued message |
+| `Ctrl+Q` | Queue message |
 | `Esc Esc` | Rewind |
 | `Alt+O` | Edit input in external editor |
 | `Alt+Z` | Undo typing / paste |

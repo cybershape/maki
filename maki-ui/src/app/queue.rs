@@ -7,7 +7,7 @@ use maki_agent::{AgentInput, AgentMode, ImageSource, InputSource};
 use maki_lua::agent_autocmd::HostEvent;
 
 use super::mode::{Mode, PlanTrigger};
-use super::{Action, App, Status};
+use super::{Action, App, InputWriter, Status};
 
 use crate::agent::shared_queue::{Compaction, QueueItem, QueueSender, QueuedInput};
 use crate::components::queue_panel::QueueEntry;
@@ -45,12 +45,24 @@ impl MessageQueue {
         self.shared.as_ref().map_or(0, |s| s.len())
     }
 
-    pub(crate) fn remove(&mut self, index: usize) {
-        if let Some(ref shared) = self.shared
-            && shared.remove(index).is_some()
-        {
+    pub(crate) fn remove(&mut self, index: usize) -> Option<QueueItem> {
+        let item = self.shared.as_ref().and_then(|s| s.remove(index));
+        if item.is_some() {
             self.clamp_focus();
         }
+        item
+    }
+
+    pub(crate) fn convert_to_steer(&mut self, index: usize) -> bool {
+        self.shared
+            .as_ref()
+            .is_some_and(|s| s.convert_to_steer(index))
+    }
+
+    pub(crate) fn convert_to_queue(&mut self, index: usize) -> bool {
+        self.shared
+            .as_ref()
+            .is_some_and(|s| s.convert_to_queue(index))
     }
 
     pub(crate) fn clear(&mut self) {
@@ -213,17 +225,74 @@ impl App {
             .map(|text| QueueEntry {
                 text: Cow::Owned(text),
                 color,
+                is_steer: true,
             })
             .collect()
     }
 
     pub(super) fn pop_active_queue(&mut self) {
+        let item = if self.is_main_chat() {
+            self.queue.remove(0)
+        } else if let Some(ref inbox) = self.chats[self.active_chat].inbox {
+            inbox.remove(0).map(|input| {
+                QueueItem::Message(QueuedInput {
+                    text: input.message.clone(),
+                    input,
+                    run_id: 0,
+                    displayed: false,
+                })
+            })
+        } else {
+            None
+        };
+
+        let Some(item) = item else {
+            return;
+        };
+        let (text, images) = match item {
+            QueueItem::Message(queued) | QueueItem::Steer(queued) => {
+                (queued.text, queued.input.images)
+            }
+            QueueItem::Compact(compaction) => {
+                (compaction.instructions.unwrap_or_default(), Vec::new())
+            }
+        };
+        self.input_box.set_input(&text);
+        for img in images {
+            self.input_box.attach_image(img);
+        }
+        self.input_box.buffer.move_to_end();
+        self.input_changed(InputWriter::Anyone);
+    }
+
+    pub(super) fn convert_active_to_steer(&mut self) -> bool {
         if self.is_main_chat() {
-            return self.queue.remove(0);
+            let idx = self.queue.focus().unwrap_or(0);
+            return self.queue.convert_to_steer(idx);
         }
-        if let Some(ref inbox) = self.chats[self.active_chat].inbox {
-            inbox.remove(0);
+        false
+    }
+
+    pub(super) fn convert_active_to_queue(&mut self) -> bool {
+        if self.is_main_chat() {
+            let idx = self.queue.focus().unwrap_or(0);
+            return self.queue.convert_to_queue(idx);
         }
+        false
+    }
+
+    pub(super) fn steer_and_notify(&mut self, msg: QueuedMessage) -> bool {
+        let Some(ref shared) = self.queue.shared else {
+            return false;
+        };
+        let input = self.build_agent_input(&msg);
+        shared.push(QueueItem::Steer(QueuedInput {
+            text: msg.text,
+            input,
+            run_id: self.run_id,
+            displayed: false,
+        }));
+        true
     }
 
     /// Deferred path: the agent is busy, so park the message and let

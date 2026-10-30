@@ -54,11 +54,9 @@ const UNCLEAN_TEXT_ERR: &str = "edit text has tabs, carriage returns or control 
 
 pub fn is_newline_key(key: &KeyEvent) -> bool {
     (matches!(key.code, KeyCode::Enter)
-        && key.modifiers.intersects(
-            KeyModifiers::SHIFT
-                .union(KeyModifiers::CONTROL)
-                .union(KeyModifiers::ALT),
-        ))
+        && key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT.union(KeyModifiers::ALT)))
         || (key.code == KeyCode::Char('j') && key.modifiers == KeyModifiers::CONTROL)
 }
 

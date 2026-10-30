@@ -150,7 +150,13 @@ pub mod key {
         modifiers: KeyModifiers::CONTROL.union(KeyModifiers::ALT),
         label: mod_key!("Alt+G"),
     };
-    pub const POP_QUEUE: Bind = ctrl_bind!('q');
+    pub const POP_QUEUE: Bind = ctrl_bind!('e');
+    pub const QUEUE: Bind = ctrl_bind!('q');
+    pub const STEER: Bind = Bind {
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::CONTROL,
+        label: "Ctrl+Enter",
+    };
     pub const DELETE_WORD: Bind = ctrl_bind!('w');
     pub const SEARCH: Bind = ctrl_bind!('f');
     pub const FORK: Bind = ctrl_bind!('f');
@@ -374,11 +380,14 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::MacMulti(
-            &["Shift+Enter", "Ctrl+Enter", "Ctrl+J", "Alt+Enter"],
-            &["⇧↵", "⌃↵", "⌃J", "⌥↵"],
-        ),
+        label: KeyLabel::MacMulti(&["Shift+Enter", "Ctrl+J", "Alt+Enter"], &["⇧↵", "⌃J", "⌥↵"]),
         description: "Newline",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::MacAlt(key::STEER.label, "⌃↵"),
+        description: "Steer agent",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
@@ -468,7 +477,13 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single(key::POP_QUEUE.label),
-        description: "Pop queue",
+        description: "Edit queued message",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::QUEUE.label),
+        description: "Queue message",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },

@@ -1451,7 +1451,13 @@ impl App {
                 KeyCode::Esc => self.queue.unfocus(),
                 _ if key::QUIT.matches(key) => self.queue.unfocus(),
                 _ if key::POP_QUEUE.matches(key) => {
-                    self.queue.remove(0);
+                    self.pop_active_queue();
+                }
+                _ if key::STEER.matches(key) => {
+                    self.convert_active_to_steer();
+                }
+                _ if key::QUEUE.matches(key) => {
+                    self.convert_active_to_queue();
                 }
                 _ => {}
             }
@@ -2049,8 +2055,12 @@ impl App {
             return vec![];
         }
         if is_ctrl(&key) {
-            if key::POP_QUEUE.matches(key) {
+            if key::POP_QUEUE.matches(key) && self.active_queue_len() > 0 {
                 return self.run_builtin(BuiltinAction::PopQueue);
+            } else if key::QUEUE.matches(key) && self.convert_active_to_queue() {
+                return vec![];
+            } else if key::STEER.matches(key) {
+                return self.handle_steer_key();
             } else if key::OPEN_EDITOR.matches(key) {
                 return self.run_builtin(BuiltinAction::PlanEditor);
             } else if key::SEARCH.matches(key) {
@@ -2179,6 +2189,39 @@ impl App {
             Sending::Shell(prefix) => self.run_shell_line(prefix),
             Sending::Message if self.is_main_chat() => self.submit_or_queue(sub.into()),
             Sending::Message => self.queue_for_subagent(sub.into()),
+        }
+    }
+
+    fn handle_steer_key(&mut self) -> Vec<Action> {
+        if self.input_box.is_empty() && self.active_queue_len() > 0 {
+            self.convert_active_to_steer();
+            return vec![];
+        }
+        let sub = self.input_box.submit().unwrap_or_default();
+        if matches!(
+            self.sending(&sub.text, !sub.images.is_empty()),
+            Sending::Message
+        ) && self.status == Status::Streaming
+        {
+            if sub.text.trim().is_empty() && sub.images.is_empty() {
+                self.flash(crate::app::queue::EMPTY_PROMPT_ERR.into());
+                return vec![];
+            }
+            if self.state.mode == Mode::Plan {
+                self.transition_plan(PlanTrigger::InteractivePrompt);
+            }
+            if self.is_main_chat() {
+                if self.steer_and_notify(sub.into()) {
+                    vec![]
+                } else {
+                    self.flash(crate::app::queue::NO_QUEUE_ERR.into());
+                    vec![]
+                }
+            } else {
+                self.queue_for_subagent(sub.into())
+            }
+        } else {
+            self.handle_submit(sub)
         }
     }
 
