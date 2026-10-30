@@ -17,7 +17,7 @@ use crate::template::Vars;
 use crate::{BufferSnapshot, ToolOutput};
 
 use super::hook::ToolHook;
-use super::schema::sanitize_tool_input_schema;
+use super::schema::{inject_toolcall_reason, sanitize_tool_input_schema};
 use super::{DescriptionContext, ToolContext};
 use crate::agent::AgentHook;
 
@@ -511,10 +511,14 @@ impl ToolRegistry {
                 continue;
             }
             let description = vars.apply(&entry.tool.description(ctx)).into_owned();
+            let mut schema = sanitize_tool_input_schema(entry.tool.schema());
+            // A tool that already declares the field (bash does, and reads it
+            // for its header) keeps its own. The inject returns false then.
+            inject_toolcall_reason(&mut schema);
             let mut def = json!({
                 "name": entry.name(),
                 "description": description,
-                "input_schema": sanitize_tool_input_schema(entry.tool.schema()),
+                "input_schema": schema,
             });
             if let Some(examples) = entry.tool.examples() {
                 if supports_examples {
@@ -615,9 +619,14 @@ mod tests {
         };
         let defs = reg.definitions(&Vars::new(), &ctx, false);
         assert_eq!(
-            defs[0]["input_schema"],
-            json!({"type": "object", "properties": {}}),
+            defs[0]["input_schema"]["type"], "object",
             "{EMPTY_SCHEMA_REJECTED}"
+        );
+        assert!(
+            defs[0]["input_schema"]["properties"]
+                .as_object()
+                .is_some_and(|props| props.contains_key(crate::tools::schema::TOOLCALL_REASON_FIELD)),
+            "every schema gains a reason field"
         );
     }
 

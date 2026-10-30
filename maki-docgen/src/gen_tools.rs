@@ -1,4 +1,5 @@
 use maki_agent::template::Vars;
+use maki_agent::tools::schema::TOOLCALL_REASON_FIELD;
 use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolSource};
 use maki_config::{PluginFileConfig, PluginsConfig};
 use regex::Regex;
@@ -79,6 +80,20 @@ fn first_paragraph(desc: &str) -> &str {
     desc.split("\n\n").next().unwrap_or(desc)
 }
 
+/// Drops a `toolcall_reason` this process injected. One a tool declared
+/// itself has no marker and stays in the reference.
+fn documented_schema(schema: &Value) -> Value {
+    let mut schema = schema.clone();
+    if schema["properties"][TOOLCALL_REASON_FIELD]["x-maki-injected"]
+        .as_bool()
+        .unwrap_or(false)
+        && let Some(properties) = schema.get_mut("properties").and_then(|p| p.as_object_mut())
+    {
+        properties.remove(TOOLCALL_REASON_FIELD);
+    }
+    schema
+}
+
 fn extract_params(schema: &Value) -> Vec<Param> {
     let properties = match schema.get("properties").and_then(|p| p.as_object()) {
         Some(p) => p,
@@ -141,7 +156,7 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
         .and_then(|d| d.as_str())
         .unwrap_or("");
     let schema = info.def.get("input_schema").cloned().unwrap_or(Value::Null);
-    let params = extract_params(&schema);
+    let params = extract_params(&documented_schema(&schema));
     let summary = first_paragraph(description);
 
     writeln!(out).unwrap();

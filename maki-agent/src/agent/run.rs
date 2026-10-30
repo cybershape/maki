@@ -208,7 +208,7 @@ impl<'h> Agent<'h> {
             cancel: CancelToken::none(),
             ledger: params.ledger,
             num_turns: 0,
-            recent_calls: RecentCalls::new(),
+            recent_calls: RecentCalls::new(&[]),
             auto_compact: compaction::auto_compact_enabled(),
             loaded_instructions: LoadedInstructions::new(),
             instruction_files: Arc::default(),
@@ -536,6 +536,10 @@ impl<'h> Agent<'h> {
         if let Some(mcp) = &self.mcp {
             self.history
                 .append_late_tools(mcp, ToolDeferral::for_model(&self.model));
+        }
+        if let Some(tools) = self.history.live_frame().map(|frame| frame.wire.clone()) {
+            self.recent_calls
+                .set_tools(tools.as_array().map_or(&[], Vec::as_slice));
         }
         // After a cut-off answer the request continues it, and an update
         // there would get a reply instead. The next request tells it.

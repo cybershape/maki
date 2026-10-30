@@ -17,6 +17,9 @@ use crate::permissions::{LayerAnswer, PermissionCheck, PromptLayers};
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
 use crate::tools::registry::{BoxFuture, InstalledHook, RegisteredTool, Tool, ToolInvocation};
+use crate::tools::schema::{
+    TOOLCALL_REASON_FIELD, strip_toolcall_reason, toolcall_reason_injected,
+};
 use crate::tools::{
     CallOrigin, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience, ToolContext,
     ToolLive, truncate_bytes,
@@ -66,18 +69,42 @@ const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
 /// gives up".
 const HOOK_CHAIN_MAX: Duration = Duration::from_secs(60);
 
-pub(super) struct RecentCalls(VecDeque<(String, u64)>);
+pub(super) struct RecentCalls {
+    calls: VecDeque<(String, u64)>,
+    /// The frame's tool array, so [`Self::hash_input`] can tell a reason we
+    /// injected from a parameter a tool declared itself.
+    tools: Vec<Value>,
+}
 
 impl RecentCalls {
-    pub(super) fn new() -> Self {
-        Self(VecDeque::new())
+    pub(super) fn new(tools: &[Value]) -> Self {
+        Self {
+            calls: VecDeque::new(),
+            tools: tools.to_vec(),
+        }
+    }
+
+    /// A frame is rebuilt on compaction and grows as MCP servers connect, so
+    /// the schemas this hashes against have to follow it.
+    pub(super) fn set_tools(&mut self, tools: &[Value]) {
+        self.tools = tools.to_vec();
     }
 
     /// Sorts keys and trims strings first, so key reordering and whitespace
     /// churn around a value do not dodge the guard. Interior whitespace is
     /// kept, it can matter inside a command or pattern.
-    fn hash_input(input: &Value) -> u64 {
+    ///
+    /// [`TOOLCALL_REASON_FIELD`] is dropped first. It is narration we asked
+    /// for, and two calls that differ only in how they were phrased are the
+    /// same call. A tool that declares the field itself is unaffected: its
+    /// value is an argument, and hashing it here would hide a real change.
+    fn hash_input(name: &str, input: &Value, tools: &[Value]) -> u64 {
         let mut input = input.clone();
+        if toolcall_reason_injected(tools, name)
+            && let Value::Object(map) = &mut input
+        {
+            map.remove(TOOLCALL_REASON_FIELD);
+        }
         input.sort_all_objects();
         trim_strings(&mut input);
         let mut h = DefaultHasher::new();
@@ -86,10 +113,10 @@ impl RecentCalls {
     }
 
     fn is_doom_loop(&self, name: &str, input: &Value) -> bool {
-        let hash = Self::hash_input(input);
-        self.0.len() >= DOOM_LOOP_THRESHOLD - 1
+        let hash = Self::hash_input(name, input, &self.tools);
+        self.calls.len() >= DOOM_LOOP_THRESHOLD - 1
             && self
-                .0
+                .calls
                 .iter()
                 .rev()
                 .take(DOOM_LOOP_THRESHOLD - 1)
@@ -97,9 +124,10 @@ impl RecentCalls {
     }
 
     fn record(&mut self, name: String, input: &Value) {
-        self.0.push_back((name, Self::hash_input(input)));
-        if self.0.len() > DOOM_LOOP_THRESHOLD {
-            self.0.pop_front();
+        let hash = Self::hash_input(&name, input, &self.tools);
+        self.calls.push_back((name, hash));
+        if self.calls.len() > DOOM_LOOP_THRESHOLD {
+            self.calls.pop_front();
         }
     }
 }
@@ -805,6 +833,15 @@ fn search_query(input: &Value) -> &str {
     input[SEARCH_QUERY_FIELD].as_str().unwrap_or_default()
 }
 
+/// The reason the model gave for this call, removed so the tool never sees it.
+///
+/// Only MCP and `tool_search` come through here, and neither publishes a
+/// schema that declares [`TOOLCALL_REASON_FIELD`], so the value is always one
+/// we asked for.
+fn take_toolcall_reason(input: &mut Value) -> Option<String> {
+    strip_toolcall_reason(true, input)
+}
+
 pub fn routed_view(name: &str, input: &Value) -> Option<RoutedView> {
     if name == TOOL_SEARCH_TOOL_NAME {
         Some(RoutedView::tool_search(input))
@@ -851,10 +888,13 @@ fn run_tool_search(
     origin: CallOrigin,
 ) -> ToolDoneEvent {
     let tool_id: Arc<str> = Arc::from(TOOL_SEARCH_TOOL_NAME);
-    let view = RoutedView::tool_search(input);
-    emit_raw_start(ctx, origin, &id, &tool_id, view.summary.clone(), input);
+    let mut input = input.clone();
+    let reason = take_toolcall_reason(&mut input);
+    let view = RoutedView::tool_search(&input);
+    let summary = reason.unwrap_or(view.summary.clone());
+    emit_raw_start(ctx, origin, &id, &tool_id, summary, &input);
     let deferral = ToolDeferral::for_model(&ctx.model);
-    let (output, is_error) = match mcp.search_tools(search_query(input), origin, deferral) {
+    let (output, is_error) = match mcp.search_tools(search_query(&input), origin, deferral) {
         Ok(found) => (found, false),
         Err(e) => (e.into(), true),
     };
@@ -1074,8 +1114,11 @@ async fn execute_mcp_tool(
     ask: Option<&str>,
     hook: Option<&Hook<'_>>,
 ) -> ToolDoneEvent {
+    let mut input = input.clone();
+    let reason = take_toolcall_reason(&mut input);
     let view = RoutedView::mcp(&tool);
-    emit_raw_start(ctx, origin, id, &tool, view.summary.clone(), input);
+    let summary = reason.unwrap_or(view.summary.clone());
+    emit_raw_start(ctx, origin, id, &tool, summary, &input);
     let done = |output: TextOutput, is_error: bool| ToolDoneEvent {
         call: None,
         id: id.to_owned(),
@@ -1092,13 +1135,13 @@ async fn execute_mcp_tool(
             return done(format!("invalid MCP tool key '{tool}': {e}").into(), true);
         }
     };
-    if let Err(e) = gate_on_input(ctx, &perm_tool, id, input, ask, hook).await {
+    if let Err(e) = gate_on_input(ctx, &perm_tool, id, &input, ask, hook).await {
         return done(e.into(), true);
     }
 
     // Only a permitted call loads the tool.
     let loaded_tools = mcp.load_called(&tool, origin, ToolDeferral::for_model(&ctx.model));
-    let (text, is_error) = match mcp.call_tool(&tool, input).await {
+    let (text, is_error) = match mcp.call_tool(&tool, &input).await {
         Ok(text) => (text, false),
         Err(e) => (e.to_string(), true),
     };
@@ -1348,7 +1391,7 @@ mod tests {
     const PROMPT_THINK_TIME: Duration = Duration::from_millis(20);
 
     fn recent_calls(entries: &[(&str, Value)]) -> RecentCalls {
-        let mut rc = RecentCalls::new();
+        let mut rc = RecentCalls::new(&[]);
         for (n, v) in entries {
             rc.record(n.to_string(), v);
         }
@@ -1376,8 +1419,34 @@ mod tests {
     #[test_case(json!({"path": "/a", "offset": 1}), json!({"path": "/a", "offset": 201}), false ; "paginated_read")]
     fn doom_loop_input_normalization(a: Value, b: Value, same: bool) {
         assert_eq!(
-            RecentCalls::hash_input(&a) == RecentCalls::hash_input(&b),
+            RecentCalls::hash_input("", &a, &[]) == RecentCalls::hash_input("", &b, &[]),
             same
+        );
+    }
+
+    #[test]
+    fn doom_loop_ignores_an_injected_reason_but_keeps_a_declared_one() {
+        let injected = vec![json!({
+            "name": "read",
+            "input_schema": {
+                "properties": { TOOLCALL_REASON_FIELD: { "x-maki-injected": true } }
+            }
+        })];
+        let declared = vec![json!({
+            "name": "read",
+            "input_schema": {
+                "properties": { TOOLCALL_REASON_FIELD: { "description": "the tool's own" } }
+            }
+        })];
+        let plain = json!({"path": "/a"});
+        let phrased = json!({"path": "/a", TOOLCALL_REASON_FIELD: "checking the file"});
+        assert_eq!(
+            RecentCalls::hash_input("read", &plain, &injected),
+            RecentCalls::hash_input("read", &phrased, &injected)
+        );
+        assert_ne!(
+            RecentCalls::hash_input("read", &plain, &declared),
+            RecentCalls::hash_input("read", &phrased, &declared)
         );
     }
 
@@ -2436,6 +2505,32 @@ mod tests {
             assert_eq!(start.tool.as_ref(), "local_echo");
             assert_eq!(start.summary, "local_echo");
             assert_eq!(start.raw_input, Some(input));
+        });
+    }
+
+    const SEARCH_REASON: &str = "looking for the probe";
+
+    #[test]
+    fn tool_search_reason_becomes_the_header_and_leaves_the_query() {
+        smol::block_on(async {
+            let (tx, rx) = flume::unbounded::<crate::Envelope>();
+            let event_tx = crate::EventSender::new(tx, 0);
+            let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
+            ctx.mcp = Some(stub_mcp(&[PROBE_QUALIFIED]));
+            let done = dispatch(
+                &ctx,
+                TOOL_SEARCH_TOOL_NAME,
+                &serde_json::json!({
+                    "query": SEARCH_QUERY,
+                    TOOLCALL_REASON_FIELD: SEARCH_REASON,
+                }),
+            )
+            .await;
+            assert!(!done.is_error, "got: {}", done.output.as_text());
+            let AgentEvent::ToolStart(start) = rx.try_recv().expect("a start").event else {
+                panic!("expected ToolStart");
+            };
+            assert_eq!(start.summary, SEARCH_REASON);
         });
     }
 

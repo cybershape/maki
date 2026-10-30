@@ -45,7 +45,7 @@ use self::http::HttpTransport;
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
 use crate::tools::CallOrigin;
-use crate::tools::schema::sanitize_tool_input_schema;
+use crate::tools::schema::{inject_toolcall_reason, sanitize_tool_input_schema};
 use crate::types::TextOutput;
 
 const SEPARATOR: &str = ".";
@@ -1170,7 +1170,8 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
                         transport: Arc::clone(transport),
                     },
                 );
-                let sanitized_schema = sanitize_tool_input_schema(t.input_schema.clone());
+                let mut sanitized_schema = sanitize_tool_input_schema(t.input_schema.clone());
+                inject_toolcall_reason(&mut sanitized_schema);
                 descriptors.push(ToolDescriptor {
                     qualified_name: Arc::clone(&t.qualified_name),
                     always_load,
@@ -1378,7 +1379,7 @@ fn tool_search_definition(deferred: &[&ToolDescriptor]) -> Value {
     if catalog.is_empty() {
         catalog.push_str(EMPTY_CATALOG);
     }
-    json!({
+    let mut definition = json!({
         "name": TOOL_SEARCH_TOOL_NAME,
         "description": format!(
             "Search and load deferred MCP tools; they are not callable until \
@@ -1398,7 +1399,9 @@ fn tool_search_definition(deferred: &[&ToolDescriptor]) -> Value {
             },
             "required": ["query"]
         }
-    })
+    });
+    inject_toolcall_reason(&mut definition["input_schema"]);
+    definition
 }
 
 fn spawn_persist_enabled(path: PathBuf, name: String, enabled: bool) {

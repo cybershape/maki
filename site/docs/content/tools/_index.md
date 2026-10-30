@@ -19,8 +19,8 @@ Commands run in the session's working directory (see Environment) by default.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `command` | string | yes |  | The bash command to execute |
-| `description` | string | no |  | Short description (3-5 words) of what the command does |
 | `timeout` | integer | no | 120 | Timeout in seconds |
+| `toolcall_reason` | string | no |  | One short sentence on why you are calling this tool and what you expect. Not your reasoning. |
 | `workdir` | string | no | cwd | Working directory |
 
 ### `list_dir` {#list_dir}

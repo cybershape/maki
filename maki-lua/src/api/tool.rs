@@ -12,7 +12,9 @@ use maki_agent::permissions::is_universal_scope;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
 use maki_agent::tools::Tool;
 use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
-use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
+use maki_agent::tools::schema::{
+    ParamSchema, TOOLCALL_REASON_FIELD, to_json_schema, try_from_json, validate,
+};
 use maki_agent::tools::{
     BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
     PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
@@ -289,6 +291,10 @@ impl Tool for LuaTool {
     }
 
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+        // Read before `validate`, which drops every key the schema does not
+        // declare. A schema that declares the field itself keeps the value:
+        // that one belongs to the tool.
+        let reason = toolcall_reason(self.schema, input);
         let validated = validate(self.schema, input.clone())?;
         let permission_state = match self.permission.as_ref().and_then(|p| p.scopes.as_ref()) {
             Some(PermissionScopeKind::Field(field)) => {
@@ -312,8 +318,30 @@ impl Tool for LuaTool {
             mutable_path_field: self.mutable_path_field.clone(),
             timeout: self.timeout,
             start_annotation: self.start_annotation.clone(),
+            reason,
         }))
     }
+}
+
+/// The model's one-line account of this call, when we asked for one.
+///
+/// A tool whose own schema already has [`TOOLCALL_REASON_FIELD`] is skipped:
+/// its value is an argument, and taking it would change what the handler sees.
+fn toolcall_reason(schema: &ParamSchema, input: &Value) -> Option<String> {
+    let ParamSchema::Object { properties, .. } = schema else {
+        return None;
+    };
+    if properties
+        .iter()
+        .any(|(name, ..)| *name == TOOLCALL_REASON_FIELD)
+    {
+        return None;
+    }
+    let reason = input
+        .get(TOOLCALL_REASON_FIELD)
+        .and_then(Value::as_str)?
+        .trim();
+    (!reason.is_empty()).then(|| reason.to_owned())
 }
 
 enum PermissionState {
@@ -327,6 +355,9 @@ struct LuaToolInvocation {
     has_header_fn: bool,
     has_start_fn: bool,
     input: Value,
+    /// Set only when the schema does not declare [`TOOLCALL_REASON_FIELD`],
+    /// so the header can lead with it without the handler ever seeing it.
+    reason: Option<String>,
     tx: Sender<Request>,
     permission_state: PermissionState,
     mutable_path_field: Option<Arc<str>>,
@@ -336,6 +367,9 @@ struct LuaToolInvocation {
 
 impl ToolInvocation for LuaToolInvocation {
     fn start_header(&self) -> HeaderFuture {
+        if let Some(reason) = &self.reason {
+            return HeaderFuture::Ready(HeaderResult::plain(reason.clone()));
+        }
         if !self.has_header_fn {
             return HeaderFuture::Ready(HeaderResult::plain(self.tool.to_string()));
         }
@@ -2047,6 +2081,7 @@ mod tests {
             timeout: Some(Duration::from_secs(60)),
             start_annotation: None,
             has_start_fn: false,
+            reason: None,
         }
     }
 
@@ -2107,6 +2142,43 @@ mod tests {
             examples: None,
             has_describe_fn: false,
         }
+    }
+
+    const CALL_REASON: &str = "checking the url";
+
+    #[test]
+    fn parse_lifts_an_injected_reason_into_the_header() {
+        let inv = make_lua_tool(None)
+            .parse(&serde_json::json!({
+                "url": "https://example.com",
+                TOOLCALL_REASON_FIELD: format!("  {CALL_REASON}  "),
+            }))
+            .unwrap();
+        assert_eq!(
+            inv.start_header().into_ready().text(),
+            CALL_REASON,
+            "the header leads with the reason instead of the tool name"
+        );
+    }
+
+    #[test]
+    fn parse_keeps_a_reason_the_schema_declares() {
+        let schema = try_from_json(&serde_json::json!({
+            "type": "object",
+            "properties": { TOOLCALL_REASON_FIELD: { "type": "string" } },
+        }))
+        .unwrap();
+        let mut tool = make_lua_tool(None);
+        let name = tool.name.to_string();
+        tool.schema = schema;
+        let inv = tool
+            .parse(&serde_json::json!({ TOOLCALL_REASON_FIELD: CALL_REASON }))
+            .unwrap();
+        assert_eq!(
+            inv.start_header().into_ready().text(),
+            name,
+            "a declared field is an argument, not a header"
+        );
     }
 
     #[test]
@@ -2208,6 +2280,7 @@ mod tests {
             timeout: None,
             start_annotation: None,
             has_start_fn: false,
+            reason: None,
         };
         let scopes = smol::block_on(inv.permission_scopes()).expect("should fallback");
         assert!(scopes.force_prompt);
@@ -2226,6 +2299,7 @@ mod tests {
             timeout: None,
             start_annotation: None,
             has_start_fn: false,
+            reason: None,
         };
         std::thread::spawn(move || {
             if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx2.recv() {
@@ -2250,6 +2324,7 @@ mod tests {
             timeout: None,
             start_annotation: None,
             has_start_fn: false,
+            reason: None,
         };
         std::thread::spawn(move || {
             if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx.recv() {

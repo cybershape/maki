@@ -16,6 +16,7 @@ use crate::components::{
 use crate::markdown::truncate_output;
 
 use crate::selection::{DocPos, RowPos, Selection};
+use maki_agent::tools::schema::TOOLCALL_REASON_FIELD;
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
@@ -592,6 +593,12 @@ impl Chat {
     }
 }
 
+/// The reason stored on a call that has no header of its own.
+fn toolcall_reason(input: &serde_json::Value) -> Option<String> {
+    let reason = input.get(TOOLCALL_REASON_FIELD)?.as_str()?.trim();
+    (!reason.is_empty()).then(|| reason.to_owned())
+}
+
 pub fn history_to_display(
     messages: &[Message],
     tool_outputs: &HashMap<String, Arc<ToolOutput>>,
@@ -706,7 +713,16 @@ pub fn history_to_display(
                             let reg = ToolRegistry::global();
                             let tool_call: Option<Box<dyn ToolInvocation>> =
                                 reg.get(name).and_then(|entry| entry.try_parse(input));
-                            let summary = reg.resolve_header(name, input);
+                            // A registry tool's header already leads with the
+                            // reason. MCP and `tool_search` have none, and no
+                            // schema of their own declares the field, so the
+                            // stored value is the one we asked the model for.
+                            let summary = if tool_call.is_none() {
+                                toolcall_reason(input)
+                            } else {
+                                None
+                            }
+                            .unwrap_or_else(|| reg.resolve_header(name, input));
                             let (status, result_text) = results
                                 .get(id.as_str())
                                 .map(|(err, text)| {

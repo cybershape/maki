@@ -15,6 +15,19 @@ use tracing::{debug, warn};
 
 pub(crate) const PARAM_PREVIEW_MAX: usize = 120;
 
+/// Injected into every tool schema that does not already declare it, so the
+/// model states why it is calling the tool. A short sentence, never a
+/// reasoning trace: asking a parameter for step-by-step reasoning draws a
+/// `reasoning_extraction` refusal.
+pub const TOOLCALL_REASON_FIELD: &str = "toolcall_reason";
+pub const TOOLCALL_REASON_DESCRIPTION: &str =
+    "One short sentence on why you are calling this tool and what you expect. Not your reasoning.";
+
+/// Set on a [`TOOLCALL_REASON_FIELD`] property we added, so a consumer that
+/// shows schemas to a person (the docs) can tell it from one a tool declared.
+/// A model never reads it: unknown schema keywords are ignored.
+const TOOLCALL_REASON_INJECTED: &str = "x-maki-injected";
+
 const PREVIEW_SUFFIX: &str = "...";
 const JSON_ENCODED_ARRAY_HINT: &str = "Pass a JSON array, not a JSON-encoded string.";
 const JSON_ENCODED_OBJECT_HINT: &str = "Pass a JSON object, not a JSON-encoded string.";
@@ -702,6 +715,77 @@ fn log_coercion(
     );
 }
 
+/// Adds [`TOOLCALL_REASON_FIELD`] to an object schema that does not already
+/// declare it. `false` means the schema already has the property, so the
+/// caller must leave both the schema and any incoming value of that name
+/// alone: it belongs to the tool, not to us.
+///
+/// A schema that is not an object, or an object without `properties`, is
+/// shaped first. [`sanitize_tool_input_schema`] is what every schema passes
+/// through before it is shown to a model, so this sees the same shape.
+pub fn inject_toolcall_reason(schema: &mut Value) -> bool {
+    if !schema.is_object() {
+        *schema = json!({ "type": "object" });
+    }
+    let map = schema.as_object_mut().expect("just made an object");
+    if !map.contains_key("properties") {
+        sanitize_object_schema(map);
+    }
+    let properties = map
+        .get_mut("properties")
+        .and_then(|p| p.as_object_mut())
+        .expect("sanitize_object_schema inserts properties");
+    if properties.contains_key(TOOLCALL_REASON_FIELD) {
+        return false;
+    }
+    properties.insert(
+        TOOLCALL_REASON_FIELD.to_owned(),
+        json!({
+            "type": "string",
+            "description": TOOLCALL_REASON_DESCRIPTION,
+            TOOLCALL_REASON_INJECTED: true,
+        }),
+    );
+    true
+}
+
+/// Pulls [`TOOLCALL_REASON_FIELD`] out of a call's arguments.
+///
+/// `injected` is what [`inject_toolcall_reason`] returned for this tool. When
+/// it is `false` the property is the tool's own and the value stays. A value
+/// that is not a string is dropped either way: the field we injected only
+/// accepts one, and anything else is the model ignoring the schema.
+pub fn strip_toolcall_reason(injected: bool, input: &mut Value) -> Option<String> {
+    if !injected {
+        return None;
+    }
+    let Value::Object(map) = input else {
+        return None;
+    };
+    match map.remove(TOOLCALL_REASON_FIELD)? {
+        Value::String(reason) => {
+            let reason = reason.trim().to_owned();
+            (!reason.is_empty()).then_some(reason)
+        }
+        _ => None,
+    }
+}
+
+/// Whether the published schema of `name` carries a [`TOOLCALL_REASON_FIELD`]
+/// we added. A tool whose own schema already declares the property, or one we
+/// cannot find a schema for, answers `false`: its value is not ours to take.
+pub fn toolcall_reason_injected(tools: &[Value], name: &str) -> bool {
+    let Some(schema) = tools
+        .iter()
+        .find_map(|tool| (tool["name"].as_str() == Some(name)).then(|| &tool["input_schema"]))
+    else {
+        return false;
+    };
+    schema["properties"][TOOLCALL_REASON_FIELD][TOOLCALL_REASON_INJECTED]
+        .as_bool()
+        .unwrap_or(false)
+}
+
 /// Sanitize a tool input schema to comply with OpenAI function-calling requirements.
 ///
 /// OpenAI requires the top-level `parameters` of every function to be an object
@@ -1356,6 +1440,86 @@ mod tests {
             result["properties"]["pair"],
             json!({"type": ["array", "null"], "items": {"type": "string"}})
         );
+    }
+
+    const REASON: &str = "why this call";
+
+    #[test]
+    fn inject_adds_the_reason_to_an_empty_schema() {
+        let mut schema = json!({});
+        assert!(inject_toolcall_reason(&mut schema));
+        assert_eq!(schema["type"], "object");
+        assert_eq!(
+            schema["properties"][TOOLCALL_REASON_FIELD],
+            json!({
+                "type": "string",
+                "description": TOOLCALL_REASON_DESCRIPTION,
+                TOOLCALL_REASON_INJECTED: true,
+            })
+        );
+        assert!(schema.get("required").is_none());
+    }
+
+    #[test]
+    fn inject_keeps_existing_properties_and_required() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"]
+        });
+        assert!(inject_toolcall_reason(&mut schema));
+        assert_eq!(schema["properties"]["path"], json!({ "type": "string" }));
+        assert_eq!(schema["required"], json!(["path"]));
+        assert!(schema["properties"].get(TOOLCALL_REASON_FIELD).is_some());
+    }
+
+    #[test]
+    fn inject_leaves_a_schema_that_already_declares_the_field() {
+        let original = json!({
+            "type": "object",
+            "properties": { TOOLCALL_REASON_FIELD: { "type": "integer" } }
+        });
+        let mut schema = original.clone();
+        assert!(!inject_toolcall_reason(&mut schema));
+        assert_eq!(schema, original);
+    }
+
+    #[test]
+    fn strip_returns_the_reason_and_drops_it() {
+        let mut input = json!({ "path": "/a", TOOLCALL_REASON_FIELD: format!("  {REASON}  ") });
+        assert_eq!(strip_toolcall_reason(true, &mut input), Some(REASON.into()));
+        assert_eq!(input, json!({ "path": "/a" }));
+    }
+
+    #[test]
+    fn strip_keeps_a_reason_the_tool_declared() {
+        let mut input = json!({ TOOLCALL_REASON_FIELD: REASON });
+        let original = input.clone();
+        assert_eq!(strip_toolcall_reason(false, &mut input), None);
+        assert_eq!(input, original);
+    }
+
+    #[test_case(json!({ TOOLCALL_REASON_FIELD: "   " }) ; "blank")]
+    #[test_case(json!({ TOOLCALL_REASON_FIELD: 7 }) ; "not_a_string")]
+    fn strip_drops_a_reason_that_is_not_a_sentence(mut input: Value) {
+        assert_eq!(strip_toolcall_reason(true, &mut input), None);
+        assert_eq!(input, json!({}));
+    }
+
+    #[test]
+    fn injected_is_recognized_only_by_our_description() {
+        let ours = json!({
+            "name": "read",
+            "input_schema": { "properties": { TOOLCALL_REASON_FIELD: { TOOLCALL_REASON_INJECTED: true } } }
+        });
+        let theirs = json!({
+            "name": "probe",
+            "input_schema": { "properties": { TOOLCALL_REASON_FIELD: { "description": "the tool's own" } } }
+        });
+        let tools = vec![ours, theirs];
+        assert!(toolcall_reason_injected(&tools, "read"));
+        assert!(!toolcall_reason_injected(&tools, "probe"));
+        assert!(!toolcall_reason_injected(&tools, "missing"));
     }
 
     #[test]

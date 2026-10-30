@@ -260,7 +260,7 @@ Commands run in the session's working directory (see Environment) by default.
 - Use `workdir` param instead of `cd <dir> && <cmd>` patterns.
 - Do NOT use to communicate text to the user.
 - Chain dependent commands with `&&`. Use batch for independent ones.
-- Provide a short `description` (3-5 words).
+- Provide a short `toolcall_reason` (3-5 words).
 - Output sent to the model is cut beyond 2000 lines or 50KB.
 - Interactive commands (sudo, ssh prompts) fail immediately.]]
 
@@ -287,7 +287,10 @@ maki.api.register_tool({
       command = { type = "string", description = "The bash command to execute", required = true },
       timeout = { type = "integer", description = "Timeout in seconds (default 120)" },
       workdir = { type = "string", description = "Working directory (default: cwd)" },
-      description = { type = "string", description = "Short description (3-5 words) of what the command does" },
+      toolcall_reason = {
+        type = "string",
+        description = "One short sentence on why you are calling this tool and what you expect. Not your reasoning.",
+      },
     },
   },
   permission = "run",
@@ -316,7 +319,7 @@ maki.api.register_tool({
 
   header = function(input)
     local command, workdir = parse_cd_hint(input)
-    local s = input.description or command
+    local s = input.toolcall_reason or command
     if workdir then
       s = s .. " in " .. relative_path(workdir)
     end
