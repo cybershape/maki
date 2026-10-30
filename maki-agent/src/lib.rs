@@ -16,8 +16,8 @@ pub mod mcp;
 pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus};
 pub use mcp::protocol::PromptRole;
 pub use mcp::{
-    McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
-    ToolDeferral,
+    McpCommand, McpFunctionInfo, McpHandle, McpModuleInfo, McpPromptArg, McpPromptInfo, McpSession,
+    McpSnapshot, McpSnapshotReader,
 };
 pub mod inbox;
 pub mod session;

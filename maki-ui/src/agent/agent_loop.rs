@@ -28,9 +28,10 @@ fn base_tools(
     vars: &Vars,
     model: &Model,
     config: &AgentConfig,
-    has_mcp: bool,
+    mcp: Option<&McpSession>,
     workflow: bool,
 ) -> RequestTools {
+    let modules = mcp.map(|s| s.modules());
     RequestTools::build(
         ToolRegistry::global(),
         vars,
@@ -38,7 +39,7 @@ fn base_tools(
         config,
         &[],
         workflow,
-        has_mcp,
+        modules.as_deref(),
     )
 }
 
@@ -217,9 +218,9 @@ impl AgentLoop {
         let instructions = self.instructions.text.clone();
         let slots = Arc::clone(&prompt_slots);
         let config = self.seed.config.clone();
-        let has_mcp = self.seed.mcp.is_some();
+        let mcp = self.seed.mcp.clone();
         let context: RunContextBuilder = Arc::new(move |model, workflow| {
-            let tools = base_tools(&vars, model, &config, has_mcp, workflow);
+            let tools = base_tools(&vars, model, &config, mcp.as_ref(), workflow);
             RunContext::render(&vars, &instructions, &slots, model, tools)
         });
         (context, prompt_slots)

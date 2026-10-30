@@ -10,7 +10,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use super::frame::LiveFrame;
-use crate::mcp::{McpSession, ToolDeferral};
+use crate::mcp::McpSession;
 use crate::session::SessionHeader;
 
 const CANCEL_MARKER: &str = "[Cancelled by user]";
@@ -131,11 +131,11 @@ impl History {
 
     /// Late MCP tools go into the stored frame too, so a resumed session sends
     /// the exact same array.
-    pub(crate) fn append_late_tools(&mut self, mcp: &McpSession, deferral: ToolDeferral) {
+    pub(crate) fn append_late_tools(&mut self, mcp: &McpSession) {
         let (Some(live), Some(stored)) = (&mut self.live, &mut self.snapshot.frame) else {
             return;
         };
-        let added = live.append_late_tools(mcp, deferral);
+        let added = live.append_late_tools(mcp);
         if added.is_empty() {
             return;
         }

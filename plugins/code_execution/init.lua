@@ -59,10 +59,6 @@ local TOOLS_HEADER = "\n\nAvailable tools (async Python functions, keyword args 
 local WORKFLOW_TOOLS_NOTE =
   "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `gather(task(...), task(...))` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
 local WORKFLOW_OFF_NOTE = "\nNot callable: %s\n"
--- MCP names and schemas already sit in the tool array (or the tool_search
--- catalog), so point at those instead of repeating them here.
-local MCP_NOTE =
-  "\nMCP tools are callable too, with the arguments their definitions declare. Hyphens become underscores (`srv__get-docs` is `srv__get_docs`).\n"
 local CALLABLE_TOOLS_ERR = "cannot list callable tools: "
 -- `alias` covers hyphens; what is left is a name no substitution can fix, like
 -- a leading digit. Binding it would raise a SyntaxError the model cannot act on.
@@ -261,8 +257,20 @@ local function describe(dctx)
   if #gated > 0 then
     parts[#parts + 1] = WORKFLOW_OFF_NOTE:format(table.concat(gated, ", "))
   end
-  if dctx.mcp then
-    parts[#parts + 1] = MCP_NOTE
+  if dctx.mcp and dctx.mcp_libraries and #dctx.mcp_libraries > 0 then
+    local lines = {
+      "\nExternal libraries (callable in Python via `await <library_name>.<function_name>(...)`):",
+    }
+    for _, lib in ipairs(dctx.mcp_libraries) do
+      local desc = (lib.description and #lib.description > 0) and lib.description or "(no description)"
+      local fns = (lib.functions and #lib.functions > 0) and table.concat(lib.functions, ", ") or "(none)"
+      table.insert(lines, string.format("- %s: %s\n  functions: %s", lib.name, desc, fns))
+    end
+    table.insert(
+      lines,
+      'Use `library_help(library_name="...", function_name="...")` to inspect parameter schemas and function documentation.\n'
+    )
+    parts[#parts + 1] = table.concat(lines, "\n")
   end
   return table.concat(parts)
 end
@@ -410,10 +418,30 @@ local function handler(input, ctx)
     end
   end
 
+  local preamble_parts = { PREAMBLE }
+  local libs = maki.agent.mcp_libraries(ctx)
+  if libs and #libs > 0 then
+    local ns_lines = {
+      "class _McpNamespace:\n    pass\n",
+    }
+    for _, lib in ipairs(libs) do
+      if lib.name:match(PY_IDENTIFIER) then
+        table.insert(ns_lines, string.format("%s = _McpNamespace()\n", lib.name))
+        for _, fn in ipairs(lib.functions or {}) do
+          if fn.name:match(PY_IDENTIFIER) then
+            local wire = lib.name .. "__" .. fn.name
+            table.insert(ns_lines, string.format("%s.%s = %s\n", lib.name, fn.name, wire))
+          end
+        end
+      end
+    end
+    table.insert(preamble_parts, table.concat(ns_lines))
+  end
+
   local result, err = maki.interpreter.run(input.code, {
     timeout = timeout,
     max_memory_mb = opts.max_memory_mb,
-    preamble = PREAMBLE,
+    preamble = table.concat(preamble_parts),
     on_output = show,
     tools = tools,
     files = file_access(tools, schemas, ctx),

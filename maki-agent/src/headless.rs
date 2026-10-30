@@ -25,7 +25,7 @@ use crate::types::EventSender;
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, EventStreamGuard,
     ImageSource, InputSource, McpHandle, McpSession, PermissionsConfig, SessionEvents,
-    SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
+    SessionMailbox, ToolOutputLines, event_stream,
 };
 
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -90,7 +90,7 @@ struct ContextSpec {
     slots: Arc<ResolvedPrompts>,
     config: AgentConfig,
     excluded_tools: Vec<&'static str>,
-    mcp: bool,
+    mcp: Option<McpHandle>,
     system_override: Option<String>,
     append_system: Option<String>,
 }
@@ -112,13 +112,14 @@ impl ContextSpec {
             slots,
             config,
             excluded_tools,
-            mcp: mcp.is_some(),
+            mcp: mcp.cloned(),
             system_override: None,
             append_system: None,
         }
     }
 
     fn render(&self, model: &Model, workflow: bool) -> RunContext {
+        let modules = self.mcp.as_ref().map(|h| h.modules());
         let tools = RequestTools::build(
             ToolRegistry::global(),
             &self.vars,
@@ -126,7 +127,7 @@ impl ContextSpec {
             &self.config,
             &self.excluded_tools,
             workflow,
-            self.mcp,
+            modules.as_deref(),
         );
         let mut context = match &self.system_override {
             Some(system) => {
@@ -148,16 +149,10 @@ impl ContextSpec {
     }
 }
 
-/// Names advertised to SDK clients: base tools plus what the first request
-/// would put in the model's context from MCP (always-load definitions and
-/// `tool_search`). Probed as [`ToolDeferral::Client`] because the native
-/// array lists every deferred definition too.
-fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String> {
-    let mut probe = tools.clone();
-    if let Some(mcp) = mcp {
-        mcp.extend_tools(&mut probe, ToolDeferral::Client);
-    }
-    extract_tool_names(&probe)
+/// Names advertised to SDK clients: base tools only. MCP functions are called
+/// through code_execution and never enter the top-level tools array.
+fn advertised_tool_names(tools: &Value, _mcp: Option<&McpSession>) -> Vec<String> {
+    extract_tool_names(tools)
 }
 
 pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
@@ -590,15 +585,15 @@ mod tests {
     }
 
     #[test]
-    fn advertised_names_show_tool_search_not_deferred_tools() {
+    fn advertised_names_show_base_tools_only() {
         let base = serde_json::json!([{"name": "read"}]);
         let mcp =
             crate::mcp::test_support::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
         let names = advertised_tool_names(&base, Some(&mcp));
         assert_eq!(
             names,
-            vec!["read", crate::mcp::TOOL_SEARCH_TOOL_NAME],
-            "clients must see the search tool, not deferred definitions"
+            vec!["read"],
+            "clients must see only base tools, MCP is called via code_execution"
         );
         assert_eq!(
             base,

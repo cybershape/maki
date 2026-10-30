@@ -26,7 +26,7 @@ use strum::IntoEnumIterator;
 
 use super::history::History;
 use super::instructions::build_system_prompt;
-use crate::mcp::{McpSession, ToolDeferral};
+use crate::mcp::McpSession;
 use crate::prompt::{PromptId, ResolvedPrompts, Slot, SlotKind};
 use crate::template::Vars;
 use crate::tools::RequestTools;
@@ -125,18 +125,17 @@ fn hint_facts(slots: &ResolvedPrompts) -> BTreeMap<String, String> {
     hints
 }
 
-/// Hashes what no update can describe: the base tools, the MCP deferral mode
-/// (it shapes every MCP entry) and the host's own prompt text. The hash is the
-/// same in every process, so a resumed session can tell if its frame still fits.
-pub(crate) fn fingerprint(context: &RunContext, mcp: Option<&McpSession>, model: &Model) -> String {
+/// Hashes what no update can describe: the base tools and the host's own prompt text.
+/// The hash is the same in every process, so a resumed session can tell if its frame still fits.
+pub(crate) fn fingerprint(
+    context: &RunContext,
+    _mcp: Option<&McpSession>,
+    _model: &Model,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(context.tools.definitions().to_string());
     hasher.update([0]);
     hasher.update(&context.authored);
-    if mcp.is_some() {
-        hasher.update([0]);
-        hasher.update(format!("{:?}", ToolDeferral::for_model(model)));
-    }
     hasher.finalize()[..FINGERPRINT_BYTES]
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -148,17 +147,14 @@ pub(crate) fn fingerprint(context: &RunContext, mcp: Option<&McpSession>, model:
 pub(crate) struct LiveFrame {
     /// Kept for its filter, which dispatch checks tool names against.
     pub(crate) tools: RequestTools,
-    /// What requests carry: the base tools, then the MCP part. It only grows.
-    /// A tool whose server went away stays listed and fails at dispatch.
+    /// What requests carry: the base tools. MCP tools are called via code_execution
+    /// and never enter the wire tools array.
     pub(crate) wire: Value,
 }
 
 impl LiveFrame {
-    pub(crate) fn build(tools: RequestTools, mcp: Option<&McpSession>, model: &Model) -> Self {
-        let mut wire = tools.definitions().clone();
-        if let Some(mcp) = mcp {
-            mcp.extend_tools(&mut wire, ToolDeferral::for_model(model));
-        }
+    pub(crate) fn build(tools: RequestTools, _mcp: Option<&McpSession>, _model: &Model) -> Self {
+        let wire = tools.definitions().clone();
         Self { tools, wire }
     }
 
@@ -178,17 +174,8 @@ impl LiveFrame {
         self.wire.as_array().map_or(&[], |wire| &wire[base..])
     }
 
-    /// Any model that reuses this frame defers the same way, because the
-    /// fingerprint covers `deferral`. So taking it from the current model is
-    /// safe.
-    pub(crate) fn append_late_tools(
-        &mut self,
-        mcp: &McpSession,
-        deferral: ToolDeferral,
-    ) -> &[Value] {
-        let before = self.wire.as_array().map_or(0, Vec::len);
-        mcp.append_late_tools(&mut self.wire, deferral);
-        self.wire.as_array().map_or(&[], |wire| &wire[before..])
+    pub(crate) fn append_late_tools(&mut self, _mcp: &McpSession) -> &[Value] {
+        &[]
     }
 }
 

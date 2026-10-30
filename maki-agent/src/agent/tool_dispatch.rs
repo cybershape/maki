@@ -10,9 +10,7 @@ use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
 use crate::agent::CallInstructions;
-use crate::mcp::{
-    McpSession, TOOL_SEARCH_TOOL_NAME, ToolDeferral, UNKNOWN_MCP, internal_tool_name, is_wire_name,
-};
+use crate::mcp::{McpSession, UNKNOWN_MCP, internal_tool_name, is_wire_name};
 use crate::permissions::{LayerAnswer, PermissionCheck, PromptLayers};
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
@@ -41,7 +39,6 @@ const MCP_SERVER_GONE: &str =
     "Its MCP server is not connected or no longer offers it, so it cannot be called now.";
 const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
 const MCP_SUMMARY_PREFIX: &str = "mcp: ";
-const SEARCH_QUERY_FIELD: &str = "query";
 
 const SOURCE_NATIVE: &str = "native";
 const SOURCE_LOCAL: &str = "local";
@@ -415,7 +412,6 @@ impl PromptLayers for PromptAsk<'_> {
 enum Route<'a> {
     Local(&'a LocalTool),
     Native(RegisteredTool),
-    ToolSearch(&'a McpSession),
     Mcp(&'a McpSession, Arc<str>),
     Unknown,
 }
@@ -428,7 +424,6 @@ impl Route<'_> {
             Self::Native(entry) => entry.source.as_log_field(),
             Self::Local(_) => Cow::Borrowed(SOURCE_LOCAL),
             Self::Mcp(..) => Cow::Borrowed(SOURCE_MCP),
-            Self::ToolSearch(_) => Cow::Borrowed(TOOL_SEARCH_TOOL_NAME),
             Self::Unknown => Cow::Borrowed(SOURCE_UNKNOWN),
         }
     }
@@ -441,7 +436,7 @@ impl Route<'_> {
     fn authority(&self) -> Option<Authority> {
         match self {
             Self::Native(entry) => Some(Authority::from(entry.tool.reach())),
-            Self::ToolSearch(_) | Self::Local(_) | Self::Mcp(..) => Some(Authority::Unbounded),
+            Self::Local(_) | Self::Mcp(..) => Some(Authority::Unbounded),
             // A rewrite cannot make the name exist, so firing here would hand
             // out a tool's authority without the tool.
             Self::Unknown => None,
@@ -478,7 +473,6 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
     } else if let Some(mcp) = ctx.mcp.as_ref() {
         match mcp.resolve(name) {
             Some(qualified) => Route::Mcp(mcp, qualified),
-            None if name == TOOL_SEARCH_TOOL_NAME => Route::ToolSearch(mcp),
             None => Route::Unknown,
         }
     } else {
@@ -555,7 +549,6 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
     }
     if let Some(mcp) = ctx.mcp.as_ref() {
         let mut names = mcp.wire_names();
-        names.push(TOOL_SEARCH_TOOL_NAME.to_owned());
         names.sort();
         for name in names {
             // MCP has no audience system: a server is reachable or it is not,
@@ -623,7 +616,7 @@ async fn run_inner(
     hook: Option<&Hook<'_>>,
 ) -> ToolDoneEvent {
     let name = resolved.name;
-    if let (Some(_), Route::Local(_) | Route::ToolSearch(_)) = (ask, &resolved.route)
+    if let (Some(_), Route::Local(_)) = (ask, &resolved.route)
         && let Err(e) = gate_on_input(ctx, &ToolKey::native(name), &id, input, ask, None).await
     {
         return ToolDoneEvent {
@@ -636,7 +629,6 @@ async fn run_inner(
         Route::Native(entry) => {
             run_native_tool(entry, id, name, input, ctx, origin, ask, hook).await
         }
-        Route::ToolSearch(mcp) => run_tool_search(mcp, id, input, ctx, origin),
         Route::Mcp(mcp, qualified) => {
             execute_mcp_tool(ctx, mcp, &id, qualified, input, origin, ask, hook).await
         }
@@ -806,13 +798,6 @@ pub struct RoutedView {
 }
 
 impl RoutedView {
-    fn tool_search(input: &Value) -> Self {
-        Self {
-            summary: search_query(input).to_owned(),
-            markdown: true,
-        }
-    }
-
     fn mcp(qualified: &str) -> Self {
         Self {
             summary: format!("{MCP_SUMMARY_PREFIX}{qualified}"),
@@ -829,23 +814,17 @@ impl RoutedView {
     }
 }
 
-fn search_query(input: &Value) -> &str {
-    input[SEARCH_QUERY_FIELD].as_str().unwrap_or_default()
-}
-
 /// The reason the model gave for this call, removed so the tool never sees it.
 ///
-/// Only MCP and `tool_search` come through here, and neither publishes a
+/// Only MCP comes through here, and it does not publish a
 /// schema that declares [`TOOLCALL_REASON_FIELD`], so the value is always one
 /// we asked for.
 fn take_toolcall_reason(input: &mut Value) -> Option<String> {
     strip_toolcall_reason(true, input)
 }
 
-pub fn routed_view(name: &str, input: &Value) -> Option<RoutedView> {
-    if name == TOOL_SEARCH_TOOL_NAME {
-        Some(RoutedView::tool_search(input))
-    } else if is_wire_name(name) {
+pub fn routed_view(name: &str, _input: &Value) -> Option<RoutedView> {
+    if is_wire_name(name) {
         Some(RoutedView::mcp(&internal_tool_name(name)))
     } else {
         None
@@ -876,37 +855,6 @@ fn emit_raw_start(
         output: None,
     };
     let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
-}
-
-/// Runs without a permission gate: search only reveals names the deferred
-/// catalog already showed the model.
-fn run_tool_search(
-    mcp: &McpSession,
-    id: String,
-    input: &Value,
-    ctx: &ToolContext,
-    origin: CallOrigin,
-) -> ToolDoneEvent {
-    let tool_id: Arc<str> = Arc::from(TOOL_SEARCH_TOOL_NAME);
-    let mut input = input.clone();
-    let reason = take_toolcall_reason(&mut input);
-    let view = RoutedView::tool_search(&input);
-    let summary = reason.unwrap_or(view.summary.clone());
-    emit_raw_start(ctx, origin, &id, &tool_id, summary, &input);
-    let deferral = ToolDeferral::for_model(&ctx.model);
-    let (output, is_error) = match mcp.search_tools(search_query(&input), origin, deferral) {
-        Ok(found) => (found, false),
-        Err(e) => (e.into(), true),
-    };
-    ToolDoneEvent {
-        call: None,
-        id,
-        tool: tool_id,
-        output: Arc::new(view.output(output)),
-        is_error,
-        annotation: None,
-        written_path: None,
-    }
 }
 
 /// Why a file-mutating tool is stopped before its permission check, if it is.
@@ -1139,19 +1087,11 @@ async fn execute_mcp_tool(
         return done(e.into(), true);
     }
 
-    // Only a permitted call loads the tool.
-    let loaded_tools = mcp.load_called(&tool, origin, ToolDeferral::for_model(&ctx.model));
     let (text, is_error) = match mcp.call_tool(&tool, &input).await {
         Ok(text) => (text, false),
         Err(e) => (e.to_string(), true),
     };
-    done(
-        TextOutput {
-            loaded_tools,
-            ..text.into()
-        },
-        is_error,
-    )
+    done(text.into(), is_error)
 }
 
 /// Deduplicates doom-loop repeats, then runs remaining calls in parallel.
@@ -1325,7 +1265,7 @@ mod tests {
     use crate::cancel::CancelToken;
     use crate::live_session::{BACKGROUND_PLAN_WRITE_DENIED, SessionMailbox};
     use crate::mcp::test_support::stub_session;
-    use crate::mcp::{ToolDeferral, tool_names};
+    use crate::mcp::tool_names;
     use crate::permissions::{
         PERMISSION_DENIED_PREFIX, PermissionAnswer, PermissionManager, TaggedAnswer,
     };
@@ -1386,8 +1326,6 @@ mod tests {
     const HOOK_TOOL_KIND: &str = "execute";
     const HOOK_ASK_REASON: &str = "a human should see this";
     const SCOPELESS_TOOL_NAME: &str = "scopeless";
-    const SEARCH_QUERY_FIELD: &str = "query";
-    const SEARCH_QUERY: &str = "probe";
     const PROMPT_THINK_TIME: Duration = Duration::from_millis(20);
 
     fn recent_calls(entries: &[(&str, Value)]) -> RecentCalls {
@@ -1878,7 +1816,6 @@ mod tests {
     /// it to.
     #[test_case(build_ctx,      HOOK_TOOL_NAME,        Some(HOOK_PERMISSION), Authority::Capability(HOOK_PERMISSION) ; "a_checked_tool_lends_its_capability")]
     #[test_case(build_ctx,      HOOK_TOOL_NAME,        None,                  Authority::Unbounded                   ; "a_tool_declaring_nothing_declares_no_limit")]
-    #[test_case(mcp_route_ctx,  TOOL_SEARCH_TOOL_NAME, None,                  Authority::Unbounded                   ; "search_declares_nothing_either")]
     #[test_case(mcp_route_ctx,  PROBE_WIRE,            None,                  Authority::Unbounded                   ; "an_mcp_tool_is_code_maki_does_not_own")]
     #[test_case(host_route_ctx, CLIENT_NAME,           None,                  Authority::Unbounded                   ; "a_host_tool_is_code_maki_does_not_own")]
     fn a_route_lends_the_authority_it_declares(
@@ -2347,16 +2284,11 @@ mod tests {
         ctx
     }
 
-    fn search_input() -> Value {
-        serde_json::json!({ SEARCH_QUERY_FIELD: SEARCH_QUERY })
-    }
-
     /// A route with no scopes of its own still has to put the ask in front of
     /// the user, so the input stands in as the scope.
     #[test_case(host_route_ctx,      CLIENT_NAME,           ToolKey::native(CLIENT_NAME),           call_input(HOOK_PLAIN) ; "a_host_tool")]
     #[test_case(scopeless_route_ctx, SCOPELESS_TOOL_NAME,   ToolKey::native(SCOPELESS_TOOL_NAME),   call_input(HOOK_PLAIN) ; "a_native_tool_without_scopes")]
     #[test_case(mcp_route_ctx,       PROBE_WIRE,            ToolKey::parse(PROBE_QUALIFIED).unwrap(), call_input(HOOK_PLAIN) ; "an_mcp_tool")]
-    #[test_case(mcp_route_ctx,       TOOL_SEARCH_TOOL_NAME, ToolKey::native(TOOL_SEARCH_TOOL_NAME), search_input()         ; "tool_search")]
     fn an_ask_on_a_route_without_scopes_prompts_on_the_input(
         build: fn() -> ToolContext,
         name: &str,
@@ -2510,73 +2442,6 @@ mod tests {
         });
     }
 
-    const SEARCH_REASON: &str = "looking for the probe";
-
-    #[test]
-    fn tool_search_reason_becomes_the_header_and_leaves_the_query() {
-        smol::block_on(async {
-            let (tx, rx) = flume::unbounded::<crate::Envelope>();
-            let event_tx = crate::EventSender::new(tx, 0);
-            let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
-            ctx.mcp = Some(stub_mcp(&[PROBE_QUALIFIED]));
-            let done = dispatch(
-                &ctx,
-                TOOL_SEARCH_TOOL_NAME,
-                &serde_json::json!({
-                    "query": SEARCH_QUERY,
-                    TOOLCALL_REASON_FIELD: SEARCH_REASON,
-                }),
-            )
-            .await;
-            assert!(!done.is_error, "got: {}", done.output.as_text());
-            let AgentEvent::ToolStart(start) = rx.try_recv().expect("a start").event else {
-                panic!("expected ToolStart");
-            };
-            assert_eq!(start.summary, SEARCH_REASON);
-        });
-    }
-
-    #[test]
-    fn tool_search_routes_and_loads_matches() {
-        smol::block_on(async {
-            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
-            let done = dispatch(
-                &mcp_ctx(&mcp),
-                TOOL_SEARCH_TOOL_NAME,
-                &serde_json::json!({"query": "probe"}),
-            )
-            .await;
-            assert!(!done.is_error, "got: {}", done.output.as_text());
-            assert_eq!(done.tool.as_ref(), TOOL_SEARCH_TOOL_NAME);
-            assert!(done.output.as_text().contains(PROBE_WIRE));
-
-            let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools, ToolDeferral::Client);
-            assert!(
-                tool_names(&tools).contains(&PROBE_WIRE),
-                "searched tool must join the next request"
-            );
-        });
-    }
-
-    #[test_case(serde_json::json!({"query": "  "}) ; "blank_query")]
-    #[test_case(serde_json::json!({}) ; "missing_query")]
-    fn tool_search_bad_query_is_error_event(input: Value) {
-        smol::block_on(async {
-            let done = dispatch(
-                &mcp_ctx(&stub_mcp(&[PROBE_QUALIFIED])),
-                TOOL_SEARCH_TOOL_NAME,
-                &input,
-            )
-            .await;
-            assert!(done.is_error);
-            assert_eq!(done.output.as_text(), crate::mcp::SEARCH_EMPTY_QUERY);
-        });
-    }
-
-    /// Lua draws a batch child from `routed_view`, so the standalone call
-    /// must emit the same summary and body format.
-    #[test_case(TOOL_SEARCH_TOOL_NAME, search_input(), SEARCH_QUERY,     true  ; "tool_search_shows_query_as_markdown")]
     #[test_case(PROBE_WIRE,            json!({}),      "mcp: srv.probe", false ; "mcp_tool_shows_qualified_name_as_plain")]
     fn routed_view_matches_the_dispatched_call(
         name: &str,
@@ -2606,47 +2471,25 @@ mod tests {
     }
 
     #[test]
-    fn calling_deferred_mcp_tool_loads_it_and_records_the_load_in_its_result() {
+    fn calling_mcp_tool_routes_to_mcp() {
         smol::block_on(async {
             let mcp = stub_mcp(&[PROBE_QUALIFIED]);
             let done = dispatch(&mcp_ctx(&mcp), PROBE_WIRE, &serde_json::json!({})).await;
             assert_eq!(done.tool.as_ref(), PROBE_QUALIFIED, "must route to MCP");
-            assert_eq!(done.output.loaded_tools(), [PROBE_WIRE]);
-
-            let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools, ToolDeferral::Client);
-            assert_eq!(
-                tool_names(&tools),
-                vec![PROBE_WIRE],
-                "called tool must join the next request"
-            );
-        });
-    }
-
-    /// `McpSession::new` rebuilds the loaded set from history, which holds no
-    /// nested call, so loading one here would make the live tool array differ
-    /// from the resumed one.
-    #[test_case(PROBE_WIRE, serde_json::json!({}), PROBE_QUALIFIED ; "tool_call")]
-    #[test_case(TOOL_SEARCH_TOOL_NAME, serde_json::json!({"query": "probe"}), TOOL_SEARCH_TOOL_NAME ; "tool_search")]
-    fn nested_call_reaches_mcp_without_loading_anything(name: &str, input: Value, routed: &str) {
-        smol::block_on(async {
-            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
-            let done = dispatch_nested(&mcp_ctx(&mcp), name, &input).await;
-            assert_eq!(done.tool.as_ref(), routed, "must route to MCP");
-            assert!(done.output.loaded_tools().is_empty());
-
-            let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools, ToolDeferral::Client);
-            assert_eq!(
-                tool_names(&tools),
-                vec![TOOL_SEARCH_TOOL_NAME],
-                "a nested call must not change the next request"
-            );
         });
     }
 
     #[test]
-    fn denied_mcp_call_does_not_load_definition() {
+    fn nested_call_reaches_mcp() {
+        smol::block_on(async {
+            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
+            let done = dispatch_nested(&mcp_ctx(&mcp), PROBE_WIRE, &serde_json::json!({})).await;
+            assert_eq!(done.tool.as_ref(), PROBE_QUALIFIED, "must route to MCP");
+        });
+    }
+
+    #[test]
+    fn denied_mcp_call_returns_error() {
         smol::block_on(async {
             let mcp = stub_mcp(&[PROBE_QUALIFIED]);
             let ctx = with_mcp(denying_ctx(ToolKey::parse(PROBE_QUALIFIED).unwrap()), &mcp);
@@ -2657,32 +2500,6 @@ mod tests {
                 "got: {}",
                 done.output.as_text()
             );
-
-            let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools, ToolDeferral::Client);
-            assert_eq!(
-                tool_names(&tools),
-                vec![TOOL_SEARCH_TOOL_NAME],
-                "denied call must not load the definition"
-            );
-        });
-    }
-
-    #[test]
-    fn local_tool_named_tool_search_shadows_mcp_search() {
-        smol::block_on(async {
-            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
-            let ctx = with_mcp(
-                local_ctx(TOOL_SEARCH_TOOL_NAME, |_| Ok("local wins".into())),
-                &mcp,
-            );
-            let done = dispatch(
-                &ctx,
-                TOOL_SEARCH_TOOL_NAME,
-                &serde_json::json!({"query": "probe"}),
-            )
-            .await;
-            assert_eq!(done.output.as_text(), "local wins");
         });
     }
 
@@ -2719,10 +2536,7 @@ mod tests {
     fn callable_lists_host_and_deferred_mcp_names() {
         let mcp = stub_mcp(&[PROBE_QUALIFIED, OTHER_QUALIFIED]);
         let ctx = with_mcp(local_ctx(CLIENT_NAME, |_| Ok(String::new())), &mcp);
-        assert_eq!(
-            callable_names(&ctx),
-            [CLIENT_NAME, OTHER_WIRE, PROBE_WIRE, TOOL_SEARCH_TOOL_NAME]
-        );
+        assert_eq!(callable_names(&ctx), [CLIENT_NAME, OTHER_WIRE, PROBE_WIRE]);
     }
 
     /// A shadowed name appears once, described by whatever `resolve` picks:
@@ -2765,7 +2579,7 @@ mod tests {
             &ctx.config,
             excluded,
             false,
-            false,
+            None,
         );
         ctx.tool_filter = Arc::clone(tools.filter());
 
@@ -2935,15 +2749,6 @@ mod tests {
                     && text != crate::tools::PLAN_WRITE_RESTRICTED,
                 "plan mode must not block or deny the call, got: {text}"
             );
-            let mut tools = serde_json::json!([]);
-            ctx.mcp
-                .as_ref()
-                .unwrap()
-                .extend_tools(&mut tools, ToolDeferral::Client);
-            assert!(
-                tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
-                "a permitted plan-mode call must load the definition"
-            );
         });
     }
 
@@ -2959,16 +2764,6 @@ mod tests {
             assert!(done.is_error);
             let text = done.output.as_text();
             assert!(text.starts_with(PERMISSION_DENIED_PREFIX), "got: {text}");
-            assert!(done.output.loaded_tools().is_empty());
-            let mut tools = serde_json::json!([]);
-            ctx.mcp
-                .as_ref()
-                .unwrap()
-                .extend_tools(&mut tools, ToolDeferral::Client);
-            assert!(
-                !tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
-                "an unapproved call must not load the definition"
-            );
         });
     }
 

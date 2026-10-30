@@ -1076,6 +1076,49 @@ mod tests {
     }
 
     #[test]
+    fn module_object_call() {
+        let mut tools: HashMap<String, ToolFn> = HashMap::new();
+        tools.insert(
+            "github__create_issue".into(),
+            Box::new(|_, args, _| Ok(args.first().cloned().unwrap_or(json!(null)))),
+        );
+        let code = r#"
+class _McpNamespace:
+    pass
+github = _McpNamespace()
+github.create_issue = github__create_issue
+github.create_issue(42)
+"#;
+        let result = run_code(code, &tools, None, default_limits()).unwrap();
+        assert_eq!(result.output, Some(json!(42)));
+    }
+
+    #[test]
+    fn async_module_object_call() {
+        let tools = stub_tools(&["github__create_issue"]);
+        let code = r#"
+class _McpNamespace:
+    pass
+github = _McpNamespace()
+github.create_issue = github__create_issue
+await github.create_issue(arg="hello")
+"#;
+        let resolver: AsyncResolver = Box::new(|pending: Vec<PendingCall>| {
+            Ok(pending
+                .into_iter()
+                .map(|pc| {
+                    (
+                        pc.call_id,
+                        Ok(json!(format!("{}:{}", pc.name, pc.kwargs[0].1))),
+                    )
+                })
+                .collect())
+        });
+        let result = run_code(code, &tools, Some(&resolver), default_limits()).unwrap();
+        assert_eq!(result.output, Some(json!("github__create_issue:\"hello\"")));
+    }
+
+    #[test]
     fn tool_call_kwargs() {
         let mut tools: HashMap<String, ToolFn> = HashMap::new();
         tools.insert(

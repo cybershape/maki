@@ -98,6 +98,19 @@ fn dctx_json(ctx: &DescriptionContext) -> Value {
         "workflow": ctx.workflow,
         "mcp": ctx.mcp,
     });
+    if let Some(modules) = ctx.mcp_libraries {
+        let libs: Vec<Value> = modules
+            .iter()
+            .map(|m| {
+                json!({
+                    "name": m.name,
+                    "description": m.description,
+                    "functions": m.functions.iter().map(|f| &f.name).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        obj["mcp_libraries"] = json!(libs);
+    }
     match ctx.filter {
         ToolFilter::All => {}
         ToolFilter::Only(names) => obj["only"] = json!(names),
@@ -2106,6 +2119,7 @@ mod tests {
             audience: ToolAudience::MAIN,
             workflow: false,
             mcp: false,
+            mcp_libraries: None,
         };
         assert_eq!(tool.description(&ctx), "test");
     }

@@ -510,16 +510,29 @@ async fn tools(
         .iter()
         .map(String::as_str)
         .collect();
+    let has_mcp = mcp_enabled && agent.mcp.is_some();
     let filter = base
         .excluding(&disabled)
         .excluding(maki_agent::tools::capability_exclusions(model));
+    let filter = if !has_mcp {
+        filter.excluding(&["library_help"])
+    } else {
+        filter
+    };
+
+    let mcp_modules = if has_mcp {
+        agent.mcp.as_ref().map(|s| s.modules())
+    } else {
+        None
+    };
 
     let vars = maki_agent::template::env_vars();
     let ctx_desc = DescriptionContext {
         filter: &filter,
         audience,
         workflow,
-        mcp: mcp_enabled && agent.mcp.is_some(),
+        mcp: has_mcp,
+        mcp_libraries: mcp_modules.as_deref(),
     };
     // Base definitions only: the session injects MCP definitions per
     // request, so baking them into a tools array would freeze the catalog.
@@ -573,6 +586,36 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
             t.set("schema", json_to_lua(&lua, &schema)?)?;
         }
         out.set(i + 1, t)?;
+    }
+    Ok((Some(out), None))
+}
+
+/// Array of active external MCP modules (libraries) and their functions.
+/// Each entry has `{ name, description, functions = { { name, description, schema } } }`.
+/// Empty when no MCP servers are running.
+///
+/// @param ctx LuaCtx Agent context.
+/// @return (table?, string?) Array of module tables, or `(nil, err)` on failure.
+#[lua_fn]
+async fn mcp_libraries(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<Table>> {
+    let agent = try_pair!(dispatch_ctx(&ctx, "mcp_libraries"));
+    let out = lua.create_table()?;
+    if let Some(mcp) = agent.mcp.as_ref() {
+        for (i, m) in mcp.modules().iter().enumerate() {
+            let module_tbl = lua.create_table()?;
+            module_tbl.set("name", m.name.as_str())?;
+            module_tbl.set("description", m.description.as_str())?;
+            let funcs_tbl = lua.create_table()?;
+            for (j, f) in m.functions.iter().enumerate() {
+                let func_tbl = lua.create_table()?;
+                func_tbl.set("name", f.name.as_str())?;
+                func_tbl.set("description", f.description.as_str())?;
+                func_tbl.set("schema", json_to_lua(&lua, &f.schema)?)?;
+                funcs_tbl.set(j + 1, func_tbl)?;
+            }
+            module_tbl.set("functions", funcs_tbl)?;
+            out.set(i + 1, module_tbl)?;
+        }
     }
     Ok((Some(out), None))
 }
@@ -1185,7 +1228,7 @@ lua_table! {
     /// })
     /// ```
     "maki.agent" => pub(crate) fn create_agent_table(plugin: Arc<str>, perms: PluginPermissions), DOCS [
-        resolve_model, system_prompt, tools, callable_tools, call_tool,
+        resolve_model, system_prompt, tools, callable_tools, mcp_libraries, call_tool,
         session(plugin, perms), list,
     ]
 }

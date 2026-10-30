@@ -77,84 +77,64 @@ Maki checks certificates against the operating system's trust store, so a CA tha
 | `headers` | map | | HTTP only. Values expand `${VAR}` from the environment |
 | `oauth` | table | | HTTP only: OAuth client (optional `client_id`, optional `client_secret`, optional `callback_port`, optional `callback_path`, optional `callback_hostname`, optional `callback_scheme`) |
 | `ca_file` | path | | HTTP only. PEM bundle that replaces the default CAs for this server and its OAuth |
+| `description` | string | | Summary of the server capabilities shown to the model |
 | `timeout` | u64 | 30000 | Milliseconds (1-300000) |
 | `enabled` | bool | true | |
-| `always_load` | bool | false | Skip tool search, load all tools upfront |
 
 Set `command` for stdio, `url` for HTTP. Pick one.
 
-One option lives at the top level of `mcp.toml`, outside any server:
+## External libraries and code execution
 
-| Field | Type | Default | Notes |
-|-------|------|---------|-------|
-| `defer_tools` | usize | 10 | Defer tools only when more than this many exist. Ignored with [native tool search](#loads-and-the-prompt-cache), which always defers |
+Every tool definition a server exposes costs context window space on every request. A server with dozens of tools can consume thousands of tokens before a conversation even starts. Adding or loading tool definitions mid-session also alters the request prefix, invalidating the prompt cache and triggering costly cache writes.
 
-## Tool search
+To keep the prompt cache completely stable across all models, Maki treats MCP servers as **external Python libraries** called exclusively inside `code_execution`.
 
-Every tool definition a server exposes costs context window space, on every request. Take Datadog's MCP server: with all toolsets on it ships over 100 tools, when a task often needs three.
+MCP functions never enter the top-level API `tools` array. The model sees available modules and their functions listed in the `code_execution` environment description, and can call them via module attributes:
 
-So Maki, like Claude Code, defers MCP tools by default. The model sees one small `tool_search` tool that lists the deferred names, searches when it actually needs something, and the matches stay loaded for the rest of the session. Resume a session and the tools it was using come back. Subagents keep their own loads, so their searches don't bloat your main conversation.
+```python
+await github.create_issue(title="Bug fix", body="Details")
+```
+
+Flat namespaced names (`await github__create_issue(...)`) remain supported as aliases.
 
 ```
-server ships 117 tool definitions
+MCP servers (e.g. github, datadog)
         │
-  native tool search, or more than defer_tools (10)?
-   │ no          │ yes
-   ▼             ▼
-   all load      context gets one small tool: tool_search
-   upfront       │
-                 │  model: tool_search("logs")
-                 ▼
-                 3 matches load, stay for the session
-                 114 definitions never enter context
+        ▼
+context keeps tools array static: [read, write, edit, bash, code_execution, library_help]
+        │
+        ▼  model calls library_help(library_name="github", function_name="create_issue")
+gets Python signature + docstring
+        │
+        ▼  model writes Python script in code_execution
+await github.create_issue(title="Bug fix")
 ```
 
-You don't configure anything for this. Add the server as usual:
+### Inspecting function documentation
 
-```toml
-[mcp.datadog]
-url = "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp?toolsets=all"
+When at least one MCP server is configured, Maki exposes the `library_help` tool to the model. The tool takes both `library_name` and `function_name` and returns the exact Python async function signature, parameter types, and docstring:
+
+```python
+async def create_issue(
+    owner: str,
+    repo: str,
+    title: str,
+    body: str = None,
+    labels: list[str] = None
+) -> str:
+    """
+    Create an issue in a repository.
+
+    Parameters:
+    - owner (str, required): The account owner of the repository.
+    - repo (str, required): The name of the repository.
+    - title (str, required): The issue title.
+    - body (str, optional): The issue contents.
+    - labels (list[str], optional): Labels to associate with this issue.
+    """
 ```
 
-Ask about an incident, and the model searches for something like `datadog logs`, gets back the few matching tools, and the other hundred definitions never enter the conversation.
-
-### Loads and the prompt cache
-
-Tool definitions sit at the front of the prompt, inside the cached prefix. Adding one there changes the prefix, so the next request rewrites the whole conversation at cache-write rates. On a long session that single rewrite can cost more than the search saved.
-
-With native tool search a load never touches the tools array. That is the Anthropic API (direct and Bedrock) on Claude Haiku 4.5, Sonnet 4.5, Opus 4.5 and newer. Older Claude models have no tool search and work like other providers, and so does a model Maki does not know yet. Maki sends every deferred definition on every request, marked as deferred so it stays out of the context, and a search result points at its matches, which the API expands in place. Calling a deferred tool straight from the catalog loads it the same way. The array is the same bytes all session long, and a load costs only the few hundred tokens of the search result.
-
-```
-request N     tools: [read, edit, ..., 117 deferred, tool_search]   cache hit
-              model: tool_search("logs")
-result        3 matches, expanded by the API
-request N+1   tools: same bytes                                      cache hit
-```
-
-So with native tool search Maki always defers, whatever the count, and a server that connects mid-session costs no rebuild. That includes an `always_load` server that connects late: its tools join deferred, and the model finds them through `tool_search`. A server that disconnects keeps its entries, and a call to one of its tools tells the model the server is not connected.
-
-Other providers have no such mechanism, so a load adds the definition to the tools array and the cache is rebuilt once. A gateway speaking the Anthropic protocol may or may not pass the expansion through. So a custom provider, or the built-in `anthropic` pointed at another `base_url`, gets the rebuild until its `providers.toml` row sets `supports_deferred_tools = true` (see [Provider fields](../providers/#provider-fields)).
-
-Without native tool search, with 10 or fewer tools across all your servers there is no search step: at that size, searching costs more than it saves, so everything loads upfront. If servers that connect later push the count past that line, `tool_search` joins then, with their tools behind it. The top-level `defer_tools` key moves that line:
-
-```toml
-defer_tools = 30
-
-[mcp.github]
-url = "https://api.githubcopilot.com/mcp/"
-```
-
-Set it to 0 to always defer, or above your tool count to never defer.
-
-If one server should skip the search step entirely, opt it out:
-
-```toml
-[mcp.linear]
-command = ["linear-mcp-server"]
-always_load = true
-```
-
-Good for small servers you rely on every turn. On a big server it defeats the point: every definition is back in your context on every request.
+When no MCP servers are configured, `library_help` is automatically hidden from the model.
 
 ## Naming and namespacing
 

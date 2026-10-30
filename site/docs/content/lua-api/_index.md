@@ -1635,6 +1635,24 @@ end
 
 ---
 
+### `maki.agent.mcp_libraries()` {#maki-agent-mcp_libraries}
+
+```lua
+maki.agent.mcp_libraries({ctx})
+```
+
+Array of active external MCP modules (libraries) and their functions.
+Each entry has `{ name, description, functions = { { name, description, schema } } }`.
+Empty when no MCP servers are running.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+
+**Returns:** (`table?`, `string?`) Array of module tables, or `(nil, err)` on failure.
+
+---
+
 ### `maki.agent.call_tool()` {#maki-agent-call_tool}
 
 ```lua

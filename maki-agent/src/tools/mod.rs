@@ -109,6 +109,7 @@ pub struct DescriptionContext<'a> {
     pub workflow: bool,
     /// Whether the session being described can reach MCP tools.
     pub mcp: bool,
+    pub mcp_libraries: Option<&'a [crate::mcp::McpModuleInfo]>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -201,14 +202,20 @@ impl RequestTools {
         config: &AgentConfig,
         excluded: &[&str],
         workflow: bool,
-        mcp: bool,
+        mcp_libraries: Option<&[crate::mcp::McpModuleInfo]>,
     ) -> Self {
-        let filter = ToolFilter::from_config(config, model, excluded);
+        let has_mcp = mcp_libraries.is_some_and(|m| !m.is_empty());
+        let mut exclusions = excluded.to_vec();
+        if !has_mcp {
+            exclusions.push("library_help");
+        }
+        let filter = ToolFilter::from_config(config, model, &exclusions);
         let ctx = DescriptionContext {
             filter: &filter,
             audience: ToolAudience::MAIN,
             workflow,
-            mcp,
+            mcp: has_mcp,
+            mcp_libraries,
         };
         Self {
             definitions: registry.definitions(vars, &ctx, model.supports_tool_examples()),

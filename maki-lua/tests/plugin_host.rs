@@ -132,6 +132,7 @@ fn tool_description(reg: &ToolRegistry, agent: &maki_config::AgentConfig, name: 
         audience: ToolAudience::MAIN,
         workflow: false,
         mcp: false,
+        mcp_libraries: None,
     };
     let defs = reg.definitions(&Vars::new(), &ctx, false);
     let def = defs
@@ -817,7 +818,7 @@ fn get_tool_returns_normalized_header_and_restore_handles() {
     );
 }
 
-/// `tool_search` and MCP tools have no registry entry, yet `get_tool`
+/// MCP tools have no registry entry, yet `get_tool`
 /// answers with the standalone call's header and format; a plain unknown
 /// name still comes back nil.
 #[test]
@@ -831,12 +832,9 @@ fn get_tool_describes_rust_routed_tools() {
             description = "p",
             schema = {MINIMAL_SCHEMA},
             handler = function()
-                local search = maki.api.get_tool("tool_search")
                 local mcp = maki.api.get_tool("srv__thing")
-                local sh = search.header({{ query = "find prs" }})
                 local mh = mcp.header({{}})
                 return table.concat({{
-                    search.name, sh[1][1] .. "/" .. sh[1][2], search.format, tostring(search.restore),
                     mcp.name, mh[1][1] .. "/" .. mh[1][2], mcp.format,
                     tostring(maki.api.get_tool("plain_unknown")),
                 }}, "|")
@@ -847,10 +845,7 @@ fn get_tool_describes_rust_routed_tools() {
     host.load_source("routed_probe_plugin", &src).unwrap();
 
     let out = exec_tool(&reg, "routed_probe", json!({})).unwrap();
-    assert_eq!(
-        out,
-        "tool_search|find prs/tool|markdown|nil|srv__thing|mcp: srv.thing/tool|plain|nil"
-    );
+    assert_eq!(out, "srv__thing|mcp: srv.thing/tool|plain|nil");
 }
 
 #[test]

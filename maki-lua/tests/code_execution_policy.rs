@@ -15,6 +15,7 @@ use maki_config::{PluginFileConfig, PluginsConfig};
 use maki_lua::PluginHost;
 
 const CODE_EXECUTION_SRC: &str = include_str!("../../plugins/code_execution/init.lua");
+const LIBRARY_HELP_SRC: &str = include_str!("../../plugins/library_help/init.lua");
 
 const ECHO_PREFIX: &str = "echo:";
 const FAIL_MSG: &str = "fixture blew up";
@@ -26,7 +27,7 @@ const WF_TASK_GATED_LINE: &str = "Not callable: wf_task";
 const INTERP_ECHO_SIG: &str = "- interp_echo(msg: str, count: int = None, flag: bool = None, items: list = None, raw: any = None) -> str";
 const WF_TASK_SIG: &str = "- wf_task(prompt: str, model_tier: str = None) -> str";
 const SUB_TOOL_SIG: &str = "- sub_tool() -> str";
-const MCP_NOTE_SUBSTR: &str = "MCP tools are callable too";
+const MCP_NOTE_SUBSTR: &str = "External libraries";
 const MCP_TOOL_QUALIFIED: &str = "srv.fetch_issue";
 const MCP_TOOL_WIRE: &str = "srv__fetch_issue";
 /// Servers publish names Python cannot spell; the sandbox binds the alias.
@@ -164,6 +165,8 @@ fn setup_with(reg: Arc<ToolRegistry>) -> (Arc<ToolRegistry>, PluginHost) {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("code_execution", CODE_EXECUTION_SRC)
         .expect("real plugin should load");
+    host.load_source("library_help", LIBRARY_HELP_SRC)
+        .expect("library_help should load");
     host.load_source("policy_fixtures", &fixture_plugin())
         .expect("fixture plugin should load");
     (reg, host)
@@ -193,6 +196,7 @@ fn describe(
             audience,
             workflow,
             mcp: false,
+            mcp_libraries: None,
         })
         .into_owned()
 }
@@ -536,10 +540,128 @@ fn agent_tools_describes_mcp_only_when_the_session_keeps_it(enabled: bool) {
 /// rather than the request's tool array.
 #[test_case::test_case(MCP_TOOL_QUALIFIED, MCP_TOOL_WIRE ; "deferred_tool_binds_its_wire_name")]
 #[test_case::test_case(HYPHEN_QUALIFIED, HYPHEN_ALIAS    ; "hyphenated_tool_binds_an_alias")]
+#[test_case::test_case(MCP_TOOL_QUALIFIED, "srv.fetch_issue" ; "module_object_style_call")]
 fn mcp_tool_is_callable_from_the_sandbox(qualified: &'static str, bound: &str) {
     let err = run_code_with(&format!("await {bound}()"), with_mcp(qualified))
         .expect_err("the stub transport fails every call");
     assert!(err.contains(MCP_REACHED_ERR), "got: {err}");
+}
+
+#[test]
+fn library_help_returns_docstring_for_function() {
+    let (reg, _host) = setup_global();
+    let ctx = shaped_ctx(&reg, with_mcp("github.create_issue"));
+    let out = run_tool(
+        &reg,
+        &ctx,
+        "library_help",
+        serde_json::json!({
+            "library_name": "github",
+            "function_name": "create_issue"
+        }),
+    )
+    .expect("library_help should succeed");
+    assert!(out.contains("async def create_issue("), "got: {out}");
+    assert!(out.contains("Parameters:"), "got: {out}");
+}
+
+#[test]
+fn library_help_errors_when_library_not_found() {
+    let (reg, _host) = setup_global();
+    let ctx = shaped_ctx(&reg, with_mcp("github.create_issue"));
+    let err = run_tool(
+        &reg,
+        &ctx,
+        "library_help",
+        serde_json::json!({
+            "library_name": "unknown_lib",
+            "function_name": "create_issue"
+        }),
+    )
+    .expect_err("unknown library should error");
+    assert!(
+        err.contains("Library 'unknown_lib' not found"),
+        "got: {err}"
+    );
+    assert!(err.contains("github"), "should list available libraries");
+}
+
+#[test]
+fn library_help_errors_when_function_not_found() {
+    let (reg, _host) = setup_global();
+    let ctx = shaped_ctx(&reg, with_mcp("github.create_issue"));
+    let err = run_tool(
+        &reg,
+        &ctx,
+        "library_help",
+        serde_json::json!({
+            "library_name": "github",
+            "function_name": "nonexistent"
+        }),
+    )
+    .expect_err("unknown function should error");
+    assert!(
+        err.contains("Function 'nonexistent' not found in library 'github'"),
+        "got: {err}"
+    );
+    assert!(
+        err.contains("create_issue"),
+        "should list available functions"
+    );
+}
+
+#[test]
+fn library_help_is_excluded_when_no_mcp() {
+    let (reg, _host) = setup_global();
+    let model = maki_providers::Model::from_spec("responses/claude-opus-4-8").unwrap();
+    let tools = maki_agent::tools::RequestTools::build(
+        &reg,
+        &maki_agent::template::Vars::new(),
+        &model,
+        &maki_config::AgentConfig::default(),
+        &[],
+        false,
+        None,
+    );
+    let names: Vec<&str> = tools
+        .definitions()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"library_help"),
+        "library_help must not be exposed when no MCP is configured: {names:?}"
+    );
+}
+
+#[test]
+fn library_help_is_included_when_mcp_present() {
+    let (reg, _host) = setup_global();
+    let model = maki_providers::Model::from_spec("responses/claude-opus-4-8").unwrap();
+    let session = stub_session(&[("github.create_issue", "")]);
+    let modules = session.modules();
+    let tools = maki_agent::tools::RequestTools::build(
+        &reg,
+        &maki_agent::template::Vars::new(),
+        &model,
+        &maki_config::AgentConfig::default(),
+        &[],
+        false,
+        Some(&modules),
+    );
+    let names: Vec<&str> = tools
+        .definitions()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"library_help"),
+        "library_help must be exposed when MCP is configured: {names:?}"
+    );
 }
 
 fn with_client_tool(audience: ToolAudience) -> impl FnOnce(&mut ToolContext) {

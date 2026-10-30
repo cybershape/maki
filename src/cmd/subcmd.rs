@@ -568,6 +568,7 @@ pub fn prompt(
             audience: ToolAudience::MAIN,
             workflow: false,
             mcp: false,
+            mcp_libraries: None,
         };
         let defs = reg.definitions(&vars, &ctx, true);
         if names {
@@ -602,7 +603,7 @@ pub fn prompt(
                 .as_deref()
                 .unwrap_or(default_spec);
             let model = Model::from_spec(model_spec).context("invalid default model")?;
-            let tools = RequestTools::build(reg, &vars, &model, &config.agent, &[], false, false);
+            let tools = RequestTools::build(reg, &vars, &model, &config.agent, &[], false, None);
             let prompt = build_system_prompt(&vars, &instructions, &slots, &model, &tools);
             // Plan mode reaches the model as a context update after the
             // prompt, so this shows that message too.

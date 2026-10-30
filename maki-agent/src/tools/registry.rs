@@ -616,6 +616,7 @@ mod tests {
             audience: ToolAudience::MAIN,
             workflow: false,
             mcp: false,
+            mcp_libraries: None,
         };
         let defs = reg.definitions(&Vars::new(), &ctx, false);
         assert_eq!(
@@ -651,6 +652,7 @@ mod tests {
             audience: ToolAudience::MAIN,
             workflow: false,
             mcp: false,
+            mcp_libraries: None,
         };
         let vars = Vars::new();
         let defs = reg.definitions(&vars, &ctx, false);
@@ -816,6 +818,7 @@ mod tests {
                 audience,
                 workflow: false,
                 mcp: false,
+                mcp_libraries: None,
             };
             reg.definitions(&vars, &ctx, false)
                 .as_array()

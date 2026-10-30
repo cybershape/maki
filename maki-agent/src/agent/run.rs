@@ -24,7 +24,7 @@ use super::instructions::{CallInstructions, LoadedInstructions};
 use super::streaming::{StreamError, StreamRequest, StreamedResponse, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
-use crate::mcp::{McpSession, ToolDeferral};
+use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedPrompts;
 use crate::tools::hook::Verdict;
@@ -534,8 +534,7 @@ impl<'h> Agent<'h> {
             self.refresh_frame()?;
         }
         if let Some(mcp) = &self.mcp {
-            self.history
-                .append_late_tools(mcp, ToolDeferral::for_model(&self.model));
+            self.history.append_late_tools(mcp);
         }
         if let Some(tools) = self.history.live_frame().map(|frame| frame.wire.clone()) {
             self.recent_calls
@@ -1367,12 +1366,6 @@ mod tests {
         m
     }
 
-    fn tool_search_model() -> Model {
-        let mut m = Model::from_spec("responses/claude-sonnet-4-5").unwrap();
-        m.supports_deferred_tools_override = Some(true);
-        m
-    }
-
     fn text_response(stop_reason: StopReason) -> StreamResponse {
         StreamResponse {
             message: Message {
@@ -2019,84 +2012,32 @@ mod tests {
         }
     }
 
-    fn tool_use_response(tool_name: &str, input: Value) -> StreamResponse {
-        StreamResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::tool_use("t1", tool_name, input)],
-                ..Default::default()
-            },
-            usage: TokenUsage::default(),
-            stop_reason: Some(StopReason::ToolUse),
-            ..Default::default()
-        }
-    }
-
-    fn search_turn(model: Model) -> (Vec<Value>, ContentBlock) {
+    #[test]
+    fn mcp_tools_stay_out_of_wire_array() {
         smol::block_on(async {
-            let provider = MockProvider::new(vec![
-                tool_use_response(
-                    crate::mcp::TOOL_SEARCH_TOOL_NAME,
-                    serde_json::json!({"query": "fetch issue"}),
-                ),
-                text_response(StopReason::EndTurn),
-            ]);
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
             let captured = Arc::clone(&provider.requests);
             let mut history = History::new(Vec::new());
-            let (agent, _event_rx) = make_agent_with(Arc::new(provider), model, &mut history);
+            let (agent, _event_rx) =
+                make_agent_with(Arc::new(provider), default_model(), &mut history);
             let mut agent = agent.with_mcp(Some(crate::mcp::test_support::stub_session(&[(
                 "srv.fetch_issue",
                 "Fetch a GitHub issue",
             )])));
             agent.run(default_input()).await.unwrap();
 
-            let tools = captured
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|r| r.tools.clone())
-                .collect();
-            let result = history
-                .as_slice()
-                .iter()
-                .flat_map(|m| &m.content)
-                .find(|b| matches!(b, ContentBlock::ToolResult { .. }))
-                .cloned()
-                .unwrap();
-            (tools, result)
-        })
-    }
-
-    #[test]
-    fn mcp_definitions_refresh_per_request() {
-        let (tools, result) = search_turn(Model::from_spec("responses/gpt-5").unwrap());
-        assert_eq!(tools.len(), 2);
-        let first = tool_names(&tools[0]);
-        assert!(first.contains(&crate::mcp::TOOL_SEARCH_TOOL_NAME));
-        assert!(!first.contains(&"srv__fetch_issue"));
-        assert!(tool_names(&tools[1]).contains(&"srv__fetch_issue"));
-        assert!(
-            matches!(&result, ContentBlock::ToolResult { loaded_tools, .. } if loaded_tools == &["srv__fetch_issue"]),
-            "got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn native_deferral_keeps_tools_array_stable_across_a_load() {
-        let (tools, result) = search_turn(tool_search_model());
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0], tools[1]);
-        let deferred = tools[0]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|t| t["name"] == "srv__fetch_issue")
-            .expect("deferred definition ships in the array");
-        assert!(maki_providers::is_deferred_tool(deferred));
-        assert!(
-            matches!(&result, ContentBlock::ToolResult { loaded_tools, .. } if loaded_tools == &["srv__fetch_issue"]),
-            "got: {result:?}"
-        );
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let names = tool_names(&requests[0].tools);
+            assert!(
+                !names.contains(&"srv__fetch_issue"),
+                "MCP tools must not enter wire tools"
+            );
+            assert!(
+                !names.contains(&"tool_search"),
+                "tool_search must not enter wire tools"
+            );
+        });
     }
 
     fn small_context_model(context_window: u32, max_output_tokens: u32) -> Model {
@@ -2795,12 +2736,11 @@ mod tests {
         );
     }
 
-    /// Which servers are up by now is luck, so a resumed process sends the MCP
-    /// tools its frame went out with and only appends the new ones.
+    /// MCP functions are called via code_execution, so the wire tools array
+    /// stays completely stable and append-only across session resume.
     #[test]
     fn resumed_session_keeps_the_mcp_part_of_its_frame() {
         let mut h = Harness::new(Vec::new());
-        h.model = tool_search_model();
         let reply = || vec![text_response(StopReason::EndTurn)];
         h.run(default_input(), reply(), |agent| {
             agent.mcp = Some(stub_session(&[("srv.first", "")]));
@@ -2813,12 +2753,8 @@ mod tests {
         h.assert_append_only();
         let requests = h.requests.lock().unwrap();
         let resumed = tool_names(&requests.last().unwrap().tools);
-        assert_eq!(resumed.last(), Some(&"srv__second"));
-        assert_eq!(
-            h.history.frame().unwrap().mcp_tools.len(),
-            resumed.len() - 1,
-            "the appended tool is stored with the frame"
-        );
+        assert!(!resumed.contains(&"srv__first"));
+        assert!(!resumed.contains(&"srv__second"));
     }
 
     #[test]

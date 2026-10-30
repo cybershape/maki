@@ -747,11 +747,10 @@ fn restore_with_state_renders_child_header_contract() {
     assert!(text.contains("line two"), "body from state: {text}");
 }
 
-/// `tool_search` and MCP tools have no plugin to ask, yet a child must
+/// MCP tools have no plugin to ask, yet a child must
 /// still look like the standalone call: its summary as the header (not
-/// the tool name twice) and, for `tool_search`, a markdown body. The stub
-/// host has no MCP at all; the view is a function of name and input alone.
-#[test_case::test_case("tool_search", json!({ "query": "find prs" }), "find prs", "• srv__thing" ; "tool_search_markdown")]
+/// the tool name twice). The stub host has no MCP at all; the view is a
+/// function of name and input alone.
 #[test_case::test_case("srv__thing",  json!({}),                      "mcp: srv.thing", "- `srv__thing`" ; "mcp_plain")]
 fn rust_routed_child_renders_like_standalone(tool: &str, params: Value, header: &str, body: &str) {
     let (_reg, host) = load_batch_host();

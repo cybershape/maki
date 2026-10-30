@@ -129,9 +129,7 @@ pub struct McpServerInfo {
 
 #[derive(Deserialize, Default)]
 pub struct McpConfig {
-    /// Defer tools behind `tool_search` only when more than this many
-    /// non-`always_load` tools exist. `None` means the built-in default;
-    /// 0 always defers, a large value disables deferral.
+    /// Legacy field kept for config backward compatibility.
     #[serde(default)]
     pub defer_tools: Option<usize>,
     #[serde(default)]
@@ -144,6 +142,8 @@ pub struct McpConfig {
 pub struct RawServerConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default = "default_timeout")]
     pub timeout: u64,
     #[serde(default)]
@@ -157,6 +157,7 @@ impl RawServerConfig {
     pub(super) fn runtime(transport: RawTransport) -> Self {
         Self {
             enabled: true,
+            description: None,
             timeout: DEFAULT_TIMEOUT_MS,
             always_load: false,
             transport,
@@ -193,9 +194,9 @@ pub struct RawHttpFields {
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub name: String,
+    pub description: Option<String>,
     pub timeout: Duration,
-    /// Skip deferral: every tool from this server enters the context upfront
-    /// instead of being discoverable through `tool_search`.
+    /// Legacy field kept for config backward compatibility.
     pub always_load: bool,
     pub transport: Transport,
 }
@@ -388,6 +389,7 @@ pub fn parse_server(
     };
     Ok(ServerConfig {
         name,
+        description: server.description,
         timeout: Duration::from_millis(server.timeout),
         always_load: server.always_load,
         transport,
@@ -526,6 +528,7 @@ mod tests {
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {
             enabled: true,
+            description: None,
             timeout: DEFAULT_TIMEOUT_MS,
             always_load: false,
             transport: RawTransport::Stdio(RawStdioFields {
@@ -542,6 +545,7 @@ mod tests {
     fn http_raw(url: &str) -> RawServerConfig {
         RawServerConfig {
             enabled: true,
+            description: None,
             timeout: DEFAULT_TIMEOUT_MS,
             always_load: false,
             transport: RawTransport::Http(RawHttpFields {

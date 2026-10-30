@@ -278,6 +278,7 @@ pub fn generate() -> String {
             audience: ToolAudience::MAIN,
             workflow: false,
             mcp: false,
+            mcp_libraries: None,
         },
         false,
     );
