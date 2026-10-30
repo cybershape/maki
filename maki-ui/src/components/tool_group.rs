@@ -12,7 +12,6 @@ use super::tool_display::ToolLines;
 use super::{GroupEntry, GroupThinkingEntry, GroupToolEntry, ToolGroupRole, ToolStatus};
 
 pub const MAX_COMPACT_ENTRIES: usize = 10;
-const GROUP_PADDING: &str = " ";
 const RAIL_CONTINUE: &str = "│  ";
 const RAIL_LAST: &str = "└  ";
 const CHILD_RAIL_CONTINUE: &str = "├  ";
@@ -74,19 +73,6 @@ pub fn format_group_duration(dur: Duration) -> String {
             format!("{millis}ms")
         } else {
             "0s".to_string()
-        }
-    }
-}
-
-pub fn format_thinking_tokens(tokens: usize) -> String {
-    if tokens < 1000 {
-        format!("({tokens}t)")
-    } else {
-        let k = tokens as f64 / 1000.0;
-        if k < 100.0 {
-            format!("({k:.1}k)")
-        } else {
-            format!("({:.0}k)", k.round())
         }
     }
 }
@@ -243,8 +229,7 @@ fn render_tool_row(
     };
 
     let mut spans = Vec::new();
-    spans.push(Span::raw(GROUP_PADDING));
-    let mut span_idx = 1;
+    let mut span_idx = 0;
 
     if !rail.is_empty() {
         spans.push(Span::styled(rail.to_string(), theme.tool_dim));
@@ -277,7 +262,7 @@ fn render_tool_row(
         theme.status_dim
     };
 
-    let left_len = GROUP_PADDING.width() + rail.width() + icon_width + tool.name.width();
+    let left_len = rail.width() + icon_width + tool.name.width();
     let summary_clean = single_line(&tool.summary);
 
     if !summary_clean.is_empty() {
@@ -337,7 +322,6 @@ fn render_thinking_row(
     };
 
     let mut spans = Vec::new();
-    spans.push(Span::raw(GROUP_PADDING));
 
     if !rail.is_empty() {
         spans.push(Span::styled(rail.to_string(), theme.tool_dim));
@@ -349,12 +333,12 @@ fn render_thinking_row(
     let preview = single_line(&thinking.text.replace(['*', '_', '#', '`', '>'], ""));
     let label = if preview.is_empty() {
         if thinking.active {
-            "Thinking..."
+            "thinking..."
         } else {
-            "Thinking"
+            "thinking"
         }
     } else {
-        "Thinking"
+        "thinking"
     };
 
     let label_style = if is_dim {
@@ -368,13 +352,7 @@ fn render_thinking_row(
         .duration
         .or_else(|| thinking.started_at.map(|st| st.elapsed()))
         .map(|d| format!("({})", format_tool_duration(d)));
-    let tokens_str = (thinking.tokens > 0).then(|| format_thinking_tokens(thinking.tokens));
-    let right_str = match (tokens_str, duration_str) {
-        (Some(tok), Some(dur)) => format!("{tok} {dur}"),
-        (Some(tok), None) => tok,
-        (None, Some(dur)) => dur,
-        (None, None) => String::new(),
-    };
+    let right_str = duration_str.unwrap_or_default();
     let right_len = right_str.width();
     let right_style = if is_dim {
         theme.tool_dim
@@ -382,7 +360,7 @@ fn render_thinking_row(
         theme.status_dim
     };
 
-    let left_len = GROUP_PADDING.width() + rail.width() + icon_width + label.width();
+    let left_len = rail.width() + icon_width + label.width();
 
     if !preview.is_empty() {
         let max_preview_len = (width as usize).saturating_sub(left_len + 1 + right_len + 1);
@@ -455,26 +433,6 @@ pub fn build_tool_group_lines(
         };
     }
 
-    if group.sealed && group.entries.len() == 1 {
-        let entry = &group.entries[0];
-        match entry {
-            GroupEntry::Tool(t) => {
-                push_tool_rows(&mut lines, &mut spinner_lines, t, "", frame, width, false)
-            }
-            GroupEntry::Thinking(th) => {
-                lines.push(render_thinking_row("", th, spinner_millis, width, false, 0))
-            }
-        }
-        return ToolLines {
-            lines,
-            highlight: None,
-            spinner_lines,
-            snapshot_base: None,
-            content_indent: "",
-            truncation: SectionFlags::default(),
-        };
-    }
-
     let theme = theme::current();
     let state_text = if has_pending_tool {
         if receiving_tool_args {
@@ -511,10 +469,9 @@ pub fn build_tool_group_lines(
     };
 
     let mut header_spans = Vec::new();
-    header_spans.push(Span::raw(GROUP_PADDING));
     header_spans.push(Span::styled(left_icon, left_style));
     if working && (has_pending_tool || (!is_thinking && working)) {
-        spinner_lines.push((0, 1));
+        spinner_lines.push((0, 0));
     }
     header_spans.push(Span::styled(state_text, Style::default()));
     if !hidden_suffix.is_empty() {
@@ -607,25 +564,22 @@ mod tests {
             group.entries.insert(0, GroupEntry::Tool(child));
         }
         let rendered = build_tool_group_lines(&group, 60, 0);
-        let parent_idx =
-            usize::from(followed_by_tool || preceded_by_tool) + usize::from(preceded_by_tool);
+        let parent_idx = 1 + usize::from(preceded_by_tool);
         let parent = rendered.lines[parent_idx].to_string();
         assert!(parent.contains("batch 2 tools"), "{parent}");
         assert!(parent.ends_with("(1.00s)"), "{parent}");
         let rail = if followed_by_tool {
             RAIL_CONTINUE
-        } else if preceded_by_tool {
-            CHILD_INDENT
         } else {
-            ""
+            CHILD_INDENT
         };
         assert_eq!(
             rendered.lines[parent_idx + 1].to_string().trim_end(),
-            format!(" {rail}├  ✓ read src/main.rs")
+            format!("{rail}├  ✓ read src/main.rs")
         );
         assert_eq!(
             rendered.lines[parent_idx + 2].to_string().trim_end(),
-            format!(" {rail}└  ✗ bash cargo check")
+            format!("{rail}└  ✗ bash cargo check")
         );
         assert!(rendered.lines.iter().all(|line| line.width() <= 60));
     }
@@ -635,13 +589,6 @@ mod tests {
         assert_eq!(format_tool_duration(Duration::from_millis(500)), "500ms");
         assert_eq!(format_tool_duration(Duration::from_millis(7430)), "7.43s");
         assert_eq!(format_tool_duration(Duration::from_millis(15900)), "15.9s");
-    }
-
-    #[test]
-    fn format_tokens() {
-        assert_eq!(format_thinking_tokens(350), "(350t)");
-        assert_eq!(format_thinking_tokens(1200), "(1.2k)");
-        assert_eq!(format_thinking_tokens(150_000), "(150k)");
     }
 
     #[test]
@@ -677,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn single_completed_tool_renders_single_line_without_header() {
+    fn single_completed_tool_renders_group_header_and_row() {
         let group = ToolGroupRole {
             id: "group-1".into(),
             sealed: true,
@@ -697,18 +644,24 @@ mod tests {
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
-        assert_eq!(tl.lines.len(), 1);
-        let text: String = tl.lines[0]
+        assert_eq!(tl.lines.len(), 2);
+        let header_text: String = tl.lines[0]
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(text.starts_with(" "));
-        assert!(text.contains("✓"));
-        assert!(text.contains("bash"));
-        assert!(text.contains("cargo check"));
-        assert!(text.contains("(1.20s)"));
-        assert!(!text.contains("worked for"));
+        assert!(header_text.contains("Worked for 1s"));
+
+        let row_text: String = tl.lines[1]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(row_text.starts_with(RAIL_LAST));
+        assert!(row_text.contains("✓"));
+        assert!(row_text.contains("bash"));
+        assert!(row_text.contains("cargo check"));
+        assert!(row_text.contains("(1.20s)"));
     }
 
     #[test]
@@ -908,7 +861,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(header_text.starts_with(" "));
+        assert!(header_text.starts_with("✓ "));
         assert!(header_text.contains("Worked for 23s"));
 
         let row1: String = tl.lines[1]
@@ -916,8 +869,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(row1.starts_with(" "));
-        assert!(row1.contains(RAIL_CONTINUE));
+        assert!(row1.starts_with(RAIL_CONTINUE));
         assert!(row1.contains("edit"));
         assert!(row1.contains("(7.43s)"));
 
@@ -926,8 +878,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(row2.starts_with(" "));
-        assert!(row2.contains(RAIL_LAST));
+        assert!(row2.starts_with(RAIL_LAST));
         assert!(row2.contains("✗"));
         assert!(row2.contains("bash"));
         assert!(row2.contains("(15.9s)"));
@@ -1066,7 +1017,7 @@ mod tests {
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
-        let title_span = &tl.lines[0].spans[2];
+        let title_span = &tl.lines[0].spans[1];
         assert_eq!(title_span.content.as_ref(), "Tool calling...");
         assert_eq!(title_span.style, Style::default());
     }
@@ -1150,7 +1101,15 @@ mod tests {
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
-        let thinking_line = tl.lines[0].to_string();
-        assert!(thinking_line.contains("(350t) (1.50s)"));
+        assert_eq!(tl.lines.len(), 2);
+        assert!(
+            tl.lines[1]
+                .spans
+                .iter()
+                .any(|s| s.content.as_ref() == "thinking")
+        );
+        let thinking_line = tl.lines[1].to_string();
+        assert!(thinking_line.contains("(1.50s)"));
+        assert!(!thinking_line.contains("350t"));
     }
 }

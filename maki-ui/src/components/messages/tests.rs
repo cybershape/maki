@@ -3416,7 +3416,7 @@ fn compact_batch_children_follow_snapshots(restored: bool, cancelled: bool) {
         assert_eq!(group.total_duration(), Duration::from_millis(1234));
     }
     let rows = tool_group::build_tool_group_lines(group, VIEW_WIDTH, 0);
-    assert!(rows.lines[1].to_string().ends_with("(1.23s)"));
+    assert!(rows.lines[2].to_string().ends_with("(1.23s)"));
     assert_eq!(
         batch.children[0].status,
         if cancelled {
@@ -3462,14 +3462,20 @@ fn compact_tools_state_text_transitions() {
         .collect();
     assert!(h2.contains("Tool calling..."));
 
-    // 3. Done: single completed tool renders single line
+    // 3. Done: single completed tool renders header and row in group
     panel.tool_done(done("call-1"));
     panel.seal_open_group();
     let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
         panic!()
     };
     let tl3 = tool_group::build_tool_group_lines(g, 80, 0);
-    assert_eq!(tl3.lines.len(), 1);
+    assert_eq!(tl3.lines.len(), 2);
+    let h3: String = tl3.lines[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(h3.contains("Worked for"));
 
     // 4. Multiple tools completed: worked for
     let mut group2 = ToolGroupRole {
@@ -3722,7 +3728,7 @@ fn compact_tools_header_snapshot_updates_group_entry_summary() {
     };
     assert_eq!(entry.summary, HEADER_TEXT);
     assert!(
-        panel.cache.segments()[0].lines()[0]
+        panel.cache.segments()[0].lines()[1]
             .to_string()
             .contains(HEADER_TEXT)
     );
@@ -3730,6 +3736,7 @@ fn compact_tools_header_snapshot_updates_group_entry_summary() {
 
 const LEFT_PAD_MSG: &str = "leftmost column must be blank padding";
 const MESSAGE_START_CHAR: &str = "y";
+const COMPACT_GROUP_START_CHAR: &str = "✓";
 
 #[test]
 fn messages_panel_renders_with_left_padding() {
@@ -3742,4 +3749,39 @@ fn messages_panel_renders_with_left_padding() {
         assert_eq!(buf[(0, y)].symbol(), " ", "{LEFT_PAD_MSG}");
     }
     assert_eq!(buf[(1, 0)].symbol(), MESSAGE_START_CHAR);
+}
+
+#[test]
+fn compact_tool_group_renders_aligned_with_panel_left_padding() {
+    let config = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(config, EventHandle::disconnected_for_test());
+    let group = ToolGroupRole {
+        id: "compact-group-0".into(),
+        sealed: true,
+        entries: vec![GroupEntry::Tool(GroupToolEntry {
+            id: "call-1".into(),
+            name: Arc::from("bash"),
+            summary: "ls".into(),
+            children: Vec::new(),
+            status: ToolStatus::Success,
+            receiving_args: false,
+            started_at: None,
+            duration: Some(Duration::from_millis(100)),
+        })],
+        started_at: None,
+        duration: Some(Duration::from_secs(1)),
+        waiting_since: None,
+    };
+    panel.push(DisplayMessage::new(
+        DisplayRole::ToolGroup(Box::new(group)),
+        String::new(),
+    ));
+    let terminal = render(&mut panel, 80, 10);
+    let buf = terminal.backend().buffer();
+
+    assert_eq!(buf[(0, 0)].symbol(), " ", "{LEFT_PAD_MSG}");
+    assert_eq!(buf[(1, 0)].symbol(), COMPACT_GROUP_START_CHAR);
 }
