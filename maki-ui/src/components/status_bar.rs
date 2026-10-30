@@ -287,17 +287,22 @@ impl StatusBar {
                 }
                 rest_spans.extend(yolo_span);
 
+                let dim_style = theme::current().status_dim;
                 let fg_style = Style::new().fg(theme::current().foreground);
-                rest_spans.push(Span::styled(CONTEXT_BAR_PREFIX, fg_style));
+                rest_spans.push(Span::styled(CONTEXT_BAR_PREFIX, dim_style));
                 if filled > 0 {
-                    rest_spans.push(Span::styled(CONTEXT_BAR_FILLED.repeat(filled), fg_style));
+                    rest_spans.push(Span::styled(
+                        CONTEXT_BAR_FILLED.repeat(filled),
+                        theme::current().progress_bar,
+                    ));
                 }
                 if unfilled > 0 {
                     rest_spans.push(Span::styled(
                         CONTEXT_BAR_UNFILLED.repeat(unfilled),
-                        theme::current().status_dim,
+                        dim_style,
                     ));
                 }
+                rest_spans.push(Span::styled(CONTEXT_BAR_SUFFIX, dim_style));
 
                 let window = format_tokens(ctx.stats.context_window).to_uppercase();
                 let cost_text = match (
@@ -312,7 +317,7 @@ impl StatusBar {
                     (None, _, _) => " ".to_string(),
                 };
                 rest_spans.push(Span::styled(
-                    format!("{CONTEXT_BAR_SUFFIX} {pct:.1}%/{window}{cost_text}"),
+                    format!(" {pct:.1}%/{window}{cost_text}"),
                     fg_style,
                 ));
 
@@ -469,6 +474,7 @@ mod tests {
 
     use super::*;
     use crate::repaint::expect::QUIET;
+    use ratatui::style::Color;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -861,5 +867,32 @@ mod tests {
         ctx.stats.context_window = window;
         let text = draw(&ctx);
         assert!(text.contains(expected), "{text}");
+    }
+
+    #[test]
+    fn context_bar_uses_theme_styles() {
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.stats.context_size = 500_000;
+        ctx.stats.context_window = 1_000_000;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
+        terminal
+            .draw(|f| StatusBar::new(FLASH_TTL).view(f, f.area(), &ctx))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let progress_fg = theme::current().progress_bar.fg.unwrap_or(Color::Reset);
+        let dim_fg = theme::current().status_dim.fg.unwrap_or(Color::Reset);
+
+        let has_progress_bar = (0..buffer.area.width).any(|x| {
+            let cell = buffer.cell((x, 0)).unwrap();
+            cell.symbol() == CONTEXT_BAR_FILLED && cell.fg == progress_fg
+        });
+        let has_bracket = (0..buffer.area.width).any(|x| {
+            let cell = buffer.cell((x, 0)).unwrap();
+            cell.symbol() == "[" && cell.fg == dim_fg
+        });
+
+        assert!(has_progress_bar);
+        assert!(has_bracket);
     }
 }
