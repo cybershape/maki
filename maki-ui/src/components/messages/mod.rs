@@ -934,6 +934,29 @@ impl MessagesPanel {
             .sum()
     }
 
+    pub fn current_turn_thinking_ms(&self) -> Option<u64> {
+        let mut sum_ms = 0u64;
+        let mut has_thinking = false;
+        for msg in self.messages.iter().rev() {
+            if matches!(msg.role, DisplayRole::Notice) {
+                break;
+            }
+            if let DisplayRole::ToolGroup(g) = &msg.role {
+                for entry in &g.entries {
+                    if let GroupEntry::Thinking(th) = entry {
+                        has_thinking = true;
+                        let dur = th
+                            .duration
+                            .or_else(|| th.started_at.map(|st| st.elapsed()))
+                            .map_or(0, |d| d.as_millis() as u64);
+                        sum_ms += dur;
+                    }
+                }
+            }
+        }
+        if has_thinking { Some(sum_ms) } else { None }
+    }
+
     #[cfg(test)]
     pub fn toggle_expansion(&mut self, tool_id: &str) -> bool {
         let Some(seg) = self

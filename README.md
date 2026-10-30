@@ -6,7 +6,7 @@
 - **Tool call reasons (`toolcall_reason`):** Injects an optional `toolcall_reason` parameter into every tool schema, prompting models to provide a concise, intent-focused reason (omitting redundant file names) for invoking the tool. The reason is displayed directly on the tool header / row title in the TUI (e.g. `reading main entry point · src/main.rs:10-29`) and stripped before execution so tool handlers receive clean arguments. In `compact_tools` mode, child tools inside `batch` calls also format and display their `toolcall_reason` in the tree.
 - **Tools & prompts:** Built-in directory listing tool is renamed from `list` to `list_dir`. System prompt hints dynamically adapt when `batch`, `code_execution`, or `task` are disabled. External MCP library and function names with non-identifier characters (such as hyphens) are normalized to valid Python identifiers across `code_execution` descriptions, sandbox namespace mounting, and `library_help`.
 - **TUI & interaction:**
-  - `compact_tools` mode grouping tools and thinking blocks with durations, waiting animations, child tool summaries, and full preservation across session restore.
+  - `compact_tools` mode grouping tools and thinking blocks with durations, waiting animations, child tool summaries, accurate summed thinking duration in turn completion stats, and full preservation across session restore.
   - Prompt queue with steer shortcut (Shift-Enter) to steer a running turn, plus recall editing for queued and previous prompts.
   - Context-window usage progress bar in status bar using theme colors; per-turn stats line upon completion.
   - Markdown LaTeX math expression rendering via `txm`.

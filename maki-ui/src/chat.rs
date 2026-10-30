@@ -439,7 +439,11 @@ impl Chat {
     }
 
     fn push_turn_stats_line(&mut self, usage: &TokenUsage) {
-        if let Some(line) = turn_stats_line(usage, self.pending_turn_stats.timing()) {
+        let mut timing = self.pending_turn_stats.timing();
+        if let Some(compact_ms) = self.messages_panel.current_turn_thinking_ms() {
+            timing.thinking_ms = compact_ms.max(timing.thinking_ms);
+        }
+        if let Some(line) = turn_stats_line(usage, timing) {
             self.messages_panel
                 .push(DisplayMessage::new(DisplayRole::Notice, line));
         }
@@ -1130,6 +1134,97 @@ mod tests {
         assert_eq!(
             notices[0],
             "Turn took 9.0s · thought for 0.2s · ↑300 ↓125 · 14 tok/s avg · TTFT 1.0s avg · cache 0% avg"
+        );
+    }
+
+    #[test]
+    fn user_turn_stats_line_sums_multiple_compact_thinking_blocks() {
+        use crate::components::{GroupEntry, GroupThinkingEntry, ToolGroupRole};
+        use maki_agent::DoneReason;
+
+        let mut chat = Chat::new(
+            MakiId::generate(),
+            None,
+            MAIN_NAME.into(),
+            UiConfig {
+                compact_tools: true,
+                ..UiConfig::default()
+            },
+            maki_lua::EventHandle::disconnected_for_test(),
+        );
+
+        let group = ToolGroupRole {
+            id: "group-1".into(),
+            sealed: false,
+            entries: vec![
+                GroupEntry::Thinking(GroupThinkingEntry {
+                    id: 0,
+                    text: "thinking block 1".into(),
+                    tokens: 10,
+                    active: false,
+                    started_at: None,
+                    duration: Some(std::time::Duration::from_millis(3_000)),
+                }),
+                GroupEntry::Thinking(GroupThinkingEntry {
+                    id: 1,
+                    text: "thinking block 2".into(),
+                    tokens: 10,
+                    active: false,
+                    started_at: None,
+                    duration: Some(std::time::Duration::from_millis(4_500)),
+                }),
+            ],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
+        };
+        chat.push(DisplayMessage::new(
+            DisplayRole::ToolGroup(Box::new(group)),
+            String::new(),
+        ));
+
+        chat.pending_turn_stats.observe(&TurnCompleteEvent {
+            message: Message::default(),
+            usage: TokenUsage {
+                input: 200,
+                output: 100,
+                ..Default::default()
+            },
+            model: String::new(),
+            cost: None,
+            subsidised_list_cost: None,
+            context_size: None,
+            context_window: 0,
+            timing: TurnTiming {
+                elapsed_ms: 10_000,
+                ttft_ms: Some(1_000),
+                thinking_ms: 0,
+            },
+        });
+
+        chat.handle_event(
+            AgentEvent::Done {
+                usage: TokenUsage {
+                    input: 200,
+                    output: 100,
+                    ..Default::default()
+                },
+                cost: None,
+                list_cost: None,
+                context_size: 0,
+                context_window: 0,
+                num_turns: 1,
+                reason: DoneReason::EndTurn,
+            },
+            None,
+        );
+
+        let notices = notice_lines(&chat);
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].contains("thought for 7.5s"),
+            "got: {}",
+            notices[0]
         );
     }
 
