@@ -305,6 +305,8 @@ impl StatusBar {
                 rest_spans.push(Span::styled(CONTEXT_BAR_SUFFIX, dim_style));
 
                 let window = format_tokens(ctx.stats.context_window).to_uppercase();
+                rest_spans.push(Span::styled(format!(" {pct:.1}%/{window}"), dim_style));
+
                 let cost_text = match (
                     ctx.stats.cost,
                     ctx.stats.list_cost,
@@ -316,10 +318,7 @@ impl StatusBar {
                     (Some(cost), _, _) => format!(" ${cost:.3} "),
                     (None, _, _) => " ".to_string(),
                 };
-                rest_spans.push(Span::styled(
-                    format!(" {pct:.1}%/{window}{cost_text}"),
-                    fg_style,
-                ));
+                rest_spans.push(Span::styled(cost_text, fg_style));
 
                 if let Some(global) = ctx.stats.global_cost.filter(|_| ctx.stats.show_global) {
                     let global_text = format!(" \u{03a3}${global:.3} ");
@@ -891,8 +890,18 @@ mod tests {
             let cell = buffer.cell((x, 0)).unwrap();
             cell.symbol() == "[" && cell.fg == dim_fg
         });
+        let has_percentage_dim = (0..buffer.area.width).any(|x| {
+            let cell = buffer.cell((x, 0)).unwrap();
+            cell.symbol() == "%" && cell.fg == dim_fg
+        });
+        let has_cost_fg = (0..buffer.area.width).any(|x| {
+            let cell = buffer.cell((x, 0)).unwrap();
+            cell.symbol() == "$" && cell.fg == theme::current().foreground
+        });
 
         assert!(has_progress_bar);
         assert!(has_bracket);
+        assert!(has_percentage_dim);
+        assert!(has_cost_fg);
     }
 }
