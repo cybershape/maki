@@ -28,6 +28,7 @@ const CHILD_DURATION_STYLE: &str = "batch_duration_ms";
 const CHILD_DURATION_PREFIX: &str = " (";
 const CHILD_DURATION_SUFFIX: &str = "ms)";
 const REASON_SEP: &str = " · ";
+const THINKING_NEWLINE_SEP: &str = " ↵ ";
 
 const BUSY_FRAMES: [&str; 4] = ["·", "•", "●", "•"];
 const BUSY_INTERVAL_MS: u128 = 140;
@@ -117,6 +118,16 @@ fn single_line(s: &str) -> String {
         }
     }
     result
+}
+
+fn format_thinking_preview(text: &str) -> String {
+    let cleaned = text.replace(['*', '_', '#', '`', '>'], "");
+    let lines: Vec<String> = cleaned
+        .lines()
+        .map(single_line)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines.join(THINKING_NEWLINE_SEP)
 }
 
 fn truncate_to_width(s: &str, max_w: usize) -> String {
@@ -539,7 +550,7 @@ fn render_thinking_row(
     let icon_width = icon.width();
     spans.push(Span::styled(icon, icon_style));
 
-    let preview = single_line(&thinking.text.replace(['*', '_', '#', '`', '>'], ""));
+    let preview = format_thinking_preview(&thinking.text);
     let label = if preview.is_empty() {
         if thinking.active {
             "thinking..."
@@ -1301,6 +1312,69 @@ mod tests {
             .iter()
             .find(|s| s.content.contains("analyzing requirements"))
             .expect("preview span found");
+        assert!(!preview_span.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn format_thinking_preview_single_line() {
+        assert_eq!(
+            format_thinking_preview("analyzing requirements"),
+            "analyzing requirements"
+        );
+    }
+
+    #[test]
+    fn format_thinking_preview_multiline_joins_with_separator() {
+        let text = "Building the AST conversion script\nDesigning the AST converter\nDesigning";
+        assert_eq!(
+            format_thinking_preview(text),
+            "Building the AST conversion script ↵ Designing the AST converter ↵ Designing"
+        );
+    }
+
+    #[test]
+    fn format_thinking_preview_collapses_empty_and_whitespace_lines() {
+        let text = "Building script\n\n   \n\nDesigning converter\n\n";
+        assert_eq!(
+            format_thinking_preview(text),
+            "Building script ↵ Designing converter"
+        );
+    }
+
+    #[test]
+    fn format_thinking_preview_strips_markdown_and_trims() {
+        let text = "### Building script\n- Designing converter\n> Note";
+        assert_eq!(
+            format_thinking_preview(text),
+            "Building script ↵ - Designing converter ↵ Note"
+        );
+    }
+
+    #[test]
+    fn thinking_row_displays_multiline_preview_with_newline_separator() {
+        let group = ToolGroupRole {
+            id: "group-1".into(),
+            sealed: false,
+            entries: vec![GroupEntry::Thinking(GroupThinkingEntry {
+                id: 0,
+                text: "Building script\nDesigning converter".into(),
+                tokens: 10,
+                active: false,
+                started_at: None,
+                duration: None,
+            })],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
+            expanded: false,
+        };
+
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let preview_span = tl.lines[1]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Building script ↵ Designing converter"))
+            .expect("multiline preview span found");
         assert!(!preview_span.style.add_modifier.contains(Modifier::ITALIC));
     }
 
