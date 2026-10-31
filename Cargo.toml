@@ -220,6 +220,11 @@ agent-client-protocol-schema = "1.10"
 wait-timeout = "0.2"
 inventory = "0.3"
 
+[profile.release]
+strip = true
+panic = "abort"
+lto = "thin"
+
 [profile.bench]
 debug = true
 
