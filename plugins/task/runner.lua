@@ -1,5 +1,5 @@
--- Everything the blocking and the background path share, from input checks to
--- the prompt loop, so the two cannot drift apart.
+-- What the task tool runs, from input checks to the prompt loop. A background
+-- task is the same call moved off its turn, so it shares all of it.
 --
 -- Structured-output story: the subagent gets a session-local structured_output
 -- tool whose handler validates the result and keeps it in `capture`. Invalid
@@ -82,13 +82,26 @@ end
 if opts.allow_background then
   schema.properties.background = {
     type = "boolean",
-    description = "Run in the background and continue other work. The result arrives later in a notice. End your turn to wait for it. Background tasks cannot ask for permissions.",
+    description = "Run in the background and continue other work. The result arrives as a message when it ends. End your turn to wait for it.",
+    needs_background = true,
   }
 end
 
 Runner.allow_background = opts.allow_background
 Runner.schema = schema
-Runner.semaphore = maki.async.semaphore(opts.max_concurrent)
+
+local slots = maki.async.semaphore(opts.max_concurrent)
+
+-- {on_wait} runs only when every slot is taken, right before the call parks
+-- for one.
+function Runner.acquire_slot(on_wait)
+  local permit = slots:try_acquire()
+  if permit then
+    return permit
+  end
+  on_wait()
+  return slots:acquire()
+end
 
 local function bounded_errors(errors)
   local out = {}

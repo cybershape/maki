@@ -1,26 +1,32 @@
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::{Future, pending};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_lite::FutureExt;
 use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
 use crate::agent::CallInstructions;
+use crate::call_scope::{CallGuard, CallScope};
+use crate::cancel::CancelToken;
 use crate::mcp::{McpSession, UNKNOWN_MCP, internal_tool_name, is_wire_name};
 use crate::permissions::{LayerAnswer, PermissionCheck, PromptLayers};
 use crate::task_set::TaskSet;
-use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
+use crate::tools::hook::{
+    Authority, ChainCut, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict, bounded,
+};
 use crate::tools::registry::{BoxFuture, InstalledHook, RegisteredTool, Tool, ToolInvocation};
 use crate::tools::schema::{
     TOOLCALL_REASON_FIELD, strip_toolcall_reason, toolcall_reason_injected,
 };
 use crate::tools::{
-    CallOrigin, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience, ToolContext,
-    ToolLive, truncate_bytes,
+    CallOrigin, FileKey, LocalTool, LocalToolFn, MovedCall, MovedLand, PermissionScopes,
+    ToolAudience, ToolContext, ToolExecResult, ToolLive, truncate_bytes,
 };
 use crate::{
     AgentError, AgentEvent, AgentSeed, CallRecord, TextOutput, ToolDoneEvent, ToolOutput,
@@ -60,10 +66,10 @@ const ERROR_OTHER: &str = "error";
 /// `similar` returns a coarser but still valid one.
 const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// The window a chain gets when the call carries no deadline of its own.
-/// Generous, because a layer may shell out before it decides, but a layer that
-/// parks and never comes back has to end somewhere short of "when the user
-/// gives up".
+/// The longest window a chain gets. An input chain ends sooner when its call
+/// does. Generous, because a layer may shell out before it decides, but a
+/// layer that parks and never comes back has to end somewhere short of "when
+/// the user gives up".
 const HOOK_CHAIN_MAX: Duration = Duration::from_secs(60);
 
 pub(super) struct RecentCalls {
@@ -185,13 +191,14 @@ pub async fn run(
                 is_error: true,
                 annotation: None,
                 written_path: None,
+                backgrounded: false,
             };
         }
     };
 
     let source = maki_otel::enabled().then(|| resolved.route.source());
     let started = Instant::now();
-    let mut done = run_inner(
+    let Ran { mut done, moved } = run_inner(
         resolved,
         id,
         &input,
@@ -202,14 +209,19 @@ pub async fn run(
     )
     .await;
     let took = started.elapsed();
-    if let Some(hook) = &hook {
-        hook.filter_output(&mut done, &input).await;
-    }
-    if origin.is_model() {
-        attach_call_instructions(ctx, &mut done);
-    }
-    if let Some(source) = source {
-        report(&done, name, &source, &input, took);
+    let output = OutputPipeline {
+        hook,
+        ctx,
+        origin,
+        tool: name,
+        source,
+    };
+    match moved {
+        None => output.apply(&mut done, &input, Filtered::Final(took)).await,
+        Some(moved) => {
+            let tail = output.detach(&done, &input, started);
+            tail.publish(&mut done, moved).await;
+        }
     }
     Arc::make_mut(&mut done.output).set_duration(took);
     done.call = Some(Box::new(CallRecord {
@@ -217,6 +229,194 @@ pub async fn run(
         duration: took,
     }));
     done
+}
+
+/// What a route hands back. Only a native call can move, and then `done`
+/// holds its receipt.
+struct Ran {
+    done: ToolDoneEvent,
+    moved: Option<MovedCall>,
+}
+
+impl From<ToolDoneEvent> for Ran {
+    fn from(done: ToolDoneEvent) -> Self {
+        Self { done, moved: None }
+    }
+}
+
+/// What dispatch makes of a tool's result, a moved call's final one included.
+fn ran(id: String, tool: Arc<str>, result: ToolExecResult) -> Ran {
+    let ToolExecResult {
+        output,
+        annotation,
+        written_path,
+        moved,
+    } = result;
+    let backgrounded = moved.is_some();
+    let done = match output {
+        Ok(output) => ToolDoneEvent {
+            call: None,
+            id,
+            tool,
+            output: Arc::new(output),
+            is_error: false,
+            annotation,
+            written_path,
+            backgrounded,
+        },
+        Err(message) => ToolDoneEvent {
+            tool,
+            backgrounded,
+            ..ToolDoneEvent::error(id, message)
+        },
+    };
+    Ran { done, moved }
+}
+
+/// Everything a call's output passes through before anyone reads it: the
+/// output hook, the instructions its call found, telemetry. An unmoved call's
+/// output takes it in [`run`]. A moved call's receipt takes it in
+/// [`MovedPipeline::publish`], and its final result in
+/// [`MovedPipeline::land`], so none of them can skip a
+/// stage another has. Instructions are drained, so each block rides on the
+/// first of them that reaches the model.
+struct OutputPipeline<'a> {
+    hook: Option<Hook<'a>>,
+    ctx: &'a ToolContext,
+    origin: CallOrigin,
+    tool: &'a str,
+    source: Option<Cow<'static, str>>,
+}
+
+#[derive(Clone, Copy)]
+enum Filtered {
+    /// Tells a layer the call moved and its result comes later. It can still
+    /// carry the call's own output, like the last lines of a command.
+    Receipt,
+    /// What the call ended with, the only one telemetry reports.
+    Final(Duration),
+}
+
+impl OutputPipeline<'_> {
+    async fn apply(&self, done: &mut ToolDoneEvent, input: &Value, filtered: Filtered) {
+        if let Some(hook) = &self.hook {
+            hook.filter_output(done, input, matches!(filtered, Filtered::Receipt))
+                .await;
+        }
+        if self.origin.is_model() {
+            attach_call_instructions(self.ctx, done);
+        }
+        if let (Some(source), Filtered::Final(took)) = (&self.source, filtered) {
+            report(done, self.tool, source, input, took);
+        }
+    }
+
+    /// The call's own cancel belongs to its turn: a stop fires it before the
+    /// final reply exists, which would end the output chain unheard and let
+    /// the raw text through. So a moved call's outputs answer to their
+    /// [window](Hook::window) alone.
+    fn detach(self, receipt: &ToolDoneEvent, input: &Value, started: Instant) -> MovedPipeline {
+        MovedPipeline {
+            layer: self.hook.map(|hook| hook.layer),
+            ctx: ToolContext {
+                cancel: CancelToken::none(),
+                ..self.ctx.clone()
+            },
+            origin: self.origin,
+            source: self.source,
+            id: receipt.id.clone(),
+            tool: Arc::clone(&receipt.tool),
+            input: input.clone(),
+            started,
+        }
+    }
+}
+
+/// A moved call's [`OutputPipeline`], owned, so it outlives the turn that
+/// dispatched the call. Only a native call moves, and its registry name is
+/// the name it was called by, so `tool` serves as both.
+struct MovedPipeline {
+    layer: Option<HookLayer>,
+    ctx: ToolContext,
+    origin: CallOrigin,
+    source: Option<Cow<'static, str>>,
+    id: String,
+    tool: Arc<str>,
+    input: Value,
+    started: Instant,
+}
+
+impl MovedPipeline {
+    fn output(&self) -> OutputPipeline<'_> {
+        OutputPipeline {
+            hook: self
+                .layer
+                .clone()
+                .map(|layer| layer.bind(&self.ctx, &self.tool)),
+            ctx: &self.ctx,
+            origin: self.origin,
+            tool: &self.tool,
+            source: self.source.clone(),
+        }
+    }
+
+    /// The one place a move becomes the model's. A receipt the model reads as
+    /// an error (an output layer denied it) tells it the call failed, so the
+    /// move is dropped unpublished: its work is fired, its receipt forgotten,
+    /// and the call ends as the model was told rather than reporting back
+    /// later on a call it already retried.
+    async fn publish(self, receipt: &mut ToolDoneEvent, moved: MovedCall) {
+        self.output()
+            .apply(receipt, &self.input, Filtered::Receipt)
+            .await;
+        if receipt.is_error {
+            warn!(
+                id = %self.id,
+                tool = %self.tool,
+                "the receipt reached the model as an error, so the call does not move"
+            );
+            receipt.backgrounded = false;
+            drop(moved);
+            return;
+        }
+        let MovedCall { result, land } = moved;
+        smol::spawn(self.land(result, Landing(Some(land)))).detach();
+    }
+
+    async fn land(self, result: BoxFuture<'static, Option<ToolExecResult>>, landing: Landing) {
+        let Some(result) = result.await else {
+            warn!(id = %self.id, tool = %self.tool, "moved call ended without a reply");
+            landing.land(None);
+            return;
+        };
+        let mut done = ran(self.id.clone(), Arc::clone(&self.tool), result).done;
+        let took = self.started.elapsed();
+        self.output()
+            .apply(&mut done, &self.input, Filtered::Final(took))
+            .await;
+        landing.land(Some(done));
+    }
+}
+
+/// A published move's `land`. The model read the receipt, so a pipeline that
+/// dies before landing (a panicking layer, an executor shutting down) still
+/// lands `None`, and the model hears the call was lost.
+struct Landing(Option<MovedLand>);
+
+impl Landing {
+    fn land(mut self, done: Option<ToolDoneEvent>) {
+        if let Some(land) = self.0.take() {
+            land(done);
+        }
+    }
+}
+
+impl Drop for Landing {
+    fn drop(&mut self) {
+        if let Some(land) = self.0.take() {
+            land(None);
+        }
+    }
 }
 
 /// A file counts as seen only once its block is on an output the model reads,
@@ -252,9 +452,16 @@ fn attach_call_instructions(ctx: &ToolContext, done: &mut ToolDoneEvent) {
 /// The call id is handed to each stage instead of held, because `run_inner`
 /// owns it in between.
 struct Hook<'a> {
-    installed: InstalledHook,
+    layer: HookLayer,
     ctx: &'a ToolContext,
     tool: &'a str,
+}
+
+/// The part of a [`Hook`] that borrows nothing, so a moved call keeps the
+/// binding it was dispatched with, even after its plugin unloads.
+#[derive(Clone)]
+struct HookLayer {
+    installed: InstalledHook,
     /// Held for `tool_kind`, which borrows from it. Copying the kind out would
     /// cost an allocation on every call, even the ones no layer reads.
     native: Option<Arc<dyn Tool>>,
@@ -262,34 +469,48 @@ struct Hook<'a> {
     authority: Authority,
 }
 
+impl HookLayer {
+    fn bind<'a>(self, ctx: &'a ToolContext, tool: &'a str) -> Hook<'a> {
+        Hook {
+            layer: self,
+            ctx,
+            tool,
+        }
+    }
+}
+
 impl<'a> Hook<'a> {
     fn of(ctx: &'a ToolContext, resolved: &Resolved<'a>, origin: CallOrigin) -> Option<Self> {
-        Some(Self {
+        let layer = HookLayer {
             installed: ctx.registry.hook()?,
-            ctx,
-            tool: resolved.name,
             native: match &resolved.route {
                 Route::Native(entry) => Some(Arc::clone(&entry.tool)),
                 _ => None,
             },
             origin,
             authority: resolved.route.authority()?,
-        })
+        };
+        Some(layer.bind(ctx, resolved.name))
     }
 
     async fn filter_input(&self, tool_id: &str, input: &Value) -> Verdict {
-        if !self.installed.wraps(self.tool, HookStage::Input) {
+        if !self.layer.installed.wraps(self.tool, HookStage::Input) {
             return Verdict::Unchanged;
         }
         let cancelled = Verdict::Denied(ERROR_CANCELLED.to_owned());
-        self.fire(HookStage::Input, tool_id, input.clone(), None, cancelled)
-            .await
+        self.fire(
+            HookStage::Input,
+            self.call(HookStage::Input, tool_id, None),
+            input.clone(),
+            cancelled,
+        )
+        .await
     }
 
     /// Rewrites the finished event in place. Text and error flag move together,
     /// so a hook that cannot reach the text cannot flip the flag either.
-    async fn filter_output(&self, done: &mut ToolDoneEvent, input: &Value) {
-        if !self.installed.wraps(self.tool, HookStage::Output) {
+    async fn filter_output(&self, done: &mut ToolDoneEvent, input: &Value, receipt: bool) {
+        if !self.layer.installed.wraps(self.tool, HookStage::Output) {
             return;
         }
         let was_error = done.is_error;
@@ -310,14 +531,12 @@ impl<'a> Hook<'a> {
             return;
         };
         let value = json!({ OUTPUT_TEXT: &*text, OUTPUT_IS_ERROR: was_error });
+        let call = HookCall {
+            receipt,
+            ..self.call(HookStage::Output, &done.id, Some(input))
+        };
         let (rewritten, is_error) = match self
-            .fire(
-                HookStage::Output,
-                &done.id,
-                value,
-                Some(input),
-                Verdict::Unchanged,
-            )
+            .fire(HookStage::Output, call, value, Verdict::Unchanged)
             .await
         {
             Verdict::Unchanged | Verdict::Ask { .. } => return,
@@ -347,44 +566,70 @@ impl<'a> Hook<'a> {
     }
 
     /// Cancellation outranks a hook: nobody is left to read the verdict, so
-    /// the wait ends with `on_cancel`.
+    /// the wait ends with `on_cancel`. A chain the host never answers ends like
+    /// one the host dropped at its window: the value passes through unchanged.
     async fn fire(
         &self,
         stage: HookStage,
-        tool_id: &str,
+        call: HookCall<'_>,
         value: Value,
-        input: Option<&Value>,
         on_cancel: Verdict,
     ) -> Verdict {
-        let call = self.call(tool_id, input);
-        self.ctx
-            .cancel
-            .race(self.installed.run(stage, value, &call))
-            .await
-            .unwrap_or(on_cancel)
-    }
-
-    fn call<'b>(&'b self, tool_id: &'b str, input: Option<&'b Value>) -> HookCall<'b> {
-        HookCall {
-            tool: self.tool,
-            tool_id,
-            tool_kind: self.native.as_deref().and_then(Tool::tool_kind),
-            input,
-            session_id: self.ctx.session_id.as_ref().map(SessionRef::as_str),
-            origin: self.origin,
-            output_mode: self.ctx.output_mode,
-            authority: self.authority,
-            cancel: &self.ctx.cancel,
-            deadline: self.window(),
+        let chain = self.layer.installed.run(stage, value, &call);
+        match self.bounded(call.deadline, chain).await {
+            Ok(verdict) => verdict,
+            Err(ChainCut::Cancelled) => on_cancel,
+            Err(ChainCut::Lapsed) => {
+                warn!(
+                    tool = %self.tool,
+                    stage = stage.as_str(),
+                    "hook chain never answered within its window, leaving the value as it was"
+                );
+                Verdict::Unchanged
+            }
         }
     }
 
-    /// Read when a stage fires, not once per call: the input chain and the tool
-    /// spend from the same budget, so an output chain handed the entry-time
-    /// answer would inherit a window the call already used up.
-    fn window(&self) -> Instant {
+    async fn bounded<T>(
+        &self,
+        deadline: Instant,
+        chain: impl Future<Output = T>,
+    ) -> Result<T, ChainCut> {
+        let grace = self.layer.installed.answer_grace();
+        bounded(&self.ctx.cancel, deadline, grace, chain).await
+    }
+
+    fn call<'b>(
+        &'b self,
+        stage: HookStage,
+        tool_id: &'b str,
+        input: Option<&'b Value>,
+    ) -> HookCall<'b> {
+        HookCall {
+            tool: self.tool,
+            tool_id,
+            tool_kind: self.layer.native.as_deref().and_then(Tool::tool_kind),
+            input,
+            session_id: self.ctx.session_id.as_ref().map(SessionRef::as_str),
+            origin: self.layer.origin,
+            output_mode: self.ctx.output_mode,
+            authority: self.layer.authority,
+            receipt: false,
+            cancel: &self.ctx.cancel,
+            deadline: self.window(stage),
+        }
+    }
+
+    /// Read when a stage fires, not once per call. The input chain spends from
+    /// the call's budget, as the tool after it does. The output chain gets a
+    /// window of its own: the result is in hand by then, and a tool that ran
+    /// past its deadline would otherwise run out the layers that redact it.
+    fn window(&self, stage: HookStage) -> Instant {
         let cap = Instant::now() + HOOK_CHAIN_MAX;
-        self.ctx.deadline.at().map_or(cap, |at| at.min(cap))
+        match stage {
+            HookStage::Input => self.ctx.deadline.at().map_or(cap, |at| at.min(cap)),
+            HookStage::Output => cap,
+        }
     }
 }
 
@@ -398,11 +643,15 @@ struct PromptAsk<'a> {
 impl PromptLayers for PromptAsk<'_> {
     fn answer<'a>(&'a self, scopes: &'a [String]) -> BoxFuture<'a, Option<LayerAnswer>> {
         Box::pin(async move {
-            let call = self.hook.call(self.tool_id, Some(self.input));
-            self.hook
+            let call = self
+                .hook
+                .call(HookStage::Input, self.tool_id, Some(self.input));
+            let chain = self
+                .hook
+                .layer
                 .installed
-                .prompt(self.input, scopes, &call, self.hook.ctx)
-                .await
+                .prompt(self.input, scopes, &call, self.hook.ctx);
+            self.hook.bounded(call.deadline, chain).await.ok().flatten()
         })
     }
 }
@@ -614,7 +863,7 @@ async fn run_inner(
     origin: CallOrigin,
     ask: Option<&str>,
     hook: Option<&Hook<'_>>,
-) -> ToolDoneEvent {
+) -> Ran {
     let name = resolved.name;
     if let (Some(_), Route::Local(_)) = (ask, &resolved.route)
         && let Err(e) = gate_on_input(ctx, &ToolKey::native(name), &id, input, ask, None).await
@@ -622,15 +871,20 @@ async fn run_inner(
         return ToolDoneEvent {
             tool: Arc::from(name),
             ..ToolDoneEvent::error(id, e)
-        };
+        }
+        .into();
     }
     match resolved.route {
-        Route::Local(local) => run_local_tool(&local.handler, id, name, input, ctx, origin).await,
+        Route::Local(local) => run_local_tool(&local.handler, id, name, input, ctx, origin)
+            .await
+            .into(),
         Route::Native(entry) => {
             run_native_tool(entry, id, name, input, ctx, origin, ask, hook).await
         }
         Route::Mcp(mcp, qualified) => {
-            execute_mcp_tool(ctx, mcp, &id, qualified, input, origin, ask, hook).await
+            execute_mcp_tool(ctx, mcp, &id, qualified, input, origin, ask, hook)
+                .await
+                .into()
         }
         Route::Unknown => {
             warn!(tool = %name, "unknown tool");
@@ -646,7 +900,9 @@ async fn run_inner(
                 is_error: true,
                 annotation: None,
                 written_path: None,
+                backgrounded: false,
             }
+            .into()
         }
     }
 }
@@ -662,18 +918,16 @@ async fn run_native_tool(
     origin: CallOrigin,
     ask: Option<&str>,
     hook: Option<&Hook<'_>>,
-) -> ToolDoneEvent {
+) -> Ran {
     let tool_id: Arc<str> = Arc::from(entry.tool.name());
     let started = Instant::now();
 
-    let done_error = |msg: String| ToolDoneEvent {
-        call: None,
-        id: id.clone(),
-        tool: Arc::clone(&tool_id),
-        output: Arc::new(ToolOutput::Plain(msg.into())),
-        is_error: true,
-        annotation: None,
-        written_path: None,
+    let done_error = |msg: String| -> Ran {
+        ToolDoneEvent {
+            tool: Arc::clone(&tool_id),
+            ..ToolDoneEvent::error(id.clone(), msg)
+        }
+        .into()
     };
 
     let invocation = match entry.tool.parse(input) {
@@ -749,43 +1003,33 @@ async fn run_native_tool(
     // Nothing else could have touched the file while the guard was held, so the
     // mtime is refreshed here instead of by each write plugin remembering to.
     // Only on success: a failed or half-finished write must leave the changed
-    // mtime visible, so the next edit is correctly told the file moved.
+    // mtime visible, so the next edit is correctly told the file moved. A
+    // receipt is half-finished: the moved work may still write.
     if result.output.is_ok()
+        && result.moved.is_none()
         && let Some(key) = &mutated
     {
         ctx.file_access.record_read(key);
     }
 
-    let elapsed = started.elapsed();
-    match result.output {
-        Ok(output) => {
-            debug!(
-                tool = %name,
-                source = %entry.source.as_log_field(),
-                elapsed_ms = elapsed.as_millis() as u64,
-                "tool ok"
-            );
-            ToolDoneEvent {
-                call: None,
-                id,
-                tool: tool_id,
-                output: Arc::new(output),
-                is_error: false,
-                annotation: result.annotation,
-                written_path: result.written_path,
-            }
-        }
-        Err(message) => {
-            warn!(
-                tool = %name,
-                source = %entry.source.as_log_field(),
-                elapsed_ms = elapsed.as_millis() as u64,
-                error = %message,
-                "tool failed"
-            );
-            done_error(message)
-        }
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match &result.output {
+        Ok(_) => debug!(
+            tool = %name,
+            source = %entry.source.as_log_field(),
+            elapsed_ms,
+            backgrounded = result.moved.is_some(),
+            "tool ok"
+        ),
+        Err(message) => warn!(
+            tool = %name,
+            source = %entry.source.as_log_field(),
+            elapsed_ms,
+            error = %message,
+            "tool failed"
+        ),
     }
+    ran(id, tool_id, result)
 }
 
 /// Header summary and body format of a call the registry cannot describe
@@ -814,21 +1058,16 @@ impl RoutedView {
     }
 }
 
-/// The reason the model gave for this call, removed so the tool never sees it.
-///
-/// Only MCP comes through here, and it does not publish a
-/// schema that declares [`TOOLCALL_REASON_FIELD`], so the value is always one
-/// we asked for.
-fn take_toolcall_reason(input: &mut Value) -> Option<String> {
-    strip_toolcall_reason(true, input)
-}
-
 pub fn routed_view(name: &str, _input: &Value) -> Option<RoutedView> {
     if is_wire_name(name) {
         Some(RoutedView::mcp(&internal_tool_name(name)))
     } else {
         None
     }
+}
+
+fn take_toolcall_reason(input: &mut Value) -> Option<String> {
+    strip_toolcall_reason(true, input)
 }
 
 /// MCP, local, and search tools never go through invocation parsing,
@@ -859,7 +1098,7 @@ fn emit_raw_start(
 
 /// Why a file-mutating tool is stopped before its permission check, if it is.
 fn mutation_block(ctx: &ToolContext, name: &str, key: &FileKey) -> Option<String> {
-    if let Some(chat) = ctx.background_for
+    if let Some(chat) = ctx.background_for.chat()
         && let Some(reason) = AgentSeed::background_write_block(chat)
     {
         warn!(
@@ -942,6 +1181,7 @@ async fn run_local_tool(
         is_error,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     }
 }
 
@@ -989,21 +1229,35 @@ async fn gate(
         tool_id: id,
         input,
     });
+    // The prompt channel belongs to the turn. A moved call has left it, so
+    // nobody there answers for it, and a wait would hold the channel from
+    // every later ask. A move during the wait withdraws the ask.
+    let unmoved = ctx.call.as_deref().filter(|call| call.home().is_none());
+    let moved = ctx.call.is_some() && unmoved.is_none();
+    let user_response_rx = ctx.user_response_rx.as_deref().filter(|_| !moved);
+    let (withdraw, ask_cancel) = ctx.cancel.child();
     let decision = ctx.permissions.enforce(
         tool,
         scopes,
         ctx.session_id.as_ref(),
         &ctx.event_tx,
-        ctx.user_response_rx.as_deref(),
+        user_response_rx,
         id,
-        &ctx.cancel,
+        &ask_cancel,
         ctx.mode.plan_path(),
         ask,
         layers.as_ref().map(|layers| layers as &dyn PromptLayers),
     );
+    let withdrawn = async move {
+        if let Some(call) = unmoved {
+            call.moved().await;
+            withdraw.cancel();
+        }
+        pending().await
+    };
     let allowed_by = ctx
         .deadline
-        .paused_while(decision)
+        .paused_while(decision.or(withdrawn))
         .await
         .map_err(|e| e.to_string())?;
     if let Some(plugin) = allowed_by {
@@ -1075,6 +1329,7 @@ async fn execute_mcp_tool(
         is_error,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     };
 
     let perm_tool = match ToolKey::parse(&tool) {
@@ -1095,13 +1350,14 @@ async fn execute_mcp_tool(
 }
 
 /// Deduplicates doom-loop repeats, then runs remaining calls in parallel.
+/// `true` when one of them moved to the background.
 pub(super) async fn process_tool_calls(
     response: maki_providers::StreamResponse,
     recent_calls: &mut RecentCalls,
     history: &mut super::history::History,
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
-) -> Result<(), AgentError> {
+) -> Result<bool, AgentError> {
     let tool_uses: Vec<(String, String, Value)> = response
         .message
         .tool_uses()
@@ -1138,12 +1394,17 @@ pub(super) async fn process_tool_calls(
     for (id, name, input) in runnable {
         spawned_ids.push(id.clone());
         let event_tx_clone = ctx.event_tx.clone();
+        let scope = Arc::new(CallScope::new(id.clone(), &ctx.cancel));
         let tool_ctx = ToolContext {
             tool_use_id: Some(id.clone()),
             call_instructions: CallInstructions::default(),
+            cancel: scope.cancel().clone(),
+            call: Some(Arc::clone(&scope)),
             ..ctx.clone()
         };
+        let guard = CallGuard::new(scope);
         set.spawn(async move {
+            let _guard = guard;
             let done = run(id, &name, &input, &tool_ctx, CallOrigin::Model).await;
             event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done.clone())));
             done
@@ -1164,6 +1425,7 @@ pub(super) async fn process_tool_calls(
         })
         .collect();
 
+    let moved = results.iter().any(|done| done.backgrounded);
     let mut all_results = results;
     all_results.extend(immediate_errors);
     let tool_msg = crate::types::tool_results(all_results);
@@ -1171,7 +1433,7 @@ pub(super) async fn process_tool_calls(
         message: Box::new(tool_msg.clone()),
     })?;
     history.push(tool_msg);
-    Ok(())
+    Ok(moved)
 }
 
 /// Low-cardinality buckets, because a raw error message would give the
@@ -1249,20 +1511,25 @@ fn report(done: &ToolDoneEvent, name: &str, source: &str, input: &Value, took: D
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::pin::pin;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use flume::Receiver;
+    use futures_lite::future::poll_once;
     use maki_config::{
         Effect, Permission, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
     };
+    use maki_providers::{ContentBlock, Message, Role, StreamResponse};
     use maki_storage::id::MakiId;
     use smol::lock::Mutex as AsyncMutex;
     use test_case::test_case;
 
     use super::*;
-    use crate::cancel::CancelToken;
+    use crate::agent::history::History;
+    use crate::call_scope::TaskHome;
+    use crate::cancel::{CancelToken, CancelTrigger};
     use crate::live_session::{BACKGROUND_PLAN_WRITE_DENIED, SessionMailbox};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::tool_names;
@@ -1277,9 +1544,9 @@ mod tests {
         stub_ctx_with_permissions, stub_seed,
     };
     use crate::tools::{
-        BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
-        ParseError, PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience,
-        ToolExecResult, ToolFilter, ToolHook, ToolReach, local_tool,
+        BackgroundFor, BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture,
+        HeaderResult, MovedCall, ParseError, PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool,
+        ToolAudience, ToolExecResult, ToolFilter, ToolHook, ToolReach, local_tool,
     };
     use crate::{AgentMode, Envelope, EventSender, InstructionBlock};
 
@@ -1297,6 +1564,7 @@ mod tests {
     const PARENT_TOOL: &str = "parent";
     const CHILD_TEXT: &str = "child_done";
     const INSTRUCTION_PATH: &str = "/repo/sub/AGENTS.md";
+    const MOVED_INSTRUCTION_PATH: &str = "/repo/moved/AGENTS.md";
     const INSTRUCTION_CONTENT: &str = "sub rules";
     const HOOK_PLAIN: &str = "ls";
     const HOOK_REWRITTEN_FROM: &str = "grep -r x .";
@@ -1327,6 +1595,11 @@ mod tests {
     const HOOK_ASK_REASON: &str = "a human should see this";
     const SCOPELESS_TOOL_NAME: &str = "scopeless";
     const PROMPT_THINK_TIME: Duration = Duration::from_millis(20);
+    const HOOK_ANSWER_GRACE: Duration = Duration::from_millis(20);
+    const MOVED_TOOL_NAME: &str = "moved_probe";
+    const MOVED_RECEIPT: &str = "moved to the background";
+    const MOVED_FINAL: &str = "the secret result";
+    const MOVED_PANIC: &str = "the moved work blew up";
 
     fn recent_calls(entries: &[(&str, Value)]) -> RecentCalls {
         let mut rc = RecentCalls::new(&[]);
@@ -1582,6 +1855,7 @@ mod tests {
         session_id: Option<String>,
         origin: CallOrigin,
         value: Value,
+        receipt: bool,
         cancelled: bool,
         deadline: Instant,
     }
@@ -1589,7 +1863,9 @@ mod tests {
     #[derive(Clone, Copy)]
     enum Reply {
         Answers(fn(HookStage, &Value) -> Verdict),
-        /// Never resolves, so only cancellation can end the wait.
+        /// Resolves on a later poll, the way a reply from the Lua thread does.
+        Late(fn(HookStage, &Value) -> Verdict),
+        /// Never resolves, so only cancellation or the window ends the wait.
         Pending,
     }
 
@@ -1666,6 +1942,16 @@ mod tests {
             self.wrapped.contains(&stage)
         }
 
+        /// Short only for a chain that never answers, which a test waits out.
+        /// A late answer gets a grace it never reaches, so a slow machine
+        /// cannot turn it into a lapse.
+        fn answer_grace(&self) -> Duration {
+            match self.reply {
+                Reply::Pending => HOOK_ANSWER_GRACE,
+                Reply::Answers(_) | Reply::Late(_) => HOOK_CHAIN_MAX,
+            }
+        }
+
         fn run<'a>(
             &'a self,
             stage: HookStage,
@@ -1682,11 +1968,16 @@ mod tests {
                 session_id: call.session_id.map(str::to_owned),
                 origin: call.origin,
                 value: value.clone(),
+                receipt: call.receipt,
                 cancelled: call.cancel.is_cancelled(),
                 deadline: call.deadline,
             });
             match self.reply {
                 Reply::Answers(answer) => Box::pin(std::future::ready(answer(stage, &value))),
+                Reply::Late(answer) => Box::pin(async move {
+                    smol::future::yield_now().await;
+                    answer(stage, &value)
+                }),
                 Reply::Pending => Box::pin(std::future::pending()),
             }
         }
@@ -1872,6 +2163,71 @@ mod tests {
         });
     }
 
+    /// A host that never answers (one mid-reload) cannot hold the call. The
+    /// chain gives up a short grace after its window and lets the value
+    /// through unchanged, just like a chain the host dropped there.
+    #[test]
+    fn a_chain_that_never_answers_ends_at_its_window() {
+        smol::block_on(async {
+            let mut ctx = build_ctx();
+            ctx.deadline = Deadline::after(Duration::ZERO);
+            let never = RecordingHook::never_answering(&[HookStage::Input]);
+            let (ctx, _hook) = hooked_with(ctx, None, never);
+
+            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+
+            assert!(!done.is_error, "{}", done.output.as_text());
+            assert_eq!(done.output.as_text(), ran(HOOK_PLAIN));
+        });
+    }
+
+    /// The host polls a chain before it checks the deadline, so a verdict can
+    /// cross back after the call's deadline. It is still the verdict: a deny
+    /// layer skipped there would let the call run, a redaction layer skipped
+    /// there would hand back the raw text.
+    #[test_case(HOOK_DENIED, steer_the_call,     HOOK_DENY_REASON ; "input_deny")]
+    #[test_case(HOOK_PLAIN,  replace_the_output, HOOK_OUTPUT_TEXT ; "output_redaction")]
+    fn a_late_answer_past_the_calls_deadline_is_heard(
+        command: &str,
+        answer: fn(HookStage, &Value) -> Verdict,
+        expected: &str,
+    ) {
+        smol::block_on(async {
+            let mut ctx = build_ctx();
+            ctx.deadline = Deadline::after(Duration::ZERO);
+            let late = RecordingHook {
+                reply: Reply::Late(answer),
+                ..RecordingHook::default()
+            };
+            let (ctx, _hook) = hooked_with(ctx, None, late);
+
+            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(command)).await;
+
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), expected);
+        });
+    }
+
+    /// A tool that overran its deadline does not take its output layers'
+    /// window with it, or the layers that redact it would be skipped.
+    #[test]
+    fn an_output_chain_gets_a_window_past_the_calls_deadline() {
+        smol::block_on(async {
+            let mut ctx = build_ctx();
+            ctx.deadline = Deadline::after(Duration::ZERO);
+            let at = ctx.deadline.at();
+            let (ctx, hook) = hooked_ctx(ctx);
+            let before = Instant::now();
+
+            dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+
+            let input = hook.at(HookStage::Input).expect("the input stage fired");
+            let output = hook.at(HookStage::Output).expect("the output stage fired");
+            assert_eq!(Some(input.deadline), at);
+            assert!(output.deadline >= before + HOOK_CHAIN_MAX);
+        });
+    }
+
     /// A chain runs off this thread, so it only dies with the call it filters
     /// when it is handed that call's own token and an instant to be killed at.
     #[test]
@@ -1980,6 +2336,210 @@ mod tests {
         });
     }
 
+    fn instruction(path: &str) -> InstructionBlock {
+        InstructionBlock {
+            path: path.into(),
+            content: INSTRUCTION_CONTENT.into(),
+        }
+    }
+
+    fn instruction_paths(done: &ToolDoneEvent) -> Vec<String> {
+        done.output
+            .instructions()
+            .into_iter()
+            .flatten()
+            .map(|block| block.path.clone())
+            .collect()
+    }
+
+    /// How a [`MovedMock`]'s work ends.
+    #[derive(Clone, Copy)]
+    enum MovedEnding {
+        Replies,
+        Silent,
+        Panics,
+    }
+
+    /// Finds [`INSTRUCTION_PATH`] and answers with a receipt. Its tail finds
+    /// [`MOVED_INSTRUCTION_PATH`], stops the call the way a user's stop does,
+    /// and ends as `ending` says. It lands where the test reads it.
+    #[derive(Clone)]
+    struct MovedMock {
+        landed: flume::Sender<Option<ToolDoneEvent>>,
+        ending: MovedEnding,
+    }
+
+    struct MovedMockInvocation(MovedMock);
+
+    impl ToolInvocation for MovedMockInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(MOVED_TOOL_NAME.into()))
+        }
+        fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+            let MovedMock { landed, ending } = self.0;
+            let (instructions, call) = (ctx.call_instructions.clone(), ctx.call.clone());
+            instructions.record(vec![instruction(INSTRUCTION_PATH)]);
+            let result: BoxFuture<'static, Option<ToolExecResult>> = Box::pin(async move {
+                instructions.record(vec![instruction(MOVED_INSTRUCTION_PATH)]);
+                call.expect("a model call has a scope").end();
+                match ending {
+                    MovedEnding::Replies => Some(Ok(ToolOutput::Plain(MOVED_FINAL.into())).into()),
+                    MovedEnding::Silent => None,
+                    MovedEnding::Panics => panic!("{MOVED_PANIC}"),
+                }
+            });
+            Box::pin(async move {
+                ToolExecResult {
+                    moved: Some(MovedCall {
+                        result,
+                        land: Box::new(move |done| {
+                            let _ = landed.send(done);
+                        }),
+                    }),
+                    ..Ok(ToolOutput::Plain(MOVED_RECEIPT.into())).into()
+                }
+            })
+        }
+    }
+
+    impl Tool for MovedMock {
+        fn name(&self) -> &str {
+            MOVED_TOOL_NAME
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            "moved mock".into()
+        }
+        fn schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(MovedMockInvocation(self.clone())))
+        }
+    }
+
+    /// Dispatches a [`MovedMock`] as a model call under a hook answering
+    /// with `answer`, and returns its receipt, where it lands, the call's
+    /// scope and the hook.
+    async fn dispatch_moved(
+        ending: MovedEnding,
+        answer: fn(HookStage, &Value) -> Verdict,
+    ) -> (
+        ToolDoneEvent,
+        flume::Receiver<Option<ToolDoneEvent>>,
+        Arc<CallScope>,
+        RecordingHook,
+    ) {
+        let (landed, landed_rx) = flume::bounded(1);
+        let scope = Arc::new(CallScope::new(TEST_ID.to_owned(), &CancelToken::none()));
+        let mut ctx = build_ctx();
+        ctx.cancel = scope.cancel().clone();
+        ctx.call = Some(Arc::clone(&scope));
+        ctx.registry = registered(Arc::new(MovedMock { landed, ending }));
+        let hook = RecordingHook::answering(answer);
+        ctx.registry.set_hook(hook.clone());
+
+        let receipt = dispatch(&ctx, MOVED_TOOL_NAME, &json!({})).await;
+        (receipt, landed_rx, scope, hook)
+    }
+
+    fn redact_the_output(stage: HookStage, _value: &Value) -> Verdict {
+        match stage {
+            HookStage::Input => Verdict::Unchanged,
+            HookStage::Output => Verdict::Replaced(
+                serde_json::json!({OUTPUT_TEXT: HOOK_OUTPUT_TEXT, OUTPUT_IS_ERROR: false}),
+            ),
+        }
+    }
+
+    fn output_firings(hook: &RecordingHook) -> Vec<Seen> {
+        hook.seen()
+            .into_iter()
+            .filter(|seen| seen.stage == HookStage::Output)
+            .collect()
+    }
+
+    /// The receipt can carry the call's own output, so a redacting layer
+    /// sees it as well as the final result, and can tell the two apart. A
+    /// stop that came first does not cut the final's layer short, and each
+    /// output carries the instructions found before it.
+    #[test]
+    fn a_moved_calls_receipt_and_final_result_both_take_the_output_pipeline() {
+        smol::block_on(async {
+            let (receipt, landed, scope, hook) =
+                dispatch_moved(MovedEnding::Replies, redact_the_output).await;
+            let landed = landed
+                .recv_async()
+                .await
+                .expect("the tail landed")
+                .expect("the call replied");
+
+            assert!(receipt.backgrounded);
+            assert!(!landed.backgrounded);
+            assert!(scope.cancel().is_cancelled());
+            for done in [&receipt, &landed] {
+                assert!(!done.is_error);
+                let text = done.output.as_text();
+                assert!(text.starts_with(HOOK_OUTPUT_TEXT), "{text}");
+            }
+            assert_eq!(instruction_paths(&receipt), [INSTRUCTION_PATH]);
+            assert_eq!(instruction_paths(&landed), [MOVED_INSTRUCTION_PATH]);
+            let outputs = output_firings(&hook);
+            let filtered: Vec<_> = outputs
+                .iter()
+                .map(|seen| (seen.value[OUTPUT_TEXT].clone(), seen.receipt))
+                .collect();
+            assert_eq!(
+                filtered,
+                [(json!(MOVED_RECEIPT), true), (json!(MOVED_FINAL), false)]
+            );
+            assert!(outputs.iter().all(|seen| !seen.cancelled));
+        });
+    }
+
+    /// Once the model read the receipt it is owed an end, even when the work
+    /// gave no reply or the pipeline died on the way to landing it.
+    #[test_case(MovedEnding::Silent ; "the_work_ends_without_a_reply")]
+    #[test_case(MovedEnding::Panics ; "the_pipeline_dies")]
+    fn a_published_move_always_lands(ending: MovedEnding) {
+        smol::block_on(async {
+            let (receipt, landed, _scope, hook) = dispatch_moved(ending, redact_the_output).await;
+
+            assert!(receipt.backgrounded);
+            assert!(
+                landed
+                    .recv_async()
+                    .await
+                    .expect("the tail landed")
+                    .is_none()
+            );
+            assert_eq!(hook.stages(), both_stages(Authority::Unbounded));
+        });
+    }
+
+    /// A receipt the model reads as an error tells it the call failed, so
+    /// the move is never published: nothing reports back later on a call the
+    /// model has likely retried.
+    #[test_case(deny_the_output    ; "a_denied_receipt")]
+    #[test_case(replace_the_output ; "a_receipt_rewritten_as_a_failure")]
+    fn a_receipt_failed_by_a_layer_unpublishes_the_move(answer: fn(HookStage, &Value) -> Verdict) {
+        smol::block_on(async {
+            let (receipt, landed, _scope, hook) =
+                dispatch_moved(MovedEnding::Replies, answer).await;
+
+            assert!(receipt.is_error);
+            assert!(!receipt.backgrounded);
+            assert!(
+                landed.recv_async().await.is_err(),
+                "dropped unlanded, which abandons the move"
+            );
+            let receipts: Vec<_> = output_firings(&hook)
+                .iter()
+                .map(|seen| seen.receipt)
+                .collect();
+            assert_eq!(receipts, [true], "the final result never ran");
+        });
+    }
+
     fn drop_the_field(stage: HookStage, _value: &Value) -> Verdict {
         match stage {
             HookStage::Input => Verdict::Replaced(serde_json::json!({})),
@@ -2048,7 +2608,7 @@ mod tests {
             seed.set_chat_settings(Default::default(), &chat_mode);
             let mut ctx = build_ctx();
             ctx.registry = registered(Arc::new(HookMock(None)));
-            ctx.background_for = Some(chat);
+            ctx.background_for = BackgroundFor::Chat(chat);
 
             let done = run(
                 TEST_ID.into(),
@@ -2271,6 +2831,57 @@ mod tests {
             let text = done.output.as_text();
             assert!(text.starts_with(PERMISSION_DENIED_PREFIX), "got: {text}");
             assert!(prompts(&events).is_empty());
+        });
+    }
+
+    fn moved_away(scope: &CallScope) -> CancelTrigger {
+        scope
+            .move_to(TaskHome {
+                chat: MakiId::generate(),
+                id: TEST_ID.to_owned(),
+                plugin: Arc::from(HOOK_TOOL_NAME),
+            })
+            .unwrap()
+    }
+
+    /// The queued allow is the control: were the user asked, the call would run.
+    #[test]
+    fn a_moved_call_asks_nobody() {
+        smol::block_on(async {
+            let (mut ctx, events) = answered(build_ctx(), PermissionAnswer::AllowOnce);
+            let scope = Arc::new(CallScope::new(TEST_ID.to_owned(), &CancelToken::none()));
+            let _task = moved_away(&scope);
+            ctx.call = Some(scope);
+            let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_as_is));
+            let done = dispatch_nested(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+
+            assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
+            assert!(prompts(&events).is_empty());
+        });
+    }
+
+    #[test]
+    fn a_move_withdraws_the_ask_and_frees_the_prompt_channel() {
+        smol::block_on(async {
+            let (event_tx, events) = flume::unbounded();
+            let (_answer_tx, answer_rx) = flume::unbounded::<String>();
+            let mut ctx = build_ctx();
+            ctx.event_tx = EventSender::new(event_tx, 0);
+            let channel = Arc::new(AsyncMutex::new(answer_rx));
+            ctx.user_response_rx = Some(Arc::clone(&channel));
+            let scope = Arc::new(CallScope::new(TEST_ID.to_owned(), &CancelToken::none()));
+            ctx.call = Some(Arc::clone(&scope));
+            let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_as_is));
+
+            let input = call_input(HOOK_PLAIN);
+            let mut done = pin!(dispatch_nested(&ctx, HOOK_TOOL_NAME, &input));
+            assert!(poll_once(&mut done).await.is_none());
+            assert_eq!(prompts(&events).len(), 1);
+
+            let _task = moved_away(&scope);
+            let done = done.await;
+            assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
+            assert!(channel.try_lock().is_some());
         });
     }
 
@@ -2806,21 +3417,19 @@ mod tests {
         });
     }
 
-    /// We measure the pause on the output hook's window instead of racing the
-    /// tool against a tiny budget, so a slow machine can't fail this. The tool
-    /// shares that same deadline, so it gets the time back too.
+    /// We measure the pause on the call's deadline instead of racing the tool
+    /// against a tiny budget, so a slow machine can't fail this.
     #[test]
     fn time_on_a_permission_prompt_does_not_spend_the_deadline() {
         smol::block_on(async {
             let mut ctx = rules_ctx(&AgentMode::Build, Vec::new());
             ctx.registry = registered(Arc::new(GuardedMock));
-            let hook = RecordingHook::default();
-            ctx.registry.set_hook(hook.clone());
             let (event_tx, events) = flume::unbounded();
             let (answer_tx, answer_rx) = flume::unbounded();
             ctx.event_tx = EventSender::new(event_tx, 0);
             ctx.user_response_rx = Some(Arc::new(AsyncMutex::new(answer_rx)));
             ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);
+            let at = ctx.deadline.at().expect("the call has a deadline");
 
             let user = async {
                 while !matches!(
@@ -2839,10 +3448,9 @@ mod tests {
             .await;
 
             assert!(!done.is_error, "got: {}", done.output.as_text());
-            let input = hook.at(HookStage::Input).expect("the input stage fired");
-            let output = hook.at(HookStage::Output).expect("the output stage fired");
+            let moved = ctx.deadline.at().expect("the call has a deadline");
             assert!(
-                output.deadline - input.deadline >= PROMPT_THINK_TIME,
+                moved - at >= PROMPT_THINK_TIME,
                 "the prompt ate into the call's budget"
             );
         });
@@ -2919,6 +3527,97 @@ mod tests {
                 "execute must not run after denial"
             );
         });
+    }
+
+    const PROBE_TOOL: &str = "probe";
+    const PARALLEL_IDS: [&str; 2] = ["call_a", "call_b"];
+
+    /// What one model call saw of its own context while it ran.
+    struct CallView {
+        id: String,
+        cancel: CancelToken,
+        scope: Arc<CallScope>,
+        cancelled_while_running: bool,
+    }
+
+    fn probe_turn(ids: &[&str]) -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: ids
+                    .iter()
+                    .map(|id| ContentBlock::tool_use(*id, PROBE_TOOL, json!({ "id": id })))
+                    .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Runs one model turn of {ids} under {run}, with {on_call} inside each call.
+    fn run_turn(
+        ids: &[&str],
+        run: CancelToken,
+        on_call: impl Fn(&ToolContext) + Send + Sync + 'static,
+    ) -> Vec<CallView> {
+        let (tx, _rx) = flume::unbounded::<Envelope>();
+        let event_tx = EventSender::new(tx, 0);
+        let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
+        ctx.cancel = run;
+        let views = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&views);
+        ctx.local_tools = Arc::new(HashMap::from([(
+            PROBE_TOOL.to_owned(),
+            local_tool(ToolAudience::all(), move |_input, call_ctx: ToolContext| {
+                on_call(&call_ctx);
+                record.lock().unwrap().push(CallView {
+                    id: call_ctx.tool_use_id.clone().unwrap(),
+                    cancel: call_ctx.cancel.clone(),
+                    scope: call_ctx.call.clone().unwrap(),
+                    cancelled_while_running: call_ctx.cancel.is_cancelled(),
+                });
+                Box::pin(async { Ok(String::new()) })
+            }),
+        )]));
+
+        smol::block_on(process_tool_calls(
+            probe_turn(ids),
+            &mut RecentCalls::new(&[]),
+            &mut History::new(Vec::new()),
+            &event_tx,
+            &ctx,
+        ))
+        .unwrap();
+        std::mem::take(&mut *views.lock().unwrap())
+    }
+
+    #[test]
+    fn parallel_calls_each_get_their_own_scope_and_token_that_ends_with_the_call() {
+        let (_run_trigger, run) = CancelToken::new();
+        let views = run_turn(&PARALLEL_IDS, run.clone(), |_| {});
+
+        assert_eq!(views.len(), PARALLEL_IDS.len());
+        for view in &views {
+            assert_eq!(view.scope.id(), view.id);
+            assert!(view.cancel.same_as(view.scope.cancel()));
+            assert!(!view.cancelled_while_running);
+            assert!(view.cancel.is_cancelled());
+        }
+        assert!(!Arc::ptr_eq(&views[0].scope, &views[1].scope));
+        assert!(!run.is_cancelled(), "a call ending must not end the run");
+    }
+
+    #[test]
+    fn cancelling_the_run_cancels_an_unmoved_call() {
+        let (run_trigger, run) = CancelToken::new();
+        let run_trigger = Mutex::new(Some(run_trigger));
+        let views = run_turn(&PARALLEL_IDS[..1], run, move |_| {
+            if let Some(trigger) = run_trigger.lock().unwrap().take() {
+                trigger.cancel();
+            }
+        });
+
+        assert!(views[0].cancelled_while_running);
     }
 }
 

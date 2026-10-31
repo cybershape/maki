@@ -3,12 +3,12 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, c_int};
 use std::fmt::Display;
-use std::future::Future;
+use std::future::{Future, pending};
 use std::panic::catch_unwind;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::ptr;
-use std::rc::Rc;
+use std::rc::{self, Rc};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
@@ -22,22 +22,27 @@ use maki_agent::permissions::{LayerAnswer, LayerVerdict, PluginRuleStore};
 use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
 use maki_agent::tools::hook::Verdict;
 use maki_agent::tools::{
-    HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
+    HeaderResult, MovedCall, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry,
+    ToolSource,
 };
 use maki_agent::{
-    BufferSnapshot, SessionEndReason, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, UiWaker,
+    AgentSeed, BufferSnapshot, CallScope, SessionEndReason, SessionMailbox, SharedBuf,
+    SnapshotLine, SnapshotSpan, SpanStyle, TaskHome, UiWaker, receipt_tag,
 };
 use mlua::chunk::{Chunk, ChunkMode, Compiler};
 use mlua::{Function, Lua, MaybeSend, MultiValue, RegistryKey, Table, Value as LuaValue, ffi};
 use serde_json::Value;
+use smol::lock::Mutex as AsyncMutex;
 use strum::{EnumString, IntoStaticStr};
 
 use maki_config::{CompatibilityConfig, RawConfig};
 use maki_providers::plugin::DeclAuthority;
 use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::now_epoch;
 
 use crate::agent_autocmd::HostEvent;
 use crate::api::action::{ActionStore, clear_plugin_actions};
+use crate::api::agent::adopt_session;
 use crate::api::autocmd::AutocmdStore;
 use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::fs::publish_walks;
@@ -64,18 +69,21 @@ use crate::api::util::command::{
     UiAttachment, as_plugin_load, install_ui_attachment, ui_send,
 };
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json_within};
-use crate::api::util::ctx::{LuaCtx, RestoreCtx};
+use crate::api::util::ctx::{DeadlineExpire, LuaCtx, RestoreCtx};
 use crate::api::util::pair::{Pair, err_pair};
 use crate::api::util::setup::ConfigStore;
 use crate::api::{Owner, create_maki_global};
-use crate::background::BackgroundSessions;
+use crate::background::{
+    BackgroundInfo, BackgroundTask, BackgroundTasks, Fire, Kind, Lifetime, MovedEnd, Stop, StopMark,
+};
 use crate::docs_render;
 use crate::error::PluginError;
 use crate::key_lint::KeyLint;
 use crate::loader::EventHandle;
 use crate::pack::Interaction;
 use crate::plugin_permissions::{
-    Ceiling, Permission, PluginPermissions, PluginReach, grant_hint, load_plugin_permissions,
+    Ceiling, Permission, PluginPermissions, PluginReach, denied_error, grant_hint,
+    load_plugin_permissions,
 };
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
@@ -88,6 +96,8 @@ pub(crate) const CANCELLED_MSG: &str = "cancelled";
 pub(crate) const OUTSIDE_TASK_ERR: &str =
     "not available at a plugin's top level: call it from a callback";
 const HANDLER_TIMEOUT_MSG: &str = "timeout";
+/// The cancel hook reason of a background task the model's `task_stop` ended.
+const STOPPED_MSG: &str = "stopped";
 pub const MAX_INFLIGHT_TOOLS: usize = 64;
 /// Finished tools kept clickable without a restore round-trip. Purely a
 /// cache: a click that misses it falls back to the restore item carried
@@ -98,7 +108,7 @@ const GC_STEP_INTERVAL: usize = 4;
 /// Only sets how fast the one-shot interrupt is re-armed after it fires, so
 /// the kill still lands within a poll of [`KILL_GRACE`]. The thread ticks even
 /// when no Lua runs, so prefer the slowest interval the grace can hide.
-const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How long a doomed task may run without yielding before the watchdog
 /// shoots it. Cleanup after a cancel or a timeout (batch marking its
 /// children cancelled, rerendering its buf) is plain Lua running with the
@@ -114,7 +124,7 @@ pub const KILL_GRACE: Duration = Duration::from_millis(500);
 pub const SLICE_WARN: Duration = Duration::from_secs(1);
 /// A slice this long is raised even with no deadline in sight. A deadline
 /// caps how long a task runs in total, this caps how long it starves the rest.
-const SLICE_KILL: Duration = Duration::from_secs(5);
+pub(crate) const SLICE_KILL: Duration = Duration::from_secs(5);
 const UNKNOWN_PLUGIN: &str = "<unknown>";
 const UNKNOWN_LOCATION: &str = "?";
 /// Wall clock a cancelled handler gets before the host stops waiting for
@@ -122,7 +132,7 @@ const UNKNOWN_LOCATION: &str = "?";
 /// runs no Lua to interrupt and renews its grace at every yield. Long
 /// enough for cleanup that waits on children, short enough that the next
 /// prompt is not stuck behind abandoned work.
-const CANCEL_ABANDON_AFTER: Duration = Duration::from_secs(5);
+pub(crate) const CANCEL_ABANDON_AFTER: Duration = Duration::from_secs(5);
 const OPT_LEVEL_JIT: u8 = 2;
 const OPT_LEVEL_DEBUGGABLE: u8 = 1;
 const DEBUG_INFO_FULL: u8 = 2;
@@ -180,6 +190,37 @@ const SPAWN_QUEUE_NOT_INIT: &str = "spawn queue not initialized";
 /// Without a cap, a runaway plugin OOM-kills the whole process.
 /// With one, it hits a catchable Lua error instead.
 pub(crate) const LUA_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
+/// Moved calls a chat may have running at once, whatever moved them.
+pub(crate) const MAX_BACKGROUND_TASKS: usize = 16;
+/// How long a Ctrl+B or a background deadline waits for a call's
+/// `ctx:on_background` hook to answer before the call stays put.
+const BACKGROUND_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
+const ALREADY_MOVED_MSG: &str = "already moved";
+const NO_LIVE_CHAT_MSG: &str = "no live chat";
+const BACKGROUND_OFF_MSG: &str = "background tasks are turned off here (--background-timeout 0)";
+const NO_RUN_MSG: &str = "no agent run to report to";
+/// A subagent waits for its moved calls before it answers, so a call that
+/// moved itself (a dev server, say) would hang it. The user's Ctrl+B is the
+/// only way one moves.
+pub(crate) const SUBAGENT_SELF_MOVE_MSG: &str =
+    "background: a subagent's tool call only moves when the user moves it";
+const MOVED_BY_USER: &str = "Moved to the background by the user";
+const MOVED_AS_ASKED: &str = "Started in the background as asked";
+const NOT_LIVE_CALL_MSG: &str = "background: not a running model call";
+const MOVED_AT_TIMEOUT_PREFIX: &str = "Hit its";
+const MOVED_AT_TIMEOUT_SUFFIX: &str = "s timeout and was moved to the background";
+const CAP_REACHED_MSG: &str = "background tasks already running";
+const HOOK_SILENT_MSG: &str = "on_background hook did not answer within";
+const MOVE_FAILED_MSG: &str = "could not move";
+const MOVE_DECLINED_MSG: &str = "declined to move";
+const RECEIPT_TAIL: &str = "Its result arrives as a message when it finishes. Do not poll or \
+     sleep for it: continue with other work or end your turn. Stop it with task_stop if it is no \
+     longer needed.";
+/// Only the session's own agent has `task_stop`: a subagent's calls move only
+/// when the user moves them, which is too rare to pay for the tool in every
+/// subagent request.
+const SUBAGENT_RECEIPT_TAIL: &str = "Its result arrives as a message before you finish. Do not \
+     poll or sleep for it: continue with other work or end your turn.";
 
 pub type LoadResult = Result<(), PluginError>;
 pub(crate) enum HintContent {
@@ -369,6 +410,17 @@ pub(crate) struct PromptRun {
     pub deadline: Instant,
     pub req: Value,
     pub ctx: Box<LuaCtx>,
+}
+
+/// Answer to a [`MoveRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveOutcome {
+    Moved,
+    /// The call never registered `ctx:on_background`, or it already ended.
+    NoHook,
+    /// Why the call stays in the foreground, worded for a flash: already
+    /// moved, the cap, or the reason a hook gave for declining.
+    NotMovable(String),
 }
 
 /// Load/clear drain in-flight tools first so we never mutate a
@@ -723,6 +775,12 @@ pub(crate) struct TaskCell {
     slice_warned: Cell<bool>,
     pub(crate) deadline: Cell<Option<Instant>>,
     pub(crate) deadline_secs: Cell<Option<u64>>,
+    pub(crate) deadline_expire: Cell<DeadlineExpire>,
+    /// The model call this task serves, shared with the calls it nests. Once
+    /// the call moved to the background no deadline ends any of them.
+    pub(crate) call: Option<Arc<CallScope>>,
+    /// `ctx:on_background`, at most one per call.
+    pub(crate) background_hook: Option<RegistryKey>,
     /// Notified by `ctx:set_deadline`, so [`until_abandoned`] re-arms on the
     /// new deadline instead of staying parked on the one it started with.
     pub(crate) deadline_changed: Event,
@@ -794,6 +852,9 @@ impl TaskCell {
             slice_warned: Cell::new(false),
             deadline: Cell::new(deadline),
             deadline_secs: Cell::new(None),
+            deadline_expire: Cell::new(DeadlineExpire::Timeout),
+            call: None,
+            background_hook: None,
             deadline_changed: Event::new(),
             bufs: BufferStore::new(),
             live,
@@ -813,12 +874,24 @@ impl TaskCell {
         Arc::new(Mutex::new(self))
     }
 
+    fn moved(&self) -> bool {
+        self.call.as_ref().is_some_and(|call| call.home().is_some())
+    }
+
+    /// The deadline that can still end the task. A moved call's subtree has
+    /// none, and an `expire = "background"` one is held back until its move
+    /// attempt either moves the call or hands it back as a plain deadline.
+    fn live_deadline(&self) -> Option<Instant> {
+        let held = self.moved() || self.deadline_expire.get() == DeadlineExpire::Background;
+        self.deadline.get().filter(|_| !held)
+    }
+
     /// Cancel outranks the deadline: once nobody waits for the reply,
     /// reporting a timeout would only mislead.
     fn doomed(&self, now: Instant) -> Option<KillReason> {
         if self.cancel.is_cancelled() {
             Some(KillReason::Cancelled)
-        } else if self.deadline.get().is_some_and(|d| now > d) {
+        } else if self.live_deadline().is_some_and(|d| now > d) {
             Some(KillReason::Deadline)
         } else {
             None
@@ -899,8 +972,469 @@ impl TaskCell {
 
 pub(crate) type TaskHandle = Arc<Mutex<TaskCell>>;
 
-type LiveTasks = Rc<RefCell<HashMap<String, TaskHandle>>>;
+type LiveTasks = Rc<RefCell<HashMap<String, Rc<LiveTask>>>>;
 type WarmTools = Rc<RefCell<VecDeque<WarmTool>>>;
+
+/// What put a call in the background, worded into its receipt.
+enum MoveTrigger {
+    User,
+    Timeout(u64),
+    /// The call moved itself with `ctx:background()`.
+    Model,
+}
+
+impl MoveTrigger {
+    /// Says how the call moved and that the result comes later. Without the
+    /// tail, models poll or sleep for the result anyway.
+    fn receipt_suffix(self, id: &str, subagent: bool) -> String {
+        let how = match self {
+            Self::User => Cow::Borrowed(MOVED_BY_USER),
+            Self::Timeout(secs) => Cow::Owned(format!(
+                "{MOVED_AT_TIMEOUT_PREFIX} {secs} {MOVED_AT_TIMEOUT_SUFFIX}"
+            )),
+            Self::Model => Cow::Borrowed(MOVED_AS_ASKED),
+        };
+        let tail = if subagent {
+            SUBAGENT_RECEIPT_TAIL
+        } else {
+            RECEIPT_TAIL
+        };
+        format!("{how} {}. {tail}", receipt_tag(id))
+    }
+}
+
+fn not_movable(reason: &str) -> MoveOutcome {
+    MoveOutcome::NotMovable(reason.to_owned())
+}
+
+/// A model call's way back to whoever dispatched it. A move and the final
+/// reply both take `reply`, and both run on the Lua thread, so whichever
+/// comes first answers and the other finds it gone. A move leaves its tail's
+/// sender behind, so the final reply of a moved call takes `reply` too.
+struct CallAnswer {
+    reply: RefCell<Option<flume::Sender<ToolCallReply>>>,
+    /// The call's [`MAX_INFLIGHT_TOOLS`] slot. A move gives it back, so long
+    /// background work never starves foreground calls.
+    slot: RefCell<Option<GateGuard>>,
+}
+
+impl CallAnswer {
+    fn new(reply: flume::Sender<ToolCallReply>, slot: Option<GateGuard>) -> Self {
+        Self {
+            reply: RefCell::new(Some(reply)),
+            slot: RefCell::new(slot),
+        }
+    }
+
+    fn open(&self) -> bool {
+        self.reply
+            .borrow()
+            .as_ref()
+            .is_some_and(|tx| !tx.is_disconnected())
+    }
+
+    /// The final reply goes to the dispatcher, or once the call moved, to
+    /// the tail dispatch runs it through before it reaches the chat. A tail
+    /// that went away took the call's [`MovedEnd`] with it, which abandoned
+    /// the call.
+    fn finish(&self, lua: &Lua, id: Option<&str>, reply: ToolCallReply) {
+        drop(self.slot.take());
+        if let Some(tx) = self.reply.take()
+            && tx.send(reply).is_ok()
+            && let Some(id) = id
+        {
+            BackgroundTasks::of(lua).final_ready(id);
+        }
+    }
+}
+
+/// A running model call the UI reaches by `tool_use_id`: clicks, and moving
+/// it to the background. Lives until the call's final reply, moved or not.
+struct LiveTask {
+    id: String,
+    handle: TaskHandle,
+    plugin: Arc<str>,
+    tool: Arc<str>,
+    /// For the start summary that names the task in `/tasks`.
+    input: Value,
+    /// Where the moved call shows: task tabs, `/tasks`, the cap.
+    chat: Option<MakiId>,
+    /// The run the moved call reports to. `None` outside a run: never moves.
+    mailbox: Option<SessionMailbox>,
+    /// The call of a subagent, not of the agent owning the session.
+    subagent: bool,
+    answer: Rc<CallAnswer>,
+    /// A hook runs for a move, so the next request waits for its verdict.
+    move_lock: AsyncMutex<()>,
+}
+
+impl LiveTask {
+    async fn try_move(&self, lua: &Lua, plugins: &PluginMap, trigger: MoveTrigger) -> MoveOutcome {
+        if let Err(refusal) = self.may_move_by(plugins, &trigger) {
+            return refusal;
+        }
+        let _moving = self.move_lock.lock().await;
+        let (hook, call) = {
+            let cell = lock_cell(&self.handle);
+            let hook = cell
+                .background_hook
+                .as_ref()
+                .and_then(|key| lua.registry_value::<Function>(key).ok());
+            (hook, cell.call.clone())
+        };
+        let (Some(hook), Some(call)) = (hook, call) else {
+            return MoveOutcome::NoHook;
+        };
+        if let Err(refusal) = self.movable_to(lua, &call) {
+            return refusal;
+        }
+        // Named before the hook runs: nothing may yield between its receipt
+        // and the commit, or its side effects could land without a move.
+        let summary = compute_header(lua, plugins, &self.plugin, &self.tool, self.input.clone())
+            .await
+            .text();
+        if let Err(refusal) = self.movable_to(lua, &call) {
+            return refusal;
+        }
+        let receipt = match self.ask(lua, hook).await {
+            Ok(receipt) => receipt,
+            Err(outcome) => return outcome,
+        };
+        self.commit(lua, &call, receipt, summary, trigger)
+    }
+
+    /// A press needs nothing. A call moving itself, by `ctx:background()` or
+    /// an `expire = "background"` deadline, makes its result wake the chat
+    /// and cost a turn, the price of `notify{ wake = true }`. A subagent waits
+    /// for its moved calls, so it never moves one itself.
+    fn may_move_by(&self, plugins: &PluginMap, trigger: &MoveTrigger) -> Result<(), MoveOutcome> {
+        if matches!(trigger, MoveTrigger::User) {
+            return Ok(());
+        }
+        if self.subagent {
+            return Err(not_movable(SUBAGENT_SELF_MOVE_MSG));
+        }
+        let granted = plugins
+            .borrow()
+            .get(&self.plugin)
+            .is_some_and(|owner| owner.permissions.is_allowed(Permission::Agent));
+        if !granted {
+            return Err(MoveOutcome::NotMovable(
+                denied_error(Permission::Agent).to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The chat the call can move to right now, and the mailbox it reports
+    /// to. Checked before the hook runs, so its side effects (bash starting a
+    /// log) only happen for a move that can land, and again at the commit,
+    /// because the hook yields.
+    fn movable_to(
+        &self,
+        lua: &Lua,
+        call: &CallScope,
+    ) -> Result<(MakiId, &SessionMailbox), MoveOutcome> {
+        if call.home().is_some() {
+            return Err(not_movable(ALREADY_MOVED_MSG));
+        }
+        // Esc already ended the call: moving it would only hide that.
+        if call.cancel().is_cancelled() {
+            return Err(not_movable(CANCELLED_MSG));
+        }
+        if !self.answer.open() {
+            return Err(MoveOutcome::NoHook);
+        }
+        let Some(chat) = self.chat else {
+            return Err(not_movable(NO_LIVE_CHAT_MSG));
+        };
+        if AgentSeed::live(chat).is_none() {
+            // A session that is up but never published a seed runs with
+            // background work off (`BackgroundMode::Blocking`).
+            let reason = if SessionMailbox::open(chat).is_ok() {
+                BACKGROUND_OFF_MSG
+            } else {
+                NO_LIVE_CHAT_MSG
+            };
+            return Err(not_movable(reason));
+        }
+        let Some(mailbox) = &self.mailbox else {
+            return Err(not_movable(NO_RUN_MSG));
+        };
+        let running = BackgroundTasks::of(lua)
+            .list(chat)
+            .iter()
+            .filter(|info| matches!(info.kind, Kind::Call { .. }))
+            .count();
+        if running >= MAX_BACKGROUND_TASKS {
+            return Err(MoveOutcome::NotMovable(format!(
+                "{MAX_BACKGROUND_TASKS} {CAP_REACHED_MSG}"
+            )));
+        }
+        Ok((chat, mailbox))
+    }
+
+    /// Runs the hook on the call's own task, as a click does. `Err` is the
+    /// outcome of a call that stays in the foreground.
+    async fn ask(&self, lua: &Lua, hook: Function) -> Result<ToolCallReply, MoveOutcome> {
+        let answered = covered(
+            None,
+            ScopedFuture::new(
+                lua.clone(),
+                Arc::clone(&self.handle),
+                hook.call_async::<MultiValue>(()),
+            ),
+        );
+        let lapsed = async {
+            smol::Timer::after(BACKGROUND_HOOK_TIMEOUT).await;
+            Err::<MultiValue, _>(mlua::Error::runtime(format!(
+                "{HOOK_SILENT_MSG} {}s",
+                BACKGROUND_HOOK_TIMEOUT.as_secs()
+            )))
+        };
+        let mut values = futures_lite::future::or(answered, lapsed)
+            .await
+            .map_err(|e| {
+                MoveOutcome::NotMovable(format!(
+                    "{} {MOVE_FAILED_MSG}: {}",
+                    self.tool,
+                    strip_traceback(&e)
+                ))
+            })?
+            .into_iter();
+        match values.next().unwrap_or(LuaValue::Nil) {
+            LuaValue::Nil => Err(MoveOutcome::NotMovable(match values.next() {
+                Some(LuaValue::String(reason)) => reason.to_string_lossy(),
+                _ => format!("{} {MOVE_DECLINED_MSG}", self.tool),
+            })),
+            receipt => {
+                let reply = ToolCallReply::from_lua_value(lua, &receipt);
+                match &reply.result {
+                    Ok(_) => Ok(reply),
+                    Err(e) => Err(MoveOutcome::NotMovable(e.clone())),
+                }
+            }
+        }
+    }
+
+    fn commit(
+        &self,
+        lua: &Lua,
+        call: &CallScope,
+        mut receipt: ToolCallReply,
+        summary: String,
+        trigger: MoveTrigger,
+    ) -> MoveOutcome {
+        let (chat, mailbox) = match self.movable_to(lua, call) {
+            Ok(target) => target,
+            Err(refusal) => return refusal,
+        };
+        // Every step that can fail comes before the landing, so a move that
+        // gives up leaves the call unmoved, and the trigger it claimed ends
+        // the call as cancelled.
+        let Ok((claim, cancel)) = call.claim_move() else {
+            return not_movable(ALREADY_MOVED_MSG);
+        };
+        // An Esc that fired the run while the call was moving reaches it
+        // through the claim. The user stopped it, so its end is quiet.
+        let stop = StopMark::default();
+        if call.cancel().is_cancelled() {
+            stop.mark(Stop::User);
+        }
+        let entry = BackgroundTask {
+            info: BackgroundInfo {
+                id: self.id.clone(),
+                plugin: Arc::clone(&self.plugin),
+                name: summary,
+                kind: Kind::Call {
+                    tool: Arc::clone(&self.tool),
+                },
+                running: true,
+                started_at: now_epoch(),
+                cost: None,
+            },
+            session: chat,
+            task: None,
+            lifetime: Lifetime::Call,
+            stop,
+            cancel: Fire::Owned(cancel),
+            mailbox: Some(mailbox.clone()),
+        };
+        let registry = BackgroundTasks::of(lua);
+        // A refused entry fires the trigger it holds, so the call ends as
+        // cancelled, answering the dispatcher it never left.
+        if let Err(e) = registry.register(entry) {
+            return MoveOutcome::NotMovable(e);
+        }
+        let ui = host_ui(lua);
+        let (tail_tx, tail_rx) = flume::bounded(1);
+        receipt.result = receipt.result.map(|text| {
+            format!(
+                "{text}\n\n{}",
+                trigger.receipt_suffix(&self.id, self.subagent)
+            )
+        });
+        receipt.moved = Some(MovedCall {
+            result: Box::pin(async move {
+                let reply: ToolCallReply = tail_rx.recv_async().await.ok()?;
+                Some(reply.into_exec_result())
+            }),
+            land: {
+                let end = MovedEnd::new(registry.clone(), self.id.clone(), ui.clone());
+                Box::new(move |done| end.land(done))
+            },
+        });
+        let delivered = self
+            .answer
+            .reply
+            .take()
+            .is_some_and(|tx| tx.send(receipt).is_ok());
+        // The dispatcher gave up on the call (Esc, its backstop) as the move
+        // was landing. The receipt came back unread, and its `MovedEnd`
+        // abandoned the entry as it dropped.
+        if !delivered {
+            return not_movable(CANCELLED_MSG);
+        }
+        self.answer.reply.replace(Some(tail_tx));
+        let home = TaskHome {
+            chat,
+            id: self.id.clone(),
+            plugin: Arc::clone(&self.plugin),
+        };
+        claim.land(home.clone());
+        // Sessions opened from here on find the home and register themselves.
+        for stub in call.take_sessions() {
+            adopt_session(&registry, ui.as_ref(), &home, stub);
+        }
+        drop(self.answer.slot.take());
+        tracing::info!(
+            id = %self.id,
+            tool = %self.tool,
+            plugin = %self.plugin,
+            %chat,
+            mailbox = %mailbox.session_id(),
+            "tool call moved to the background"
+        );
+        MoveOutcome::Moved
+    }
+}
+
+/// A press of `Ctrl+B` on a call, or the call's own `ctx:background()`.
+pub(crate) struct MoveRequest {
+    tool_use_id: String,
+    trigger: MoveTrigger,
+    reply: flume::Sender<MoveOutcome>,
+}
+
+impl MoveRequest {
+    pub(crate) fn by_user(tool_use_id: String) -> (Self, flume::Receiver<MoveOutcome>) {
+        Self::new(tool_use_id, MoveTrigger::User)
+    }
+
+    fn new(tool_use_id: String, trigger: MoveTrigger) -> (Self, flume::Receiver<MoveOutcome>) {
+        let (reply, rx) = flume::bounded(1);
+        let request = Self {
+            tool_use_id,
+            trigger,
+            reply,
+        };
+        (request, rx)
+    }
+}
+
+/// Where every move is asked for. [`serve_moves`] answers apart from the
+/// request queue, which would wait behind a plugin load draining the very
+/// call to move.
+struct Moves(flume::Sender<MoveRequest>);
+
+/// Weak, because it runs on the executor it spawns on: a strong link would
+/// keep the executor, and every moved call on it, alive past the host.
+async fn serve_moves(
+    ex: rc::Weak<smol::LocalExecutor<'_>>,
+    lua: Lua,
+    live_tasks: LiveTasks,
+    plugins: PluginMap,
+    requests: flume::Receiver<MoveRequest>,
+) {
+    while let Ok(request) = requests.recv_async().await {
+        let Some(ex) = ex.upgrade() else {
+            return;
+        };
+        ex.spawn(serve_move(
+            lua.clone(),
+            Rc::clone(&live_tasks),
+            Rc::clone(&plugins),
+            request,
+        ))
+        .detach();
+    }
+}
+
+async fn serve_move(lua: Lua, live_tasks: LiveTasks, plugins: PluginMap, request: MoveRequest) {
+    let MoveRequest {
+        tool_use_id,
+        trigger,
+        reply,
+    } = request;
+    let task = live_tasks.borrow().get(&tool_use_id).map(Rc::clone);
+    let outcome = match (task, trigger) {
+        (None, MoveTrigger::User) => MoveOutcome::NoHook,
+        (None, _) => not_movable(NOT_LIVE_CALL_MSG),
+        (Some(task), trigger) => task.try_move(&lua, &plugins, trigger).await,
+    };
+    let _ = reply.send(outcome);
+}
+
+/// `ctx:background()`, waiting on the call's own task while
+/// [`serve_moves`] runs the hook.
+pub(crate) async fn move_self(lua: &Lua, tool_use_id: &str) -> MoveOutcome {
+    let Some(tx) = lua.app_data_ref::<Moves>().map(|own| own.0.clone()) else {
+        return not_movable(NOT_LIVE_CALL_MSG);
+    };
+    let (request, rx) = MoveRequest::new(tool_use_id.to_owned(), MoveTrigger::Model);
+    if tx.send(request).is_err() {
+        return not_movable(NOT_LIVE_CALL_MSG);
+    }
+    rx.recv_async()
+        .await
+        .unwrap_or_else(|_| not_movable(NOT_LIVE_CALL_MSG))
+}
+
+/// Moves a call whose `expire = "background"` deadline passed. A call that
+/// stays (not live, no live chat, no hook, a decline) gets its deadline back
+/// as a plain one, already lapsed, so it times out as usual.
+async fn expire_to_background(
+    lua: &Lua,
+    handle: &TaskHandle,
+    task: Option<&LiveTask>,
+    plugins: &PluginMap,
+) {
+    let secs = loop {
+        let (changed, due) = {
+            let cell = lock_cell(handle);
+            let held = cell.deadline_expire.get() == DeadlineExpire::Background;
+            let due = cell.deadline.get().filter(|_| held);
+            let secs = cell.deadline_secs.get().unwrap_or(0);
+            (cell.deadline_changed.listen(), due.map(|at| (at, secs)))
+        };
+        match due {
+            Some((at, secs)) if at <= Instant::now() => break secs,
+            Some((at, _)) => {
+                futures_lite::future::or(async { _ = smol::Timer::at(at).await }, changed).await
+            }
+            None => changed.await,
+        }
+    };
+    if let Some(task) = task {
+        task.try_move(lua, plugins, MoveTrigger::Timeout(secs))
+            .await;
+    }
+    let cell = lock_cell(handle);
+    if !cell.moved() {
+        cell.deadline_expire.set(DeadlineExpire::Timeout);
+        cell.deadline_changed.notify(usize::MAX);
+    }
+}
 
 /// A finished tool that still answers clicks. `handle` is a fresh cell
 /// holding only the root buf; `_claim` keeps the buf handler slots alive
@@ -933,13 +1467,28 @@ pub(crate) fn register_cancel_hook(lua: &Lua, callback: Function) -> Result<(), 
     Ok(())
 }
 
+/// Hooks word their partial-output marker from this string. A call nested in
+/// a moved one shares its scope, so both find the stop under the scope's id.
+/// Read without creating the registry: a hook may fire under an app data
+/// borrow.
+fn cut_reason(lua: &Lua, handle: &TaskHandle, reason: KillReason) -> &'static str {
+    if reason == KillReason::Deadline {
+        return HANDLER_TIMEOUT_MSG;
+    }
+    let call = lock_cell(handle).call.clone();
+    let by_model = call.is_some_and(|call| {
+        lua.app_data_ref::<BackgroundTasks>()
+            .is_some_and(|registry| registry.stopped_by(call.id()) == Stop::Model)
+    });
+    if by_model { STOPPED_MSG } else { CANCELLED_MSG }
+}
+
 fn fire_cancel_hooks(lua: &Lua, handle: &TaskHandle, reason: KillReason) {
-    // Hooks word their partial-output marker from this string.
-    let reason = match reason {
-        KillReason::Cancelled => CANCELLED_MSG,
-        KillReason::Deadline => HANDLER_TIMEOUT_MSG,
-    };
     let hooks = std::mem::take(&mut lock_cell(handle).cancel_hooks);
+    if hooks.is_empty() {
+        return;
+    }
+    let reason = cut_reason(lua, handle, reason);
     for key in hooks {
         if let Err(e) = lua
             .registry_value::<Function>(&key)
@@ -1804,7 +2353,7 @@ async fn run_host_hook(lua: &Lua, hook: HostHook) {
                 json_to_lua(lua, &event.payload(Some(&end.session))).unwrap_or(LuaValue::Nil);
             crate::api::autocmd::dispatch(lua.clone(), event.name().to_owned(), None, data).await;
             with_jobs(lua, |store| store.kill_session(lua, end.session));
-            BackgroundSessions::of(lua).end_session(end.session);
+            BackgroundTasks::of(lua).end_session(end.session);
             // Nothing can pick from this session's plan form again.
             clear_session_rows(lua, &end.session.to_string());
             clear_session_hints(lua, end.session);
@@ -1837,11 +2386,28 @@ async fn deliver_pending(
     }
 }
 
+/// Deliver what {job_id} has queued, then leave {delivering} so the next
+/// event it queues gets a task again. The delivery scope republishes the
+/// task handle across callback yields: an unscoped resume would run with no
+/// task, out of the watchdog's reach.
+async fn deliver_job(lua: Lua, job_id: u32, delivering: Rc<RefCell<HashSet<u32>>>) {
+    let scope = TaskScope::delivery(&lua);
+    scope
+        .scope_future(deliver_pending(&lua, usize::MAX, || {
+            with_jobs(&lua, |store| store.next_event_of(job_id)).map(|event| (job_id, event))
+        }))
+        .await;
+    delivering.borrow_mut().remove(&job_id);
+}
+
 impl Drop for TaskScope {
     fn drop(&mut self) {
         let task_id = {
             let mut cell = lock_cell(&self.handle);
             cell.clear_cancel_hooks(&self.lua);
+            if let Some(key) = cell.background_hook.take() {
+                self.lua.remove_registry_value(key).ok();
+            }
             cell.id
         };
         with_jobs(&self.lua, |store| {
@@ -1854,7 +2420,7 @@ impl Drop for TaskScope {
                 );
             }
         });
-        BackgroundSessions::of(&self.lua).end_task(task_id);
+        BackgroundTasks::of(&self.lua).end_task(task_id);
     }
 }
 
@@ -1993,8 +2559,15 @@ pub(crate) fn enqueue_async_task(
     let (cancel, live_ctx, lineage, detached) = match &handle {
         Some(h) => {
             let cell = lock_cell(h);
+            // A handler often leaves work past its reply, like highlighting
+            // the view it returned, and its call token fires with the reply.
+            let cancel = cell
+                .call
+                .as_ref()
+                .map_or(&cell.cancel, |call| call.owner())
+                .clone();
             (
-                cell.cancel.clone(),
+                cancel,
                 cell.live.clone(),
                 cell.lineage.clone(),
                 cell.detached,
@@ -2145,6 +2718,10 @@ struct InflightGate {
     /// What [`Self::drain`] waits on. Unlike `count`, it leaves out work under
     /// a `maki.async.spawn` task and includes work still waiting for a slot.
     held: Cell<usize>,
+    /// Holds of nested calls, by the model call they run under. Once that
+    /// call moves to the background they stop holding the drain: the work may
+    /// go on for hours, and it survives `/reload` anyway.
+    call_holds: RefCell<Vec<Arc<CallScope>>>,
     event: Event,
 }
 
@@ -2154,6 +2731,7 @@ impl InflightGate {
             gc: GcPacer::new(lua, LUA_MEMORY_LIMIT),
             count: Cell::new(0),
             held: Cell::new(0),
+            call_holds: RefCell::new(Vec::new()),
             event: Event::new(),
         }
     }
@@ -2191,7 +2769,28 @@ impl InflightGate {
     /// a `drain` queued right behind a spawn cannot slip past it.
     async fn drain(&self) {
         smol::future::yield_now().await;
-        self.wait_until(|| self.held.get() == 0).await;
+        loop {
+            let released = self.event.listen();
+            if self.held.get() > 0 {
+                released.await;
+                continue;
+            }
+            let Some(call) = self.unmoved_call_hold() else {
+                return;
+            };
+            let moved = call.moved_listener();
+            if call.home().is_none() {
+                futures_lite::future::or(released, moved).await;
+            }
+        }
+    }
+
+    fn unmoved_call_hold(&self) -> Option<Arc<CallScope>> {
+        self.call_holds
+            .borrow()
+            .iter()
+            .find(|call| call.home().is_none())
+            .cloned()
     }
 
     /// Admission and accounting in one step, on the task's own poll: the
@@ -2284,19 +2883,41 @@ fn covered<F: Future>(slot: Option<GateGuard>, inner: F) -> SlotCovered<F> {
 /// Keeps [`InflightGate::drain`] waiting from the moment work queues for a
 /// slot until it gives the slot back. A nested call riding its caller's slot
 /// takes one of its own, since a detached caller's slot holds none.
-struct DrainHold(Rc<InflightGate>);
+struct DrainHold {
+    gate: Rc<InflightGate>,
+    /// The model call a nested call runs under: its move releases the hold.
+    call: Option<Arc<CallScope>>,
+}
 
 impl DrainHold {
     fn new(gate: &Rc<InflightGate>) -> Self {
-        gate.held.set(gate.held.get() + 1);
-        Self(Rc::clone(gate))
+        Self::under(gate, None)
+    }
+
+    fn under(gate: &Rc<InflightGate>, call: Option<Arc<CallScope>>) -> Self {
+        match &call {
+            Some(call) => gate.call_holds.borrow_mut().push(Arc::clone(call)),
+            None => gate.held.set(gate.held.get() + 1),
+        }
+        Self {
+            gate: Rc::clone(gate),
+            call,
+        }
     }
 }
 
 impl Drop for DrainHold {
     fn drop(&mut self) {
-        self.0.held.set(self.0.held.get().saturating_sub(1));
-        self.0.event.notify(usize::MAX);
+        match &self.call {
+            Some(call) => {
+                let mut holds = self.gate.call_holds.borrow_mut();
+                if let Some(at) = holds.iter().position(|held| Arc::ptr_eq(held, call)) {
+                    holds.swap_remove(at);
+                }
+            }
+            None => self.gate.held.set(self.gate.held.get().saturating_sub(1)),
+        }
+        self.gate.event.notify(usize::MAX);
     }
 }
 
@@ -2526,6 +3147,8 @@ impl DeferQueue {
 /// to interrupt and renews its grace at every yield. `or`, not `race`: a
 /// handler that finished in the same slice deserves to have its result
 /// reported, even one whose deadline had already lapsed when it started.
+/// A call moved to the background has nobody waiting on a deadline, see
+/// [`TaskCell::live_deadline`].
 async fn until_abandoned<T>(
     fut: impl Future<Output = T>,
     handle: &TaskHandle,
@@ -2533,17 +3156,29 @@ async fn until_abandoned<T>(
     let cancel = lock_cell(handle).cancel.clone();
     let timed_out = async {
         loop {
-            // Listen before reading: a `ctx:set_deadline` landing between the
-            // two wakes us instead of leaving us armed on the stale deadline.
-            let changed = lock_cell(handle).deadline_changed.listen();
-            // Bound before the match: the guard would outlive the await.
-            let deadline = lock_cell(handle).deadline.get();
+            // Listen before reading: a `ctx:set_deadline` or a move landing
+            // between the two wakes us instead of leaving us armed on the
+            // stale deadline. Scoped so the guard never outlives an await.
+            let (changed, moved, deadline) = {
+                let cell = lock_cell(handle);
+                (
+                    cell.deadline_changed.listen(),
+                    cell.call.as_ref().map(|call| call.moved_listener()),
+                    cell.live_deadline(),
+                )
+            };
+            let rearmed = futures_lite::future::or(changed, async {
+                match moved {
+                    Some(moved) => moved.await,
+                    None => std::future::pending().await,
+                }
+            });
             match deadline {
                 Some(dl) if dl <= Instant::now() => break,
                 Some(dl) => {
-                    futures_lite::future::or(async { _ = smol::Timer::at(dl).await }, changed).await
+                    futures_lite::future::or(async { _ = smol::Timer::at(dl).await }, rearmed).await
                 }
-                None => changed.await,
+                None => rearmed.await,
             }
         }
         HANDLER_TIMEOUT_MSG
@@ -3034,13 +3669,14 @@ impl LuaRuntime {
             });
         }
 
+        let live_tasks: LiveTasks = Rc::new(RefCell::new(HashMap::new()));
         Ok(Self {
             _watchdog: watchdog,
             lua,
             pending,
             plugin_rules,
             plugins,
-            live_tasks: Rc::new(RefCell::new(HashMap::new())),
+            live_tasks,
             warm_tools: Rc::new(RefCell::new(VecDeque::new())),
             registry,
             tx,
@@ -3080,7 +3716,7 @@ impl LuaRuntime {
             store.kill_owner(&self.lua, &JobOwner::Plugin(Arc::from(name)));
             store.detach_plugin_callbacks(&self.lua, name);
         });
-        BackgroundSessions::of(&self.lua).end_plugin(name);
+        BackgroundTasks::of(&self.lua).end_plugin(name);
         if let Some(mut store) = self.lua.app_data_mut::<PluginOptionSpecs>() {
             store.remove(name);
         }
@@ -3489,6 +4125,7 @@ impl LuaRuntime {
                     start_annotation: t.start_annotation.clone(),
                     examples: t.examples.clone(),
                     has_describe_fn: t.describe_key.is_some(),
+                    background_only: t.background_only.clone(),
                 });
                 (
                     tool,
@@ -4607,6 +5244,7 @@ async fn run_tool_call(
     warm_tools: WarmTools,
     plugins: PluginMap,
     shutdown: Arc<AtomicBool>,
+    answer: Rc<CallAnswer>,
 ) -> ToolCallReply {
     let handler: Function = {
         let plugins_ref = plugins.borrow();
@@ -4633,8 +5271,15 @@ async fn run_tool_call(
         Ok(v) => v,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
-    let live_sink = ctx.agent().and_then(|a| a.live_sink.clone());
     let session = ctx.session();
+    let agent = ctx.agent();
+    let live_sink = agent.and_then(|a| a.live_sink.clone());
+    let call = agent.and_then(|a| a.call.clone());
+    let chat = agent
+        .and_then(|a| a.session_id.as_ref())
+        .map(SessionRef::id);
+    let mailbox = agent.and_then(|a| a.mailbox.clone());
+    let subagent = agent.is_some_and(|a| a.task_id.is_some());
     let ctx_ud = match lua.create_userdata(*ctx) {
         Ok(u) => u,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
@@ -4644,14 +5289,29 @@ async fn run_tool_call(
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
     cell.live_sink = live_sink;
     cell.lineage.session = session;
+    cell.call = call;
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
 
     let async_thread = handler.call_async::<LuaValue>((input_lua, ctx_ud));
-    if let Some(id) = &live_id {
+    let task = live_id.clone().map(|id| {
+        Rc::new(LiveTask {
+            id,
+            handle: Arc::clone(&handle),
+            plugin: Arc::clone(&plugin),
+            tool: Arc::clone(&tool),
+            input,
+            chat,
+            mailbox,
+            subagent,
+            answer,
+            move_lock: AsyncMutex::new(()),
+        })
+    });
+    if let Some(task) = &task {
         live_tasks
             .borrow_mut()
-            .insert(id.clone(), Arc::clone(&handle));
+            .insert(task.id.clone(), Rc::clone(task));
     }
 
     let call_future = scope.scope_future(async {
@@ -4694,15 +5354,25 @@ async fn run_tool_call(
                         tracing::debug!(%tool, error = %strip_traceback(&e), "handler error superseded by cancel hook reply");
                         reply
                     }
+                    // A handler the deadline caught before it set up its
+                    // hooks reads the way the dispatch loop words a timeout.
+                    None if kill == Some(KillReason::Deadline) => {
+                        tracing::debug!(%tool, error = %strip_traceback(&e), "handler abandoned at its deadline");
+                        timeout_reply(&handle, &plugin, &tool)
+                    }
                     None => ToolCallReply::err(strip_traceback(&e)),
                 }
             }
         }
     });
 
-    // `tool.rs` timeout is the absolute backstop; the dispatch loop
-    // and watchdog interrupt enforce the per-plugin deadline from TaskCell.
-    let reply = call_future.await;
+    // `tool.rs` timeout is the absolute backstop. The dispatch loop and
+    // watchdog interrupt enforce the per-plugin deadline from TaskCell.
+    let reply = futures_lite::future::or(call_future, async {
+        expire_to_background(&lua, &handle, task.as_deref(), &plugins).await;
+        pending().await
+    })
+    .await;
     if let Some(id) = &live_id {
         live_tasks.borrow_mut().remove(id);
         // Best-effort cache: any tool with a root buf can serve clicks.
@@ -4732,12 +5402,13 @@ async fn run_tool_call(
 pub(crate) struct LuaThread {
     pub tx: flume::Sender<Request>,
     pub prio_tx: flume::Sender<Request>,
+    pub moves: flume::Sender<MoveRequest>,
     /// Shared with the runtime on the Lua thread, so a handle can answer "is
     /// anyone layering this" without a roundtrip.
     pub layered: Arc<LayeredTools>,
     /// Shared with the runtime too: Esc on a plugin task closes its session
     /// from the event loop, with no Lua-thread hop.
-    pub background: BackgroundSessions,
+    pub background: BackgroundTasks,
     pub join: Option<JoinHandle<()>>,
     pub shutdown: Arc<AtomicBool>,
     pub command_reader: LuaCommandReader,
@@ -4764,6 +5435,8 @@ pub fn spawn(
     let (tx, rx) = flume::unbounded::<Request>();
     let (prio_tx, prio_rx) = flume::unbounded::<Request>();
     let prio_tx_thread = prio_tx.clone();
+    let (moves, move_requests) = flume::unbounded::<MoveRequest>();
+    let moves_thread = moves.clone();
     let tx_clone = tx.clone();
     let layered: Arc<LayeredTools> = Arc::default();
     let layered_thread = Arc::clone(&layered);
@@ -4780,7 +5453,7 @@ pub fn spawn(
     let (input_rule_store, input_rules_reader) = InputRuleStore::new();
     let key_lint = KeyLint::default();
     let key_lint_thread = key_lint.clone();
-    let background = BackgroundSessions::default();
+    let background = BackgroundTasks::default();
     let background_thread = background.clone();
     // The file index outlives any one plugin host, so the walks a host
     // rebuilt by `/reload` is waiting on are the ones the old host started.
@@ -4820,25 +5493,32 @@ pub fn spawn(
             rt.lua.set_app_data(ProviderRequests(prio_tx_thread));
 
             let ex = Rc::new(smol::LocalExecutor::new());
+            rt.lua.set_app_data(Moves(moves_thread));
+            ex.spawn(serve_moves(
+                Rc::downgrade(&ex),
+                rt.lua.clone(),
+                Rc::clone(&rt.live_tasks),
+                Rc::clone(&rt.plugins),
+                move_requests,
+            ))
+            .detach();
             {
                 let lua = rt.lua.clone();
+                // Weak, or the executor would own a task that owns it back.
+                let host = Rc::downgrade(&ex);
                 ex.spawn(async move {
+                    // One task per job, so a callback parked on a prompt or a
+                    // request holds back only its own job's events.
+                    let delivering = Rc::new(RefCell::new(HashSet::new()));
                     loop {
-                        // Pop before building the scope so an idle pump costs
-                        // nothing. The delivery scope republishes the task
-                        // handle across callback yields: an unscoped resume
-                        // would run with no task, out of the watchdog's reach.
-                        if let Some(first) = with_jobs(&lua, |store| store.next_plugin_event()) {
-                            let mut first = Some(first);
-                            let scope = TaskScope::delivery(&lua);
-                            scope
-                                .scope_future(deliver_pending(&lua, usize::MAX, || {
-                                    first
-                                        .take()
-                                        .or_else(|| with_jobs(&lua, |s| s.next_plugin_event()))
-                                }))
-                                .await;
-                            drop(scope);
+                        if let Some(host) = host.upgrade() {
+                            for job_id in with_jobs(&lua, |s| s.plugin_jobs_with_events()) {
+                                if delivering.borrow_mut().insert(job_id) {
+                                    let delivering = Rc::clone(&delivering);
+                                    host.spawn(deliver_job(lua.clone(), job_id, delivering))
+                                        .detach();
+                                }
+                            }
                         }
                         smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
                     }
@@ -4995,8 +5675,9 @@ pub fn spawn(
                             let shutdown_ref = Arc::clone(&rt.shutdown);
                             let g = Rc::clone(&gate);
                             let cancel = ctx.cancel.clone();
+                            let call = ctx.agent().and_then(|agent| agent.call.clone());
                             ex.spawn(async move {
-                                let _hold = nested.then(|| DrainHold::new(&g));
+                                let _hold = nested.then(|| DrainHold::under(&g, call));
                                 let slot = if nested {
                                     None
                                 } else {
@@ -5008,8 +5689,10 @@ pub fn spawn(
                                         }
                                     }
                                 };
+                                let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
+                                let answer = Rc::new(CallAnswer::new(reply, slot));
                                 let res = covered(
-                                    slot,
+                                    None,
                                     run_tool_call(
                                         lua.clone(),
                                         plugin,
@@ -5022,10 +5705,11 @@ pub fn spawn(
                                         warm_tools,
                                         plugins,
                                         shutdown_ref,
+                                        Rc::clone(&answer),
                                     ),
                                 )
                                 .await;
-                                let _ = reply.send(res);
+                                answer.finish(&lua, live_id.as_deref(), res);
                             })
                             .detach();
                         }
@@ -5320,7 +6004,7 @@ pub fn spawn(
                                 .live_tasks
                                 .borrow()
                                 .get(&tool_use_id)
-                                .map(Arc::clone)
+                                .map(|task| Arc::clone(&task.handle))
                                 .or_else(|| {
                                     rt.warm_tools
                                         .borrow()
@@ -5404,8 +6088,9 @@ pub fn spawn(
                             };
                             let lua = rt.lua.clone();
                             let g = Rc::clone(&gate);
+                            let call = ctx.agent().and_then(|agent| agent.call.clone());
                             ex.spawn(async move {
-                                let _hold = nested.then(|| DrainHold::new(&g));
+                                let _hold = nested.then(|| DrainHold::under(&g, call));
                                 let slot = match nested {
                                     true => None,
                                     false => Some(g.acquire().await),
@@ -5422,6 +6107,7 @@ pub fn spawn(
                     }
                 }
             }));
+            BackgroundTasks::of(&rt.lua).lose_all();
             // Clones of the host (`EventHandle`, `LuaTool`) can still hold
             // a live sender, so dropping the receivers alone does not free
             // queued requests. Drain them so their reply channels drop and
@@ -5446,6 +6132,7 @@ pub fn spawn(
     Ok(LuaThread {
         tx,
         prio_tx,
+        moves,
         layered,
         background,
         join: Some(handle),
@@ -5462,7 +6149,37 @@ pub fn spawn(
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use maki_agent::cancel::CancelTrigger;
+
+    use super::*;
+
+    pub(crate) const MOVED_CALL_ID: &str = "toolu_moved";
+    const MOVED_PLUGIN: &str = "batch";
+
+    pub(crate) fn moved_home() -> TaskHome {
+        TaskHome {
+            chat: MakiId::generate(),
+            id: MOVED_CALL_ID.to_owned(),
+            plugin: Arc::from(MOVED_PLUGIN),
+        }
+    }
+
+    /// A model call, moved or not. Hold on to the triggers it hands back:
+    /// dropping one fires it, and the call would read as cancelled.
+    pub(crate) fn call_scope(
+        moved: bool,
+    ) -> (Arc<CallScope>, CancelTrigger, Option<CancelTrigger>) {
+        let (run_trigger, run) = CancelToken::new();
+        let call = Arc::new(CallScope::new(MOVED_CALL_ID.to_owned(), &run));
+        let task_trigger = moved.then(|| call.move_to(moved_home()).expect("first move"));
+        (call, run_trigger, task_trigger)
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::{MOVED_CALL_ID, call_scope, moved_home};
     use super::*;
     use crate::api::r#fn::JobSpec;
     use crate::api::tool::ToolCallReply;
@@ -5718,6 +6435,26 @@ mod tests {
 
     /// Enough turns for anything not parked on a real wait to finish.
     const SETTLE_YIELDS: usize = 8;
+    const STOP_TOOL: &str = "task_stop";
+
+    #[test]
+    fn drain_lets_go_of_nested_work_once_its_call_moves() {
+        let ex = smol::LocalExecutor::new();
+        block_on_or_fail(ex.run(async {
+            let g = Rc::new(gate());
+            let (call, _run, _) = call_scope(false);
+            let _nested = DrainHold::under(&g, Some(Arc::clone(&call)));
+            let g2 = Rc::clone(&g);
+            let waiter = ex.spawn(async move { g2.drain().await });
+            for _ in 0..SETTLE_YIELDS {
+                smol::future::yield_now().await;
+            }
+            assert!(!waiter.is_finished());
+
+            let _task = call.move_to(moved_home()).unwrap();
+            waiter.await;
+        }));
+    }
 
     #[test]
     fn drain_waits_for_held_work_queued_behind_detached_slots() {
@@ -7229,5 +7966,44 @@ mod tests {
             layer_delegation(&lua, &plugins, cost)(&layer, LAYERED_SLOT),
             allowed
         );
+    }
+
+    fn deadline_cell(call: &Arc<CallScope>, deadline: Instant, expire: DeadlineExpire) -> TaskCell {
+        let mut cell = TaskCell::new(call.cancel().clone(), Some(deadline), None);
+        cell.call = Some(Arc::clone(call));
+        cell.deadline_expire.set(expire);
+        cell
+    }
+
+    #[test_case(false, DeadlineExpire::Timeout, Some(KillReason::Deadline) ; "a_foreground_call_times_out")]
+    #[test_case(true, DeadlineExpire::Timeout, None ; "a_moved_call_outlives_its_deadline")]
+    #[test_case(false, DeadlineExpire::Background, None ; "a_background_expiry_waits_for_its_move")]
+    fn a_lapsed_deadline_dooms_only_a_call_still_waited_for(
+        moved: bool,
+        expire: DeadlineExpire,
+        doomed: Option<KillReason>,
+    ) {
+        let (call, _run, _task) = call_scope(moved);
+        let now = Instant::now();
+        let cell = deadline_cell(&call, now, expire);
+        assert_eq!(cell.doomed(now + Duration::from_secs(1)), doomed);
+    }
+
+    #[test_case(false, Err(HANDLER_TIMEOUT_MSG) ; "a_foreground_call_is_abandoned")]
+    #[test_case(true, Ok(()) ; "a_moved_call_runs_on")]
+    fn until_abandoned_stops_timing_a_moved_call(moved: bool, expected: Result<(), &'static str>) {
+        let (call, _run, _task) = call_scope(moved);
+        let handle = deadline_cell(&call, Instant::now(), DeadlineExpire::Timeout).into_handle();
+        let out = block_on_or_fail(until_abandoned(smol::future::yield_now(), &handle));
+        assert_eq!(out, expected);
+    }
+
+    #[test_case(false, true  ; "main_agent")]
+    #[test_case(true,  false ; "subagent_without_the_tool")]
+    fn receipt_offers_task_stop_only_to_the_main_agent(subagent: bool, offers_stop: bool) {
+        let suffix = MoveTrigger::User.receipt_suffix(MOVED_CALL_ID, subagent);
+
+        assert!(suffix.contains(&receipt_tag(MOVED_CALL_ID)), "{suffix}");
+        assert_eq!(suffix.contains(STOP_TOOL), offers_stop, "{suffix}");
     }
 }

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use maki_agent::agent::SessionExport;
-use maki_agent::{Envelope, SharedBuf, SubagentInfo, Transcript};
+use maki_agent::{Envelope, SharedBuf, SubagentInfo, TaskEnd, Transcript};
 use maki_storage::id::MakiId;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
@@ -728,6 +728,8 @@ pub enum BuiltinAction {
     HistoryPrev,
     HistoryNext,
     Newline,
+    /// Moves the main chat's movable running calls to the background.
+    Background,
 }
 
 impl BuiltinAction {
@@ -763,6 +765,9 @@ impl BuiltinAction {
             Self::Undo | Self::Redo | Self::HistoryPrev | Self::HistoryNext | Self::Newline => {
                 EDITS_TEXT
             }
+            // Each moved call's result wakes the chat and costs a turn, the
+            // price of `notify{ wake = true }`.
+            Self::Background => &[Permission::Agent],
         }
     }
 }
@@ -871,6 +876,14 @@ pub enum UiAction {
         session: MakiId,
         plugin: Arc<str>,
         info: Box<SubagentInfo>,
+    },
+    /// How moved call `id` ended, when its final reply cannot say. A stopped
+    /// call's reply often reads as a failure, since its process was killed,
+    /// so `Cancelled` comes first. A `Lost` call never replies at all.
+    PluginTaskEnded {
+        session: MakiId,
+        id: String,
+        end: TaskEnd,
     },
 }
 

@@ -688,6 +688,8 @@ mod tests {
             client_secret_expires_at: None,
             redirect_uri: None,
             token_endpoint: None,
+            auth_server: None,
+            resource: None,
         }
     }
 

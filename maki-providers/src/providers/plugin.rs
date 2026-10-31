@@ -22,7 +22,8 @@ use crate::provider::{BoxFuture, Provider};
 use crate::spec::{BASES, ProviderRegistry, ProviderSpec};
 use crate::types::ThinkingFallback;
 use crate::{
-    AgentError, Effort, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    ThinkingConfig,
 };
 
 use super::codec::{self, BodyHook, CodecOptions, RequestCtx};
@@ -1323,6 +1324,10 @@ impl Provider for PluginProvider {
     fn adjust_model(&self, model: &mut Model) {
         self.inner.adjust_model(model);
     }
+
+    fn served_context_window<'a>(&'a self, model: &'a Model) -> BoxFuture<'a, Option<u32>> {
+        self.inner.served_context_window(model)
+    }
 }
 
 /// Builds from registry data alone: no hook runs here, because this is called
@@ -1465,9 +1470,9 @@ pub fn effective_authority(slug: &str) -> Option<String> {
     ))
 }
 
-/// What a codec declaration sends for `adaptive`. One that names no
-fn declared_adaptive_effort(_model: &Model) -> Option<Effort> {
-    None
+/// What a codec declaration sends for `choice`.
+fn declared_sends_thinking(_model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
+    choice
 }
 
 pub fn spec(slug: &str) -> Option<&'static ProviderSpec> {

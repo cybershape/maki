@@ -1,6 +1,7 @@
 //! Async agent loop with tools.
 
 pub mod agent;
+pub mod call_scope;
 pub mod cancel;
 pub mod child_guard;
 pub use child_guard::ChildGuard;
@@ -27,10 +28,14 @@ pub use agent::{
     Agent, AgentParams, AgentRunParams, DisplayItem, History, HistorySnapshot, Instructions,
     LoadedInstructions, ModelSlot, RunContext, RunContextBuilder, SharedMessages, Transcript,
     UNAVAILABLE_RESULT, close_dangling_tool_calls, display_order, find_subdirectory_instructions,
-    is_instruction_file, observation_line,
+    is_instruction_file, observation_detail, observation_line,
 };
-pub use cancel::{CancelMap, CancelToken, CancelTrigger};
-pub use live_session::{AgentSeed, MailboxError, SessionMailbox};
+pub use call_scope::{AlreadyMoved, CallGuard, CallScope, SessionStub, TaskHome};
+pub use cancel::{CancelHandle, CancelMap, CancelToken, CancelTrigger};
+pub use live_session::{
+    AgentSeed, BackgroundNotice, MailboxError, SessionMailbox, TaskLabel, receipt_tag,
+    result_notice,
+};
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub mod command;
 pub mod diff;
@@ -46,13 +51,16 @@ use std::path::{Path, PathBuf};
 
 pub use maki_providers::AgentError;
 use maki_providers::Message;
-pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
+pub use maki_providers::{
+    EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, TaskEnd, ThinkingConfig,
+};
 pub use types::{
-    AgentEvent, BufferSnapshot, CallRecord, DoneReason, Envelope, EventSender, EventStreamGuard,
-    GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, RunLedger,
-    RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanColor,
-    SpanStyle, SteerKind, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput,
-    ToolStartEvent, TurnCompleteEvent, TurnTiming, UiWaker, event_stream,
+    AgentEvent, BufferSnapshot, CallRecord, CostTally, DoneReason, Envelope, EventSender,
+    EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND,
+    PartStatus, RunLedger, RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine,
+    SnapshotSpan, SpanColor, SpanStyle, SteerKind, SubagentInfo, TextOutput, ToolDoneEvent,
+    ToolInput, ToolOutput, ToolPart, ToolStartEvent, TurnCompleteEvent, TurnTiming, UiWaker,
+    event_stream,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

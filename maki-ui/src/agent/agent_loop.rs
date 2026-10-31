@@ -9,11 +9,12 @@ use maki_agent::prompt::ResolvedPrompts;
 use maki_agent::session::Resumed;
 use maki_agent::template;
 use maki_agent::template::Vars;
-use maki_agent::tools::{RequestTools, ToolAudience, ToolRegistry};
+use maki_agent::tools::{BackgroundFor, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, AgentSeed, CancelMap,
     CancelToken, DoneReason, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
-    RunContext, RunContextBuilder, RunLedger, SessionMailbox, SharedMessages, ToolOutputLines,
+    RunContext, RunContextBuilder, RunLedger, RunTotals, SessionMailbox, SharedMessages,
+    ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -135,7 +136,8 @@ impl AgentLoop {
 
     async fn process_run(&mut self, run: QueueRun, run_id: u64) {
         let live = self.cancels.start(run_id);
-        let result = self.dispatch_run(run, run_id, live.token()).await;
+        let ledger = Arc::new(RunLedger::default());
+        let result = self.dispatch_run(run, run_id, live.token(), &ledger).await;
         // A `tool_use_id` only names work inside the run that issued the call,
         // so the run ending is what stops whatever still hangs off one, rather
         // than a group emptying out.
@@ -146,7 +148,7 @@ impl AgentLoop {
         // the app already drew, leave the status bar red and fail the exit
         // under `--exit-on-done`.
         if let Err(e) = result {
-            self.emit_error(run_id, e);
+            self.emit_error(run_id, e, ledger.totals());
         }
     }
 
@@ -155,6 +157,7 @@ impl AgentLoop {
         run: QueueRun,
         run_id: u64,
         cancel: &CancelToken,
+        ledger: &Arc<RunLedger>,
     ) -> Result<(), AgentError> {
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
         match run {
@@ -175,7 +178,7 @@ impl AgentLoop {
                     })
                     .collect();
                 if let Some(input) = shared_queue::merge_inputs(inputs) {
-                    self.do_agent_run(input, event_tx, cancel).await?;
+                    self.do_agent_run(input, event_tx, cancel, ledger).await?;
                 }
             }
         }
@@ -280,6 +283,7 @@ impl AgentLoop {
         mut input: AgentInput,
         event_tx: EventSender,
         cancel: &CancelToken,
+        ledger: &Arc<RunLedger>,
     ) -> Result<DoneReason, AgentError> {
         if let Some(ref mcp) = self.seed.mcp
             && cancel.race(mcp.ready()).await.is_err()
@@ -331,14 +335,14 @@ impl AgentLoop {
                 tool_output_lines: self.seed.tool_output_lines,
                 permissions: Arc::clone(&self.seed.permissions),
                 session_id: Some(self.seed.session_id.clone()),
-                background_for: None,
+                background_for: BackgroundFor::None,
                 task_id: None,
                 mailbox: Some(self.mailbox.clone()),
                 timeouts: self.seed.timeouts,
                 file_access: Arc::clone(&self.seed.file_access),
                 prompt_slots: Arc::clone(&prompt_slots),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
-                ledger: Arc::new(RunLedger::default()),
+                ledger: Arc::clone(ledger),
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
                 model_policy: Arc::clone(&self.seed.model_policy),
@@ -377,10 +381,10 @@ impl AgentLoop {
             .store(Arc::clone(&self.instructions.files));
     }
 
-    fn emit_error(&self, run_id: u64, error: AgentError) {
+    fn emit_error(&self, run_id: u64, error: AgentError, totals: RunTotals) {
         error!(error = %error, "agent error");
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
-        let _ = event_tx.send(AgentEvent::error(&error));
+        let _ = event_tx.send(AgentEvent::error(&error, totals));
     }
 }
 

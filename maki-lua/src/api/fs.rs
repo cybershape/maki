@@ -24,10 +24,10 @@ use crate::runtime::LUA_MEMORY_LIMIT;
 /// All plugins share one Lua heap, and callers often copy what they read. So a
 /// big read fails here with a clear error, before it can run some other tool
 /// out of memory.
-const MAX_READ_BYTES: u64 = LUA_MEMORY_LIMIT as u64 / 8;
+pub(crate) const MAX_READ_BYTES: u64 = LUA_MEMORY_LIMIT as u64 / 8;
 const NON_UTF8_CONTENT_ERR: &str = "non-utf8 content; use read_bytes";
 const SCAN_CHUNK: usize = 64 * 1024;
-const LINE_CUT_MARKER: &str = "...";
+pub(crate) const LINE_CUT_MARKER: &str = "...";
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     maki_storage::paths::expand_tilde(Path::new(path))
@@ -214,12 +214,36 @@ fn skip_lines(reader: &mut impl BufRead, n: u64) -> IoResult<u64> {
     Ok(skipped)
 }
 
+#[derive(Clone)]
+pub(crate) struct Line {
+    pub text: String,
+    /// Its length before any cut, so a caller can say how much was dropped.
+    pub bytes: u64,
+}
+
+impl From<String> for Line {
+    fn from(text: String) -> Self {
+        let bytes = text.len() as u64;
+        Self { text, bytes }
+    }
+}
+
+#[cfg(test)]
+impl From<&str> for Line {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
 /// The next line without its `\n` or `\r\n`, or `None` at the end of the file.
 /// A line over `max_bytes` is cut and gets [`LINE_CUT_MARKER`]. The rest of it
 /// is skipped without ever landing in memory, which is how a file that is one
 /// 300 MB line still pages fine. Without `max_bytes`, a line over
 /// [`MAX_READ_BYTES`] fails the read.
-fn next_line(reader: &mut impl BufRead, max_bytes: Option<u64>) -> IoResult<Option<String>> {
+pub(crate) fn next_line(
+    reader: &mut impl BufRead,
+    max_bytes: Option<u64>,
+) -> IoResult<Option<Line>> {
     let keep = max_bytes.unwrap_or(MAX_READ_BYTES);
     // The extra 2 bytes let a line of exactly `keep` bytes see its `\r\n`, so it is not cut.
     let window = keep + 2;
@@ -228,14 +252,23 @@ fn next_line(reader: &mut impl BufRead, max_bytes: Option<u64>) -> IoResult<Opti
     if read == 0 {
         return Ok(None);
     }
-    if line.ends_with(b"\n") || read < window {
+    let bytes = if line.ends_with(b"\n") || read < window {
         line.pop_if(|b| *b == b'\n');
         line.pop_if(|b| *b == b'\r');
+        line.len() as u64
     } else {
-        reader.skip_until(b'\n')?;
-    }
+        let (rest, last) = skip_rest_of_line(reader)?;
+        // Stripped like the `\r` of a line that fits: by the last byte before the newline.
+        let ends_in_cr = if rest == 0 {
+            line.last().copied()
+        } else {
+            last
+        } == Some(b'\r');
+        read + rest - u64::from(ends_in_cr)
+    };
     if line.len() as u64 <= keep {
-        return String::from_utf8(line).map(Some).map_err(|_| non_utf8());
+        let text = String::from_utf8(line).map_err(|_| non_utf8())?;
+        return Ok(Some(Line { text, bytes }));
     }
     if max_bytes.is_none() {
         return Err(too_large());
@@ -248,7 +281,35 @@ fn next_line(reader: &mut impl BufRead, max_bytes: Option<u64>) -> IoResult<Opti
         Err(_) => return Err(non_utf8()),
     }
     line.extend_from_slice(LINE_CUT_MARKER.as_bytes());
-    String::from_utf8(line).map(Some).map_err(|_| non_utf8())
+    let text = String::from_utf8(line).map_err(|_| non_utf8())?;
+    Ok(Some(Line { text, bytes }))
+}
+
+/// Skips to the next `\n` and returns how many bytes came before it, and the
+/// last of them.
+fn skip_rest_of_line(reader: &mut impl BufRead) -> IoResult<(u64, Option<u8>)> {
+    let (mut skipped, mut last) = (0, None);
+    loop {
+        let buf = match reader.fill_buf() {
+            Ok(buf) => buf,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if buf.is_empty() {
+            return Ok((skipped, last));
+        }
+        let (rest, found) = match buf.iter().position(|b| *b == b'\n') {
+            Some(newline) => (&buf[..newline], true),
+            None => (buf, false),
+        };
+        skipped += rest.len() as u64;
+        last = rest.last().copied().or(last);
+        let consumed = rest.len() + usize::from(found);
+        reader.consume(consumed);
+        if found {
+            return Ok((skipped, last));
+        }
+    }
 }
 
 struct PageQuery {
@@ -296,7 +357,7 @@ fn read_line_page(
     let mut lines = Vec::new();
     let mut bytes = 0;
     while query.limit.is_none_or(|l| (lines.len() as u64) < l)
-        && let Some(line) = next_line(&mut reader, query.max_line_bytes)?
+        && let Some(Line { text: line, .. }) = next_line(&mut reader, query.max_line_bytes)?
     {
         // A line costs its `String` here and a string and a table slot in Lua,
         // so even a file of empty lines has to run into the limit.
@@ -815,6 +876,25 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
     })
     .await;
     Ok(pair(touched(removed, result).await.map(|()| true)))
+}
+
+/// Move the file or directory at {from} to {to}, replacing {to} if it is an
+/// existing file. Both must be on the same filesystem. Nothing is copied, so
+/// renaming a large file costs the same as a small one.
+///
+/// @param from string Path to move.
+/// @param to string New path. `~/` is expanded.
+/// @return (true?, string?) `true` on success, or nil plus an error message.
+/// @example
+/// local ok, err = maki.fs.rename("out.log", "out.log.1")
+/// if err then print("rename failed: " .. err) end
+#[lua_fn(guard = FsWrite)]
+async fn rename(_lua: Lua, from: String, to: String) -> LuaResult<Pair<bool>> {
+    let from = try_pair!(make_absolute(&from));
+    let to = try_pair!(make_absolute(&to));
+    let result = smol::fs::rename(&from, &to).await;
+    let result = touched(from, result).await;
+    Ok(pair(touched(to, result).await.map(|()| true)))
 }
 
 /// Create the directory at {path}. Set `parents = true` to create
@@ -1368,8 +1448,8 @@ lua_table! {
     "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions, plugin: Arc<str>), DOCS [
         read(perms), read_bytes(perms), read_lines(perms), metadata(perms), dirname, basename,
         joinpath, normalize, abspath, parents, root(perms), relpath, ext,
-        dir(perms), write(perms), append(perms), atomic_write(perms), rm(perms), mkdir(perms),
-        glob(perms), grep(perms), fuzzy_files(perms, plugin),
+        dir(perms), write(perms), append(perms), atomic_write(perms), rename(perms),
+        rm(perms), mkdir(perms), glob(perms), grep(perms), fuzzy_files(perms, plugin),
     ]
 }
 
@@ -1393,6 +1473,18 @@ mod tests {
     const READ_LIMIT_ERROR: &str = "file exceeds the 67108864-byte read limit";
     const TEST_READ_LIMIT: u64 = 4;
     const TEST_PLUGIN: &str = "test";
+
+    const OUTPUT_LIMITS_SRC: &str = include_str!("../../../plugins/lib/maki/output_limits.lua");
+
+    #[test]
+    fn full_output_ceiling_matches_the_read_limit() {
+        let lua = Lua::new();
+        let limits: Table = lua.load(OUTPUT_LIMITS_SRC).eval().unwrap();
+        assert_eq!(
+            limits.get::<u64>("FULL_OUTPUT_MAX_BYTES").unwrap(),
+            MAX_READ_BYTES
+        );
+    }
 
     #[test]
     fn read_file_ok() {
@@ -1486,7 +1578,51 @@ mod tests {
         let (lines, total) = read_line_page(&mut reader, &query).unwrap();
         assert_eq!(lines, ["l2"]);
         assert_eq!(total, None);
-        assert_eq!(next_line(&mut reader, None).unwrap().as_deref(), Some("l3"));
+        let next = next_line(&mut reader, None).unwrap().map(|line| line.text);
+        assert_eq!(next.as_deref(), Some("l3"));
+    }
+
+    /// The length a cut line had leaves out its line ending, the same way
+    /// the text of a whole line does.
+    #[test_case("abcdefgh\n", 8; "cut_line")]
+    #[test_case("abcdefgh\r\n", 8; "cut_crlf_line")]
+    #[test_case("abcdefgh", 8; "cut_line_at_eof")]
+    #[test_case("abc\r\n", 3; "whole_crlf_line")]
+    fn next_line_reports_the_uncut_length(content: &str, expected: u64) {
+        let line = next_line(&mut small_reader(content.as_bytes()), Some(4))
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.bytes, expected);
+    }
+
+    /// Fails its second read with `Interrupted`, which a reader must retry.
+    struct InterruptedOnce<R> {
+        inner: R,
+        reads: usize,
+    }
+
+    impl<R: Read> Read for InterruptedOnce<R> {
+        fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+            self.reads += 1;
+            if self.reads == 2 {
+                return Err(IoError::from(ErrorKind::Interrupted));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    #[test]
+    fn next_line_retries_an_interrupted_skip() {
+        const CHUNK: usize = 4;
+        let inner = InterruptedOnce {
+            inner: &b"abcdefgh\nnext\n"[..],
+            reads: 0,
+        };
+        let mut reader = BufReader::with_capacity(CHUNK, inner);
+        let cut = next_line(&mut reader, Some(2)).unwrap().unwrap();
+        assert_eq!((cut.text.as_str(), cut.bytes), ("ab...", 8));
+        let next = next_line(&mut reader, Some(2)).unwrap().unwrap();
+        assert_eq!(next.bytes, 4);
     }
 
     #[test_case(b"ok\xff\n"; "inside_the_kept_bytes")]
@@ -2090,6 +2226,71 @@ mod tests {
 
         assert!(error.to_string().contains(FS_WRITE_PERMISSION));
         assert!(!file.exists());
+    }
+
+    #[test_case(false ; "to_a_new_path")]
+    #[test_case(true ; "replacing_an_existing_file")]
+    fn rename_moves_the_file(replace: bool) {
+        let tmp = TempDir::new().unwrap();
+        let from = tmp.path().join("out.log");
+        let to = tmp.path().join("out.log.1");
+        std::fs::write(&from, FIRST_CONTENT).unwrap();
+        if replace {
+            std::fs::write(&to, REPLACEMENT_CONTENT).unwrap();
+        }
+        let lua = Lua::new();
+        let table =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let rename: mlua::Function = table.get("rename").unwrap();
+
+        let (ok, err): (Value, Value) =
+            smol::block_on(rename.call_async((from.to_str().unwrap(), to.to_str().unwrap())))
+                .unwrap();
+
+        assert_eq!((ok, err), (Value::Boolean(true), Value::Nil));
+        assert!(!from.exists());
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), FIRST_CONTENT);
+    }
+
+    #[test]
+    fn rename_of_a_missing_file_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let to = tmp.path().join("to.txt");
+        let lua = Lua::new();
+        let table =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let rename: mlua::Function = table.get("rename").unwrap();
+
+        let (ok, err): (Value, Value) = smol::block_on(rename.call_async((
+            tmp.path().join("ghost.txt").to_str().unwrap(),
+            to.to_str().unwrap(),
+        )))
+        .unwrap();
+
+        assert_eq!(ok, Value::Nil);
+        assert!(matches!(err, Value::String(_)));
+        assert!(!to.exists());
+    }
+
+    #[test]
+    fn rename_requires_fs_write_permission() {
+        let tmp = TempDir::new().unwrap();
+        let from = tmp.path().join("out.log");
+        std::fs::write(&from, FIRST_CONTENT).unwrap();
+        let to = tmp.path().join("out.log.1");
+        let lua = Lua::new();
+        let table =
+            create_fs_table(&lua, &PluginPermissions::denied(), Arc::from(TEST_PLUGIN)).unwrap();
+        let rename: mlua::Function = table.get("rename").unwrap();
+
+        let error = smol::block_on(
+            rename.call_async::<(Value, Value)>((from.to_str().unwrap(), to.to_str().unwrap())),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains(FS_WRITE_PERMISSION));
+        assert!(from.exists());
+        assert!(!to.exists());
     }
 
     #[test]

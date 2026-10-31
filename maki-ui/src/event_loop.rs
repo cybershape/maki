@@ -16,6 +16,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
+use crate::app::tasks::TaskStatus;
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
@@ -25,7 +26,7 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle,
-    Transcript, mcp,
+    SessionMailbox, Transcript, mcp,
 };
 use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
@@ -53,12 +54,12 @@ use serde_json::json;
 use tracing::{debug, info, warn};
 
 use crate::agent::{
-    AgentHandles, ModelSlot, ModelSlots,
+    AgentHandles, ModelSlot, ModelSlots, Respawn,
     shared_queue::{Compaction, QueueItem, QueuedInput},
 };
 use crate::app::mode::Mode;
 use crate::app::shell::{ShellEvent, spawn_shell};
-use crate::app::tasks::{TaskStatus, diff_task_states};
+use crate::app::tasks::TaskWatch;
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
 use crate::color_compat;
 use crate::components::input::Submission;
@@ -95,6 +96,10 @@ pub(crate) struct ShutdownReport {
     /// after dropping the terminal guard, so the line is not lost with the
     /// alternate screen.
     pub unsaved: Vec<MakiId>,
+    /// A result that settled but no run drained yet lives only in its
+    /// session's mailbox. `/reload` carries these over so the next generation
+    /// finds it there instead of reporting the work lost.
+    pub mailboxes: Vec<SessionMailbox>,
 }
 
 pub struct EventLoopParams {
@@ -114,6 +119,8 @@ pub struct EventLoopParams {
     pub permissions: Arc<PermissionManager>,
     pub timeouts: Timeouts,
     pub exit_on_done: bool,
+    /// How long `exit_on_done` waits for background work, `None` for not at all.
+    pub background_wait: Option<Duration>,
     pub lua_command_reader: LuaCommandReader,
     pub keymap_reader: KeymapReader,
     pub hint_reader: HintReader,
@@ -127,6 +134,9 @@ pub struct EventLoopParams {
     /// What `/trust` would grant and what the `[restricted]` indicator reports.
     /// `None` when the folder is trusted or has nothing to ask about.
     pub trust_question: Option<TrustQuestion>,
+    /// The mailboxes the generation before handed over, held until this one
+    /// registered its own.
+    pub handed_over: Vec<SessionMailbox>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -358,9 +368,7 @@ struct SessionRuntime {
     shell_rx: flume::Receiver<ShellEvent>,
     last_status: SessionStatus,
     last_title: String,
-    /// Keyed by task id, never by position: a session reset reuses positions,
-    /// so a new task would inherit the old one's status.
-    last_tasks: Vec<(Arc<str>, TaskStatus)>,
+    last_tasks: TaskWatch,
     notifications: RunNotificationState,
     /// This session's model and provider, one cell per runtime and never
     /// shared. The agent loop reads it at the start of every turn, and a
@@ -391,6 +399,7 @@ impl SessionRuntime {
         SessionStatus::of(&self.app) == SessionStatus::Idle
             && self.handles.queue.is_empty()
             && !self.app.holds_recovery_text()
+            && self.app.takes_mailbox_runs()
     }
 }
 
@@ -430,6 +439,7 @@ impl SpawnCtx {
             Resumed {
                 id: SessionRef::from(session.id),
                 history: session.messages().to_vec(),
+                message_timestamps: session.message_timestamps().to_vec(),
                 context_size: session.meta.context_size,
                 frame: session.frame().cloned(),
                 // The tab owns the session and persists it through
@@ -479,7 +489,7 @@ impl SpawnCtx {
             shell_rx,
             last_status: SessionStatus::Idle,
             last_title,
-            last_tasks: Vec::new(),
+            last_tasks: TaskWatch::default(),
             notifications: RunNotificationState::default(),
             slot: cell,
         }
@@ -609,6 +619,7 @@ impl<'t> EventLoop<'t> {
             permissions,
             timeouts,
             exit_on_done,
+            background_wait,
             lua_command_reader,
             keymap_reader,
             hint_reader,
@@ -620,6 +631,7 @@ impl<'t> EventLoop<'t> {
             model_policy,
             project_config,
             trust_question,
+            handed_over,
         } = params;
         // A `/reload` generation inherits the handles of the one before it,
         // so every loop has to claim the UI back for itself.
@@ -696,12 +708,14 @@ impl<'t> EventLoop<'t> {
                 rt
             })
             .collect();
+        drop(handed_over);
         if runtimes.is_empty() {
             return Err(eyre!("event loop needs at least one session"));
         }
         let focused = focused.min(runtimes.len() - 1);
         let app = &mut runtimes[focused].app;
         app.exit_on_done = exit_on_done;
+        app.background_wait = background_wait;
         if needs_login {
             app.login_picker.open(app.storage.clone());
         }
@@ -811,13 +825,23 @@ impl<'t> EventLoop<'t> {
             }
 
             if let Some(i) = self.sessions.iter().position(|rt| {
-                rt.app.exit_request != ExitRequest::None && !rt.notifications.waiting_for_drain()
+                rt.app.exit_request != ExitRequest::None
+                    && !rt.notifications.waiting_for_drain()
+                    && !rt.app.awaits_background(Instant::now())
             }) {
-                // A backgrounded session can finish an `exit_on_done` turn;
-                // focus it so shutdown reports its exit code and id.
-                self.set_focused(i);
-                self.emit_notifications();
-                break Ok(());
+                // A result settling since the drain above both clears its
+                // receipt and wakes the session, so the wake is claimed after
+                // the read: its run goes first, and that run's drain exits.
+                if self.sessions[i].app.exit_on_done {
+                    dirty |= self.start_mailbox_runs();
+                }
+                if self.sessions[i].app.exit_request != ExitRequest::None {
+                    // A backgrounded session can finish an `exit_on_done` turn.
+                    // Focus it so shutdown reports its exit code and id.
+                    self.set_focused(i);
+                    self.emit_notifications();
+                    break Ok(());
+                }
             }
 
             // Sleeping a whole frame instead of a fraction of one is what
@@ -909,6 +933,16 @@ impl<'t> EventLoop<'t> {
     /// [`App::tick_background`].
     fn tick(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
+        // A quit ends the whole process, so each session's double press
+        // counts the background tasks of all of them.
+        let running: usize = self
+            .sessions
+            .iter()
+            .map(|rt| rt.app.running_background_tasks().count())
+            .sum();
+        for rt in &mut self.sessions {
+            rt.app.background_elsewhere = running - rt.app.running_background_tasks().count();
+        }
         for (i, rt) in self.sessions.iter_mut().enumerate() {
             if i == self.focused {
                 dirty |= rt.app.tick();
@@ -981,6 +1015,9 @@ impl<'t> EventLoop<'t> {
         dirty |= self.start_mailbox_runs();
         self.emit_status_changes();
         self.emit_title_changes();
+        for rt in &mut self.sessions {
+            rt.app.settle_stranded_parts();
+        }
         self.emit_task_changes();
         self.emit_notifications();
         // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
@@ -1149,6 +1186,11 @@ impl<'t> EventLoop<'t> {
                     rt.app.open_plugin_task(&info, plugin);
                 }
             }
+            UiAction::PluginTaskEnded { session, id, end } => {
+                if let Some(rt) = self.sessions.iter_mut().find(|rt| rt.id() == session) {
+                    rt.app.end_task(&id, end.into());
+                }
+            }
         }
     }
 
@@ -1213,47 +1255,42 @@ impl<'t> EventLoop<'t> {
         let handle = &self.ctx.lua_event_handle;
         for rt in &mut self.sessions {
             let session_id = rt.app.state.session.id;
-            diff_task_states(&mut rt.last_tasks, rt.app.task_states(), |task| {
-                handle.fire(
-                    Some(&session_id),
-                    HostEvent::TaskStatusChanged {
-                        id: task.id,
-                        name: task.name,
-                        status: task.status.into(),
-                        plugin: task.plugin.map(|plugin| &**plugin),
-                    },
-                );
-                if self.program_status_enabled {
-                    let sanitized = sanitize_task_id(task.id);
-                    let state = match task.status {
-                        TaskStatus::Working => crate::program_status::State::Working,
-                        TaskStatus::Idle => crate::program_status::State::Idle,
-                        TaskStatus::Done => crate::program_status::State::Done,
-                        TaskStatus::Error => crate::program_status::State::Error,
-                    };
-                    let mut report = crate::program_status::ProgramStatusReport::new(state);
-                    report.id = Some(sanitized);
-                    report.title = Some(task.name.to_string());
-                    let _ = crate::program_status::emit_program_status(&report);
-                }
-            });
+            rt.last_tasks
+                .diff(session_id, rt.app.task_states(), |task| {
+                    handle.fire(
+                        Some(&session_id),
+                        HostEvent::TaskStatusChanged {
+                            id: task.id,
+                            name: task.name,
+                            status: task.status.into(),
+                            plugin: task.plugin.map(|plugin| &**plugin),
+                        },
+                    );
+                    if self.program_status_enabled {
+                        let sanitized = sanitize_task_id(task.id);
+                        let state = match task.status {
+                            TaskStatus::Working => crate::program_status::State::Working,
+                            TaskStatus::Idle => crate::program_status::State::Idle,
+                            TaskStatus::Done | TaskStatus::Cancelled => {
+                                crate::program_status::State::Done
+                            }
+                            TaskStatus::Error => crate::program_status::State::Error,
+                        };
+                        let mut report = crate::program_status::ProgramStatusReport::new(state);
+                        report.id = Some(sanitized);
+                        report.title = Some(task.name.to_string());
+                        let _ = crate::program_status::emit_program_status(&report);
+                    }
+                });
         }
     }
 
     /// Called only after the cancel went out, so a handler that checks
     /// `maki.agent.list()` already finds a stopped plugin task gone.
-    fn emit_task_stopped(&self, idx: usize, id: &str) {
-        let app = &self.sessions[idx].app;
-        let plugin = app
-            .task_states()
-            .find(|task| &**task.id == id)
-            .and_then(|task| task.plugin);
+    fn emit_task_stopped(&self, idx: usize, id: &str, plugin: Option<&str>) {
         self.ctx.lua_event_handle.fire(
-            Some(&app.state.session.id),
-            HostEvent::TaskStopped {
-                id,
-                plugin: plugin.map(|plugin| &**plugin),
-            },
+            Some(&self.sessions[idx].app.state.session.id),
+            HostEvent::TaskStopped { id, plugin },
         );
         if self.program_status_enabled {
             let sanitized = sanitize_task_id(id);
@@ -1814,7 +1851,7 @@ impl<'t> EventLoop<'t> {
                 .app
                 .apply_loaded_session(open, &slot.model);
             self.apply_model(idx, slot);
-            self.respawn_agent(idx, history);
+            self.respawn_agent(idx, history, Respawn::Load);
         } else {
             let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
             self.set_focused(idx);
@@ -1999,7 +2036,7 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn respawn_agent(&mut self, idx: usize, history: Vec<Message>) {
+    fn respawn_agent(&mut self, idx: usize, history: Vec<Message>, reason: Respawn) {
         let rt = &mut self.sessions[idx];
         rt.reset_run_notifications();
         let lua_handle = rt.app.lua_event_handle.clone();
@@ -2013,6 +2050,7 @@ impl<'t> EventLoop<'t> {
             &permissions,
             &mut rt.app,
             lua_handle,
+            reason,
         );
     }
 
@@ -2052,13 +2090,13 @@ impl<'t> EventLoop<'t> {
                 self.sessions[idx]
                     .handles
                     .cancel_subagent(tool_use_id.clone());
-                self.emit_task_stopped(idx, &tool_use_id);
+                self.emit_task_stopped(idx, &tool_use_id, None);
             }
-            Action::CancelPluginTask { id } => {
+            Action::CancelPluginTask { id, plugin } => {
                 self.ctx.lua_event_handle.cancel_plugin_session(&id);
-                self.emit_task_stopped(idx, &id);
+                self.emit_task_stopped(idx, &id, Some(&plugin));
             }
-            Action::RestartAgent(history) => self.respawn_agent(idx, history),
+            Action::RestartAgent(history) => self.respawn_agent(idx, history, Respawn::Restart),
             Action::OpenFork(open) => self.open_fork(idx, *open),
             Action::ChangeModel(spec) => {
                 if let Err(e) = self.change_model(&spec) {
@@ -2267,6 +2305,7 @@ impl<'t> EventLoop<'t> {
         }
         let kill_mcp_ms = lap();
         let mut tabs = Vec::with_capacity(self.sessions.len());
+        let mut mailboxes = Vec::with_capacity(self.sessions.len());
         let mut agent_tasks = Vec::with_capacity(self.sessions.len());
         for rt in self.sessions.drain(..) {
             let SessionRuntime {
@@ -2279,6 +2318,7 @@ impl<'t> EventLoop<'t> {
                 session: Arc::unwrap_or_clone(app.state.session),
                 claim: app.state.claim,
             });
+            mailboxes.push(handles.mailbox().clone());
             agent_tasks.push(handles.into_task());
         }
         let save_sessions_ms = lap();
@@ -2311,6 +2351,7 @@ impl<'t> EventLoop<'t> {
             tabs,
             focused: self.focused,
             unsaved,
+            mailboxes,
         }
     }
 }

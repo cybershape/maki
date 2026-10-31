@@ -10,16 +10,16 @@
 - **上游跟踪分支**: `upstream/main`
 - **当前本地分支**: `main`（跟踪 `origin/main`: `git@github.com:cybershape/maki.git`）
 - **最新同步的上游 Commit**:
-  - **Commit SHA**: `1a8b897bf15d818d9b0fc399a6145eeb42b9e304`
-  - **Commit 日期**: `Thu Oct 29 21:54:56 2026 +0100`
-  - **Commit 作者**: `Luca Barbato <lu_zero@gentoo.org>`
-  - **Commit 信息**: `providers(mistral): Refresh Large 4 pricing`
+  - **Commit SHA**: `7ae4c5d10eb353ae41f67e5b7a5767fa7800fc51`
+  - **Commit 日期**: `Fri Oct 30 20:35:58 2026 +0200`
+  - **Commit 作者**: `Tony Solomonik <tony.solomonik@gmail.com>`
+  - **Commit 信息**: `fix(background): make moved tasks read clearly in the chat and \`/tasks\``
 - **初始分叉点 (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit 日期**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit 信息**: `chore(deps): move monty to crates.io 1.x`
 
-> 本次已成功合并 `upstream/main`（至 commit `1a8b897b`）。
+> 本次已成功合并 `upstream/main`（至 commit `7ae4c5d1`）。
 
 ---
 
@@ -76,6 +76,38 @@
 | `2bfb89fc` | `feat(ui): add left padding to chat messages panel` | 聊天消息面板增加左侧内边距 padding |
 | `b7d57572` | `feat(ui): capitalize tool group titles and show thinking duration` | 工具组标题首字母大写并展示思考耗时 |
 | `c72e8fa1` | `Merge branch 'upstream/main' into main` | 合并上游提交（至 `1a8b897b`），包含 serde-saphyr 替代弃用的 serde_yaml、agent-client-protocol-schema 升级至 1.13.0、`sess:send` 运行中子 agent 消息推送、日志记录 project 标识等 |
+| `6069e830` | `docs: update upstream tracking record to 1a8b897b` | 更新上游跟踪记录文档至 `1a8b897b` |
+| `bcaa1d21` | `feat(storage): record timestamps in session log records` | 会话日志消息持久化记录 unix 时间戳 |
+| `9104593f` | `fix(ui): remove leading padding in compact tool groups` | 移除紧凑工具组内部多余的起始左侧缩进 |
+| `137a821e` | `feat(ui): include waiting time in compact thinking and tool call durations` | 紧凑工具组将等待模型响应的时间计入思考和首个工具调用的耗时 |
+| `da932b30` | `feat(ui): summarize tool calls and thoughts in tool group header` | 紧凑工具组头部摘要展示工具调用和思考概要 |
+| `24382572` | `fix(ui): use "thinking" instead of "thought" in group summary` | 紧凑工具组概要统一使用 "thinking" 术语 |
+| `25eb4d73` | `feat(ui): support true queue execution, steer shortcut, and recall editing` | UI 支持队列化执行、Alt+S 即时干预快捷键、Recall 历史输入重入编辑 |
+| `4d8dcb46` | `fix(ui): use theme colors for context window progress bar in status bar` | 状态栏上下文进度条应用主题配色 |
+| `7771692d` | `fix(ui): dim context percentage and window size in status bar` | 状态栏上下文占比百分比与窗口大小显示样式调暗 |
+| `19e40f75` | `feat(ui): support OSC 7501 Program Status Protocol` | UI 支持 OSC 7501 程序状态通知协议（Working, Idle, Done, Error） |
+| `7f136ab7` | `feat(ui): display user messages with chevron and background, remove maki prefix` | UI 用户消息采用背景色块与 Chevron 装饰展示，移除 `maki> ` 命令行前缀 |
+| `2c3a9d79` | `feat: show a model-written reason on every tool call` | 工具调用支持并展示模型填写的 `toolcall_reason` 原因说明 |
+| `7b40aa5e` | `feat: store how long each thinking block took` | 会话与数据模型中记录每个思考块的耗时 |
+| `e6679ed4` | `feat: encourage models to fill toolcall_reason` | 系统提示词引导模型填写 `toolcall_reason` |
+| `29a7e495` | `fix: tell an injected toolcall_reason by its description` | 区分注入的 `toolcall_reason` 属性定义 |
+| `7b20b515` | `build: leave LTO off unless a release asks for it` | 默认构建关闭 LTO 以提高编译速度，仅在 release-lto 配置下开启 |
+| `f26eff25` | `feat: adjust prompt tool usage when batch, code_execution, or task are disabled` | 当 batch、code_execution 或 task 禁用时动态调整系统提示词 |
+| `91af6fff` | `feat(ui): refine compact tool summaries with toolcall_reason` | 紧凑工具行摘要优先渲染 `toolcall_reason` |
+| `df344898` | `feat: tell models not to mention file names in toolcall_reason` | 提示词明确要求模型在 `toolcall_reason` 中不要冗余提及文件名 |
+| `cc535772` | `docs: update fork changes in README and add maintenance rule to AGENTS` | README 更新 fork 差异总结并向 AGENTS.md 增加 fork 维护准则 |
+| `5b5dae02` | `feat(mcp): replace tool_search with code_execution external libraries` | MCP 工具发现与执行改为通过 Python `code_execution` 外部库模式，替代 tool_search |
+| `4a93166c` | `feat(config): enable library_help in DEFAULT_BUILTINS` | 将 `library_help` 工具加入默认内置工具清单 |
+| `265a90e5` | `feat(ui): format batch child tool summaries with toolcall_reason in compact mode` | 紧凑模式下格式化 batch 子工具摘要，展示 `toolcall_reason` |
+| `cf8e3c13` | `feat(ui): enable inline image rendering for Rex terminal` | UI 支持 Rex 终端行内图片渲染 |
+| `686e9a76` | `fix(mcp): await mcp ready before building frame tools and compaction` | 构建 frame 工具与上下文压缩前先等待 MCP 初始化就绪 |
+| `c2e04192` | `feat(ui): support ratio and negative offset in max_width` | `max_width` 支持比例与负向偏移量计算表达式 |
+| `da15dc8d` | `fix(mcp): normalize hyphenated identifiers for python sandbox and library_help` | MCP 工具和参数中的连字符统一转换为下划线以兼容 Python 语法标识符 |
+| `fb49721e` | `fix(ui): apply max_width once when laying out the frame` | UI 布局时仅在顶层单次应用 `max_width` |
+| `67e6fec3` | `feat(ui): sum compact thinking durations in turn completion stats line` | 每 turn 统计行汇总紧凑思考耗时 |
+| `51d9955f` | `docs: describe MCP-through-code_execution and old-session incompatibility` | 文档描述通过代码执行使用 MCP 工具的机制及旧 session 兼容性说明 |
+| `0e1f3227` | `fix(session): keep message timestamps across a headless resume` | 修复 headless 恢复会话时保留消息时间戳 |
+| Pending | `Merge branch 'upstream/main' into main` | 合并上游提交（至 `7ae4c5d1`），包含 slow tool call 后台任务管理（Ctrl+B）、`/tasks` 嵌套展示与交互优化、bash 输出行数/体积限制及全量日志落盘、Lua 插件任务隔离调度等 |
 
 ---
 

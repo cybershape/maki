@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::fmt::Write;
+use std::ops::AddAssign;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -8,8 +9,8 @@ use std::time::Duration;
 use flume::{Receiver, Sender};
 use maki_config::ToolKey;
 use maki_providers::{
-    AgentError, ContentBlock, ImageSource, Message, RequestOptions, Role, StopReason, TokenUsage,
-    add_cost,
+    AgentError, ContentBlock, ImageSource, Message, RequestOptions, Role, StopReason, TaskEnd,
+    TokenUsage, add_cost,
 };
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
@@ -257,6 +258,10 @@ pub enum ToolOutput {
     },
 }
 
+fn counted(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
 /// Saturating arithmetic so callers can't overflow with any combination of inputs.
 fn lines_remaining_after(total: usize, start_line: usize, shown: usize) -> usize {
     let end = start_line.saturating_add(shown).saturating_sub(1);
@@ -276,23 +281,21 @@ impl ToolOutput {
                 if *total_lines > shown {
                     Some(format!("{shown} of {total_lines} lines"))
                 } else {
-                    Some(format!("{shown} lines"))
+                    Some(counted(shown, "line", "lines"))
                 }
             }
-            Self::WriteCode { byte_count, .. } => Some(format!("{byte_count} bytes")),
+            Self::WriteCode { byte_count, .. } => Some(counted(*byte_count, "byte", "bytes")),
             Self::GrepResult { entries } => {
                 let matches: usize = entries.iter().map(|e| e.match_count()).sum();
-                let files = entries.len();
-                let f = if files == 1 { "file" } else { "files" };
-                Some(format!("{matches} matches in {files} {f}"))
+                Some(format!(
+                    "{} in {}",
+                    counted(matches, "match", "matches"),
+                    counted(entries.len(), "file", "files")
+                ))
             }
-            Self::ReadDir(t) => {
-                let n = t.text.lines().count();
-                Some(format!("{n} entries"))
-            }
+            Self::ReadDir(t) => Some(counted(t.text.lines().count(), "entry", "entries")),
             Self::Plain(text) | Self::Markdown(text) if !text.text.is_empty() => {
-                let n = text.text.lines().count();
-                Some(format!("{n} lines"))
+                Some(counted(text.text.lines().count(), "line", "lines"))
             }
             Self::Image { text, .. } => Some(
                 text.strip_prefix("[image: ")
@@ -528,6 +531,10 @@ pub struct ToolDoneEvent {
     /// doom-loop refusal, a restored transcript) has none.
     #[serde(skip)]
     pub call: Option<Box<CallRecord>>,
+    /// The call moved to the background and `output` is its receipt. Travels
+    /// live only: a restored transcript shows the receipt text alone.
+    #[serde(skip)]
+    pub backgrounded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -550,7 +557,16 @@ impl ToolDoneEvent {
             annotation: None,
             written_path: None,
             call: None,
+            backgrounded: false,
         }
+    }
+
+    /// How long the call ran before this result, a receipt's until the move.
+    /// Zero when dispatch did not time it.
+    pub fn ran_for(&self) -> Duration {
+        self.call
+            .as_ref()
+            .map_or(Duration::ZERO, |call| call.duration)
     }
 
     pub fn written_path(&self) -> Option<&str> {
@@ -571,7 +587,11 @@ impl ToolDoneEvent {
 pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
     let mut content = Vec::with_capacity(results.len());
     let mut images = Vec::new();
+    let mut receipts = Vec::new();
     for r in results {
+        if r.backgrounded {
+            receipts.push(r.id.clone());
+        }
         content.push(ContentBlock::ToolResult {
             tool_use_id: r.id,
             content: r.output.as_text(),
@@ -590,6 +610,7 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
     Message {
         role: Role::User,
         content,
+        receipts,
         ..Default::default()
     }
 }
@@ -659,6 +680,30 @@ pub enum SessionEndReason {
 /// `maki.agent.call_tool` hands it to a caller's `on_annotation`.
 pub const ALLOWED_BY: &str = "allowed by";
 
+/// Spelled the way `maki.task.list()` spells a task's status, so a part reads
+/// like any other task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartStatus {
+    Working,
+    Done,
+    Error,
+    Cancelled,
+}
+
+/// A piece of a call, like the `bash` child of a `batch`, that gets its own
+/// task under the call once the call moves. A subagent child already has a
+/// task of its own, so it is never a part.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolPart {
+    /// Stable across reports, or the part opens a new tab each time.
+    pub id: String,
+    pub name: String,
+    pub tool: Arc<str>,
+    pub status: PartStatus,
+    pub body: Option<Arc<SharedBuf>>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -680,6 +725,17 @@ pub enum AgentEvent {
         content: String,
     },
     ToolDone(Box<ToolDoneEvent>),
+    /// A running top-level call gained (`true`) or lost a background hook, so
+    /// a Ctrl+B press would move it now.
+    ToolMovable {
+        id: String,
+        movable: bool,
+    },
+    /// What a running top-level call is made of now, see [`ToolPart`].
+    ToolParts {
+        id: String,
+        parts: Vec<ToolPart>,
+    },
     TurnComplete(Box<TurnCompleteEvent>),
     ToolResultsSubmitted {
         message: Box<Message>,
@@ -723,6 +779,10 @@ pub enum AgentEvent {
         message: String,
         /// The provider rejected the credentials, so a re-login is what fixes it.
         auth: bool,
+        /// What the run spent before it failed, the same bill a `Done` carries,
+        /// so a frontend settles either ending alike. Empty when no run started.
+        #[serde(flatten)]
+        totals: RunTotals,
     },
     PermissionRequest {
         id: String,
@@ -753,6 +813,11 @@ pub enum AgentEvent {
     /// shows the same line.
     ObservationLine {
         text: String,
+        /// What the line unfolds to, see `observation_detail`.
+        detail: Option<String>,
+        /// Set when the line answers a background task, for its colored dot.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        end: Option<TaskEnd>,
     },
     /// A plugin changed the run in a way the transcript alone would not show.
     /// `text` is the message as sent, the reason for a drop, or the message
@@ -794,10 +859,11 @@ pub enum AgentEvent {
 }
 
 impl AgentEvent {
-    pub fn error(error: &AgentError) -> Self {
+    pub fn error(error: &AgentError, totals: RunTotals) -> Self {
         Self::Error {
             message: error.user_message(),
             auth: error.is_auth_error(),
+            totals,
         }
     }
 }
@@ -1109,7 +1175,7 @@ pub struct TurnCompleteEvent {
 }
 
 /// What one run spent, itself and everything it spawned.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct RunTotals {
     pub usage: TokenUsage,
     pub cost: Option<f64>,
@@ -1117,6 +1183,83 @@ pub struct RunTotals {
     /// alike so the total is never a partial sum of whichever turns happened
     /// to be subsidised.
     pub list_cost: Option<f64>,
+}
+
+impl RunTotals {
+    /// What `self` holds beyond `earlier`, a smaller total of the same spend.
+    /// Every paid round carries tokens, so when none moved nothing was spent,
+    /// whatever residue two float sums of the same rounds leave in the costs.
+    pub fn since(&self, earlier: &Self) -> Self {
+        let usage = TokenUsage {
+            input: self.usage.input.saturating_sub(earlier.usage.input),
+            output: self.usage.output.saturating_sub(earlier.usage.output),
+            cache_creation: self
+                .usage
+                .cache_creation
+                .saturating_sub(earlier.usage.cache_creation),
+            cache_read: self
+                .usage
+                .cache_read
+                .saturating_sub(earlier.usage.cache_read),
+            cost: None,
+        };
+        if usage == TokenUsage::default() {
+            return Self::default();
+        }
+        Self {
+            usage,
+            cost: cost_since(self.cost, earlier.cost),
+            list_cost: cost_since(self.list_cost, earlier.list_cost),
+        }
+    }
+}
+
+impl AddAssign for RunTotals {
+    fn add_assign(&mut self, rhs: Self) {
+        self.usage += rhs.usage;
+        add_cost(&mut self.cost, rhs.cost);
+        add_cost(&mut self.list_cost, rhs.list_cost);
+    }
+}
+
+fn cost_since(now: Option<f64>, earlier: Option<f64>) -> Option<f64> {
+    now.map(|now| now - earlier.unwrap_or_default())
+        .filter(|spent| *spent > 0.0)
+}
+
+/// The cost a frontend reports: runs that ended plus the one still streaming.
+/// Turns land their cost as they go, but once a run ends its ledger is the
+/// truth, since it also counts compaction and what work moved off an earlier
+/// turn spent since, which no turn reported.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CostTally {
+    settled: Option<f64>,
+    running: Option<f64>,
+}
+
+impl CostTally {
+    pub fn starting_at(cost: Option<f64>) -> Self {
+        Self {
+            settled: cost,
+            running: None,
+        }
+    }
+
+    pub fn turn(&mut self, cost: Option<f64>) {
+        add_cost(&mut self.running, cost);
+    }
+
+    /// The run ended: `ledger` is the cost its `Done` or `Error` carries.
+    pub fn settle(&mut self, ledger: Option<f64>) {
+        self.running = None;
+        add_cost(&mut self.settled, ledger);
+    }
+
+    pub fn total(&self) -> Option<f64> {
+        let mut total = self.settled;
+        add_cost(&mut total, self.running);
+        total
+    }
 }
 
 /// Spend accumulator for one run, chained to the run that spawned it.
@@ -1133,19 +1276,24 @@ pub struct RunLedger {
 
 impl RunLedger {
     pub fn child(parent: &Arc<Self>) -> Arc<Self> {
+        Self::carrying(parent, RunTotals::default())
+    }
+
+    /// A child that opens with `carried` on it: spend `parent` already holds,
+    /// which this one reports again but never passes up.
+    pub fn carrying(parent: &Arc<Self>, carried: RunTotals) -> Arc<Self> {
         Arc::new(Self {
-            totals: Mutex::default(),
+            totals: Mutex::new(carried),
             parent: Some(Arc::clone(parent)),
         })
     }
 
     pub fn add(&self, usage: TokenUsage, cost: Option<f64>, list_cost: Option<f64>) {
-        {
-            let mut totals = self.locked();
-            totals.usage += usage;
-            add_cost(&mut totals.cost, cost);
-            add_cost(&mut totals.list_cost, list_cost);
-        }
+        *self.locked() += RunTotals {
+            usage,
+            cost,
+            list_cost,
+        };
         if let Some(parent) = &self.parent {
             parent.add(usage, cost, list_cost);
         }
@@ -1182,6 +1330,11 @@ pub struct SubagentInfo {
     /// queue between turns, so a message lands as a user interrupt.
     #[serde(skip)]
     pub inbox: Option<Arc<crate::SubagentInbox>>,
+    /// The model's call this session runs under when that is not its own
+    /// `task` call, like the `batch` it is a child of. Once that call moves,
+    /// `/tasks` lists the session under it.
+    #[serde(skip)]
+    pub parent_call: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1318,13 +1471,13 @@ mod tests {
     use std::pin::pin;
     use test_case::test_case;
 
-    #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 lines")     ; "plain_short_annotates")]
+    #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 line")      ; "plain_short_annotates")]
     #[test_case(ToolOutput::Plain((0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n").into()), Some("20 lines") ; "plain_long_annotates")]
     #[test_case(ToolOutput::Plain(String::new().into()),             None                ; "plain_empty_no_annotation")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec!["x".into(); 5], total_lines: 5, instructions: None }, Some("5 lines") ; "read_code_full_file")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("5 of 100 lines") ; "read_code_partial")]
     #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec![] }, Some("99 bytes") ; "write_code_bytes")]
-    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }] }, Some("1 matches in 1 file") ; "grep_file_count")]
+    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }] }, Some("1 match in 1 file") ; "grep_file_count")]
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: String::new(), summary: "ok".into() }, None ; "diff_no_annotation")]
     fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
         assert_eq!(output.annotation().as_deref(), expected);
@@ -1484,7 +1637,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_results_builds_message_with_tool_result_blocks() {
+    fn tool_results_builds_message_with_tool_result_blocks_and_receipts() {
         let msg = tool_results(vec![
             ToolDoneEvent {
                 call: None,
@@ -1494,6 +1647,7 @@ mod tests {
                 is_error: false,
                 annotation: None,
                 written_path: None,
+                backgrounded: true,
             },
             ToolDoneEvent {
                 call: None,
@@ -1503,10 +1657,12 @@ mod tests {
                 is_error: true,
                 annotation: None,
                 written_path: None,
+                backgrounded: false,
             },
         ]);
         assert!(matches!(msg.role, Role::User));
         assert_eq!(msg.content.len(), 2);
+        assert_eq!(msg.receipts, ["t1"]);
         assert!(
             matches!(&msg.content[0], ContentBlock::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "t1" && !is_error)
         );
@@ -1532,6 +1688,7 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path: None,
+            backgrounded: false,
         };
 
         let msg = tool_results(vec![
@@ -1615,6 +1772,7 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path: Some("/plans/slug.md".into()),
+            backgrounded: false,
         };
         assert!(!ok_event.wrote_to(Path::new("/plans/other.md")));
 
@@ -1851,6 +2009,7 @@ mod tests {
             is_error,
             annotation: None,
             written_path,
+            backgrounded: false,
         };
         assert_eq!(event.written_path(), expected);
     }
@@ -1888,6 +2047,9 @@ mod tests {
     const SECOND_INPUT: u32 = 5;
     const OWN_SUBTREE_MSG: &str = "a child ledger reports only what it spent itself";
     const ROLLUP_MSG: &str = "a child's spend has to land in the parent's totals";
+    const CARRIED_ONCE_MSG: &str =
+        "a carried balance shows on the child and stays counted once on the parent";
+    const FLOAT_RESIDUE: f64 = 1e-12;
 
     fn usage(input: u32) -> TokenUsage {
         TokenUsage {
@@ -1913,6 +2075,18 @@ mod tests {
         assert_eq!(totals.list_cost, expected);
     }
 
+    #[test_case(Some(SECOND_COST), FIRST_COST + SECOND_COST ; "a_priced_ledger_replaces_its_turns")]
+    #[test_case(None, FIRST_COST ; "an_unpriced_ledger_adds_nothing")]
+    fn cost_tally_settles_a_run(ledger: Option<f64>, expected: f64) {
+        let mut tally = CostTally::starting_at(Some(FIRST_COST));
+        tally.turn(Some(FIRST_COST));
+        assert_eq!(tally.total(), Some(FIRST_COST * 2.0));
+
+        tally.settle(ledger);
+        tally.settle(None);
+        assert_eq!(tally.total(), Some(expected));
+    }
+
     #[test]
     fn ledger_child_spend_rolls_up_into_parent() {
         let parent = Arc::new(RunLedger::default());
@@ -1935,6 +2109,46 @@ mod tests {
             Some(FIRST_COST + SECOND_COST),
             "{ROLLUP_MSG}"
         );
+    }
+
+    #[test]
+    fn carried_spend_is_reported_by_the_child_but_not_passed_up() {
+        let parent = Arc::new(RunLedger::default());
+        parent.add(usage(FIRST_INPUT), Some(FIRST_COST), None);
+        let child = RunLedger::carrying(&parent, parent.totals());
+        child.add(usage(SECOND_INPUT), Some(SECOND_COST), None);
+
+        for totals in [child.totals(), parent.totals()] {
+            assert_eq!(
+                totals.usage.input,
+                FIRST_INPUT + SECOND_INPUT,
+                "{CARRIED_ONCE_MSG}"
+            );
+            assert_eq!(
+                totals.cost,
+                Some(FIRST_COST + SECOND_COST),
+                "{CARRIED_ONCE_MSG}"
+            );
+        }
+    }
+
+    #[test_case(SECOND_INPUT, Some(SECOND_COST) ; "spent_rounds_are_the_difference")]
+    #[test_case(0, None ; "no_tokens_means_no_spend_despite_cost_residue")]
+    fn totals_since_an_earlier_reading(input: u32, expected_cost: Option<f64>) {
+        let earlier = RunTotals {
+            usage: usage(FIRST_INPUT),
+            cost: Some(FIRST_COST),
+            list_cost: None,
+        };
+        let now = RunTotals {
+            usage: usage(FIRST_INPUT + input),
+            cost: Some(FIRST_COST + expected_cost.unwrap_or(FLOAT_RESIDUE)),
+            list_cost: None,
+        };
+
+        let spent = now.since(&earlier);
+        assert_eq!(spent.usage.input, input);
+        assert_eq!(spent.cost, expected_cost);
     }
 
     const STREAM_RUN_IDS: [u64; 3] = [1, 2, 3];

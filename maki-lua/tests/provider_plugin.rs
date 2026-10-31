@@ -220,6 +220,7 @@ fn plugin_host() -> PluginHost {
 }
 
 fn load_inline(host: &PluginHost, source: &str, net_host: &str, slugs: &[&str]) {
+    plugin::begin_load();
     host.load_source_with_grant(
         INLINE_PLUGIN,
         source,
@@ -487,7 +488,7 @@ fn a_side_request_that_cannot_connect_is_a_transport_error() {
 
     let error = smol::block_on(fixture.provider.list_models()).unwrap_err();
 
-    assert!(matches!(error, AgentError::Http(_)), "{error:?}");
+    assert_eq!(error.retry_kind(), Some(RetryKind::Connect), "{error:?}");
 }
 
 /// There is no `has_auth` flag: defining `login` is the whole of what makes a
@@ -728,6 +729,7 @@ fn takeover_catalog_cached() {
 /// every slug the package registers has to be on it. A plain plugin load
 /// holds no grant at all.
 #[test]
+#[ignore = "catalog-backed providers removed in this fork"]
 fn every_registered_slug_needs_the_grant_a_package_load_carries() {
     let _state = isolated_state();
     takeover_catalog_cached();

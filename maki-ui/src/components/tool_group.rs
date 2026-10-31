@@ -597,6 +597,7 @@ pub fn build_tool_group_lines(
             snapshot_base: None,
             content_indent: "",
             truncation: SectionFlags::default(),
+            elapsed: None,
         };
     }
 
@@ -687,6 +688,7 @@ pub fn build_tool_group_lines(
         snapshot_base: None,
         content_indent: "",
         truncation: SectionFlags::default(),
+        elapsed: None,
     }
 }
 

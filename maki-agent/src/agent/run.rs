@@ -14,7 +14,7 @@ use maki_providers::{
 use maki_storage::frame::{LiveFacts, PromptFacts};
 
 use super::compaction::{self, CompactReason, CompactSteer, Compacted};
-use super::display_order::observation_line;
+use super::display_order::{observation_detail, observation_line};
 use super::frame::{
     FRAME_REBUILT, FrameFit, RunContextBuilder, context_update, fingerprint, fit_frame,
 };
@@ -29,7 +29,8 @@ use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedPrompts;
 use crate::tools::hook::Verdict;
 use crate::tools::{
-    Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter, ToolOutputMode,
+    BackgroundFor, Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter,
+    ToolOutputMode,
 };
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
@@ -37,7 +38,7 @@ use crate::{
     TurnCompleteEvent, TurnTiming,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
-use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::id::SessionRef;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 /// One compaction is the whole remedy for an overflowing prompt, so a second
@@ -70,6 +71,12 @@ const MODEL_BINDING_MISMATCH: &str = "model_binding_mismatch";
 const THINKING_DROPPED: &str =
     "The prompt changed under earlier reasoning, so it was dropped to keep the session going.";
 
+fn served_window_notice(model: &str, served: u32, planned: u32) -> String {
+    format!(
+        "The server runs {model} with a {served}-token context, below the {planned} tokens maki planned for. Compacting to fit from now on. Raise the server's context length for more room."
+    )
+}
+
 pub async fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
     model: &Model,
@@ -91,6 +98,7 @@ pub async fn resolve_compaction_model(
 
 /// The model and provider a frontend is running. Shared, so a picker can swap
 /// it while a run is in flight: [`Agent`] re-reads it every turn.
+#[derive(Clone)]
 pub struct ModelSlot {
     pub model: Model,
     pub provider: Arc<dyn Provider>,
@@ -113,7 +121,7 @@ pub struct AgentParams {
     /// for anything the user watches. Its file writes are denied while the
     /// chat plans, see [`crate::AgentSeed::background_write_block`]. Subagents
     /// inherit it, or a monitor could get around the block by starting one.
-    pub background_for: Option<MakiId>,
+    pub background_for: BackgroundFor,
     pub task_id: Option<Arc<str>>,
     pub mailbox: Option<SessionMailbox>,
     pub timeouts: maki_providers::Timeouts,
@@ -172,7 +180,7 @@ pub struct Agent<'h> {
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
-    background_for: Option<MakiId>,
+    background_for: BackgroundFor,
     task_id: Option<Arc<str>>,
     mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
@@ -186,6 +194,9 @@ pub struct Agent<'h> {
     model_policy: Arc<ModelPolicy>,
     model_sync: Option<Arc<ArcSwap<ModelSlot>>>,
     stop_continuations: u32,
+    /// The last tool round moved a call to the background. Its receipt tells
+    /// the model to end the turn, so an empty reply after it is no stall.
+    moved_last_round: bool,
 }
 
 impl<'h> Agent<'h> {
@@ -233,6 +244,7 @@ impl<'h> Agent<'h> {
             model_policy: params.model_policy,
             model_sync: None,
             stop_continuations: 0,
+            moved_last_round: false,
         }
     }
 
@@ -307,6 +319,7 @@ impl<'h> Agent<'h> {
         self.rollback_len = self.history.len();
         self.carry_from = self.history.len();
         self.stop_continuations = 0;
+        self.moved_last_round = false;
         self.mode = mode;
         self.workflow = workflow;
         self.opts = RequestOptions { thinking, fast };
@@ -414,10 +427,8 @@ impl<'h> Agent<'h> {
         let Some(message) = message else {
             return Ok(());
         };
-        if drain_mailbox && let Some(mailbox) = &self.mailbox {
-            for message in mailbox.drain() {
-                self.land_observation(message)?;
-            }
+        if drain_mailbox {
+            self.land_mailbox()?;
         }
         self.tell_changes();
         if !message.content.is_empty() {
@@ -426,13 +437,29 @@ impl<'h> Agent<'h> {
         Ok(())
     }
 
+    fn land_mailbox(&mut self) -> Result<(), AgentError> {
+        let Some(mailbox) = &self.mailbox else {
+            return Ok(());
+        };
+        for message in mailbox.drain() {
+            self.land_observation(message)?;
+        }
+        Ok(())
+    }
+
     /// The line follows the observation into history, so frontends draw it
-    /// once and a restore draws it too.
+    /// once and a restore draws it too. `detail` is what the model reads.
     fn land_observation(&mut self, message: Message) -> Result<(), AgentError> {
         let line = observation_line(&message).map(str::to_owned);
+        let detail = line
+            .as_ref()
+            .and(observation_detail(&message))
+            .map(str::to_owned);
+        let end = message.settles.as_ref().map(|settled| settled.end);
         self.history.push(message);
         if let Some(text) = line {
-            self.event_tx.send(AgentEvent::ObservationLine { text })?;
+            self.event_tx
+                .send(AgentEvent::ObservationLine { text, detail, end })?;
         }
         Ok(())
     }
@@ -452,6 +479,7 @@ impl<'h> Agent<'h> {
             if self.turns_exhausted() {
                 return Ok(DoneReason::MaxTurns);
             }
+            self.follow_served_window().await?;
             self.try_auto_compact().await?;
             match self.turn().await? {
                 TurnOutcome::Continue => {}
@@ -529,6 +557,40 @@ impl<'h> Agent<'h> {
         self.prompt_facts = candidate.facts;
         self.provider = Arc::clone(&current.provider);
         self.model = Arc::new(current.model.clone());
+    }
+
+    /// A local server may load the model with less room than it supports, and
+    /// then it quietly cuts the oldest tokens instead of letting maki compact
+    /// them. So the budget follows what the server says it serves. The slot
+    /// learns it too, or the next `sync_model` would hand back the old window.
+    async fn follow_served_window(&mut self) -> Result<(), AgentError> {
+        let Some(served) = self.provider.served_context_window(&self.model).await else {
+            return Ok(());
+        };
+        let planned = self.model.context_window;
+        if served == planned {
+            return Ok(());
+        }
+        info!(session = ?self.session_id, model = %self.model.id, served, planned, "following the served context window");
+        if served < planned {
+            self.event_tx.send(AgentEvent::Notice {
+                text: served_window_notice(&self.model.id, served, planned),
+            })?;
+        }
+        self.model = Arc::new(Model {
+            context_window: served,
+            ..(*self.model).clone()
+        });
+        if let Some(slot) = &self.model_sync {
+            slot.rcu(|current| {
+                let mut next = ModelSlot::clone(current);
+                if next.model.provider == self.model.provider && next.model.id == self.model.id {
+                    next.model.context_window = served;
+                }
+                next
+            });
+        }
+        Ok(())
     }
 
     /// Right before every request. A compaction drops the frame, so it may
@@ -638,7 +700,7 @@ impl<'h> Agent<'h> {
 
         if has_tools {
             let history_len_before = self.history.len();
-            self.process_tool_calls(response).await?;
+            self.moved_last_round = self.process_tool_calls(response).await?;
             self.gauge
                 .append(&self.history.as_slice()[history_len_before..]);
         } else {
@@ -667,7 +729,10 @@ impl<'h> Agent<'h> {
             return Ok(TurnOutcome::Continue);
         }
 
+        // The request is going out anyway, so a notice rides along behind the
+        // tool results. After a final answer it stays queued: that is the wake.
         if has_tools {
+            self.land_mailbox()?;
             return Ok(TurnOutcome::Continue);
         }
         let reason = stop_reason.into();
@@ -926,7 +991,9 @@ impl<'h> Agent<'h> {
     /// place in history. Returns true when the model was nudged to try again.
     fn recover_stalled_turn(&mut self) -> Result<bool, AgentError> {
         let nudges = self.history.recent_nudges();
-        let nudge = nudges < MAX_NUDGES && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
+        let nudge = !self.moved_last_round
+            && nudges < MAX_NUDGES
+            && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
         self.history.push(Message::empty_marker());
         if !nudge {
             return Ok(false);
@@ -942,8 +1009,8 @@ impl<'h> Agent<'h> {
     }
 
     /// Fails closed: the filter is the frame's, and without one no tool may
-    /// run under some other set.
-    async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
+    /// run under some other set. `true` when a call moved to the background.
+    async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<bool, AgentError> {
         let filter = self
             .history
             .live_frame()
@@ -967,7 +1034,7 @@ impl<'h> Agent<'h> {
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
             session_id: self.session_id.clone(),
-            background_for: self.background_for,
+            background_for: self.background_for.clone(),
             task_id: self.task_id.clone(),
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
@@ -975,6 +1042,8 @@ impl<'h> Agent<'h> {
             loaded_instructions: self.loaded_instructions.clone(),
             instruction_files: self.instruction_files.clone(),
             call_instructions: CallInstructions::default(),
+            call: None,
+            mailbox: self.mailbox.clone(),
             cancel: self.cancel.clone(),
             mcp: self.mcp.clone(),
             deadline: Deadline::default(),
@@ -1188,8 +1257,10 @@ fn interrupt_message(message: String, images: Vec<ImageSource>) -> Message {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::collections::{BTreeMap, VecDeque};
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use maki_config::ProjectConfig;
@@ -1199,6 +1270,7 @@ mod tests {
         StreamResponse, ThinkingSupport, TokenUsage,
     };
     use maki_storage::frame::{FactsUpdate, PlanChange};
+    use maki_storage::id::MakiId;
     use serde_json::Value;
     use test_case::test_case;
 
@@ -1214,8 +1286,14 @@ mod tests {
     use crate::session::StoredSession;
     use crate::template::Vars;
     use crate::tools::RequestTools;
-    use crate::{EarlierInput, Envelope};
+    use crate::tools::{
+        DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, MovedCall, ParseError, Tool,
+        ToolExecResult, ToolInvocation, ToolRegistry, ToolSource,
+    };
+    use crate::{EarlierInput, Envelope, ToolOutput};
 
+    const MOVING_TOOL: &str = "moving_probe";
+    const MOVING_RECEIPT: &str = "Moved to the background. End your turn.";
     const QUEUED_MESSAGES: [&str; 3] = ["first", "second", "third"];
     const RESPONSE_TEXT: &str = "response";
     const PLAN_ENDED: &str = "Plan mode ended. You may edit files again.";
@@ -1276,6 +1354,7 @@ mod tests {
     struct MockProvider {
         responses: Mutex<Vec<StreamResponse>>,
         requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        served_window: Option<u32>,
     }
 
     impl MockProvider {
@@ -1283,6 +1362,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses),
                 requests: Arc::default(),
+                served_window: None,
             }
         }
     }
@@ -1316,6 +1396,10 @@ mod tests {
 
         fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
+        }
+
+        fn served_context_window<'a>(&'a self, _: &'a Model) -> BoxFuture<'a, Option<u32>> {
+            Box::pin(async { self.served_window })
         }
     }
 
@@ -1443,7 +1527,7 @@ mod tests {
                     Arc::default(),
                 )),
                 session_id: None,
-                background_for: None,
+                background_for: BackgroundFor::None,
                 task_id: None,
                 mailbox: None,
                 timeouts: maki_providers::Timeouts::default(),
@@ -1823,11 +1907,13 @@ mod tests {
         Interrupt,
     }
 
-    fn notice_lines(events: &[Envelope]) -> Vec<&str> {
+    fn notice_lines(events: &[Envelope]) -> Vec<(&str, Option<&str>)> {
         events
             .iter()
             .filter_map(|envelope| match &envelope.event {
-                AgentEvent::ObservationLine { text } => Some(text.as_str()),
+                AgentEvent::ObservationLine { text, detail, .. } => {
+                    Some((text.as_str(), detail.as_deref()))
+                }
                 _ => None,
             })
             .collect()
@@ -1883,7 +1969,10 @@ mod tests {
                 agent.run(input).await.unwrap();
             }
 
-            assert_eq!(notice_lines(&drain_events(&event_rx)), [NOTICE_LINE]);
+            assert_eq!(
+                notice_lines(&drain_events(&event_rx)),
+                [(NOTICE_LINE, Some(NOTICE_BODY))]
+            );
             let landed = observations(&history);
             assert_eq!(landed.len(), 1);
             assert_eq!(landed[0].display_text.as_deref(), Some(NOTICE_LINE));
@@ -1936,7 +2025,7 @@ mod tests {
                 assert_eq!(mailbox.drain().len(), 1);
             } else {
                 assert_eq!(kinds, [false, true, false]);
-                assert_eq!(lines, [NOTICE_LINE]);
+                assert_eq!(lines, [(NOTICE_LINE, Some(NOTICE_BODY))]);
             }
         });
     }
@@ -1961,6 +2050,110 @@ mod tests {
             let landed = observations(&history);
             assert_eq!(landed.len(), 1);
             assert_eq!(landed[0].display_text, None);
+        });
+    }
+
+    /// Lands a notice when the loop looks for queued input, which is right
+    /// after the tool results are in and before the next request goes out.
+    struct NotifyOnce {
+        session: MakiId,
+        wake: bool,
+        armed: AtomicBool,
+    }
+
+    impl NotifyOnce {
+        fn new(session: MakiId, wake: bool) -> Arc<Self> {
+            Arc::new(Self {
+                session,
+                wake,
+                armed: AtomicBool::new(true),
+            })
+        }
+    }
+
+    impl InterruptSource for NotifyOnce {
+        fn poll(&self) -> Option<ExtractedCommand> {
+            if self.armed.swap(false, Ordering::Relaxed) {
+                SessionMailbox::notify(
+                    self.session,
+                    NOTICE_BODY.into(),
+                    Some(NOTICE_LINE),
+                    self.wake,
+                )
+                .unwrap();
+            }
+            None
+        }
+    }
+
+    #[test]
+    fn a_notice_landing_mid_run_follows_the_tool_results_in_the_next_request() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            let mock = MockProvider::new(vec![
+                tool_call_response("glob", "t1"),
+                text_response(StopReason::EndTurn),
+            ]);
+            let requests = Arc::clone(&mock.requests);
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(mock, &mut history);
+            agent.mailbox = Some(mailbox.clone());
+            let mut agent = agent.with_interrupt_source(NotifyOnce::new(id, false));
+
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            let messages = history.as_slice();
+            let [.., results, notice, _answer] = messages else {
+                panic!("history too short: {messages:?}");
+            };
+            assert!(
+                results
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+            );
+            assert!(notice.is_observation());
+            assert_eq!(notice.first_text_content(), Some(NOTICE_BODY));
+            assert_eq!(observations(&history).len(), 1);
+            assert!(mailbox.drain().is_empty());
+            assert_eq!(
+                notice_lines(&drain_events(&event_rx)),
+                [(NOTICE_LINE, Some(NOTICE_BODY))]
+            );
+
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_append_only(&requests[0], &requests[1]);
+            assert_eq!(
+                requests[1].messages.last(),
+                Some(&serde_json::to_value(notice).unwrap())
+            );
+        });
+    }
+
+    #[test]
+    fn a_notice_landing_as_the_model_answers_stays_queued() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            let mock = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let requests = Arc::clone(&mock.requests);
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(mock, &mut history);
+            agent.mailbox = Some(mailbox.clone());
+            let mut agent = agent.with_interrupt_source(NotifyOnce::new(id, true));
+
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert!(observations(&history).is_empty());
+            assert!(notice_lines(&drain_events(&event_rx)).is_empty());
+            let woken = mailbox.claim_wake();
+            assert_eq!(woken.len(), 1);
+            assert_eq!(woken[0].first_text_content(), Some(NOTICE_BODY));
         });
     }
 
@@ -2103,6 +2296,62 @@ mod tests {
             let outcome = agent.run(default_input()).await.unwrap();
             assert_eq!(outcome, DoneReason::Cancelled);
         });
+    }
+
+    #[test_case(200_000, 32_768, true ; "smaller_window_compacts_and_tells")]
+    #[test_case(32_768, 200_000, false ; "larger_window_is_silent")]
+    #[test_case(200_000, 200_000, false ; "same_window_changes_nothing")]
+    fn budget_follows_the_served_window(planned: u32, served: u32, shrinks: bool) {
+        let mut h = Harness::new(Vec::new());
+        h.model = small_context_model(planned, 8_192);
+        h.served_window = Some(served);
+        let first_turn = StreamResponse {
+            usage: TokenUsage {
+                input: 30_000,
+                ..Default::default()
+            },
+            ..tool_call_response("glob", "t1")
+        };
+        let replies = vec![
+            first_turn,
+            text_response(StopReason::EndTurn),
+            text_response(StopReason::EndTurn),
+        ];
+        let start = h.model.clone();
+        let mut slot = None;
+        let (_, events) = h.run(default_input(), replies, |agent| {
+            let shared = Arc::new(ArcSwap::from_pointee(ModelSlot {
+                model: start,
+                provider: Arc::clone(&agent.provider),
+            }));
+            agent.model_sync = Some(Arc::clone(&shared));
+            agent.auto_compact = true;
+            slot = Some(shared);
+        });
+
+        let notice = served_window_notice(&h.model.id, served, planned);
+        assert_eq!(
+            has_event(
+                &events,
+                |event| matches!(event, AgentEvent::Notice { text } if *text == notice)
+            ),
+            shrinks
+        );
+        assert_eq!(
+            has_event(&events, |event| matches!(
+                event,
+                AgentEvent::AutoCompacting { .. }
+            )),
+            shrinks
+        );
+        assert_eq!(
+            events.iter().rev().find_map(|event| match &event.event {
+                AgentEvent::TurnComplete(turn) => Some(turn.context_window),
+                _ => None,
+            }),
+            Some(served)
+        );
+        assert_eq!(slot.unwrap().load().model.context_window, served);
     }
 
     fn small_context_model(context_window: u32, max_output_tokens: u32) -> Model {
@@ -2413,6 +2662,7 @@ mod tests {
         model: Model,
         history: History,
         requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        served_window: Option<u32>,
     }
 
     impl Harness {
@@ -2422,6 +2672,7 @@ mod tests {
                 model: default_model(),
                 history: History::new(prior),
                 requests: Arc::default(),
+                served_window: None,
             }
         }
 
@@ -2434,6 +2685,7 @@ mod tests {
             smol::block_on(async {
                 let mut mock = MockProvider::new(responses);
                 mock.requests = Arc::clone(&self.requests);
+                mock.served_window = self.served_window;
                 let (mut agent, event_rx) =
                     make_agent_with(Arc::new(mock), self.model.clone(), &mut self.history);
                 agent.context = self.world.builder();
@@ -2635,8 +2887,7 @@ mod tests {
         .into_session(StoredSession::new("", HERE_CWD))
         .unwrap();
         let (messages, timestamps) = session.drain_messages().into_iter().unzip();
-        History::restored_with_timestamps(messages, timestamps)
-            .with_frame(session.frame().cloned())
+        History::restored_with_timestamps(messages, timestamps).with_frame(session.frame().cloned())
     }
 
     /// The imported facts are older than the update after them, so the model
@@ -3748,6 +3999,77 @@ mod tests {
                 .filter(|e| matches!(e.event, AgentEvent::Nudge))
                 .count();
             assert_eq!(nudges, MAX_NUDGES as usize + 1);
+        });
+    }
+
+    /// Answers every call with a receipt, as `bash(background = true)` does.
+    struct MovingTool;
+
+    struct MovingInvocation;
+
+    impl ToolInvocation for MovingInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(MOVING_TOOL.into()))
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async {
+                ToolExecResult {
+                    moved: Some(MovedCall {
+                        result: Box::pin(async { None }),
+                        land: Box::new(drop),
+                    }),
+                    ..Ok(ToolOutput::Plain(MOVING_RECEIPT.into())).into()
+                }
+            })
+        }
+    }
+
+    impl Tool for MovingTool {
+        fn name(&self) -> &str {
+            MOVING_TOOL
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            MOVING_TOOL.into()
+        }
+        fn schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(MovingInvocation))
+        }
+    }
+
+    /// The receipt tells the model to end its turn, so a reply with only
+    /// thinking after it is the answer asked for, not a stall to nudge.
+    #[test_case(MOVING_TOOL, 0 ; "no_nudge_after_a_moved_call")]
+    #[test_case("glob", 1 ; "nudge_after_a_call_that_stayed")]
+    fn nudge_after_a_tool_round(tool: &str, expected_nudges: usize) {
+        smol::block_on(async {
+            let responses = vec![
+                tool_call_response(tool, "t1"),
+                thinking_response(),
+                text_response(StopReason::EndTurn),
+            ];
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            let registry = ToolRegistry::new();
+            registry
+                .register(
+                    Arc::new(MovingTool),
+                    ToolSource::Lua {
+                        plugin: MOVING_TOOL.into(),
+                    },
+                )
+                .unwrap();
+            agent.registry = Arc::new(registry);
+            let _ = agent.run(default_input()).await;
+            drop(agent);
+
+            let nudges = drain_events(&event_rx)
+                .iter()
+                .filter(|e| matches!(e.event, AgentEvent::Nudge))
+                .count();
+            assert_eq!(nudges, expected_nudges);
         });
     }
 

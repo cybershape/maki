@@ -16,12 +16,13 @@ use maki_agent::tools::schema::{
     ParamSchema, TOOLCALL_REASON_FIELD, to_json_schema, try_from_json, validate,
 };
 use maki_agent::tools::{
-    BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
+    BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, MovedCall, ParseError,
     PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
     ToolReach, is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
-    AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, SharedBuf, TextOutput, ToolOutput,
+    AgentEvent, BufferSnapshot, CallScope, ImageMediaType, ImageSource, SharedBuf, TextOutput,
+    ToolOutput,
 };
 use maki_config::{
     CompatibilityAgent, CompatibilityConfig, Effect, PermissionRule, ToolKey, ToolOutputLines,
@@ -169,6 +170,33 @@ impl ToolPermission<PermissionScopeSpec> {
     }
 }
 
+const NEEDS_BACKGROUND_KEY: &str = "needs_background";
+
+/// What a tool offers only to a session whose model can move a call to the
+/// background itself.
+#[derive(Clone, Default)]
+pub(crate) struct BackgroundOnly {
+    pub(crate) tool: bool,
+    pub(crate) params: Vec<String>,
+}
+
+impl BackgroundOnly {
+    fn from_spec(spec: &Table, schema: &Value) -> LuaResult<Self> {
+        let params = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(_, param)| param.get(NEEDS_BACKGROUND_KEY) == Some(&Value::Bool(true)))
+            .map(|(name, _)| name.clone())
+            .collect();
+        Ok(Self {
+            tool: spec_opt(spec, NEEDS_BACKGROUND_KEY, "a boolean")?.unwrap_or(false),
+            params,
+        })
+    }
+}
+
 pub(crate) struct PendingTool {
     pub(crate) name: Arc<str>,
     pub(crate) description: String,
@@ -185,6 +213,7 @@ pub(crate) struct PendingTool {
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
     pub(crate) describe_key: Option<RegistryKey>,
+    pub(crate) background_only: BackgroundOnly,
 }
 
 impl PendingTool {
@@ -238,6 +267,7 @@ pub(crate) struct LuaTool {
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
     pub(crate) has_describe_fn: bool,
+    pub(crate) background_only: BackgroundOnly,
 }
 
 impl Tool for LuaTool {
@@ -282,6 +312,22 @@ impl Tool for LuaTool {
 
     fn schema(&self) -> Value {
         to_json_schema(self.schema)
+    }
+
+    fn offered_schema(&self, background: bool) -> Option<Value> {
+        if background {
+            return Some(self.schema());
+        }
+        if self.background_only.tool {
+            return None;
+        }
+        let mut schema = self.schema();
+        if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+            for param in &self.background_only.params {
+                properties.remove(param);
+            }
+        }
+        Some(schema)
     }
 
     fn audience(&self) -> ToolAudience {
@@ -546,10 +592,12 @@ impl ToolInvocation for LuaToolInvocation {
             }
 
             let recv = async { Some(reply_rx.recv_async().await) };
+            let call = ctx.call.as_deref();
+            let own_call = call.is_some_and(|call| ctx.tool_use_id.as_deref() == Some(call.id()));
             let result = match effective_secs {
                 Some(secs) => {
                     futures_lite::future::race(recv, async move {
-                        smol::Timer::after(Duration::from_secs(secs)).await;
+                        backstop(Duration::from_secs(secs), call, own_call).await;
                         None
                     })
                     .await
@@ -566,9 +614,9 @@ impl ToolInvocation for LuaToolInvocation {
                 ))
                 .into(),
                 Some(Err(_)) => Err("lua thread disconnected".to_string()).into(),
-                Some(Ok(reply)) => {
+                Some(Ok(mut reply)) => {
                     if let Some(ref id) = ctx.tool_use_id {
-                        if let Some(live_buf) = reply.live_buf {
+                        if let Some(live_buf) = reply.live_buf.take() {
                             crate::runtime::send_render_event(
                                 &ctx.event_tx,
                                 id,
@@ -580,42 +628,45 @@ impl ToolInvocation for LuaToolInvocation {
                             );
                         }
                         crate::runtime::RestoreReply {
-                            body: reply.snapshot,
-                            header: reply.header,
+                            body: reply.snapshot.take(),
+                            header: reply.header.take(),
                         }
                         .emit(id, None, &ctx.event_tx);
                     }
-                    let format = reply.format;
-                    let image = reply.image;
-                    let state = reply.state;
-                    ToolExecResult {
-                        output: reply.result.map(|s| {
-                            if let Some(source) = image {
-                                ToolOutput::Image { source, text: s }
-                            } else if let Some(diff) = reply.diff {
-                                ToolOutput::Diff {
-                                    summary: s,
-                                    path: diff.path,
-                                    before: diff.before,
-                                    after: diff.after,
-                                }
-                            } else {
-                                let inner = TextOutput {
-                                    state,
-                                    ..TextOutput::from(s)
-                                };
-                                match format {
-                                    LuaOutputFormat::Markdown => ToolOutput::Markdown(inner),
-                                    LuaOutputFormat::Plain => ToolOutput::Plain(inner),
-                                }
-                            }
-                        }),
-                        annotation: reply.annotation,
-                        written_path: reply.written_path,
-                    }
+                    reply.into_exec_result()
                 }
             }
         })
+    }
+}
+
+/// Ends the wait after {timeout}, unless {call} moved to the background
+/// first. A moved call, and every call nested in it, runs until its work ends
+/// or someone stops it.
+///
+/// A move and the timeout can land at the same moment. For the model call
+/// itself ({own_call}) the timeout ends the call through the same trigger a
+/// move claims, so only one wins: the receipt is the reply, or the move finds
+/// the call already ended.
+async fn backstop(timeout: Duration, call: Option<&CallScope>, own_call: bool) {
+    let Some(call) = call else {
+        smol::Timer::after(timeout).await;
+        return;
+    };
+    let lapsed = async {
+        smol::Timer::after(timeout).await;
+        if own_call {
+            call.end()
+        } else {
+            call.home().is_none()
+        }
+    };
+    let moved = async {
+        call.moved().await;
+        false
+    };
+    if !futures_lite::future::or(lapsed, moved).await {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -782,6 +833,7 @@ fn register_prompt(
 ///   permission      (string)   The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
 ///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
+///   needs_background (boolean) Offer the tool only to a model that can move a call to the background itself: the main agent of a session where background tasks are on. Default: false. A schema property can set the same key to hide just that (optional) parameter. The choice is made when the session's tool list is built, and a call that names a hidden parameter still validates.
 /// @return
 /// @example
 /// maki.api.register_tool({
@@ -1224,8 +1276,11 @@ fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
 /// `server__tool` shaped name resolves whether or not a server offers it,
 /// so this is not an existence check for MCP tools.
 ///
+/// `background_params` lists the parameters marked `needs_background`,
+/// which only a session that can move calls to the background sees.
+///
 /// @param name string Exact tool name.
-/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, header?, restore?, format? }, or nil if not found.
+/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, background_params?, header?, restore?, format? }, or nil if not found.
 /// @example
 /// local t = maki.api.get_tool("bash")
 /// if t then
@@ -1336,16 +1391,36 @@ fn routed_tool_entry(lua: &Lua, name: String) -> LuaResult<LuaValue> {
 
 fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
     let t = lua.create_table()?;
+    let schema = entry.tool.schema();
     t.set("name", entry.name())?;
     if let Some(alias) = identifier_alias(entry.name()) {
         t.set("alias", alias)?;
     }
-    t.set("schema", json_to_lua(lua, &entry.tool.schema())?)?;
+    t.set("schema", json_to_lua(lua, &schema)?)?;
     t.set("audiences", audiences_to_lua(lua, entry.tool.audience())?)?;
     if let Some(kind) = entry.tool.tool_kind() {
         t.set("kind", kind)?;
     }
+    let background_params = background_params(&schema, entry.tool.offered_schema(false));
+    if !background_params.is_empty() {
+        t.set("background_params", background_params)?;
+    }
     Ok(t)
+}
+
+/// The parameters `schema` has and `offered`, the schema a session without
+/// background moves gets, leaves out. A tool that such a session never sees
+/// has none, since the whole tool is the condition.
+fn background_params(schema: &Value, offered: Option<Value>) -> Vec<String> {
+    let properties = |schema: &Value| schema.get("properties").and_then(Value::as_object).cloned();
+    let (Some(all), Some(offered)) = (properties(schema), offered.as_ref().and_then(properties))
+    else {
+        return Vec::new();
+    };
+    all.keys()
+        .filter(|name| !offered.contains_key(*name))
+        .cloned()
+        .collect()
 }
 
 /// Async so wrapped fns can yield (e.g. bash restore highlights inline).
@@ -1690,6 +1765,7 @@ fn register_tool_from_lua(
         .ok()
         .map(|s| Arc::from(s.as_str()));
     let audience = parse_audience(audiences, ToolAudience::default())?;
+    let background_only = BackgroundOnly::from_spec(spec, &schema_val)?;
     let timeout = parse_timeout(spec)?;
     let start_annotation = parse_start_annotation(spec, &schema_val)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
@@ -1733,6 +1809,7 @@ fn register_tool_from_lua(
             start_annotation,
             examples,
             describe_key,
+            background_only,
         });
 
     Ok(())
@@ -1838,9 +1915,53 @@ pub(crate) struct ToolCallReply {
     /// return. It becomes `ToolOutput::Image` with `llm_output` as caption.
     pub image: Option<ImageSource>,
     pub state: Option<Value>,
+    /// Set when `result` is the receipt of a call that moved to the
+    /// background.
+    pub moved: Option<MovedCall>,
 }
 
 impl ToolCallReply {
+    pub(crate) fn into_exec_result(self) -> ToolExecResult {
+        let Self {
+            result,
+            format,
+            annotation,
+            written_path,
+            diff,
+            image,
+            state,
+            moved,
+            ..
+        } = self;
+        let output = result.map(|s| {
+            if let Some(source) = image {
+                ToolOutput::Image { source, text: s }
+            } else if let Some(diff) = diff {
+                ToolOutput::Diff {
+                    summary: s,
+                    path: diff.path,
+                    before: diff.before,
+                    after: diff.after,
+                }
+            } else {
+                let inner = TextOutput {
+                    state,
+                    ..TextOutput::from(s)
+                };
+                match format {
+                    LuaOutputFormat::Markdown => ToolOutput::Markdown(inner),
+                    LuaOutputFormat::Plain => ToolOutput::Plain(inner),
+                }
+            }
+        });
+        ToolExecResult {
+            output,
+            annotation,
+            written_path,
+            moved,
+        }
+    }
+
     pub fn from_lua_value(lua: &Lua, val: &LuaValue) -> Self {
         let mut result = coerce_tool_result(val);
         let LuaValue::Table(t) = val else {
@@ -1885,6 +2006,7 @@ impl ToolCallReply {
             diff,
             image,
             state,
+            moved: None,
         }
     }
 
@@ -1917,6 +2039,7 @@ impl ToolCallReply {
             diff: None,
             image: None,
             state: None,
+            moved: None,
         }
     }
 
@@ -2005,6 +2128,22 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::block_on_or_fail;
+    use crate::runtime::test_support::{call_scope, moved_home};
+
+    const BACKGROUND_PARAM: &str = "background";
+
+    #[test_case::test_case(Some(serde_json::json!({ "properties": { "command": {} } })), &[BACKGROUND_PARAM] ; "a_hidden_param")]
+    #[test_case::test_case(Some(serde_json::json!({ "properties": { "command": {}, "background": {} } })), &[] ; "offered_everywhere")]
+    #[test_case::test_case(None, &[] ; "a_background_only_tool")]
+    fn background_params_are_those_offered_only_for_the_background(
+        offered: Option<Value>,
+        expected: &[&str],
+    ) {
+        let schema = serde_json::json!({ "properties": { "command": {}, "background": {} } });
+
+        assert_eq!(background_params(&schema, offered), expected);
+    }
 
     #[test_case::test_case("echo", true ; "simple_name")]
     #[test_case::test_case("tool123", true ; "trailing_digits")]
@@ -2155,6 +2294,7 @@ mod tests {
             has_start_fn: false,
             examples: None,
             has_describe_fn: false,
+            background_only: BackgroundOnly::default(),
         }
     }
 
@@ -2530,5 +2670,34 @@ mod tests {
         };
         let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
         smol::block_on(inv.start(&ctx));
+    }
+
+    /// Once the timeout ended the model call, a move landing late finds
+    /// nothing to move, so the two never both answer it.
+    #[test_case::test_case(true ; "own_call")]
+    #[test_case::test_case(false ; "nested_call")]
+    fn the_backstop_fires_for_a_call_still_in_the_foreground(own_call: bool) {
+        let (call, _run, _task) = call_scope(false);
+        block_on_or_fail(backstop(Duration::ZERO, Some(&*call), own_call));
+        assert_eq!(call.cancel().is_cancelled(), own_call);
+        assert_eq!(call.move_to(moved_home()).is_err(), own_call);
+    }
+
+    /// A bash nested in a moved batch would otherwise die at its own timeout.
+    #[test_case::test_case(true ; "own_call")]
+    #[test_case::test_case(false ; "nested_call")]
+    fn the_backstop_never_fires_once_the_call_moved(own_call: bool) {
+        let (call, _run, _task) = call_scope(true);
+        let fired = block_on_or_fail(futures_lite::future::or(
+            async {
+                backstop(Duration::ZERO, Some(&*call), own_call).await;
+                true
+            },
+            async {
+                smol::future::yield_now().await;
+                false
+            },
+        ));
+        assert!(!fired);
     }
 }

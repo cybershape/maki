@@ -19,7 +19,7 @@ use agent_client_protocol_schema::v1::{
 };
 use color_eyre::eyre::Context;
 use flume::{Receiver, Sender, WeakSender};
-use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
+use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
@@ -27,15 +27,15 @@ use maki_agent::session::{Resumed, StoredSession};
 use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience, local_tool};
 use maki_agent::types::AgentEvent;
 use maki_agent::{
-    AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, InputSource, SessionEndReason,
-    SessionEvents,
+    AgentInput, AgentMode, CancelToken, CostTally, Envelope, ImageMediaType, ImageSource,
+    InputSource, SessionEndReason, SessionEvents,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
 use maki_providers::model::Model;
 use maki_providers::models_cache::{cached_model_specs, fetch_all_models_cached};
 use maki_providers::provider::available_model_specs;
-use maki_providers::{ThinkingConfig, add_cost, settle_session};
+use maki_providers::{ThinkingConfig, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::{SessionClaim, SessionError, StoredThinking};
@@ -171,8 +171,8 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         models_rx: Some(models_rx.clone()),
     };
 
-    loop {
-        let incoming = smol::future::race(
+    while !params.stop.is_cancelled() {
+        let incoming_fut = smol::future::race(
             async {
                 match lines_rx.recv_async().await {
                     Ok(line) => Some(Incoming::Line(line)),
@@ -185,8 +185,11 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
                     Err(_) => smol::future::pending().await,
                 }
             },
-        )
-        .await;
+        );
+        let incoming = match params.stop.race(incoming_fut).await {
+            Ok(inc) => inc,
+            Err(_) => break,
+        };
 
         match incoming {
             Some(Incoming::Line(line)) => handle_line(&mut server, &line, &params).await,
@@ -198,7 +201,12 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     close_session(&mut server, SessionEndReason::Shutdown).await;
     drop(server);
     writer_task.await;
-    reader_task.await.context("read stdin")?;
+    // A stop leaves stdin open, so its read would never end.
+    if params.stop.is_cancelled() {
+        reader_task.cancel().await;
+    } else {
+        reader_task.await.context("read stdin")?;
+    }
 
     Ok(())
 }
@@ -623,6 +631,15 @@ fn start_session(
         plugin_rules: Arc::clone(&params.plugin_rules),
         project_config,
         local_tools,
+        // Results ride the next prompt. The client never asked for a turn,
+        // so nothing wakes one.
+        background: if params.background {
+            BackgroundMode::Detached
+        } else {
+            BackgroundMode::Blocking
+        },
+        // `close_session` ends it, on a stop as on end of input.
+        stop: CancelToken::none(),
     });
     let session_ref = handle.session_id.clone();
     let usage = Arc::new(Mutex::new(SessionUsage {
@@ -826,6 +843,8 @@ async fn close_session(srv: &mut Server, reason: SessionEndReason) {
         let resp = PromptResponse::new(StopReason::Cancelled);
         srv.respond(id, Ok(AgentResponse::PromptResponse(resp)));
     }
+    // Only after the hook, which stops the session's background work, so the
+    // track this drops saves the full bill.
     state.handle.task.cancel().await;
     if let Some(mcp) = state.mcp {
         mcp.shutdown().await;
@@ -922,6 +941,7 @@ fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpEr
         .ok_or_else(|| AcpError::new(-32602, format!("unknown mode: {mode_str}")))?;
 
     let session = srv.session.as_mut().ok_or_else(no_session)?;
+    session.handle.switch_mode(new_mode.clone());
     session.current_mode = new_mode;
 
     let sid = SessionId::from(session.handle.session_id.to_string());
@@ -1053,10 +1073,10 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
 fn handle_notification(srv: &Server, method: &str) {
     match method {
         "session/cancel" => {
+            // Asks stay: a call moved to the background outlives the turn
+            // and may be parked on one, and a stale answer is tagged, so
+            // whoever waits next drops it.
             if let Some(session) = &srv.session {
-                // Every answer still in flight belongs to the cancelled turn,
-                // so forget the ids and let them be dropped on arrival.
-                session.pending.lock().unwrap().asks.clear();
                 let _ = session.handle.cancel_tx.try_send(());
             }
         }
@@ -1172,7 +1192,7 @@ fn start_event_pump(
 ) -> Task<()> {
     smol::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
-        let mut cost_total = initial_cost;
+        let mut cost = CostTally::starting_at(initial_cost);
         // A permission request only carries scopes, which are matching keys and
         // not always paths, so the file context a client needs has to come from
         // the tool call that asked for permission. Kept for the turn, like
@@ -1186,7 +1206,7 @@ fn start_event_pump(
             // A subagent's turn spends session money even though its events
             // stay out of the transcript.
             if let AgentEvent::TurnComplete(tc) = &event {
-                add_cost(&mut cost_total, tc.cost);
+                cost.turn(tc.cost);
             }
 
             let update = match event {
@@ -1270,6 +1290,7 @@ fn start_event_pump(
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
                 AgentEvent::ToolDone(event) => translate::tool_done(&event, &cwd, home.as_deref()),
                 AgentEvent::TurnComplete(event) => {
+                    let cost_total = cost.total();
                     let used = event
                         .context_size
                         .unwrap_or_else(|| event.usage.context_tokens())
@@ -1286,6 +1307,7 @@ fn start_event_pump(
                     context_window,
                     ..
                 } => {
+                    let cost_total = cost.total();
                     let used = u64::from(context_size_after);
                     {
                         let mut u = usage.lock().unwrap();
@@ -1294,14 +1316,17 @@ fn start_event_pump(
                     }
                     translate::gauge_usage_update(used, u64::from(context_window), cost_total)
                 }
-                AgentEvent::ObservationLine { text } => {
+                AgentEvent::ObservationLine { text, .. } => {
                     translate::notice(&MakiId::generate().to_string(), &text)
                 }
                 AgentEvent::Done {
                     context_size,
                     reason,
+                    cost: ledger,
                     ..
                 } => {
+                    cost.settle(ledger);
+                    let cost_total = cost.total();
                     tool_inputs.clear();
                     {
                         let mut u = usage.lock().unwrap();
@@ -1320,11 +1345,16 @@ fn start_event_pump(
                     }
                     continue;
                 }
-                AgentEvent::Error { message, auth } => {
+                AgentEvent::Error {
+                    message,
+                    auth,
+                    totals,
+                } => {
                     // A turn that dies on a provider 500 never reaches `Done`,
                     // and the pump outlives the session, so without this the
                     // whole file a `write` was carrying stays pinned forever.
                     tool_inputs.clear();
+                    cost.settle(totals.cost);
                     if let Some(id) = finish_turn(&pending) {
                         let error = if auth {
                             AcpError::auth_required()
@@ -1343,14 +1373,10 @@ fn start_event_pump(
     })
 }
 
-/// Takes the client's outstanding `session/prompt`, if any. A turn only ends
-/// with nothing parked on an ask, so an ask still registered here belongs to a
-/// waiter that is already gone: it is dropped rather than left to sit in the
-/// map for the life of the session.
+/// Takes the client's outstanding `session/prompt`, if any. Its asks stay
+/// until answered: a call moved to the background can still be parked on one.
 fn finish_turn(pending: &PendingState) -> Option<RequestId> {
-    let mut pending = pending.lock().unwrap();
-    pending.asks.clear();
-    pending.prompt.take()
+    pending.lock().unwrap().prompt.take()
 }
 
 fn send(out_tx: &Sender<Value>, msg: impl Serialize) {
@@ -1388,10 +1414,12 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 mod tests {
     use std::sync::LazyLock;
 
+    use maki_agent::headless::SessionEnd;
     use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
     use maki_agent::tools::PermissionScopes;
     use maki_agent::{
-        CancelToken, DoneReason, EventSender, SubagentInfo, ToolStartEvent, TurnCompleteEvent,
+        CancelToken, DoneReason, EventSender, RunTotals, SubagentInfo, ToolStartEvent,
+        TurnCompleteEvent,
     };
     use maki_config::project::TrustQuestion;
     use maki_config::{AgentConfig, Effect, ToolKey, TrustFileConfig};
@@ -1401,6 +1429,8 @@ mod tests {
     use maki_storage::StateDir;
     use maki_storage::sessions::{Session, StoredTokenUsage};
     use maki_storage::trusted_folders::{CanonicalFolder, TrustStatus, TrustedFolders};
+    use smol::Timer;
+    use smol::future;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -1431,6 +1461,7 @@ mod tests {
     const NEXT_TURN_SCOPE: &str = "rm -rf /";
     const NEXT_TURN_TOOL_USE_ID: &str = "toolu_next_turn";
     const STALE_ALLOW: &str = "a stale answer must never allow the next turn's tool";
+    const CLOSE_WAITED: &str = "closing a session must not wait for its background work";
 
     /// Where fixture servers claim their placeholder session. One dir is enough,
     /// since fresh ids never collide and nothing is written under them.
@@ -1630,6 +1661,7 @@ mod tests {
             answer_tx,
             cancel_tx: flume::unbounded().0,
             model_tx: flume::unbounded().0,
+            mode_tx: flume::unbounded().0,
             session_id: SessionRef::from(claim.id()),
             permissions: Arc::new(PermissionManager::new(
                 maki_config::PermissionsConfig::default(),
@@ -1637,7 +1669,8 @@ mod tests {
                 ProjectConfig::for_project(Path::new("/project")),
                 Arc::default(),
             )),
-            task: smol::spawn(async {}),
+            task: smol::spawn(async { SessionEnd::default() }),
+            spend: Arc::default(),
         };
         let server = Server {
             out_tx,
@@ -1678,6 +1711,8 @@ mod tests {
             trust_policy: Arc::default(),
             on_session_end: None,
             storage,
+            background: false,
+            stop: CancelToken::none(),
         }
     }
 
@@ -1753,6 +1788,7 @@ mod tests {
     const PROMPT_ID: i64 = 7;
     const SUBAGENT_COST: f64 = 0.25;
     const TURN_COST: f64 = 0.5;
+    const LEDGER_COST: f64 = 0.75;
     const CONTEXT_WINDOW: u32 = 200_000;
     const PARENT_TOOL_USE_ID: &str = "toolu_1";
     /// A string id no ask can ever carry, since ours are minted as numbers.
@@ -1814,6 +1850,7 @@ mod tests {
             opts: None,
             answer_tx,
             inbox: None,
+            parent_call: None,
         }
     }
 
@@ -1852,7 +1889,7 @@ mod tests {
     }
 
     #[test_case(false ; "answers_reach_the_agent_that_asked_even_out_of_order")]
-    #[test_case(true ; "cancel_drops_every_outstanding_answer")]
+    #[test_case(true ; "cancel_keeps_the_asks_a_moved_call_may_wait_on")]
     fn concurrent_subagent_permissions(cancel: bool) {
         let (srv, main_rx, out_rx) = test_server();
         let children = [flume::unbounded(), flume::unbounded()];
@@ -1925,7 +1962,7 @@ mod tests {
             .zip(CHILD_TOOL_USE_IDS.iter().chain([&PARENT_TOOL_USE_ID]))
         {
             let expected = TaggedAnswer::new(*asked_id, expected).encode();
-            assert_eq!(rx.try_recv().ok(), (!cancel).then_some(expected));
+            assert_eq!(rx.try_recv().ok(), Some(expected));
             assert!(rx.is_empty(), "each answer is delivered only once");
         }
     }
@@ -2004,9 +2041,9 @@ mod tests {
     }
 
     /// The race the ids exist for: the cancel lands while the permission
-    /// envelope is still queued in the pump, so the pump registers a fresh ask
-    /// after `asks` was cleared and the client answers it for real. With
-    /// nobody parked, that answer waits in the channel for the next turn.
+    /// envelope is still queued in the pump, so the pump still asks and the
+    /// client answers it for real. With nobody parked, that answer waits in
+    /// the channel for the next turn.
     #[test]
     fn an_answer_for_a_cancelled_ask_is_not_consumed_by_the_next_turn() {
         let (srv, answer_rx, out_rx) = test_server();
@@ -2107,6 +2144,8 @@ mod tests {
             sender
                 .send(AgentEvent::ObservationLine {
                     text: NOTICE_LINE.to_owned(),
+                    detail: None,
+                    end: None,
                 })
                 .unwrap();
             sender
@@ -2118,6 +2157,8 @@ mod tests {
                 .send_envelope(Envelope {
                     event: AgentEvent::ObservationLine {
                         text: CHILD_NOTICE_LINE.to_owned(),
+                        detail: None,
+                        end: None,
                     },
                     subagent: Some(subagent(None)),
                     run_id: 0,
@@ -2166,6 +2207,7 @@ mod tests {
                 .send(AgentEvent::Error {
                     message: TURN_ERROR.to_owned(),
                     auth,
+                    totals: RunTotals::default(),
                 })
                 .unwrap();
         });
@@ -2181,7 +2223,7 @@ mod tests {
     /// provider error has to let go of it just like a turn that finished.
     #[test_case(None, true ; "a_live_turn_shows_the_file_its_tool_call_named")]
     #[test_case(Some(done_event()), false ; "a_finished_turn_releases_its_tool_inputs")]
-    #[test_case(Some(AgentEvent::Error { message: TURN_ERROR.to_owned(), auth: false }), false ; "a_failed_turn_releases_its_tool_inputs")]
+    #[test_case(Some(AgentEvent::Error { message: TURN_ERROR.to_owned(), auth: false, totals: RunTotals::default() }), false ; "a_failed_turn_releases_its_tool_inputs")]
     fn a_terminal_event_releases_the_turns_tool_inputs(
         terminal: Option<AgentEvent>,
         keeps_input: bool,
@@ -2289,6 +2331,73 @@ mod tests {
             out_rx.is_empty(),
             "the subagent turn pays but stays out of the transcript"
         );
+    }
+
+    /// A run's `Done` or `Error` carries its ledger, which also bills
+    /// compaction and moved work, so it replaces what the run's turns added
+    /// up to.
+    #[test_case(false ; "a_finished_run")]
+    #[test_case(true ; "a_failed_run")]
+    fn event_pump_settles_a_run_on_its_ledger(failed: bool) {
+        let (srv, .., out_rx) = test_server();
+        let ledger = RunTotals {
+            cost: Some(LEDGER_COST),
+            ..RunTotals::default()
+        };
+        let ending = if failed {
+            AgentEvent::Error {
+                message: TURN_ERROR.to_owned(),
+                auth: false,
+                totals: ledger,
+            }
+        } else {
+            AgentEvent::Done {
+                usage: ledger.usage,
+                cost: ledger.cost,
+                list_cost: None,
+                context_size: 0,
+                context_window: CONTEXT_WINDOW,
+                num_turns: 1,
+                reason: DoneReason::EndTurn,
+            }
+        };
+        run_pump(&srv, Some(RECORDED_COST), |sender| {
+            sender
+                .send(AgentEvent::TurnComplete(turn_complete(TURN_COST)))
+                .unwrap();
+            sender.send(ending).unwrap();
+            sender
+                .send(AgentEvent::TurnComplete(turn_complete(TURN_COST)))
+                .unwrap();
+        });
+
+        let last = out_rx.try_iter().last().expect("the next turn reports");
+        assert_eq!(
+            last["params"]["update"]["cost"]["amount"].as_f64(),
+            Some(RECORDED_COST + LEDGER_COST + TURN_COST)
+        );
+    }
+
+    /// Results ride the next prompt and nothing wakes a turn, so a session
+    /// closed with work out stops it rather than waiting on it. The task that
+    /// never ends stands in for that work.
+    #[test]
+    fn close_session_returns_at_once_with_background_work_out() {
+        let (mut srv, ..) = test_server();
+        srv.session.as_mut().unwrap().handle.task = smol::spawn(future::pending());
+
+        let closed = smol::block_on(future::or(
+            async {
+                close_session(&mut srv, SessionEndReason::Shutdown).await;
+                true
+            },
+            async {
+                Timer::after(STDIN_DEADLOCK_TIMEOUT).await;
+                false
+            },
+        ));
+
+        assert!(closed, "{CLOSE_WAITED}");
     }
 
     #[test]

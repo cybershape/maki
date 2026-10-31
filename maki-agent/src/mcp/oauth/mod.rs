@@ -222,6 +222,8 @@ pub async fn authenticate(
         client_secret_expires_at: reg.client_secret_expires_at,
         redirect_uri: Some(redirect_uri),
         token_endpoint: Some(auth_server.token_endpoint.clone()),
+        auth_server: None,
+        resource: None,
     };
 
     save_mcp_auth(storage, server_name, &data)

@@ -1,15 +1,20 @@
 //! `maki.task`. The host keeps the subagent transcripts, so a plugin only needs
 //! to list the tasks and show one.
 
+use maki_agent::SessionMailbox;
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Lua, Result as LuaResult, Table, Value};
+use mlua::{Either as LuaEither, Lua, LuaSerdeExt, Result as LuaResult, UserDataRef, Value};
 
 use crate::api::util::command::{TaskRequest, UiAction, ui_json_roundtrip};
-use crate::api::util::pair::Pair;
+use crate::api::util::ctx::LuaCtx;
+use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::background::BackgroundTasks;
 use crate::plugin_permissions::PluginPermissions;
-use crate::runtime::is_user_action;
+use crate::runtime::{CANCEL_ABANDON_AFTER, is_user_action};
 
 const USER_ACTION_ERR: &str = "stopping a task requires a user command or keybind";
+const TASK_ID_ERR: &str = "stop(ctx, id): id must be a string";
+const STOP_OPTS_ERR: &str = "stop(id, opts): opts must be a table";
 
 async fn roundtrip(
     lua: Lua,
@@ -30,10 +35,19 @@ async fn roundtrip(
 /// [maki.agent.session](#maki-agent-session) has its session id and a
 /// `plugin` field.
 ///
-/// @return (table|nil, string|nil) Array of `{id, session, name, focused, status?, plugin?}`
-///   where `status` is `"working"`, `"idle"` (a plugin task between prompts),
-///   `"done"`, or `"error"`, and `session` is the chat session that `stop()`
-///   asks for. Or nil and an error.
+/// @return (table|nil, string|nil) Array of `{id, session, name, focused, status?, plugin?,
+///   parent?, part?, started_at?, ended_at?, cost?}` where `status` is `"working"`,
+///   `"idle"` (a plugin task between prompts), `"done"`, `"error"`, or
+///   `"cancelled"` (stopped by the user or the model), and `session` is the
+///   chat session that `stop()` asks for. `parent` is the id of the call the
+///   task runs under, like a `batch` that started it. That call is listed
+///   only once it moved. `part` is true for a piece listed with
+///   `ctx:set_parts()`. Stopping a part stops its whole call, while a
+///   subagent the call started stops alone. `started_at` and `ended_at` are
+///   Unix seconds: when the task started, or moved to the background, and
+///   when it finished. A task loaded from disk has neither. `cost` is what a
+///   subagent billed so far, in dollars. The main chat has none of the
+///   three. Or nil and an error.
 /// @example
 /// for _, t in ipairs(maki.task.list() or {}) do
 ///   print(t.name, t.status or "main")
@@ -84,23 +98,62 @@ async fn remove(
 /// commands run through `maki.api.run_command` get an error instead, or any
 /// plugin could stop work that is not its own.
 ///
-/// @param id string Task id, as returned by `list()`.
-/// @param opts table `session` (string), the chat session of the `list()`
-///   row. If the user switched sessions since, this returns an error rather
-///   than stopping a task with the same id in the other session.
-/// @return (boolean|nil, string|nil) true on success, or nil and an error.
+/// From a tool handler, `stop(ctx, id)` is the model's stop. It stops a
+/// background task (a command or subagent) that the calling agent moved,
+/// which is allowed because the tool call belongs to a turn the user started.
+/// It waits up to 5 seconds for the final reply and returns it, and the agent
+/// gets no notice of the end. A late reply returns no `output`, and the
+/// result reaches the agent later as a quiet notice. A task another agent
+/// moved, a finished task or an unknown id returns an error that names the
+/// agent's running task ids.
+///
+/// @param id string|LuaCtx Task id, as returned by `list()`. Or the handler's
+///   ctx, for the model's stop.
+/// @param opts table|string `session` (string), the chat session of the
+///   `list()` row. If the user switched sessions since, this returns an error
+///   rather than stopping a task with the same id in the other session. With a
+///   ctx: the background task id.
+/// @return (boolean|table|nil, string|nil) true on success, or nil and an
+///   error. With a ctx, success is `{name, output?}`. `name` is the task's
+///   name in `/tasks`, and `output` is the final reply, missing when it was
+///   late.
 /// @example
 /// local _, err = maki.task.stop(task.id, { session = task.session })
+/// -- in a tool handler
+/// local stopped, err = maki.task.stop(ctx, input.id)
 #[lua_fn]
 async fn stop(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
-    id: String,
-    opts: Table,
+    id: LuaEither<UserDataRef<LuaCtx>, String>,
+    opts: Value,
 ) -> LuaResult<Pair<Value>> {
+    let id = match id {
+        LuaEither::Left(ctx) => {
+            let Value::String(task_id) = opts else {
+                return Err(mlua::Error::runtime(TASK_ID_ERR));
+            };
+            let task_id = String::from(&*task_id.to_str()?);
+            let Some(agent) = ctx.agent() else {
+                return Ok(ctx.cap_err_pair("maki.task.stop"));
+            };
+            let asker = agent.mailbox.as_ref().map(SessionMailbox::session_id);
+            drop(ctx);
+            let stopped = try_pair!(
+                BackgroundTasks::of(&lua)
+                    .stop_by_model(asker, &task_id, CANCEL_ABANDON_AFTER)
+                    .await
+            );
+            return Ok((Some(lua.to_value(&stopped)?), None));
+        }
+        LuaEither::Right(id) => id,
+    };
     if !is_user_action(&lua) {
-        return Ok((None, Some(USER_ACTION_ERR.to_owned())));
+        return Ok(err_pair(USER_ACTION_ERR));
     }
+    let Value::Table(opts) = opts else {
+        return Err(mlua::Error::runtime(STOP_OPTS_ERR));
+    };
     let session = opts.get::<String>("session")?;
     roundtrip(lua, tx, TaskRequest::Stop { id, session }).await
 }
@@ -121,6 +174,7 @@ lua_table! {
 mod tests {
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, UiReply};
+    use mlua::Table;
     use serde_json::json;
     use std::thread::JoinHandle;
     use test_case::test_case;

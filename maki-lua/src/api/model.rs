@@ -136,11 +136,13 @@ fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Tab
 /// can go straight back in.
 ///
 /// `thinking_options` lists named thinking choices, cheapest first, as
-/// `{name, tokens?}` per row. Request paths that use named `thinking_fields`
+/// `{name, tokens?, sends}` per row. Request paths that use named `thinking_fields`
 /// expose those levels without token counts. Toggle-only fields expose
 /// `adaptive` and, when allowed, `off`. Otherwise the generic budget ladder applies.
-/// `tokens` is absent on `off` and `adaptive` too. The list is empty exactly
-/// when `supports_thinking` is false.
+/// `tokens` is absent on `off` and `adaptive` too. `sends` is the row the
+/// request goes out as: the row's own name, or the level a model that does
+/// not take this one snaps it to. The list is empty exactly when
+/// `supports_thinking` is false.
 ///
 /// `thinking` keeps the session's intent and delegation ceiling.
 /// `thinking_shown` names the effective row to highlight, including snapped
@@ -158,7 +160,7 @@ fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Tab
 /// local m = maki.model.get()
 /// if m.spec ~= "anthropic/claude-opus-4-6" then ... end
 /// for _, option in ipairs(m.thinking_options) do
-///   print(option.name, option.tokens)
+///   print(option.name, option.tokens, option.sends)
 /// end
 #[lua_fn]
 async fn get(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
