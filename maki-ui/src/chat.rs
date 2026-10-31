@@ -1228,7 +1228,7 @@ fn turn_stats_line(usage: &TokenUsage, timing: TurnTiming) -> Option<String> {
         .ttft_ms
         .map_or_else(String::new, |ms| format!(" · t₁ {}", fmt_secs(ms)));
     Some(format!(
-        "◷ {} · ✦ {} · ↑{} ↓{} · » {} t/s{} · ⛁ {}%",
+        "◷ {} / {} · ↑{} ↓{} · » {} t/s{} · ⛁ {}%",
         fmt_secs(timing.elapsed_ms),
         fmt_secs(timing.thinking_ms),
         format_tokens(total_input),
@@ -1288,7 +1288,7 @@ mod tests {
         };
         assert_eq!(
             turn_stats_line(&usage, timing).unwrap(),
-            "◷ 11s · ✦ 0s · ↑6.4k ↓725 · » 67 t/s · t₁ 4.5s · ⛁ 96%"
+            "◷ 11s / 0s · ↑6.4k ↓725 · » 67 t/s · t₁ 4.5s · ⛁ 96%"
         );
     }
 
@@ -1345,7 +1345,7 @@ mod tests {
         assert_eq!(notices.len(), 1);
         assert_eq!(
             notices[0],
-            "◷ 9.0s · ✦ 0.2s · ↑300 ↓125 · » 14 t/s · t₁ 1.0s · ⛁ 0%"
+            "◷ 9.0s / 0.2s · ↑300 ↓125 · » 14 t/s · t₁ 1.0s · ⛁ 0%"
         );
     }
 
@@ -1435,7 +1435,7 @@ mod tests {
         let notices = notice_lines(&chat);
         assert_eq!(notices.len(), 1);
         assert!(
-            notices[0].contains("✦ 7.5s"),
+            notices[0].contains("◷ 10s / 7.5s"),
             "got: {}",
             notices[0]
         );
