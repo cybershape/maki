@@ -319,11 +319,10 @@ end
 -- installed we refuse rather than read the path it steered away from.
 -- A replacement write tool without `append` would drop the flag and overwrite
 -- the file, so appends are refused there.
--- Metadata and listings follow the list_dir tool the same way, minus the call,
--- since it never prompts and a walk would make one call per directory. mkdir
--- has no tool of its own, so it only goes where the write tool would go
--- without asking. The sandbox looks before it creates, so mkdir also needs
--- `inspect`.
+-- Metadata and listings (inspect) remain available to the sandbox even when
+-- the list_dir tool itself is disabled or hidden from the model, since
+-- os/pathlib inspection is a core interpreter capability. mkdir looks before
+-- it creates, so mkdir also needs `inspect`.
 local function file_access(tools, schemas, ctx)
   local files = {}
   if tools.read then
@@ -354,13 +353,11 @@ local function file_access(tools, schemas, ctx)
       return maki.fs.mkdir(path, { parents = parents })
     end
   end
-  if tools.list_dir then
-    files.inspect = function()
-      if hooked(LIST_INPUT_SLOTS) then
-        return nil, INSPECT_HOOKED_ERR
-      end
-      return true
+  files.inspect = function()
+    if hooked(LIST_INPUT_SLOTS) then
+      return nil, INSPECT_HOOKED_ERR
     end
+    return true
   end
   return files
 end

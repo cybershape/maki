@@ -304,6 +304,21 @@ fn describe_includes_list_dir_tool() {
 }
 
 #[test]
+fn describe_excludes_list_dir_when_filtered() {
+    let (reg, _host) = setup();
+    let desc = describe(
+        &reg,
+        &ToolFilter::AllExcept(vec!["list_dir".into()]),
+        ToolAudience::MAIN,
+        false,
+    );
+    assert!(
+        !desc.lines().any(|l| l.starts_with("- list_dir(")),
+        "did not expect list_dir in tool signatures: {desc}"
+    );
+}
+
+#[test]
 fn list_dir_tool_is_callable_and_preserves_builtin_list() {
     let out = run_code(
         "res = await list_dir(path='test_path')\nitems = list([1, 2])\nprint(f'{res}')\nprint(f'items: {len(items)}')",
@@ -440,14 +455,27 @@ fn open_for_writing_is_refused_where_the_write_tool_is(shape: fn(&mut ToolContex
 }
 
 /// Loud on purpose, since `os.path.exists` would turn an `OSError` into False.
-/// mkdir looks before it creates, so it needs the list tool too.
 #[test_case::test_case("os.path.exists(path)", LIST_HOOK, &[] ; "list_tool_hooked")]
-#[test_case::test_case("os.path.exists(path)", NO_POLICY, &["list_dir"] ; "list_tool_disabled")]
-#[test_case::test_case("os.makedirs(path + '.d', exist_ok=True)", NO_POLICY, &["list_dir"] ; "mkdir_with_list_tool_disabled")]
 fn os_metadata_is_refused_where_the_list_tool_is(code: &str, policy: &str, disabled: &[&str]) {
     let (out, _) = run_on_file(code, policy, |_| {}, disabled);
     let err = out.expect_err("the query must be refused");
     assert!(err.contains(RUNTIME_ERROR), "got: {err}");
+}
+
+/// Disabling `list_dir` hides the tool from LLM/code_execution, but keeps
+/// files.inspect capability in the sandbox.
+#[test_case::test_case("os.path.exists(path)" ; "exists_with_list_tool_disabled")]
+#[test_case::test_case("os.makedirs(path + '.d', exist_ok=True)" ; "mkdir_with_list_tool_disabled")]
+fn os_metadata_serves_even_when_list_dir_disabled(code: &str) {
+    let (out, _) = run_on_file(code, NO_POLICY, |_| {}, &["list_dir"]);
+    out.expect("metadata query must succeed even when list_dir is disabled");
+}
+
+#[test]
+fn list_dir_tool_not_callable_when_disabled() {
+    let (out, _) = run_on_file("await list_dir(path='.')", NO_POLICY, |_| {}, &["list_dir"]);
+    let err = out.expect_err("disabled list_dir tool must not be callable");
+    assert!(err.contains(NAME_ERROR), "got: {err}");
 }
 
 /// `build_mode` also proves metadata is served, as a refused `isdir` would raise.
