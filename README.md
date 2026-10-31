@@ -8,7 +8,7 @@
 - **TUI & interaction:**
   - `compact_tools` mode grouping tools and thinking blocks with durations, waiting animations, child tool summaries, accurate summed thinking duration in turn completion stats, and full preservation across session restore. Visible entries before folding are configurable via `compact_lines` (default `10`, `0` folds all entries). The hidden-count line (`... (X hidden)`) expands on click to reveal all calls. Clicking a row opens a detail popup with full untruncated input and output, horizontal inner padding, top scroll default, and `j`/`k` shortcut keys to navigate between previous and next items.
   - Prompt queue with steer shortcut (Shift-Enter) to steer a running turn, plus recall editing for queued and previous prompts.
-  - Context-window usage progress bar in status bar using theme colors; per-turn stats line upon completion.
+  - Context-window usage progress bar in status bar using theme colors; compact single-width Unicode per-turn stats line upon completion (`◷` elapsed, `✦` thinking, `↑`/`↓` tokens, `»` speed, `t₁` TTFT, `⛁` cache).
   - Markdown LaTeX math expression rendering via `txm`.
   - OSC 7501 Program Status Protocol support for terminal status reporting; inline image rendering for Rex (`TERM_PROGRAM=rex`).
   - Stylized user messages with chevron prefix and background tint.
