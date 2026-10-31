@@ -23,6 +23,7 @@ pub use mcp::{
 pub mod inbox;
 pub mod session;
 pub use inbox::SubagentInbox;
+pub mod sleep;
 pub(crate) mod task_set;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, DisplayItem, History, HistorySnapshot, Instructions,

@@ -300,7 +300,11 @@ pub(crate) async fn stream_with_retry(
         })?;
     let messages = &*adapted;
     let mut retry = RetryState::new(retry, provider.keys().map_or(1, |keys| keys.key_count()));
+    let mut sleep_detector = crate::sleep::SleepDetector::new();
     loop {
+        if let Some(_slept) = sleep_detector.check() {
+            retry.note_wake(crate::sleep::WAKE_GRACE_DURATION);
+        }
         // The turn budget is all that moves. What the model declares stays put:
         // the thinking a request may spend is read off the `max_tokens` this
         // produces, so the two can never disagree, whatever a provider
@@ -316,8 +320,26 @@ pub(crate) async fn stream_with_retry(
         // `race` checks the token before it polls, so a run cancelled while a
         // retry slept on a server `Retry-After` never pays for the attempt it
         // woke up to make.
+        let stream_call = async {
+            futures_lite::future::or(
+                async {
+                    provider
+                        .stream_message(model, messages, system, tools, &ptx, opts, session_id)
+                        .await
+                },
+                async {
+                    let slept = crate::sleep::watch_for_sleep(
+                        Duration::from_millis(500),
+                        crate::sleep::DEFAULT_SLEEP_THRESHOLD,
+                    )
+                    .await;
+                    Err(AgentError::SystemSleep(slept))
+                },
+            )
+            .await
+        };
         let result = cancel
-            .race(provider.stream_message(model, messages, system, tools, &ptx, opts, session_id))
+            .race(stream_call)
             .await
             .unwrap_or(Err(AgentError::Cancelled));
         drop(ptx);
@@ -347,6 +369,9 @@ pub(crate) async fn stream_with_retry(
             Err(e) => {
                 attempt += 1;
                 emit_api_error(model, &e, attempt, started.elapsed());
+                if let AgentError::SystemSleep(_) = &e {
+                    retry.note_wake(crate::sleep::WAKE_GRACE_DURATION);
+                }
                 // Rotation is decided above anything `retry_kind()` says: a
                 // fresh key and a delay cure different problems. A 401 or a 403
                 // is dead for the key that produced it, fine for the next one,
@@ -361,10 +386,16 @@ pub(crate) async fn stream_with_retry(
                 let (message, delay) = if rotated {
                     (e.retry_message(), Duration::ZERO)
                 } else if let Some(kind) = e.retry_kind() {
+                    let in_grace = kind == maki_providers::retry::RetryKind::Connect && retry.is_in_wake_grace();
                     let Some(delay) = retry.next_delay(kind, e.retry_after()) else {
                         return Err(e.into());
                     };
-                    (e.retry_message(), delay)
+                    let message = if in_grace {
+                        "waiting for network connection...".to_owned()
+                    } else {
+                        e.retry_message()
+                    };
+                    (message, delay)
                 } else {
                     // A budget overflow is the one rejection maki caused itself,
                     // by asking for more output than the prompt left room for.
@@ -1099,6 +1130,65 @@ mod tests {
 
             assert!(result.is_err(), "no key in the pool is accepted");
             assert_eq!(server.keys_seen().len(), keys, "and no key is tried twice");
+        });
+    }
+
+    struct SleepThenOkServer {
+        slept: Mutex<bool>,
+    }
+
+    impl Provider for SleepThenOkServer {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                let mut slept = self.slept.lock().unwrap();
+                if !*slept {
+                    *slept = true;
+                    return Err(AgentError::SystemSleep(Duration::from_secs(60)));
+                }
+                Ok(StreamResponse {
+                    message: Message::user("ok".into()),
+                    usage: TokenUsage::default(),
+                    stop_reason: Some(maki_providers::StopReason::EndTurn),
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, AgentError>,
+        > {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    #[test]
+    fn system_sleep_triggers_retry_and_announces() {
+        smol::block_on(async {
+            let server = SleepThenOkServer {
+                slept: Mutex::new(false),
+            };
+            let policy = RetryPolicy {
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(5),
+                ..RetryPolicy::default()
+            };
+            let (result, events) = send(&server, &strict_model(STRICT_WINDOW), None, policy).await;
+            result.expect("retries after system sleep and succeeds");
+            let retries = retries_of(&events);
+            assert_eq!(retries.len(), 1);
+            assert!(retries[0].1.contains("System resumed from sleep"));
         });
     }
 }

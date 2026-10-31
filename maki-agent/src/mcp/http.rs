@@ -65,6 +65,7 @@ pub(super) fn build_client(
         // which would otherwise flip this transport to h2 over TLS. Its
         // streaming responses are tuned for HTTP/1.1, so pin it.
         .version_negotiation(VersionNegotiation::http11())
+        .tcp_keepalive(Duration::from_secs(15))
         .timeout(timeout);
     let builder = match ca_file {
         Some(path) if !path.is_file() => {

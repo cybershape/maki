@@ -3155,6 +3155,7 @@ async fn until_abandoned<T>(
 ) -> Result<T, &'static str> {
     let cancel = lock_cell(handle).cancel.clone();
     let timed_out = async {
+        let mut detector = maki_agent::sleep::SleepDetector::new();
         loop {
             // Listen before reading: a `ctx:set_deadline` or a move landing
             // between the two wakes us instead of leaving us armed on the
@@ -3174,9 +3175,26 @@ async fn until_abandoned<T>(
                 }
             });
             match deadline {
-                Some(dl) if dl <= Instant::now() => break,
+                Some(dl) if dl <= Instant::now() => {
+                    if let Some(slept) = detector.check() {
+                        let cell = lock_cell(handle);
+                        if let Some(cur) = cell.deadline.get() {
+                            cell.deadline.set(Some(cur + slept));
+                            cell.deadline_changed.notify(usize::MAX);
+                        }
+                        continue;
+                    }
+                    break;
+                }
                 Some(dl) => {
-                    futures_lite::future::or(async { _ = smol::Timer::at(dl).await }, rearmed).await
+                    futures_lite::future::or(async { _ = smol::Timer::at(dl).await }, rearmed).await;
+                    if let Some(slept) = detector.check() {
+                        let cell = lock_cell(handle);
+                        if let Some(cur) = cell.deadline.get() {
+                            cell.deadline.set(Some(cur + slept));
+                            cell.deadline_changed.notify(usize::MAX);
+                        }
+                    }
                 }
                 None => rearmed.await,
             }

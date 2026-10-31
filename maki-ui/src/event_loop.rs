@@ -24,6 +24,7 @@ use maki_agent::agent::SessionExport;
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
+use maki_agent::sleep::SleepDetector;
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle,
     SessionMailbox, Transcript, mcp,
@@ -525,6 +526,7 @@ pub(crate) struct EventLoop<'t> {
     _model_fetch_task: smol::Task<()>,
     program_status_enabled: bool,
     last_program_status: Option<crate::program_status::ProgramStatusReport>,
+    sleep_detector: SleepDetector,
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -758,6 +760,7 @@ impl<'t> EventLoop<'t> {
             _model_fetch_task: bg.task,
             program_status_enabled,
             last_program_status: None,
+            sleep_detector: SleepDetector::new(),
         };
         if loop_instance.program_status_enabled {
             let report = crate::program_status::ProgramStatusReport::idle();
@@ -933,6 +936,25 @@ impl<'t> EventLoop<'t> {
     /// [`App::tick_background`].
     fn tick(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
+        if let Some(slept) = self.sleep_detector.check() {
+            info!(
+                slept_ms = slept.as_millis(),
+                "system resumed from sleep in event loop"
+            );
+            dirty = Dirty::YES;
+            for rt in &self.sessions {
+                if let Some(ref mcp) = rt.handles.mcp_handle {
+                    let snapshot = mcp.reader().load();
+                    for info in &snapshot.infos {
+                        if info.transport_kind == "http" {
+                            mcp.send(McpCommand::Reconnect {
+                                server: info.name.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
         // A quit ends the whole process, so each session's double press
         // counts the background tasks of all of them.
         let running: usize = self

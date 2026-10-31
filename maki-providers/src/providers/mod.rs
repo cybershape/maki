@@ -20,6 +20,7 @@ pub mod plugin;
 pub mod responses;
 
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;
 const EMPTY_SSE_ERROR_MESSAGE: &str = "provider sent an error frame with no detail";
 const AUTHORIZATION_HEADER: &str = "authorization";
@@ -306,6 +307,7 @@ impl Timeouts {
         client
             .connect_timeout(self.connect)
             .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, self.low_speed)
+            .tcp_keepalive(TCP_KEEPALIVE_INTERVAL)
     }
 }
 

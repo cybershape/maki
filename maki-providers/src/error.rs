@@ -134,6 +134,8 @@ pub enum AgentError {
     Cancelled,
     #[error("stream timed out after {secs}s of inactivity")]
     Timeout { secs: u64 },
+    #[error("system resumed from sleep ({0:?})")]
+    SystemSleep(Duration),
     #[error("compaction returned no summary")]
     EmptySummary,
 }
@@ -168,6 +170,7 @@ pub enum ErrorProjection {
     Channel,
     Cancelled,
     Timeout,
+    SystemSleep,
     EmptySummary,
 }
 
@@ -197,6 +200,7 @@ impl AgentError {
             Self::Channel => ErrorProjection::Channel,
             Self::Cancelled => ErrorProjection::Cancelled,
             Self::Timeout { .. } => ErrorProjection::Timeout,
+            Self::SystemSleep(_) => ErrorProjection::SystemSleep,
             Self::EmptySummary => ErrorProjection::EmptySummary,
         }
     }
@@ -224,6 +228,7 @@ impl AgentError {
             Self::Http(e) if is_connect_failure(e) => Some(RetryKind::Connect),
             Self::Io(e) if e.kind() == io::ErrorKind::ConnectionRefused => Some(RetryKind::Connect),
             Self::Io(_) | Self::Http(_) => Some(RetryKind::Transient),
+            Self::SystemSleep(_) => Some(RetryKind::Transient),
             Self::Timeout { .. } => Some(RetryKind::Timeout),
             Self::Api { .. }
             | Self::Config { .. }
@@ -393,6 +398,7 @@ impl AgentError {
             Self::Http(e) if is_connect_failure(e) => CONNECT_FAILED_MESSAGE.into(),
             Self::Http(_) => NETWORK_ERROR_MESSAGE.into(),
             Self::Timeout { .. } => "stream timed out, retrying".into(),
+            Self::SystemSleep(_) => "system resumed from sleep, reconnecting".into(),
             Self::HttpRequest(e) => format!("request error: {e}"),
             Self::Json(_) => "received an invalid response from the API".into(),
             Self::Channel => "internal error, try again".into(),
@@ -450,6 +456,7 @@ impl AgentError {
             Self::Api { status: 529, .. } => "Provider is overloaded".into(),
             Self::Api { status, .. } if *status >= 500 => format!("Server error ({status})"),
             Self::Io(_) | Self::Http(_) => "Connection error".into(),
+            Self::SystemSleep(_) => "System resumed from sleep, reconnecting...".into(),
             Self::Timeout { .. } => "Stream timed out".into(),
             _ => self.to_string(),
         }
@@ -786,7 +793,7 @@ mod tests {
 
     /// One sample per `AgentError` variant. A new variant means a new sample
     /// in [`corpus`] and a bump here, or the corpus quietly stops covering it.
-    const VARIANT_COUNT: usize = 11;
+    const VARIANT_COUNT: usize = 12;
     /// One status per branch the answers below split on: refused for size
     /// (400, 413), stale token (401), dead key but live account (403), rate
     /// limit (429), server trouble (500). The rest behave like one of these.
@@ -861,6 +868,7 @@ mod tests {
             AgentError::Channel,
             AgentError::Cancelled,
             AgentError::Timeout { secs: TIMEOUT_SECS },
+            AgentError::SystemSleep(Duration::from_secs(TIMEOUT_SECS)),
             AgentError::EmptySummary,
         ]);
         corpus

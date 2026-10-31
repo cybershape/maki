@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use maki_config::{
     DEFAULT_MAX_RETRIES, DEFAULT_MAX_TIMEOUT_RETRIES, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_MAX_MS,
@@ -130,6 +130,7 @@ pub struct RetryState {
     /// regardless: the worst a jumping index costs is a skipped key, never a
     /// spin.
     rotations_left: u32,
+    wake_grace_until: Option<Instant>,
 }
 
 impl RetryState {
@@ -142,7 +143,24 @@ impl RetryState {
             rotations_left: u32::try_from(key_count)
                 .unwrap_or(u32::MAX)
                 .saturating_sub(1),
+            wake_grace_until: None,
         }
+    }
+
+    /// Sets or extends a wake grace period during which connect failures
+    /// (e.g. while Wi-Fi reconnects after system sleep) do not deplete
+    /// the connect retry budget.
+    pub fn note_wake(&mut self, grace_duration: Duration) {
+        let until = Instant::now() + grace_duration;
+        self.wake_grace_until = Some(self.wake_grace_until.map_or(until, |prev| prev.max(until)));
+    }
+
+    pub fn is_in_wake_grace(&self) -> bool {
+        self.wake_grace_until.is_some_and(|until| Instant::now() < until)
+    }
+
+    pub fn policy(&self) -> &RetryPolicy {
+        &self.policy
     }
 
     /// Books a step of the key walk, or `false` once every key has been tried.
@@ -163,15 +181,19 @@ impl RetryState {
     /// we do, within [`RetryPolicy::base_delay`] and [`RETRY_AFTER_CAP`].
     pub fn next_delay(&mut self, kind: RetryKind, hint: Option<Duration>) -> Option<Duration> {
         let budget = Budget::of(kind, hint);
+        let in_grace = kind == RetryKind::Connect && self.is_in_wake_grace();
         let spent = &mut self.spent[budget as usize];
-        if budget
-            .limit(&self.policy)
-            .is_some_and(|limit| *spent >= limit)
+        if !in_grace
+            && budget
+                .limit(&self.policy)
+                .is_some_and(|limit| *spent >= limit)
         {
             return None;
         }
-        *spent += 1;
-        let attempt = *spent;
+        if !in_grace {
+            *spent += 1;
+        }
+        let attempt = (*spent).max(1);
 
         // The hint is obeyed for any retryable error, not only a 429, so a 503
         // carrying `Retry-After: 3600` parks an unbounded retry for up to
@@ -347,5 +369,25 @@ mod tests {
         assert_eq!(walk(&mut state), KEYS as u32 - 1);
         assert_eq!(spend(&mut state, RetryKind::RateLimit), RETRIES);
         assert_eq!(spend(&mut state, RetryKind::Timeout), RETRIES);
+    }
+
+    #[test]
+    fn wake_grace_spares_connect_budget() {
+        const RETRIES: u32 = 2;
+        let mut state = RetryState::new(
+            RetryPolicy {
+                base_delay: BASE,
+                max_delay: MAX,
+                max_retries: RETRIES,
+                max_timeout_retries: RETRIES,
+            },
+            ONE_KEY,
+        );
+        state.note_wake(Duration::from_secs(60));
+        assert!(state.is_in_wake_grace());
+        for _ in 0..10 {
+            assert!(state.next_delay(RetryKind::Connect, None).is_some());
+        }
+        assert_eq!(state.spent[Budget::Connect as usize], 0);
     }
 }

@@ -9,24 +9,44 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::sleep::SleepDetector;
+
 pub(crate) const DEADLINE_EXCEEDED: &str = "timeout exceeded";
 
+#[derive(Debug)]
+struct DeadlineInner {
+    at: Instant,
+    detector: SleepDetector,
+}
+
 #[derive(Clone, Debug, Default)]
-pub struct Deadline(Option<Arc<Mutex<Instant>>>);
+pub struct Deadline(Option<Arc<Mutex<DeadlineInner>>>);
 
 impl Deadline {
     pub fn after(budget: Duration) -> Self {
-        Self(Some(Arc::new(Mutex::new(Instant::now() + budget))))
+        Self(Some(Arc::new(Mutex::new(DeadlineInner {
+            at: Instant::now() + budget,
+            detector: SleepDetector::new(),
+        }))))
     }
 
-    fn instant(&self) -> Option<MutexGuard<'_, Instant>> {
-        self.0
-            .as_deref()
-            .map(|at| at.lock().unwrap_or_else(PoisonError::into_inner))
+    fn inner(&self) -> Option<MutexGuard<'_, DeadlineInner>> {
+        let mut guard = self.0.as_deref()?.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slept) = guard.detector.check() {
+            guard.at += slept;
+        }
+        Some(guard)
+    }
+
+    pub fn compensate_sleep(&self, duration: Duration) {
+        if let Some(inner) = self.0.as_deref() {
+            let mut inner = inner.lock().unwrap_or_else(PoisonError::into_inner);
+            inner.at += duration;
+        }
     }
 
     pub fn at(&self) -> Option<Instant> {
-        self.instant().as_deref().copied()
+        self.inner().map(|inner| inner.at)
     }
 
     /// Only wrap waits on the user. Real work should still spend the budget.
@@ -35,8 +55,8 @@ impl Deadline {
     pub async fn paused_while<F: Future>(&self, wait: F) -> F::Output {
         let paused_at = Instant::now();
         let output = wait.await;
-        if let Some(mut at) = self.instant() {
-            *at += paused_at.elapsed();
+        if let Some(mut inner) = self.inner() {
+            inner.at += paused_at.elapsed();
         }
         output
     }
@@ -99,5 +119,13 @@ mod tests {
         smol::block_on(deadline.paused_while(smol::Timer::after(WAIT)));
 
         assert!(clone.at().unwrap() - before >= WAIT);
+    }
+
+    #[test]
+    fn compensate_sleep_extends_deadline() {
+        let deadline = Deadline::after(BUDGET);
+        let before = deadline.at().unwrap();
+        deadline.compensate_sleep(Duration::from_secs(30));
+        assert!(deadline.at().unwrap() >= before + Duration::from_secs(30));
     }
 }
