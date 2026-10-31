@@ -86,6 +86,35 @@ const PACK_BUSY_ERR: &str = "a package command is already running";
 const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
 const FORKED_MSG: &str = "Forked, {key} to switch back";
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(50);
+const RESIZE_MAX_DELAY: Duration = Duration::from_millis(200);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResizeDebounce {
+    deadline: Instant,
+    first_at: Instant,
+}
+
+impl ResizeDebounce {
+    fn new(now: Instant) -> Self {
+        Self {
+            deadline: now + RESIZE_DEBOUNCE,
+            first_at: now,
+        }
+    }
+
+    fn touch(&mut self, now: Instant) -> Dirty {
+        if now.duration_since(self.first_at) >= RESIZE_MAX_DELAY {
+            return Dirty::YES;
+        }
+        self.deadline = now + RESIZE_DEBOUNCE;
+        Dirty::NO
+    }
+
+    fn is_settled(&self, now: Instant) -> bool {
+        now >= self.deadline
+    }
+}
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -527,6 +556,7 @@ pub(crate) struct EventLoop<'t> {
     program_status_enabled: bool,
     last_program_status: Option<crate::program_status::ProgramStatusReport>,
     sleep_detector: SleepDetector,
+    resize_debounce: Option<ResizeDebounce>,
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -761,6 +791,7 @@ impl<'t> EventLoop<'t> {
             program_status_enabled,
             last_program_status: None,
             sleep_detector: SleepDetector::new(),
+            resize_debounce: None,
         };
         if loop_instance.program_status_enabled {
             let report = crate::program_status::ProgramStatusReport::idle();
@@ -813,6 +844,7 @@ impl<'t> EventLoop<'t> {
         let mut dirty = Dirty::YES;
         let result = loop {
             dirty |= self.tick();
+            dirty |= self.check_resize_debounce();
             match self.drain_channels() {
                 Ok(d) => dirty |= d,
                 Err(e) => break Err(e),
@@ -821,7 +853,12 @@ impl<'t> EventLoop<'t> {
             for rt in &self.sessions {
                 rt.handles.publish_chat_settings(&rt.app);
             }
-            if dirty.take()
+            let should_paint = if self.is_resizing() {
+                false
+            } else {
+                dirty.take()
+            };
+            if should_paint
                 && let Err(e) = self.paint()
             {
                 break Err(e);
@@ -850,20 +887,26 @@ impl<'t> EventLoop<'t> {
             // Sleeping a whole frame instead of a fraction of one is what
             // makes a spinner cost 12 paints a second instead of 62.
             let cadence = self.sessions[self.focused].app.cadence();
-            match self.next_wake(cadence.frame().unwrap_or(IDLE_POLL)) {
+            let mut timeout = cadence.frame().unwrap_or(IDLE_POLL);
+            if let Some(ref debounce) = self.resize_debounce {
+                timeout = timeout.min(debounce.deadline.saturating_duration_since(Instant::now()));
+            }
+            match self.next_wake(timeout) {
                 // Any event can change the screen, so paint after handling it
                 // rather than asking every handler to prove it did.
-                Some(wake) => {
-                    dirty = Dirty::YES;
-                    if let Err(e) = self.handle_wake(wake) {
-                        break Err(e);
-                    }
-                }
+                Some(wake) => match self.handle_wake(wake) {
+                    Ok(d) => dirty |= d,
+                    Err(e) => break Err(e),
+                },
                 // Only the clock moved, so motion alone owes the frame. The
                 // cadence is the one from before the sleep, so motion that
                 // just stopped still gets a last paint to clear itself off
                 // the screen.
-                None => dirty |= Dirty::from(cadence.moves()),
+                None => {
+                    if !self.is_resizing() {
+                        dirty |= Dirty::from(cadence.moves());
+                    }
+                }
             }
         };
         // Fatal errors still save every session, kill MCP process groups,
@@ -907,19 +950,76 @@ impl<'t> EventLoop<'t> {
         sel.wait_timeout(timeout).ok().flatten()
     }
 
-    fn handle_wake(&mut self, wake: Wake) -> Result<()> {
-        match wake {
-            Wake::Input(ev) => self.handle_input(ev),
-            Wake::InputGone => return Err(eyre!("terminal input reader stopped")),
-            Wake::Ui(action) => self.handle_ui_action(action),
-            Wake::PluginWindow | Wake::Decor => {}
-            Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
-            Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
-            Wake::Warn(warning) => self.focused_app().flash(warning),
-            Wake::Pack(preparation) => self.finish_pack(*preparation),
-            Wake::ModelsDiscovered => self.rebuild_models(),
+    fn note_resize(&mut self) -> Dirty {
+        let now = Instant::now();
+        if let Some(debounce) = &mut self.resize_debounce {
+            if debounce.touch(now) == Dirty::YES {
+                self.resize_debounce = None;
+                Dirty::YES
+            } else {
+                Dirty::NO
+            }
+        } else {
+            self.resize_debounce = Some(ResizeDebounce::new(now));
+            Dirty::NO
         }
-        Ok(())
+    }
+
+    fn check_resize_debounce(&mut self) -> Dirty {
+        if let Some(debounce) = &self.resize_debounce
+            && debounce.is_settled(Instant::now())
+        {
+            self.resize_debounce = None;
+            Dirty::YES
+        } else {
+            Dirty::NO
+        }
+    }
+
+    fn clear_resize_debounce(&mut self) {
+        self.resize_debounce = None;
+    }
+
+    fn is_resizing(&self) -> bool {
+        self.resize_debounce.is_some()
+    }
+
+    fn handle_wake(&mut self, wake: Wake) -> Result<Dirty> {
+        let dirty = match wake {
+            Wake::Input(Event::Resize(..)) => self.note_resize(),
+            Wake::Input(ev) => {
+                self.clear_resize_debounce();
+                self.handle_input(ev);
+                Dirty::YES
+            }
+            Wake::InputGone => return Err(eyre!("terminal input reader stopped")),
+            Wake::Ui(action) => {
+                self.handle_ui_action(action);
+                Dirty::YES
+            }
+            Wake::PluginWindow | Wake::Decor => Dirty::YES,
+            Wake::Agent(i, envelope) => {
+                self.handle_agent(i, envelope);
+                Dirty::YES
+            }
+            Wake::Shell(i, event) => {
+                self.sessions[i].app.handle_shell_event(event);
+                Dirty::YES
+            }
+            Wake::Warn(warning) => {
+                self.focused_app().flash(warning);
+                Dirty::YES
+            }
+            Wake::Pack(preparation) => {
+                self.finish_pack(*preparation);
+                Dirty::YES
+            }
+            Wake::ModelsDiscovered => {
+                self.rebuild_models();
+                Dirty::YES
+            }
+        };
+        Ok(dirty)
     }
 
     /// The one save trigger. A checkpoint writes only on a real change, so
@@ -1015,8 +1115,7 @@ impl<'t> EventLoop<'t> {
         for _ in 0..DRAIN_BUDGET {
             match self.next_wake(Duration::ZERO) {
                 Some(wake) => {
-                    self.handle_wake(wake)?;
-                    dirty = Dirty::YES;
+                    dirty |= self.handle_wake(wake)?;
                 }
                 None => break,
             }
@@ -1898,6 +1997,10 @@ impl<'t> EventLoop<'t> {
         }
         let mut pending = Some(raw);
         while let Some(ev) = pending.take() {
+            if matches!(ev, Event::Resize(..)) {
+                let _ = self.note_resize();
+                continue;
+            }
             let (msg, leftover) = self.translate(ev);
             if let Some(msg) = msg {
                 let actions = self.sessions[self.focused].app.update(msg);
@@ -2566,5 +2669,42 @@ mod tests {
         );
         assert_eq!(sanitize_task_id("weird $#@! chars"), "task/weirdchars");
         assert_eq!(sanitize_task_id("@#$!"), "task");
+    }
+
+    #[test]
+    fn resize_debounce_settles_after_delay() {
+        let start = Instant::now();
+        let debounce = ResizeDebounce::new(start);
+
+        assert!(!debounce.is_settled(start));
+        assert!(!debounce.is_settled(start + Duration::from_millis(49)));
+        assert!(debounce.is_settled(start + Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn resize_debounce_extends_on_rapid_events() {
+        let start = Instant::now();
+        let mut debounce = ResizeDebounce::new(start);
+
+        let t1 = start + Duration::from_millis(16);
+        assert_eq!(debounce.touch(t1), Dirty::NO);
+        assert!(!debounce.is_settled(start + Duration::from_millis(50)));
+        assert!(debounce.is_settled(t1 + Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn resize_debounce_throttles_continuous_events() {
+        let start = Instant::now();
+        let mut debounce = ResizeDebounce::new(start);
+
+        let mut current = start;
+        while current - start < RESIZE_MAX_DELAY {
+            current += Duration::from_millis(16);
+            if current - start < RESIZE_MAX_DELAY {
+                assert_eq!(debounce.touch(current), Dirty::NO);
+            }
+        }
+
+        assert_eq!(debounce.touch(current), Dirty::YES);
     }
 }
