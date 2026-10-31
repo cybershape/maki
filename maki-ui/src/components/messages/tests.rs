@@ -3130,7 +3130,7 @@ fn panel_with_sealed_groups(tools: usize, thinking: usize, groups: usize) -> Mes
                 })
             })
             .chain((0..tools).map(|id| {
-                GroupEntry::Tool(GroupToolEntry {
+                GroupEntry::Tool(Box::new(GroupToolEntry {
                     id: format!("tool-{group}-{id}"),
                     name: BASH_TOOL_NAME.into(),
                     summary: GROUP_RESIZE_TEXT.into(),
@@ -3140,7 +3140,8 @@ fn panel_with_sealed_groups(tools: usize, thinking: usize, groups: usize) -> Mes
                     receiving_args: false,
                     started_at: None,
                     duration: Some(GROUP_RESIZE_DURATION),
-                })
+                    detail: None,
+                }))
             }))
             .collect();
         panel.push(DisplayMessage::new(
@@ -3374,7 +3375,7 @@ fn spinner_updates_preserve_display_mode(compact: bool) {
         let GroupEntry::Tool(batch) = &mut group.entries[0] else {
             panic!()
         };
-        let mut child = batch.clone();
+        let mut child = (**batch).clone();
         child.name = "read".into();
         batch.children.push(child);
     }
@@ -3607,7 +3608,7 @@ fn compact_tools_state_text_transitions() {
         id: "group-2".into(),
         sealed: true,
         entries: vec![
-            GroupEntry::Tool(GroupToolEntry {
+            GroupEntry::Tool(Box::new(GroupToolEntry {
                 id: "c1".into(),
                 name: Arc::from("edit"),
                 summary: "a.rs".into(),
@@ -3617,8 +3618,9 @@ fn compact_tools_state_text_transitions() {
                 receiving_args: false,
                 started_at: None,
                 duration: Some(std::time::Duration::from_millis(100)),
-            }),
-            GroupEntry::Tool(GroupToolEntry {
+                detail: None,
+            })),
+            GroupEntry::Tool(Box::new(GroupToolEntry {
                 id: "c2".into(),
                 name: Arc::from("bash"),
                 summary: "test".into(),
@@ -3628,7 +3630,8 @@ fn compact_tools_state_text_transitions() {
                 receiving_args: false,
                 started_at: None,
                 duration: Some(std::time::Duration::from_millis(200)),
-            }),
+                detail: None,
+            })),
         ],
         started_at: None,
         duration: None,
@@ -3958,7 +3961,7 @@ fn compact_tool_group_renders_aligned_with_panel_left_padding() {
     let group = ToolGroupRole {
         id: "compact-group-0".into(),
         sealed: true,
-        entries: vec![GroupEntry::Tool(GroupToolEntry {
+        entries: vec![GroupEntry::Tool(Box::new(GroupToolEntry {
             id: "call-1".into(),
             name: Arc::from("bash"),
             summary: "ls".into(),
@@ -3968,7 +3971,8 @@ fn compact_tool_group_renders_aligned_with_panel_left_padding() {
             receiving_args: false,
             started_at: None,
             duration: Some(Duration::from_millis(100)),
-        })],
+            detail: None,
+        }))],
         started_at: None,
         duration: Some(Duration::from_secs(1)),
         waiting_since: None,
@@ -4175,6 +4179,89 @@ fn moved_row_shows_elapsed_since_the_move() {
     );
     render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
     assert!(header_text(&panel, MOVABLE_ID).contains(ELAPSED_MINUTE));
+}
+
+const COMPACT_OUTPUT: &str = "listed two files";
+const COMPACT_THINKING: &str = "the build fails on the unused import";
+const TITLE_OPENS_NOTHING: &str = "the group title is not a call";
+
+fn compact_panel() -> MessagesPanel {
+    MessagesPanel::new(
+        UiConfig {
+            compact_tools: true,
+            ..Default::default()
+        },
+        EventHandle::disconnected_for_test(),
+    )
+}
+
+#[test]
+fn compact_row_click_names_the_call_and_skips_the_title() {
+    let mut panel = compact_panel();
+    let mut start_ev = start("call-1", BASH_TOOL_NAME);
+    start_ev.raw_input = Some(serde_json::json!({ "command": "ls" }));
+    panel.tool_start(start_ev);
+    panel.thinking_delta(COMPACT_THINKING);
+    panel.tool_done(ToolDoneEvent {
+        output: Arc::new(ToolOutput::Plain(COMPACT_OUTPUT.into())),
+        ..done("call-1")
+    });
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    assert_eq!(
+        panel.compact_target_at(0, view_area()),
+        None,
+        "{TITLE_OPENS_NOTHING}"
+    );
+    let tool = panel.compact_target_at(1, view_area()).expect("tool row");
+    assert_eq!(tool.entry, 0);
+    assert_eq!(tool.child, None);
+    let thinking = panel.compact_target_at(2, view_area()).expect("thinking row");
+    assert_eq!(thinking.entry, 1);
+    assert_eq!(thinking.child, None);
+    assert_eq!(
+        panel.handle_click(1, 0, view_area()),
+        ClickOutcome::OpenCompact(tool)
+    );
+}
+
+#[test]
+fn compact_batch_child_click_names_the_child() {
+    let mut panel = compact_panel();
+    let mut start_ev = start("batch-1", "batch");
+    start_ev.raw_input = Some(serde_json::json!({
+        "tool_calls": [{ "tool": "read", "parameters": { "path": "src/main.rs" } }]
+    }));
+    panel.tool_start(start_ev);
+    panel.tool_snapshot(
+        "batch-1",
+        BufferSnapshot::from_arc(Arc::new(vec![SnapshotLine {
+            spans: vec![
+                SnapshotSpan {
+                    text: "● ".into(),
+                    style: SpanStyle::Named("tool_success".into()),
+                },
+                SnapshotSpan {
+                    text: "read> ".into(),
+                    style: SpanStyle::Named("tool_prefix".into()),
+                },
+                SnapshotSpan {
+                    text: "src/main.rs".into(),
+                    style: SpanStyle::Default,
+                },
+            ],
+        }])),
+        None,
+    );
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    let child = panel.compact_target_at(2, view_area()).expect("child row");
+    assert_eq!(child.entry, 0);
+    assert_eq!(child.child, Some(0));
+    assert_eq!(
+        panel.handle_click(2, 0, view_area()),
+        ClickOutcome::OpenCompact(child)
+    );
 }
 
 fn notice_panel(detail: Option<&str>) -> MessagesPanel {

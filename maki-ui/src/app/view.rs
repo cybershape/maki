@@ -343,6 +343,10 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
+        let r = self.compact_detail.view(frame, full);
+        if r.width > 0 {
+            overlay_rect = r;
+        }
         let r = self.help_modal.view(frame, full, &self.keymap_reader);
         if r.width > 0 {
             overlay_rect = r;

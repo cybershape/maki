@@ -17,8 +17,9 @@ use super::tool_display::{
     format_timestamp_now, hint_columns, instructions_search_text, notice_style, outcome_glyph,
     search_text_for, thinking_style, truncate_to_header, user_style,
 };
+use super::compact_detail::CompactTarget;
 use super::{
-    BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, GroupEntry,
+    BackgroundBadge, BackgroundOutcome, CompactDetail, DisplayMessage, DisplayRole, GroupEntry,
     GroupThinkingEntry, GroupToolEntry, IMAGE_PLACEHOLDER, ToolGroupRole, ToolRole, ToolStatus,
     code_view::SectionFlags, tool_group,
 };
@@ -75,6 +76,8 @@ pub enum ClickOutcome {
     OpenTask(String),
     /// A running row's hint: move only this call.
     MoveCall(String),
+    /// A compact row: open what the call actually did.
+    OpenCompact(CompactTarget),
 }
 
 #[derive(Clone, Copy)]
@@ -429,7 +432,7 @@ impl MessagesPanel {
                     let start_time = wait_start
                         .or_else(|| g.entries.is_empty().then_some(g.started_at).flatten())
                         .unwrap_or_else(Instant::now);
-                    g.entries.push(GroupEntry::Tool(GroupToolEntry {
+                    g.entries.push(GroupEntry::Tool(Box::new(GroupToolEntry {
                         id: id.clone(),
                         name: Arc::from(name),
                         summary: String::new(),
@@ -439,7 +442,8 @@ impl MessagesPanel {
                         receiving_args: true,
                         started_at: Some(start_time),
                         duration: None,
-                    }));
+                        detail: None,
+                    })));
                 }
                 let gid = g.id.clone();
                 self.rebuild_tool_group_segment(&gid);
@@ -450,7 +454,7 @@ impl MessagesPanel {
             let group = ToolGroupRole {
                 id: gid,
                 sealed: false,
-                entries: vec![GroupEntry::Tool(GroupToolEntry {
+                entries: vec![GroupEntry::Tool(Box::new(GroupToolEntry {
                     id,
                     name: Arc::from(name),
                     summary: String::new(),
@@ -460,7 +464,8 @@ impl MessagesPanel {
                     receiving_args: true,
                     started_at: Some(Instant::now()),
                     duration: None,
-                })],
+                    detail: None,
+                }))],
                 started_at: Some(Instant::now()),
                 duration: None,
                 waiting_since: None,
@@ -502,6 +507,15 @@ impl MessagesPanel {
                         entry.summary = summary.clone();
                         entry.raw_input = event.raw_input.clone();
                         entry.receiving_args = false;
+                        let detail =
+                            entry.detail.get_or_insert_with(|| CompactDetail::from_start(&event));
+                        detail.input = event.input.clone();
+                        detail.raw_input = event.raw_input.clone();
+                        detail.annotation = event.annotation.clone();
+                        detail.render_header = event.render_header.clone();
+                        if let Some(output) = &event.output {
+                            detail.output = Some(Arc::new(output.clone()));
+                        }
                         if entry.started_at.is_none() {
                             let wait_start = g.waiting_since.take();
                             let start_time = wait_start
@@ -540,8 +554,8 @@ impl MessagesPanel {
                 let start_time = wait_start
                     .or_else(|| g.entries.is_empty().then_some(g.started_at).flatten())
                     .unwrap_or_else(Instant::now);
-                g.entries.push(GroupEntry::Tool(GroupToolEntry {
-                    id: event.id,
+                g.entries.push(GroupEntry::Tool(Box::new(GroupToolEntry {
+                    id: event.id.clone(),
                     name: Arc::clone(&event.tool),
                     summary: summary.clone(),
                     raw_input: event.raw_input.clone(),
@@ -550,7 +564,8 @@ impl MessagesPanel {
                     receiving_args: false,
                     started_at: Some(start_time),
                     duration: None,
-                }));
+                    detail: Some(CompactDetail::from_start(&event)),
+                })));
                 let gid = g.id.clone();
                 self.rebuild_tool_group_segment(&gid);
                 return;
@@ -560,17 +575,18 @@ impl MessagesPanel {
             let group = ToolGroupRole {
                 id: gid,
                 sealed: false,
-                entries: vec![GroupEntry::Tool(GroupToolEntry {
-                    id: event.id,
+                entries: vec![GroupEntry::Tool(Box::new(GroupToolEntry {
+                    id: event.id.clone(),
                     name: Arc::clone(&event.tool),
                     summary,
-                    raw_input: event.raw_input,
+                    raw_input: event.raw_input.clone(),
                     children: Vec::new(),
                     status: ToolStatus::InProgress,
                     receiving_args: false,
                     started_at: Some(Instant::now()),
                     duration: None,
-                })],
+                    detail: Some(CompactDetail::from_start(&event)),
+                }))],
                 started_at: Some(Instant::now()),
                 duration: None,
                 waiting_since: None,
@@ -613,6 +629,26 @@ impl MessagesPanel {
     }
 
     pub fn tool_output(&mut self, tool_id: &str, content: &str) {
+        if self.compact_tools
+            && self.messages.iter_mut().rev().any(|msg| {
+                let DisplayRole::ToolGroup(group) = &mut msg.role else {
+                    return false;
+                };
+                let Some(entry) = group.entries.iter_mut().find_map(|entry| match entry {
+                    GroupEntry::Tool(tool) if tool.id == tool_id => Some(tool),
+                    _ => None,
+                }) else {
+                    return false;
+                };
+                entry
+                    .detail
+                    .get_or_insert_with(CompactDetail::default)
+                    .live_output = Some(content.to_owned());
+                true
+            })
+        {
+            return;
+        }
         let Some(msg) = self
             .messages
             .iter_mut()
@@ -646,6 +682,18 @@ impl MessagesPanel {
                         ToolStatus::Success
                     };
                     entry.receiving_args = false;
+                    if let Some(detail) = &mut entry.detail {
+                        detail.output = Some(Arc::clone(&event.output));
+                        detail.live_output = None;
+                        if let Some(note) = event
+                            .annotation
+                            .as_deref()
+                            .map(str::to_owned)
+                            .or_else(|| event.output.annotation())
+                        {
+                            append_annotation(&mut detail.annotation, &note);
+                        }
+                    }
                     let dur = event
                         .call
                         .as_ref()
@@ -1067,6 +1115,10 @@ impl MessagesPanel {
         self.messages.len()
     }
 
+    pub fn messages(&self) -> &[DisplayMessage] {
+        &self.messages
+    }
+
     #[cfg(test)]
     pub fn message_at(&self, index: usize) -> Option<&DisplayMessage> {
         self.messages.get(index)
@@ -1213,8 +1265,58 @@ impl MessagesPanel {
 
     /// {col} is the screen column, for the right-aligned move hint.
     pub fn handle_click(&mut self, row: u16, col: u16, area: Rect) -> ClickOutcome {
+        if let Some(target) = self.compact_target_at(row, area) {
+            return ClickOutcome::OpenCompact(target);
+        }
         self.tool_target_at(row, col, area)
             .unwrap_or_else(|| self.toggle_click(row, area))
+    }
+
+    /// The compact row under a click. The title row is the group itself and
+    /// opens nothing; every row under it is one call, a batch child included.
+    pub fn compact_target_at(&self, row: u16, area: Rect) -> Option<CompactTarget> {
+        if !self.compact_tools || area.height == 0 {
+            return None;
+        }
+        let pos = self
+            .layout()
+            .advance(self.scroll, u32::from(row.saturating_sub(area.y)));
+        if pos.seg >= self.live_start {
+            return None;
+        }
+        let seg = self.cache.get(pos.seg)?;
+        let group_id = seg.tool_id.as_deref()?;
+        let msg = self
+            .messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::ToolGroup(g) if g.id == group_id))?;
+        let DisplayRole::ToolGroup(group) = &msg.role else {
+            return None;
+        };
+        let line = seg.source_line_at(pos.row, self.viewport_width)?;
+        if line == 0 {
+            return None;
+        }
+        let hidden = group
+            .entries
+            .len()
+            .saturating_sub(tool_group::MAX_COMPACT_ENTRIES);
+        let mut cursor = 1 + usize::from(hidden > 0);
+        for (entry_idx, entry) in group.entries.iter().enumerate().skip(hidden) {
+            let rows = match entry {
+                GroupEntry::Tool(tool) => 1 + tool.children.len(),
+                GroupEntry::Thinking(_) => 1,
+            };
+            if (cursor..cursor + rows).contains(&line) {
+                return Some(CompactTarget {
+                    group_id: group_id.to_owned(),
+                    entry: entry_idx,
+                    child: line.checked_sub(cursor + 1),
+                });
+            }
+            cursor += rows;
+        }
+        None
     }
 
     /// The click a row takes when it targets no task, for a moved row whose
@@ -1843,8 +1945,16 @@ impl MessagesPanel {
                     if !header.is_empty() {
                         entry.summary = header;
                     }
+                    entry
+                        .detail
+                        .get_or_insert_with(CompactDetail::default)
+                        .render_header = Some(snapshot.clone());
                     return Some(group.id.clone());
                 }
+                entry
+                    .detail
+                    .get_or_insert_with(CompactDetail::default)
+                    .render_snapshot = Some(snapshot.clone());
                 if entry.name.as_ref() != tool_group::BATCH_TOOL {
                     return Some(group.id.clone());
                 }

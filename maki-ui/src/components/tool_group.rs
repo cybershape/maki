@@ -368,6 +368,7 @@ pub(super) fn batch_children(
                 receiving_args: false,
                 started_at: None,
                 duration,
+                detail: None,
             })
         })
         .collect()
@@ -575,7 +576,7 @@ pub fn build_tool_group_lines(
         .entries
         .iter()
         .filter_map(|e| match e {
-            GroupEntry::Tool(t) if t.status == ToolStatus::InProgress => Some(t),
+            GroupEntry::Tool(t) if t.status == ToolStatus::InProgress => Some(t.as_ref()),
             _ => None,
         })
         .collect();
@@ -713,6 +714,7 @@ mod tests {
             receiving_args: false,
             started_at: None,
             duration: None,
+            detail: None,
         };
         let mut batch = child.clone();
         batch.name = Arc::from(BATCH_TOOL);
@@ -725,16 +727,16 @@ mod tests {
         let mut group = ToolGroupRole {
             id: "group".into(),
             sealed: true,
-            entries: vec![GroupEntry::Tool(batch)],
+            entries: vec![GroupEntry::Tool(Box::new(batch))],
             started_at: None,
             duration: None,
             waiting_since: None,
         };
         if followed_by_tool {
-            group.entries.push(GroupEntry::Tool(child.clone()));
+            group.entries.push(GroupEntry::Tool(Box::new(child.clone())));
         }
         if preceded_by_tool {
-            group.entries.insert(0, GroupEntry::Tool(child));
+            group.entries.insert(0, GroupEntry::Tool(Box::new(child)));
         }
         let rendered = build_tool_group_lines(&group, 60, 0);
         let parent_idx = 1 + usize::from(preceded_by_tool);
@@ -801,7 +803,7 @@ mod tests {
         let group = ToolGroupRole {
             id: "group-1".into(),
             sealed: true,
-            entries: vec![GroupEntry::Tool(GroupToolEntry {
+            entries: vec![GroupEntry::Tool(Box::new(GroupToolEntry {
                 id: "call-1".into(),
                 name: Arc::from("bash"),
                 summary: "cargo check".into(),
@@ -811,7 +813,8 @@ mod tests {
                 receiving_args: false,
                 started_at: None,
                 duration: Some(Duration::from_millis(1200)),
-            })],
+                detail: None,
+            }))],
             started_at: None,
             duration: None,
             waiting_since: None,
@@ -863,7 +866,7 @@ mod tests {
         let group = ToolGroupRole {
             id: "group-1".into(),
             sealed: false,
-            entries: vec![GroupEntry::Tool(GroupToolEntry {
+            entries: vec![GroupEntry::Tool(Box::new(GroupToolEntry {
                 id: "call-1".into(),
                 name: Arc::from("bash"),
                 summary: "ls".into(),
@@ -873,7 +876,8 @@ mod tests {
                 receiving_args: false,
                 started_at: None,
                 duration: Some(Duration::from_millis(100)),
-            })],
+                detail: None,
+            }))],
             started_at: None,
             duration: None,
             waiting_since: None,
@@ -914,7 +918,7 @@ mod tests {
         let group = ToolGroupRole {
             id: "group-1".into(),
             sealed: false,
-            entries: vec![GroupEntry::Tool(GroupToolEntry {
+            entries: vec![GroupEntry::Tool(Box::new(GroupToolEntry {
                 id: "call-1".into(),
                 name: Arc::from("bash"),
                 summary: "cargo check".into(),
@@ -924,7 +928,8 @@ mod tests {
                 receiving_args: false,
                 started_at: None,
                 duration: None,
-            })],
+                detail: None,
+            }))],
             started_at: None,
             duration: None,
             waiting_since: None,
@@ -946,7 +951,7 @@ mod tests {
         let group = ToolGroupRole {
             id: "group-1".into(),
             sealed: false,
-            entries: vec![GroupEntry::Tool(GroupToolEntry {
+            entries: vec![GroupEntry::Tool(Box::new(GroupToolEntry {
                 id: "call-1".into(),
                 name: Arc::from("bash"),
                 summary: String::new(),
@@ -956,7 +961,8 @@ mod tests {
                 receiving_args: true,
                 started_at: None,
                 duration: None,
-            })],
+                detail: None,
+            }))],
             started_at: None,
             duration: None,
             waiting_since: None,
@@ -1005,7 +1011,7 @@ mod tests {
             id: "group-1".into(),
             sealed: true,
             entries: vec![
-                GroupEntry::Tool(GroupToolEntry {
+                GroupEntry::Tool(Box::new(GroupToolEntry {
                     id: "call-1".into(),
                     name: Arc::from("edit"),
                     summary: "foo.rs".into(),
@@ -1015,8 +1021,9 @@ mod tests {
                     receiving_args: false,
                     started_at: None,
                     duration: Some(Duration::from_millis(7430)),
-                }),
-                GroupEntry::Tool(GroupToolEntry {
+                    detail: None,
+                })),
+                GroupEntry::Tool(Box::new(GroupToolEntry {
                     id: "call-2".into(),
                     name: Arc::from("bash"),
                     summary: "cargo test".into(),
@@ -1026,7 +1033,8 @@ mod tests {
                     receiving_args: false,
                     started_at: None,
                     duration: Some(Duration::from_millis(15900)),
-                }),
+                    detail: None,
+                })),
             ],
             started_at: None,
             duration: None,
@@ -1067,7 +1075,7 @@ mod tests {
     fn hides_beyond_max_entries() {
         let mut entries = Vec::new();
         for i in 0..15 {
-            entries.push(GroupEntry::Tool(GroupToolEntry {
+            entries.push(GroupEntry::Tool(Box::new(GroupToolEntry {
                 id: format!("call-{i}"),
                 name: Arc::from("read"),
                 summary: format!("file_{i}.rs"),
@@ -1077,7 +1085,8 @@ mod tests {
                 receiving_args: false,
                 started_at: None,
                 duration: Some(Duration::from_millis(100)),
-            }));
+                detail: None,
+            })));
         }
 
         let group = ToolGroupRole {
@@ -1111,7 +1120,7 @@ mod tests {
             id: "group-1".into(),
             sealed: false,
             entries: vec![
-                GroupEntry::Tool(GroupToolEntry {
+                GroupEntry::Tool(Box::new(GroupToolEntry {
                     id: "call-1".into(),
                     name: Arc::from("bash"),
                     summary: "git status".into(),
@@ -1121,8 +1130,9 @@ mod tests {
                     receiving_args: false,
                     started_at: None,
                     duration: Some(Duration::from_millis(100)),
-                }),
-                GroupEntry::Tool(GroupToolEntry {
+                    detail: None,
+                })),
+                GroupEntry::Tool(Box::new(GroupToolEntry {
                     id: "call-2".into(),
                     name: Arc::from("bash"),
                     summary: "Run compact_test".into(),
@@ -1132,7 +1142,8 @@ mod tests {
                     receiving_args: false,
                     started_at: None,
                     duration: None,
-                }),
+                    detail: None,
+                })),
             ],
             started_at: None,
             duration: None,
@@ -1189,7 +1200,7 @@ mod tests {
         let group = ToolGroupRole {
             id: "group-1".into(),
             sealed: false,
-            entries: vec![GroupEntry::Tool(GroupToolEntry {
+            entries: vec![GroupEntry::Tool(Box::new(GroupToolEntry {
                 id: "call-1".into(),
                 name: Arc::from("bash"),
                 summary: "ls".into(),
@@ -1199,7 +1210,8 @@ mod tests {
                 receiving_args: false,
                 started_at: None,
                 duration: None,
-            })],
+                detail: None,
+            }))],
             started_at: None,
             duration: None,
             waiting_since: None,
@@ -1255,7 +1267,7 @@ mod tests {
     #[test]
     fn group_summary_shows_all_entries() {
         let entries = vec![
-            GroupEntry::Tool(GroupToolEntry {
+            GroupEntry::Tool(Box::new(GroupToolEntry {
                 id: "t0".into(),
                 name: Arc::from("tool"),
                 summary: "op 0".into(),
@@ -1265,7 +1277,8 @@ mod tests {
                 receiving_args: false,
                 started_at: None,
                 duration: None,
-            }),
+                detail: None,
+            })),
             GroupEntry::Thinking(GroupThinkingEntry {
                 id: 0,
                 text: "thinking".into(),
@@ -1298,7 +1311,7 @@ mod tests {
     fn sealed_group_title_shows_worked_for_and_hidden() {
         let mut entries = Vec::new();
         for i in 0..22 {
-            entries.push(GroupEntry::Tool(GroupToolEntry {
+            entries.push(GroupEntry::Tool(Box::new(GroupToolEntry {
                 id: format!("c{i}"),
                 name: Arc::from("tool"),
                 summary: format!("op {i}"),
@@ -1308,7 +1321,8 @@ mod tests {
                 receiving_args: false,
                 started_at: None,
                 duration: None,
-            }));
+                detail: None,
+            })));
         }
         let group = ToolGroupRole {
             id: "group-done".into(),
@@ -1339,7 +1353,7 @@ mod tests {
     fn sealed_group_title_shows_tools_and_thoughts_hidden() {
         let mut entries = Vec::new();
         for i in 0..10 {
-            entries.push(GroupEntry::Tool(GroupToolEntry {
+            entries.push(GroupEntry::Tool(Box::new(GroupToolEntry {
                 id: format!("t{i}"),
                 name: Arc::from("tool"),
                 summary: format!("op {i}"),
@@ -1349,7 +1363,8 @@ mod tests {
                 receiving_args: false,
                 started_at: None,
                 duration: None,
-            }));
+                detail: None,
+            })));
         }
         for i in 0..2 {
             entries.push(GroupEntry::Thinking(GroupThinkingEntry {

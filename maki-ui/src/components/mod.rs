@@ -1,4 +1,5 @@
 pub(crate) mod alert_modal;
+pub(crate) mod compact_detail;
 pub(crate) mod btw_modal;
 pub(crate) mod code_view;
 pub mod command;
@@ -36,7 +37,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
-use maki_agent::{BufferSnapshot, TaskEnd, ToolDoneEvent, ToolInput, ToolOutput};
+use maki_agent::{
+    BufferSnapshot, TaskEnd, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
+};
 use maki_lua::{PackCommand, PackPlan};
 use maki_providers::{ImageSource, Message, ModelTier};
 use ratatui::text::{Line, Span};
@@ -466,7 +469,7 @@ pub struct ToolRole {
     pub name: Arc<str>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct GroupToolEntry {
     pub id: String,
     pub name: Arc<str>,
@@ -477,6 +480,67 @@ pub struct GroupToolEntry {
     pub receiving_args: bool,
     pub started_at: Option<Instant>,
     pub duration: Option<Duration>,
+    /// What the compact row collapses. A click opens it; the row itself stays
+    /// one line. `None` on a batch child, which has no call of its own.
+    pub detail: Option<CompactDetail>,
+}
+
+/// The call a compact row stands for, kept so a click can show it in full.
+#[derive(Debug, Clone, Default)]
+pub struct CompactDetail {
+    pub input: Option<ToolInput>,
+    pub raw_input: Option<Value>,
+    pub output: Option<Arc<ToolOutput>>,
+    pub annotation: Option<String>,
+    pub render_header: Option<BufferSnapshot>,
+    pub render_snapshot: Option<BufferSnapshot>,
+    pub live_output: Option<String>,
+    pub truncated_lines: usize,
+}
+
+impl PartialEq for CompactDetail {
+    fn eq(&self, other: &Self) -> bool {
+        self.input == other.input
+            && self.raw_input == other.raw_input
+            && self.annotation == other.annotation
+            && self.render_header == other.render_header
+            && self.render_snapshot == other.render_snapshot
+            && self.live_output == other.live_output
+            && self.truncated_lines == other.truncated_lines
+            && match (&self.output, &other.output) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl PartialEq for GroupToolEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.name == other.name
+            && self.summary == other.summary
+            && self.raw_input == other.raw_input
+            && self.children == other.children
+            && self.status == other.status
+            && self.receiving_args == other.receiving_args
+            && self.started_at == other.started_at
+            && self.duration == other.duration
+            && self.detail == other.detail
+    }
+}
+
+impl CompactDetail {
+    pub fn from_start(event: &ToolStartEvent) -> Self {
+        Self {
+            input: event.input.clone(),
+            raw_input: event.raw_input.clone(),
+            output: event.output.clone().map(Arc::new),
+            annotation: event.annotation.clone(),
+            render_header: event.render_header.clone(),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -491,7 +555,7 @@ pub struct GroupThinkingEntry {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum GroupEntry {
-    Tool(GroupToolEntry),
+    Tool(Box<GroupToolEntry>),
     Thinking(GroupThinkingEntry),
 }
 

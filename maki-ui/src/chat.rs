@@ -10,7 +10,7 @@ use crate::components::input::Draft;
 use crate::components::messages::{ClickOutcome, MessagesPanel, PromptProgress, ScrollPos};
 use crate::components::tool_display::append_annotation;
 use crate::components::{
-    BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, GroupEntry,
+    BackgroundBadge, BackgroundOutcome, CompactDetail, DisplayMessage, DisplayRole, GroupEntry,
     GroupThinkingEntry, GroupToolEntry, ToolGroupRole, ToolRole, ToolStatus,
 };
 use crate::markdown::truncate_output;
@@ -481,6 +481,10 @@ impl Chat {
 
     pub fn extract_selection_text(&self, sel: &Selection, msg_area: Rect) -> String {
         self.messages_panel.extract_selection_text(sel, msg_area)
+    }
+
+    pub fn messages(&self) -> &[DisplayMessage] {
+        self.messages_panel.messages()
     }
 
     pub fn handle_click(&mut self, row: u16, col: u16, area: Rect) -> ClickOutcome {
@@ -975,6 +979,14 @@ pub fn history_to_display(
                                     receiving_args: false,
                                     started_at: None,
                                     duration: stored.and_then(|o| o.duration()),
+                                    detail: Some(CompactDetail {
+                                        raw_input: Some(input.clone()),
+                                        output: stored.cloned(),
+                                        annotation,
+                                        live_output: result_text.map(str::to_owned),
+                                        truncated_lines,
+                                        ..CompactDetail::default()
+                                    }),
                                 };
                                 if let Some(DisplayMessage {
                                     role: DisplayRole::ToolGroup(g),
@@ -982,13 +994,13 @@ pub fn history_to_display(
                                 }) = display.last_mut()
                                     && !g.sealed
                                 {
-                                    g.entries.push(GroupEntry::Tool(entry));
+                                    g.entries.push(GroupEntry::Tool(Box::new(entry)));
                                     continue;
                                 }
                                 let group = ToolGroupRole {
                                     id: format!("compact-group-{}", display.len()),
                                     sealed: false,
-                                    entries: vec![GroupEntry::Tool(entry)],
+                                    entries: vec![GroupEntry::Tool(Box::new(entry))],
                                     started_at: None,
                                     duration: None,
                                     waiting_since: None,

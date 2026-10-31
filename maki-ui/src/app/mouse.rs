@@ -93,7 +93,36 @@ impl App {
             ClickOutcome::MoveCall(id) => {
                 self.move_to_background(Some(&id));
             }
+            ClickOutcome::OpenCompact(target) => self.open_compact_detail(target),
             ClickOutcome::Handled | ClickOutcome::None => {}
+        }
+    }
+
+    /// Copies the clicked row out of the transcript, so output landing later
+    /// cannot move the text the reader is looking at.
+    fn open_compact_detail(&mut self, target: crate::components::compact_detail::CompactTarget) {
+        use crate::components::{DisplayRole, GroupEntry};
+
+        let Some(msg) = self.chats[self.active_chat].messages().iter().rfind(
+            |m| matches!(&m.role, DisplayRole::ToolGroup(g) if g.id == target.group_id),
+        ) else {
+            return;
+        };
+        let DisplayRole::ToolGroup(group) = &msg.role else {
+            return;
+        };
+        match group.entries.get(target.entry) {
+            Some(GroupEntry::Tool(tool)) => {
+                let entry = target
+                    .child
+                    .and_then(|idx| tool.children.get(idx))
+                    .unwrap_or(tool);
+                self.compact_detail.open_tool(entry.clone());
+            }
+            Some(GroupEntry::Thinking(thinking)) if target.child.is_none() => {
+                self.compact_detail.open_thinking(thinking.clone());
+            }
+            _ => {}
         }
     }
 

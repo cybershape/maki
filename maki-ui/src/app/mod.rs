@@ -32,6 +32,7 @@ use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
 use crate::components::alert_modal::AlertModal;
+use crate::components::compact_detail::CompactDetailModal;
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{
     CommandAction, CommandPalette, ParsedCommand, PluginAccess, SUBMITS_PROMPT,
@@ -556,6 +557,7 @@ pub struct App {
     pub(super) mcp_picker: McpPicker,
     pub(super) rewind_picker: RewindPicker,
     pub(super) alert_modal: AlertModal,
+    pub(super) compact_detail: CompactDetailModal,
     pub(super) help_modal: HelpModal,
     pub(super) usage_modal: UsageModal,
     pub(super) btw_modal: BtwModal,
@@ -715,6 +717,7 @@ impl App {
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
             alert_modal: AlertModal::new(),
+            compact_detail: CompactDetailModal::new(),
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
             btw_modal: BtwModal::new(typewriter, ui_config.thinking_lines),
@@ -1372,6 +1375,10 @@ impl App {
             self.btw_modal.scroll(delta);
             return None;
         }
+        if self.compact_detail.is_open() {
+            self.compact_detail.scroll(delta);
+            return None;
+        }
         if self.help_modal.is_open() {
             self.help_modal.scroll(delta);
             return None;
@@ -1499,6 +1506,11 @@ impl App {
             if action != PlanFormAction::Passthrough {
                 return Some(self.handle_plan_form_action(action));
             }
+        }
+
+        if self.compact_detail.is_open() {
+            self.compact_detail.handle_key(key);
+            return Some(vec![]);
         }
 
         if self.help_modal.is_open() {
@@ -3242,9 +3254,10 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
+    fn overlays(&self) -> [&dyn Overlay; 15] {
         [
             &self.alert_modal,
+            &self.compact_detail,
             &self.help_modal,
             &self.usage_modal,
             &self.btw_modal,
@@ -3261,9 +3274,10 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 15] {
         [
             &mut self.alert_modal,
+            &mut self.compact_detail,
             &mut self.help_modal,
             &mut self.usage_modal,
             &mut self.btw_modal,
@@ -3626,6 +3640,7 @@ impl App {
         }
         if self.pack_review.is_open()
             || self.plan_form_active()
+            || self.compact_detail.is_open()
             || self.help_modal.is_open()
             || self.usage_modal.is_open()
             || self.btw_modal.is_open()
