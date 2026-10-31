@@ -11,9 +11,10 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::components::input::{COMMAND_PREFIX, sent_text};
+use crate::components::modal::clear_area;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
@@ -762,7 +763,7 @@ impl CommandPalette {
             })
             .collect();
 
-        frame.render_widget(Clear, popup);
+        clear_area(frame, popup);
         frame.render_widget(
             Paragraph::new(lines).style(Style::new().bg(t.background)),
             popup,

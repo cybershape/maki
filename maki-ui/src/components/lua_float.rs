@@ -6,10 +6,11 @@ use maki_lua::{Anchor, Axis, Border, FloatConfig, Key, Split, TitlePos, WinComma
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
+use crate::components::modal::clear_area;
 use crate::components::split_layout::SplitReq;
 use crate::components::{
     Overlay, hint_footer,
@@ -551,7 +552,7 @@ impl FloatManager {
         let win = &mut self.windows[idx];
         win.painting = true;
 
-        frame.render_widget(Clear, popup);
+        clear_area(frame, popup);
 
         let border_type = match win.config.border {
             Border::None => None,
