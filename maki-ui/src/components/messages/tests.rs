@@ -3484,7 +3484,7 @@ fn compact_batch_children_follow_snapshots(restored: bool, cancelled: bool) {
         assert_eq!(batch.duration, Some(Duration::from_millis(1234)));
         assert_eq!(group.total_duration(), Duration::from_millis(1234));
     }
-    let rows = tool_group::build_tool_group_lines(group, VIEW_WIDTH, 0);
+    let rows = tool_group::build_tool_group_lines(group, VIEW_WIDTH, 0, tool_group::DEFAULT_COMPACT_LINES);
     assert!(rows.lines[2].to_string().ends_with("(1.23s)"));
     assert_eq!(
         batch.children[0].status,
@@ -3568,7 +3568,7 @@ fn compact_tools_state_text_transitions() {
     let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
         panic!()
     };
-    let tl1 = tool_group::build_tool_group_lines(g, 80, 0);
+    let tl1 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
     let h1: String = tl1.lines[0]
         .spans
         .iter()
@@ -3581,7 +3581,7 @@ fn compact_tools_state_text_transitions() {
     let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
         panic!()
     };
-    let tl2 = tool_group::build_tool_group_lines(g, 80, 0);
+    let tl2 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
     let h2: String = tl2.lines[0]
         .spans
         .iter()
@@ -3595,7 +3595,7 @@ fn compact_tools_state_text_transitions() {
     let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
         panic!()
     };
-    let tl3 = tool_group::build_tool_group_lines(g, 80, 0);
+    let tl3 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
     assert_eq!(tl3.lines.len(), 2);
     let h3: String = tl3.lines[0]
         .spans
@@ -3639,7 +3639,7 @@ fn compact_tools_state_text_transitions() {
         waiting_since: None,
         expanded: false,
     };
-    let tl4 = tool_group::build_tool_group_lines(&group2, 80, 0);
+    let tl4 = tool_group::build_tool_group_lines(&group2, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
     let h4: String = tl4.lines[0]
         .spans
         .iter()
@@ -3659,7 +3659,7 @@ fn compact_tools_state_text_transitions() {
             duration: None,
         }),
     );
-    let tl5 = tool_group::build_tool_group_lines(&group2, 80, 0);
+    let tl5 = tool_group::build_tool_group_lines(&group2, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
     let h5: String = tl5.lines[0]
         .spans
         .iter()
@@ -3681,7 +3681,7 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         panic!()
     };
     assert!(!g.sealed);
-    let tl = tool_group::build_tool_group_lines(g, 80, 0);
+    let tl = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
     let h: String = tl.lines[0]
         .spans
         .iter()
@@ -3698,7 +3698,7 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         panic!()
     };
     assert!(!g.sealed);
-    let tl2 = tool_group::build_tool_group_lines(g, 80, 0);
+    let tl2 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
     let h2: String = tl2.lines[0]
         .spans
         .iter()
@@ -3713,7 +3713,7 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         panic!()
     };
     assert!(!g.sealed);
-    let tl3 = tool_group::build_tool_group_lines(g, 80, 0);
+    let tl3 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
     let h3: String = tl3.lines[0]
         .spans
         .iter()
@@ -3730,7 +3730,7 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         panic!()
     };
     assert!(g.sealed);
-    let tl4 = tool_group::build_tool_group_lines(g, 80, 0);
+    let tl4 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
     let h4: String = tl4.lines[0]
         .spans
         .iter()
@@ -4329,6 +4329,78 @@ fn clicking_hidden_line_in_compact_group_expands_all_entries() {
         .expect("entry 14");
     assert_eq!(target14.entry, 14);
     assert_eq!(target14.child, None);
+}
+
+#[test]
+fn compact_lines_config_controls_visible_rows_and_click_target() {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            compact_tools: true,
+            compact_lines: 3,
+            ..Default::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    let child = GroupToolEntry {
+        id: String::new(),
+        name: Arc::from("read"),
+        summary: "src/main.rs".into(),
+        raw_input: None,
+        children: Vec::new(),
+        status: ToolStatus::Success,
+        receiving_args: false,
+        started_at: None,
+        duration: None,
+        detail: None,
+    };
+    let entries: Vec<GroupEntry> = (0..5)
+        .map(|i| {
+            let mut c = child.clone();
+            c.summary = format!("file_{i}.rs");
+            GroupEntry::Tool(Box::new(c))
+        })
+        .collect();
+    let group = ToolGroupRole {
+        id: "group-1".into(),
+        sealed: true,
+        entries,
+        started_at: None,
+        duration: None,
+        waiting_since: None,
+        expanded: false,
+    };
+    panel.push(DisplayMessage::new(
+        DisplayRole::ToolGroup(Box::new(group)),
+        String::new(),
+    ));
+    render(&mut panel, VIEW_WIDTH, 30);
+
+    // Row 0 is header.
+    // Row 1 is "... (2 hidden)" because compact_lines is 3 and entries count is 5.
+    // Row 2 is entry 2 (file_2.rs).
+    // Row 3 is entry 3 (file_3.rs).
+    // Row 4 is entry 4 (file_4.rs).
+    let target = panel
+        .compact_target_at(2, Rect::new(0, 0, VIEW_WIDTH, 30))
+        .expect("entry 2");
+    assert_eq!(target.entry, 2);
+
+    let target4 = panel
+        .compact_target_at(4, Rect::new(0, 0, VIEW_WIDTH, 30))
+        .expect("entry 4");
+    assert_eq!(target4.entry, 4);
+
+    // Clicking row 1 expands
+    assert_eq!(
+        panel.handle_click(1, 0, Rect::new(0, 0, VIEW_WIDTH, 30)),
+        ClickOutcome::Handled
+    );
+
+    // After expand, row 1 is entry 0
+    let target0 = panel
+        .compact_target_at(1, Rect::new(0, 0, VIEW_WIDTH, 30))
+        .expect("entry 0");
+    assert_eq!(target0.entry, 0);
 }
 
 fn notice_panel(detail: Option<&str>) -> MessagesPanel {

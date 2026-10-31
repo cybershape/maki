@@ -134,6 +134,7 @@ pub struct MessagesPanel {
     /// every frame, so they always sit at the end of the cache.
     live_start: usize,
     pub compact_tools: bool,
+    pub compact_lines: usize,
 }
 
 impl MessagesPanel {
@@ -185,6 +186,7 @@ impl MessagesPanel {
             task_id: None,
             live_start: 0,
             compact_tools: ui_config.compact_tools,
+            compact_lines: ui_config.compact_lines,
         }
     }
 
@@ -1312,7 +1314,7 @@ impl MessagesPanel {
         let DisplayRole::ToolGroup(group) = &mut msg.role else {
             return false;
         };
-        if group.expanded || group.entries.len() <= tool_group::MAX_COMPACT_ENTRIES {
+        if group.expanded || group.entries.len() <= self.compact_lines {
             return false;
         }
         group.expanded = true;
@@ -1352,7 +1354,7 @@ impl MessagesPanel {
             group
                 .entries
                 .len()
-                .saturating_sub(tool_group::MAX_COMPACT_ENTRIES)
+                .saturating_sub(self.compact_lines)
         };
         let mut cursor = 1 + usize::from(hidden > 0);
         for (entry_idx, entry) in group.entries.iter().enumerate().skip(hidden) {
@@ -2302,6 +2304,7 @@ impl MessagesPanel {
             g,
             self.viewport_width,
             self.started_at.elapsed().as_millis(),
+            self.compact_lines,
         );
         let seg = self.cache.get_mut(seg_idx).unwrap();
         seg.update_with_reuse(tl, &self.hl_worker);
@@ -2338,6 +2341,7 @@ impl MessagesPanel {
                     g,
                     self.viewport_width,
                     self.started_at.elapsed().as_millis(),
+                    self.compact_lines,
                 );
                 let id = g.id.clone();
                 self.cache.push_spacer_if_needed();

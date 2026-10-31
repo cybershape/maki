@@ -35,6 +35,7 @@ pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
 pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
 pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
 pub const DEFAULT_THINKING_LINES: usize = 3;
+pub const DEFAULT_COMPACT_LINES: usize = 10;
 const NEVER_COLLAPSE_THINKING: i64 = -1;
 const THINKING_LINES_RANGE: &str =
     "thinking_lines must be -1 (never collapse), 0 (header only) or a row count";
@@ -673,6 +674,7 @@ pub struct UiFileConfig {
     pub prefer_model_name: Option<bool>,
     pub show_cost: Option<bool>,
     pub compact_tools: Option<bool>,
+    pub compact_lines: Option<usize>,
     pub max_width: Option<MaxWidth>,
 }
 
@@ -697,6 +699,7 @@ impl UiFileConfig {
             prefer_model_name,
             show_cost,
             compact_tools,
+            compact_lines,
             max_width
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
@@ -1561,6 +1564,13 @@ pub struct UiConfig {
     pub compact_tools: bool,
 
     #[config(
+        default = DEFAULT_COMPACT_LINES,
+        min = 0,
+        desc = "Maximum visible entries under a compact tool group before folding (0 hides all entries)"
+    )]
+    pub compact_lines: usize,
+
+    #[config(
         default = None,
         ty = "integer | float",
         default_doc = "none",
@@ -1596,6 +1606,7 @@ impl UiConfig {
             prefer_model_name: f.prefer_model_name.unwrap_or(true),
             show_cost: f.show_cost.unwrap_or(true),
             compact_tools: f.compact_tools.unwrap_or(false),
+            compact_lines: f.compact_lines.unwrap_or(DEFAULT_COMPACT_LINES),
             max_width: f.max_width,
         }
     }
@@ -5413,6 +5424,25 @@ mod tests {
         let parsed: RawConfig = toml::from_str("[ui]\ncompact_tools = true\n").unwrap();
         let cfg = UiConfig::from_file(parsed.ui);
         assert!(cfg.compact_tools);
+    }
+
+    #[test]
+    fn compact_lines_defaults_to_10_and_can_be_customized() {
+        let default_cfg = UiConfig::from_file(UiFileConfig::default());
+        assert_eq!(default_cfg.compact_lines, 10);
+
+        let parsed: RawConfig = toml::from_str("[ui]\ncompact_lines = 5\n").unwrap();
+        let cfg = UiConfig::from_file(parsed.ui);
+        assert_eq!(cfg.compact_lines, 5);
+
+        let parsed_zero: RawConfig = toml::from_str("[ui]\ncompact_lines = 0\n").unwrap();
+        let cfg_zero = UiConfig::from_file(parsed_zero.ui);
+        assert_eq!(cfg_zero.compact_lines, 0);
+
+        let mut base: UiFileConfig = toml::from_str("compact_lines = 10\n").unwrap();
+        let overlay: UiFileConfig = toml::from_str("compact_lines = 3\n").unwrap();
+        base.merge(overlay);
+        assert_eq!(base.compact_lines, Some(3));
     }
 
     #[test]
