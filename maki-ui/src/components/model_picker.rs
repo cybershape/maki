@@ -281,7 +281,7 @@ impl ModelPicker {
     fn preselect_current_model(&mut self) -> bool {
         if self
             .picker
-            .select_item_by(|e| e.spec == self.current_spec && e.suffix().is_none())
+            .select_item_by(|e| e.spec == self.current_spec && e.suffix().is_some())
             || self.picker.select_item_by(|e| e.spec == self.current_spec)
         {
             return true;
@@ -749,34 +749,45 @@ mod tests {
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
             matches!(action, ModelPickerAction::Select(ref s) if s == "zai/glm-5"),
-            "current model should be preselected in its provider section",
+            "current model should be preselected",
         );
     }
 
     #[test]
-    fn reopen_preselects_current_model_in_provider_section() {
+    fn open_preselects_current_model_in_recent_section_when_in_recents() {
         let models = test_models();
         let mut p = ModelPicker::new(models);
         p.set_recents(vec![
             "zai/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
         ]);
-        p.open("anthropic/claude-sonnet-4-20250514");
-        p.handle_key(key(KeyCode::Down));
-        let action = p.handle_key(key(KeyCode::Enter));
-        assert!(
-            matches!(action, ModelPickerAction::Select(ref s) if s == "zai/glm-5"),
-            "selecting the provider entry should return its spec",
-        );
-
         p.open("zai/glm-5");
 
-        let entry = p.picker.selected_item().expect("selection on reopen");
+        let entry = p.picker.selected_item().expect("selection on open");
         assert_eq!(entry.spec, "zai/glm-5");
         assert_eq!(
             entry.section(),
-            Some("zai"),
-            "selection should land on the provider entry, not the Recent copy",
+            Some("Recent"),
+            "selection should land on the Recent copy when present in recents",
+        );
+    }
+
+    #[test]
+    fn open_preselects_current_model_in_provider_section_when_not_in_recents() {
+        let models = test_models();
+        let mut p = ModelPicker::new(models);
+        p.set_recents(vec![
+            "zai/glm-5".into(),
+            "anthropic/claude-sonnet-4-20250514".into(),
+        ]);
+        p.open("anthropic/claude-opus-4-6-20260101");
+
+        let entry = p.picker.selected_item().expect("selection on open");
+        assert_eq!(entry.spec, "anthropic/claude-opus-4-6-20260101");
+        assert_eq!(
+            entry.section(),
+            Some("anthropic"),
+            "selection should land on provider entry when model is not in recents",
         );
     }
 
@@ -790,15 +801,16 @@ mod tests {
         ]);
         p.open("anthropic/claude-sonnet-4-20250514");
         p.handle_key(key(KeyCode::Down));
+        p.handle_key(key(KeyCode::Down));
         p.handle_key(key(KeyCode::Char('!')));
 
         let _ = p.refresh();
 
         let entry = p.picker.selected_item().expect("selection after refresh");
-        assert_eq!(entry.spec, "zai/glm-5");
+        assert_eq!(entry.spec, "anthropic/claude-sonnet-4-20250514");
         assert_eq!(
             entry.section(),
-            Some("zai"),
+            Some("anthropic"),
             "selection should stay on the provider entry, not jump to Recent",
         );
     }
@@ -812,6 +824,8 @@ mod tests {
             "anthropic/claude-sonnet-4-20250514".into(),
         ]);
         p.open("anthropic/claude-sonnet-4-20250514");
+        p.handle_key(key(KeyCode::Down));
+        p.handle_key(key(KeyCode::Down));
 
         models.store(None);
         let _ = p.refresh();
