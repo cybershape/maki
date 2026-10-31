@@ -107,7 +107,7 @@
 | `67e6fec3` | `feat(ui): sum compact thinking durations in turn completion stats line` | 每 turn 统计行汇总紧凑思考耗时 |
 | `51d9955f` | `docs: describe MCP-through-code_execution and old-session incompatibility` | 文档描述通过代码执行使用 MCP 工具的机制及旧 session 兼容性说明 |
 | `0e1f3227` | `fix(session): keep message timestamps across a headless resume` | 修复 headless 恢复会话时保留消息时间戳 |
-| Pending | `Merge branch 'upstream/main' into main` | 合并上游提交（至 `7ae4c5d1`），包含 slow tool call 后台任务管理（Ctrl+B）、`/tasks` 嵌套展示与交互优化、bash 输出行数/体积限制及全量日志落盘、Lua 插件任务隔离调度等 |
+| `ce0c8984` | `Merge branch 'upstream/main' into main` | 合并上游提交（至 `7ae4c5d1`），包含 slow tool call 后台任务管理（Ctrl+B）、`/tasks` 嵌套展示与交互优化、bash 输出行数/体积限制及全量日志落盘、Lua 插件任务隔离调度等 |
 
 ---
 
