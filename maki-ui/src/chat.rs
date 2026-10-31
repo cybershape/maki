@@ -884,6 +884,7 @@ pub fn history_to_display(
                                     started_at: None,
                                     duration: None,
                                     waiting_since: None,
+                                    expanded: false,
                                 };
                                 display.push(DisplayMessage::new(
                                     DisplayRole::ToolGroup(Box::new(group)),
@@ -1004,6 +1005,7 @@ pub fn history_to_display(
                                     started_at: None,
                                     duration: None,
                                     waiting_since: None,
+                                    expanded: false,
                                 };
                                 display.push(DisplayMessage::new(
                                     DisplayRole::ToolGroup(Box::new(group)),
@@ -1387,6 +1389,7 @@ mod tests {
             started_at: None,
             duration: None,
             waiting_since: None,
+            expanded: false,
         };
         chat.push(DisplayMessage::new(
             DisplayRole::ToolGroup(Box::new(group)),

@@ -317,6 +317,34 @@ pub fn extract_batch_child_input(batch_raw_input: &Value, index: usize) -> Optio
     Some(Value::Object(map))
 }
 
+pub fn extract_batch_child_output(batch_output: &str, child_idx: usize) -> Option<String> {
+    let mut sections = Vec::new();
+    let mut current_section: Option<Vec<&str>> = None;
+    for line in batch_output.lines() {
+        if line.starts_with("## ") {
+            if let Some(sec) = current_section.take() {
+                sections.push(sec.join("\n"));
+            }
+            current_section = Some(Vec::new());
+        } else if let Some(sec) = &mut current_section {
+            sec.push(line);
+        }
+    }
+    if let Some(sec) = current_section {
+        sections.push(sec.join("\n"));
+    }
+    let section = sections.get(child_idx)?;
+    let trimmed = section.trim();
+    let clean = if let Some((content, _)) = trimmed.rsplit_once("\n\nAll ") {
+        content
+    } else if let Some((content, _)) = trimmed.rsplit_once("\n\nExecuted ") {
+        content
+    } else {
+        trimmed
+    };
+    Some(clean.strip_prefix("[ERROR] ").unwrap_or(clean).to_string())
+}
+
 pub(super) fn batch_children(
     snapshot: &BufferSnapshot,
     batch_raw_input: Option<&Value>,
@@ -651,7 +679,11 @@ pub fn build_tool_group_lines(
     }
     lines.push(Line::from(header_spans));
 
-    let hidden_count = group.entries.len().saturating_sub(MAX_COMPACT_ENTRIES);
+    let hidden_count = if group.expanded {
+        0
+    } else {
+        group.entries.len().saturating_sub(MAX_COMPACT_ENTRIES)
+    };
     if hidden_count > 0 {
         lines.push(Line::from(vec![
             Span::styled(RAIL_CONTINUE, theme.tool_dim),
@@ -731,6 +763,7 @@ mod tests {
             started_at: None,
             duration: None,
             waiting_since: None,
+            expanded: false,
         };
         if followed_by_tool {
             group.entries.push(GroupEntry::Tool(Box::new(child.clone())));
@@ -792,6 +825,7 @@ mod tests {
             started_at: None,
             duration: None,
             waiting_since: None,
+            expanded: false,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -818,6 +852,7 @@ mod tests {
             started_at: None,
             duration: None,
             waiting_since: None,
+            expanded: false,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -850,6 +885,7 @@ mod tests {
             started_at: None,
             duration: None,
             waiting_since: None,
+            expanded: false,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -881,6 +917,7 @@ mod tests {
             started_at: None,
             duration: None,
             waiting_since: None,
+            expanded: false,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -902,6 +939,7 @@ mod tests {
             started_at: None,
             duration: None,
             waiting_since: Some(Instant::now() - Duration::from_millis(1520)),
+            expanded: false,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -933,6 +971,7 @@ mod tests {
             started_at: None,
             duration: None,
             waiting_since: None,
+            expanded: false,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -966,6 +1005,7 @@ mod tests {
             started_at: None,
             duration: None,
             waiting_since: None,
+            expanded: false,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -993,6 +1033,7 @@ mod tests {
             started_at: None,
             duration: None,
             waiting_since: None,
+            expanded: false,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -1039,6 +1080,7 @@ mod tests {
             started_at: None,
             duration: None,
             waiting_since: None,
+            expanded: false,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -1096,6 +1138,7 @@ mod tests {
             started_at: None,
             duration: None,
             waiting_since: None,
+            expanded: false,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -1148,6 +1191,7 @@ mod tests {
             started_at: None,
             duration: None,
             waiting_since: None,
+            expanded: false,
         };
 
         let mut tl = build_tool_group_lines(&group, 80, 0);
@@ -1215,6 +1259,7 @@ mod tests {
             started_at: None,
             duration: None,
             waiting_since: None,
+            expanded: false,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -1239,6 +1284,7 @@ mod tests {
             started_at: None,
             duration: None,
             waiting_since: None,
+            expanded: false,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -1295,6 +1341,7 @@ mod tests {
             started_at: None,
             duration: Some(Duration::from_secs(10)),
             waiting_since: None,
+            expanded: false,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -1331,6 +1378,7 @@ mod tests {
             started_at: None,
             duration: Some(Duration::from_secs(95)),
             waiting_since: None,
+            expanded: false,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -1383,6 +1431,7 @@ mod tests {
             started_at: None,
             duration: Some(Duration::from_secs(10)),
             waiting_since: None,
+            expanded: false,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -1417,6 +1466,7 @@ mod tests {
             started_at: None,
             duration: None,
             waiting_since: None,
+            expanded: false,
         };
 
         let tl = build_tool_group_lines(&group, 80, 0);
@@ -1571,5 +1621,75 @@ mod tests {
 
         assert_eq!(children[2].name.as_ref(), "write");
         assert_eq!(children[2].summary, "src/lib.rs");
+    }
+
+    #[test]
+    fn expanded_group_renders_all_entries_without_hidden_notice() {
+        let child = GroupToolEntry {
+            id: String::new(),
+            name: Arc::from("read"),
+            summary: "src/main.rs".into(),
+            raw_input: None,
+            children: Vec::new(),
+            status: ToolStatus::Success,
+            receiving_args: false,
+            started_at: None,
+            duration: None,
+            detail: None,
+        };
+        let entries: Vec<GroupEntry> = (0..15)
+            .map(|_| GroupEntry::Tool(Box::new(child.clone())))
+            .collect();
+        let group_collapsed = ToolGroupRole {
+            id: "group".into(),
+            sealed: true,
+            entries: entries.clone(),
+            started_at: None,
+            duration: None,
+            waiting_since: None,
+            expanded: false,
+        };
+        let tl_collapsed = build_tool_group_lines(&group_collapsed, 80, 0);
+        let collapsed_text = tl_collapsed
+            .lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(collapsed_text.contains("... (5 hidden)"));
+
+        let group_expanded = ToolGroupRole {
+            id: "group".into(),
+            sealed: true,
+            entries,
+            started_at: None,
+            duration: None,
+            waiting_since: None,
+            expanded: true,
+        };
+        let tl_expanded = build_tool_group_lines(&group_expanded, 80, 0);
+        let expanded_text = tl_expanded
+            .lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!expanded_text.contains("hidden"));
+        // 1 header line + 15 entry lines = 16 lines
+        assert_eq!(tl_expanded.lines.len(), 16);
+    }
+
+    #[test]
+    fn extract_batch_child_output_parses_sections() {
+        let batch_output = "## read\nfile contents line 1\nfile contents line 2\n\n## bash\n[ERROR] cargo error: unresolved\n\nAll 2 tools executed successfully.";
+        assert_eq!(
+            extract_batch_child_output(batch_output, 0),
+            Some("file contents line 1\nfile contents line 2".to_string())
+        );
+        assert_eq!(
+            extract_batch_child_output(batch_output, 1),
+            Some("cargo error: unresolved".to_string())
+        );
+        assert_eq!(extract_batch_child_output(batch_output, 2), None);
     }
 }

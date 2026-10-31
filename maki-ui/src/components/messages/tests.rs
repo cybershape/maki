@@ -3152,6 +3152,7 @@ fn panel_with_sealed_groups(tools: usize, thinking: usize, groups: usize) -> Mes
                 started_at: None,
                 duration: None,
                 waiting_since: None,
+                expanded: false,
             })),
             String::new(),
         ));
@@ -3636,6 +3637,7 @@ fn compact_tools_state_text_transitions() {
         started_at: None,
         duration: None,
         waiting_since: None,
+        expanded: false,
     };
     let tl4 = tool_group::build_tool_group_lines(&group2, 80, 0);
     let h4: String = tl4.lines[0]
@@ -3976,6 +3978,7 @@ fn compact_tool_group_renders_aligned_with_panel_left_padding() {
         started_at: None,
         duration: Some(Duration::from_secs(1)),
         waiting_since: None,
+        expanded: false,
     };
     panel.push(DisplayMessage::new(
         DisplayRole::ToolGroup(Box::new(group)),
@@ -4262,6 +4265,70 @@ fn compact_batch_child_click_names_the_child() {
         panel.handle_click(2, 0, view_area()),
         ClickOutcome::OpenCompact(child)
     );
+}
+
+#[test]
+fn clicking_hidden_line_in_compact_group_expands_all_entries() {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            compact_tools: true,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    let child = GroupToolEntry {
+        id: String::new(),
+        name: Arc::from("read"),
+        summary: "src/main.rs".into(),
+        raw_input: None,
+        children: Vec::new(),
+        status: ToolStatus::Success,
+        receiving_args: false,
+        started_at: None,
+        duration: None,
+        detail: None,
+    };
+    let entries: Vec<GroupEntry> = (0..15)
+        .map(|i| {
+            let mut c = child.clone();
+            c.summary = format!("file_{i}.rs");
+            GroupEntry::Tool(Box::new(c))
+        })
+        .collect();
+    let group = ToolGroupRole {
+        id: "group-1".into(),
+        sealed: true,
+        entries,
+        started_at: None,
+        duration: None,
+        waiting_since: None,
+        expanded: false,
+    };
+    panel.push(DisplayMessage::new(
+        DisplayRole::ToolGroup(Box::new(group)),
+        String::new(),
+    ));
+    render(&mut panel, VIEW_WIDTH, 30);
+
+    // Row 0 is header. Row 1 is "... (5 hidden)".
+    // Clicking row 1 should expand the group.
+    assert_eq!(
+        panel.handle_click(1, 0, Rect::new(0, 0, VIEW_WIDTH, 30)),
+        ClickOutcome::Handled
+    );
+
+    // After expanding, row 1 is entry 0 (file_0.rs), row 2 is entry 1 (file_1.rs).
+    let target0 = panel
+        .compact_target_at(1, Rect::new(0, 0, VIEW_WIDTH, 30))
+        .expect("entry 0");
+    assert_eq!(target0.entry, 0);
+    assert_eq!(target0.child, None);
+
+    let target14 = panel
+        .compact_target_at(15, Rect::new(0, 0, VIEW_WIDTH, 30))
+        .expect("entry 14");
+    assert_eq!(target14.entry, 14);
+    assert_eq!(target14.child, None);
 }
 
 fn notice_panel(detail: Option<&str>) -> MessagesPanel {

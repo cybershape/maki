@@ -122,6 +122,7 @@ pub(crate) struct ModalScroll {
     max_offset: u16,
     viewport_h: u16,
     auto_scroll: bool,
+    top_pinned: bool,
 }
 
 impl ModalScroll {
@@ -131,20 +132,26 @@ impl ModalScroll {
             max_offset: 0,
             viewport_h: 0,
             auto_scroll: true,
+            top_pinned: false,
         }
     }
 
     pub fn new_top() -> Self {
         Self {
             auto_scroll: false,
+            top_pinned: true,
             ..Self::new()
         }
     }
 
     pub fn reset(&mut self) {
-        let auto_scroll = self.auto_scroll;
-        *self = Self::new();
-        self.auto_scroll = auto_scroll;
+        if self.top_pinned {
+            *self = Self::new_top();
+        } else {
+            let auto_scroll = self.auto_scroll;
+            *self = Self::new();
+            self.auto_scroll = auto_scroll;
+        }
     }
 
     pub fn offset(&self) -> u16 {
@@ -154,7 +161,9 @@ impl ModalScroll {
     pub fn update_dimensions(&mut self, total: u16, viewport_h: u16) {
         self.viewport_h = viewport_h;
         self.max_offset = total.saturating_sub(viewport_h);
-        if self.auto_scroll {
+        if self.top_pinned {
+            self.clamp();
+        } else if self.auto_scroll {
             self.offset = self.max_offset;
         } else {
             self.clamp();
@@ -167,7 +176,9 @@ impl ModalScroll {
     pub fn scroll(&mut self, delta: i32) {
         self.offset = apply_scroll_delta(self.offset, delta);
         self.clamp();
-        self.auto_scroll = self.offset >= self.max_offset;
+        if !self.top_pinned {
+            self.auto_scroll = self.offset >= self.max_offset;
+        }
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> bool {
@@ -567,6 +578,7 @@ pub struct ToolGroupRole {
     pub started_at: Option<Instant>,
     pub duration: Option<Duration>,
     pub waiting_since: Option<Instant>,
+    pub expanded: bool,
 }
 
 impl ToolGroupRole {

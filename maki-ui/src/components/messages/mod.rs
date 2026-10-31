@@ -312,6 +312,7 @@ impl MessagesPanel {
             started_at: Some(Instant::now()),
             duration: None,
             waiting_since: Some(Instant::now()),
+            expanded: false,
         };
         self.messages.push(DisplayMessage::new(
             DisplayRole::ToolGroup(Box::new(group)),
@@ -379,6 +380,7 @@ impl MessagesPanel {
                     started_at: Some(Instant::now()),
                     duration: None,
                     waiting_since: None,
+                    expanded: false,
                 };
                 self.messages.push(DisplayMessage::new(
                     DisplayRole::ToolGroup(Box::new(group)),
@@ -469,6 +471,7 @@ impl MessagesPanel {
                 started_at: Some(Instant::now()),
                 duration: None,
                 waiting_since: None,
+                expanded: false,
             };
             self.messages.push(DisplayMessage::new(
                 DisplayRole::ToolGroup(Box::new(group)),
@@ -590,6 +593,7 @@ impl MessagesPanel {
                 started_at: Some(Instant::now()),
                 duration: None,
                 waiting_since: None,
+                expanded: false,
             };
             self.messages.push(DisplayMessage::new(
                 DisplayRole::ToolGroup(Box::new(group)),
@@ -1265,11 +1269,56 @@ impl MessagesPanel {
 
     /// {col} is the screen column, for the right-aligned move hint.
     pub fn handle_click(&mut self, row: u16, col: u16, area: Rect) -> ClickOutcome {
+        if self.try_expand_compact_group(row, area) {
+            return ClickOutcome::Handled;
+        }
         if let Some(target) = self.compact_target_at(row, area) {
             return ClickOutcome::OpenCompact(target);
         }
         self.tool_target_at(row, col, area)
             .unwrap_or_else(|| self.toggle_click(row, area))
+    }
+
+    /// Expands hidden rows in a compact tool group if the clicked line is the hidden count notice.
+    pub fn try_expand_compact_group(&mut self, row: u16, area: Rect) -> bool {
+        if !self.compact_tools || area.height == 0 {
+            return false;
+        }
+        let pos = self
+            .layout()
+            .advance(self.scroll, u32::from(row.saturating_sub(area.y)));
+        if pos.seg >= self.live_start {
+            return false;
+        }
+        let Some(seg) = self.cache.get(pos.seg) else {
+            return false;
+        };
+        let Some(group_id) = seg.tool_id.as_deref() else {
+            return false;
+        };
+        let Some(line) = seg.source_line_at(pos.row, self.viewport_width) else {
+            return false;
+        };
+        if line != 1 {
+            return false;
+        }
+        let Some(msg) = self
+            .messages
+            .iter_mut()
+            .rfind(|m| matches!(&m.role, DisplayRole::ToolGroup(g) if g.id == group_id))
+        else {
+            return false;
+        };
+        let DisplayRole::ToolGroup(group) = &mut msg.role else {
+            return false;
+        };
+        if group.expanded || group.entries.len() <= tool_group::MAX_COMPACT_ENTRIES {
+            return false;
+        }
+        group.expanded = true;
+        let group_id = group_id.to_owned();
+        self.rebuild_tool_group_segment(&group_id);
+        true
     }
 
     /// The compact row under a click. The title row is the group itself and
@@ -1297,10 +1346,14 @@ impl MessagesPanel {
         if line == 0 {
             return None;
         }
-        let hidden = group
-            .entries
-            .len()
-            .saturating_sub(tool_group::MAX_COMPACT_ENTRIES);
+        let hidden = if group.expanded {
+            0
+        } else {
+            group
+                .entries
+                .len()
+                .saturating_sub(tool_group::MAX_COMPACT_ENTRIES)
+        };
         let mut cursor = 1 + usize::from(hidden > 0);
         for (entry_idx, entry) in group.entries.iter().enumerate().skip(hidden) {
             let rows = match entry {
@@ -1353,6 +1406,9 @@ impl MessagesPanel {
     }
 
     fn toggle_at(&mut self, row: u16, area: Rect) -> bool {
+        if self.try_expand_compact_group(row, area) {
+            return true;
+        }
         if area.height == 0 {
             return false;
         }

@@ -101,7 +101,11 @@ impl App {
     /// Copies the clicked row out of the transcript, so output landing later
     /// cannot move the text the reader is looking at.
     fn open_compact_detail(&mut self, target: crate::components::compact_detail::CompactTarget) {
-        use crate::components::{DisplayRole, GroupEntry};
+        use std::sync::Arc;
+        use maki_agent::ToolOutput;
+        use crate::components::compact_detail::Shown;
+        use crate::components::tool_group::extract_batch_child_output;
+        use crate::components::{CompactDetail, DisplayRole, GroupEntry};
 
         let Some(msg) = self.chats[self.active_chat].messages().iter().rfind(
             |m| matches!(&m.role, DisplayRole::ToolGroup(g) if g.id == target.group_id),
@@ -111,18 +115,53 @@ impl App {
         let DisplayRole::ToolGroup(group) = &msg.role else {
             return;
         };
-        match group.entries.get(target.entry) {
-            Some(GroupEntry::Tool(tool)) => {
-                let entry = target
-                    .child
-                    .and_then(|idx| tool.children.get(idx))
-                    .unwrap_or(tool);
-                self.compact_detail.open_tool(entry.clone());
+
+        let mut items = Vec::new();
+        let mut selected_idx = 0;
+
+        for (e_idx, entry) in group.entries.iter().enumerate() {
+            match entry {
+                GroupEntry::Tool(tool) => {
+                    let tool_idx = items.len();
+                    if e_idx == target.entry && target.child.is_none() {
+                        selected_idx = tool_idx;
+                    }
+                    items.push(Shown::Tool(tool.clone()));
+
+                    for (c_idx, child) in tool.children.iter().enumerate() {
+                        let child_target_idx = items.len();
+                        if e_idx == target.entry && target.child == Some(c_idx) {
+                            selected_idx = child_target_idx;
+                        }
+                        let mut child_entry = child.clone();
+                        if child_entry.detail.is_none() && let Some(parent_detail) = &tool.detail {
+                            let child_output = parent_detail
+                                .output
+                                .as_ref()
+                                .and_then(|out| extract_batch_child_output(&out.as_display_text(), c_idx));
+                            if let Some(out_str) = child_output {
+                                child_entry.detail = Some(CompactDetail {
+                                    raw_input: child_entry.raw_input.clone(),
+                                    output: Some(Arc::new(ToolOutput::Plain(out_str.into()))),
+                                    ..CompactDetail::default()
+                                });
+                            }
+                        }
+                        items.push(Shown::Tool(Box::new(child_entry)));
+                    }
+                }
+                GroupEntry::Thinking(thinking) => {
+                    let thinking_idx = items.len();
+                    if e_idx == target.entry && target.child.is_none() {
+                        selected_idx = thinking_idx;
+                    }
+                    items.push(Shown::Thinking(thinking.clone()));
+                }
             }
-            Some(GroupEntry::Thinking(thinking)) if target.child.is_none() => {
-                self.compact_detail.open_thinking(thinking.clone());
-            }
-            _ => {}
+        }
+
+        if !items.is_empty() {
+            self.compact_detail.open_group(items, selected_idx);
         }
     }
 
