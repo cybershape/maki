@@ -143,6 +143,10 @@ Use for chained/dependent tool calls and filtering/processing results, e.g. filt
 - 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
 - NEVER use as a proxy or wrapper for a single tool call. If no code logic, chaining, or output filtering is needed, invoke the tool directly.
 - NOT a thinking scratchpad. Reason in your response text.
+- Monty sandbox limitations (avoid common failures):
+  * Generator expressions `(x for ...)` materialize as `list`, and `iter()` is unavailable: DO NOT use `next(x for ...)`; use a `for` loop or `[...][0]` instead.
+  * No `:=` (walrus), no `del` (use `d.pop(k, None)`), no `*args` unpacking in calls (`f(*args)`), no `match/case`, no decorators (`@...`).
+  * Builtins NOT implemented: `iter`, `callable`, `dir`, `globals`, `locals`, `eval`, `exec`.
 ]]
 
 local schema = {
