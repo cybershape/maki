@@ -361,6 +361,7 @@ fn default_tool_usage(prompt: PromptId, is_tool_enabled: &impl Fn(&str) -> bool)
             }
             lines.push("- Read files before editing them. Match surrounding context, conventions, and imports.".to_string());
             lines.push("- Prefer edits over full file writes.".to_string());
+            lines.push("- The `toolcall_reason` parameter is one short sentence explaining why you are calling this tool and what you expect. Do not mention file names or paths. It helps the user understand your rationale; providing it is strongly encouraged.".to_string());
             lines.join("\n")
         }
         PromptId::Research => {

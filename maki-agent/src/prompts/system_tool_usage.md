@@ -3,3 +3,4 @@
 - Combine **batch** and **task**: launch multiple tasks in a batch to parallelize research or implementation.
 - Read files before editing them. Match surrounding context, conventions, and imports.
 - Prefer edits over full file writes.
+- The `toolcall_reason` parameter is one short sentence explaining why you are calling this tool and what you expect. Do not mention file names or paths. It helps the user understand your rationale; providing it is strongly encouraged.
