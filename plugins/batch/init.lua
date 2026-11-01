@@ -25,7 +25,7 @@ local CANCELLED_ERROR = "cancelled"
 local DISCARDED_ERROR = string.format("maximum of %d tools per batch", MAX_BATCH_SIZE)
 local WAITING_FMT = "batch is waiting on %s"
 local NOTHING_RUNNING = "batch has no running tool left to move"
-local MOVED_HEADER = "Still running in the background (their results arrive when they finish):"
+local MOVED_HEADER = "Still running in the background:"
 local BACKGROUND_PARAM = "background"
 local FOREGROUND_NOTE = "Could not start in the background (%s). Ran in the foreground.\n\n"
 local MOVED_ITEM_FMT = "- %s"
@@ -783,9 +783,7 @@ end
 local function legacy_restore(children, output, tol)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, { max_lines = tol.other, keep = "head" })
-  local header = render_children(children)
-  append_separator(header)
-  view:set_header(header)
+  view:set_header(render_children(children))
   for _, line in ipairs(maki.split(output, "\n")) do
     view:append(BODY_INDENT .. line)
   end

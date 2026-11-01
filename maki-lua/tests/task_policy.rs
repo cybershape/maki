@@ -17,6 +17,7 @@ use maki_agent::{
     AgentEvent, AgentMode, BufferSnapshot, CancelToken, Envelope, SharedBuf, ToolDoneEvent,
     ToolOutput,
 };
+use maki_lua::test_support::runtime;
 use maki_lua::{MoveOutcome, PluginHost};
 use serde_json::{Value, json};
 
@@ -54,7 +55,7 @@ const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
 
 const FIRST_CALL_ID: &str = "toolu_first";
 const SECOND_CALL_ID: &str = "toolu_second";
-const MOVED_RECEIPT: &str = "Subagent parked moved to the background";
+const MOVED_RECEIPT: &str = "Subagent parked";
 const WAITING_FOR_SLOT: &str = "waiting for a free subagent slot";
 /// Mirrors the task plugin's `FOREGROUND_NOTE` wording.
 const FOREGROUND_NOTE_HEAD: &str = "Could not start in the background (";
@@ -391,7 +392,8 @@ fn exec_tool_with_ctx(
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
-    smol::block_on(inv.execute(ctx))
+    runtime()
+        .block_on(inv.execute(ctx))
         .output
         .map(|out| match out {
             ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
@@ -712,12 +714,14 @@ fn raising_prompt_does_not_leak_semaphore_permit() {
 }
 
 #[test]
-fn background_input_is_opt_in() {
+fn background_input_is_on_by_default_and_can_be_turned_off() {
     let advertised = |reg: &ToolRegistry| {
         reg.get(TASK_TOOL).unwrap().tool.schema()["properties"]["background"].is_object()
     };
-    assert!(!advertised(&load_task_host().0));
-    assert!(advertised(&load_background_host().0));
+    let mut off = serde_json::Map::new();
+    off.insert("allow_background".into(), json!(false));
+    assert!(advertised(&load_task_host().0));
+    assert!(!advertised(&load_task_host_with_opts(off).0));
 }
 
 #[test]

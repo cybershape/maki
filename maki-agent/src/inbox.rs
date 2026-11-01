@@ -1,20 +1,36 @@
-//! Messages a user queues for a subagent while it runs. The host pushes,
-//! the subagent's loop drains them between turns as one `<user-interrupt>`.
+//! Messages queued for a subagent while it runs, typed in its tab or sent by
+//! a plugin. The host pushes, the subagent's loop drains them between turns,
+//! each as its own message in one burst.
 
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};
+
+use event_listener::Event;
 
 use crate::{AgentInput, ExtractedCommand, InterruptSource};
 
 #[derive(Default)]
 pub struct SubagentInbox {
     items: Mutex<VecDeque<AgentInput>>,
+    pushed: Event,
 }
 
 impl SubagentInbox {
     pub fn push(&self, input: AgentInput) {
         self.lock().push_back(input);
+        self.pushed.notify(usize::MAX);
+    }
+
+    /// Resolves once something is queued, for a session idle between runs.
+    pub async fn wait_nonempty(&self) {
+        loop {
+            let listener = self.pushed.listen();
+            if !self.is_empty() {
+                return;
+            }
+            listener.await;
+        }
     }
 
     pub fn remove(&self, index: usize) -> Option<AgentInput> {

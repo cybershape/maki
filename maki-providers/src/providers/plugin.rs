@@ -13,6 +13,8 @@ use maki_storage::auth::{lock_credentials, plugin_auth_stamp};
 use maki_storage::id::SessionRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 use url::{Host, Url};
 
@@ -379,6 +381,11 @@ impl Target {
     }
 }
 
+/// Only the openai codecs thread a body hook through [`codec::build`].
+///
+/// An exhaustive match rather than a list of the ones that work, so a new
+/// codec breaks this line and someone has to answer for it. An option a codec
+/// cannot honour is a registration error, never a no-op.
 fn honours_build_body(target: Target) -> bool {
     match target {
         Target::Codec(_) => true,
@@ -393,6 +400,10 @@ fn honours_openai_wire(target: Target) -> bool {
     }
 }
 
+/// Google drops the system prefix and always has (see `super::google`), so a
+/// plugin that sets one against it is told instead of ignored. Asked of the
+/// spec behind the target, because `codec = "google"` and `base = "google"`
+/// reach the same constructor and must answer alike.
 fn honours_system_prefix(_target: Target) -> bool {
     true
 }
@@ -570,7 +581,7 @@ fn register_owned(
     reg: Registration,
     authority: DeclAuthority,
     owner: Option<Arc<str>>,
-    _takeovers: &[String],
+    takeovers: &[String],
 ) -> Result<(), RegisterError> {
     let Registration { decl, hooks } = reg;
     let slug = decl.slug.clone();
@@ -590,6 +601,13 @@ fn register_owned(
     };
     if reserved {
         return Err(RegisterError::ReservedSlug(slug));
+    }
+    // A granted takeover of a served name is logged.
+    if authority == DeclAuthority::ThirdParty && false {
+        if !takeovers.contains(&slug) {
+            return Err(RegisterError::UngrantedTakeover(slug));
+        }
+        warn!(slug, "third-party plugin replaces the models.dev provider");
     }
     // A `providers.toml` entry only defines a provider when it sets a
     // `protocol`, and only a third party loses the slug to it. Without one the
@@ -714,6 +732,10 @@ fn shared_auth(slug: &str, owner: Option<Arc<str>>) -> Arc<AuthState> {
         *state = Arc::new(AuthState::new());
     }
     Arc::clone(state)
+}
+
+pub fn clear_auth(slug: &str) {
+    AUTH.write().unwrap().remove(slug);
 }
 
 fn entries() -> Arc<Registry> {
@@ -929,14 +951,14 @@ impl AuthState {
         purpose: AuthPurpose,
     ) -> Result<Recovery, AgentError> {
         let owned = slug.to_owned();
-        let (_lock, stored) = smol::unblock(move || match StateDir::resolve() {
+        let (_lock, stored) = spawn_blocking(move || match StateDir::resolve() {
             Ok(dir) => (
                 Some(lock_credentials(&dir, &owned)),
                 plugin_auth_stamp(&dir, &owned),
             ),
             Err(_) => (None, None),
         })
-        .await;
+        .await?;
         let purpose = match purpose {
             AuthPurpose::Refresh
                 if self.gate.ran() && *self.store_seen.lock().unwrap() != stored =>
@@ -967,7 +989,7 @@ impl AuthState {
             .into_resolved(slug, &self.hosts())?;
         let owned = slug.to_owned();
         let stamp =
-            smol::unblock(move || plugin_auth_stamp(&StateDir::resolve().ok()?, &owned)).await;
+            spawn_blocking(move || plugin_auth_stamp(&StateDir::resolve().ok()?, &owned)).await?;
         let mut current = self.current.lock().unwrap();
         // A hook that omits base_url keeps the resolved one. Falling back to
         // the provider's default origin would silently repoint the token.
@@ -1022,8 +1044,8 @@ impl PluginEntry {
         };
         let slug = self.decl.slug.clone();
         // A reload re-reads what is stored, so it spends no token. It waits
-        // for neither the gate nor the cross-process lock, and it runs under
-        // `block_on` on the ui thread, where either wait would freeze the ui.
+        // for neither the gate nor the cross-process lock: it runs first on a
+        // respawned agent task, and either wait would hold the first request.
         if matches!(purpose, AuthPurpose::Reload) {
             self.auth.mint(&slug, hook.as_ref(), purpose).await?;
             return Ok(Recovery::Adopted);
@@ -1034,14 +1056,13 @@ impl PluginEntry {
         // hook still holds the token nor drop what the hook minted with it.
         let auth = Arc::clone(&self.auth);
         let (done, outcome) = flume::bounded(1);
-        smol::spawn(async move {
+        tokio::spawn(async move {
             let minted = auth
                 .gate
                 .single_flight(seen, auth.locked_mint(&slug, hook.as_ref(), purpose))
                 .await;
             let _ = done.send(minted);
-        })
-        .detach();
+        });
         outcome
             .recv_async()
             .await
@@ -1061,7 +1082,7 @@ impl PluginEntry {
 /// long after that refresh finished, and it must not refresh again.
 #[derive(Default)]
 struct RefreshGate {
-    lock: smol::lock::Mutex<()>,
+    lock: AsyncMutex<()>,
     /// Bumped by every hook run that went through the gate, so not by a
     /// reload. We count instead of comparing tokens because a refresh can hand
     /// back the very same bytes.
@@ -1110,7 +1131,6 @@ impl RefreshGate {
     }
 }
 
-#[allow(dead_code)]
 struct BodyAdapter(Arc<dyn Hook<BodyInput, Value>>);
 
 impl BodyHook for BodyAdapter {
@@ -1242,7 +1262,7 @@ impl Provider for PluginProvider {
                         }
                         forwarded
                     };
-                    let (result, forwarded) = futures_lite::future::zip(attempt, forward).await;
+                    let (result, forwarded) = tokio::join!(attempt, forward);
                     match result {
                         // The plugin mints credentials without the user, so a
                         // dead token costs a silent recovery instead of a
@@ -1470,7 +1490,9 @@ pub fn effective_authority(slug: &str) -> Option<String> {
     ))
 }
 
-/// What a codec declaration sends for `choice`.
+/// What a codec declaration sends for `choice`. One that names no
+/// `openai.thinking` dialect leaves the mode to the model's own fields, which
+/// send nothing for a mode they do not spell.
 fn declared_sends_thinking(_model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
     choice
 }
@@ -1578,9 +1600,9 @@ pub fn owns_slug(slug: &str) -> bool {
         .any(|slugs| slugs.contains(slug))
 }
 
-/// Blocks, so it belongs to the cli thread and never to the plugin host's: the
-/// hook it drives runs on the host, and waiting for it from there deadlocks.
-pub fn login(slug: &str) -> Result<(), AgentError> {
+/// The hook runs on the plugin host, so awaiting this from the host's own
+/// thread deadlocks: only the cli drives it.
+pub async fn login(slug: &str) -> Result<(), AgentError> {
     let entry = entry(slug).ok_or_else(|| unknown(slug))?;
     let hook = entry
         .hooks
@@ -1589,17 +1611,17 @@ pub fn login(slug: &str) -> Result<(), AgentError> {
         .ok_or_else(|| AgentError::Config {
             message: format!("provider '{slug}' does not support login (uses API key)"),
         })?;
-    smol::block_on(hook.call(()))
+    hook.call(()).await
 }
 
 /// Runs the `logout` hook, `false` when no registered provider defines one.
 /// Forgetting what maki stored never needs one, so the hook is only for what
 /// maki cannot do itself, like revoking a token upstream.
-pub fn logout(slug: &str) -> Result<bool, AgentError> {
+pub async fn logout(slug: &str) -> Result<bool, AgentError> {
     let Some(hook) = entry(slug).and_then(|entry| entry.hooks.logout.clone()) else {
         return Ok(false);
     };
-    smol::block_on(hook.call(()))?;
+    hook.call(()).await?;
     Ok(true)
 }
 
@@ -1608,7 +1630,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    use futures_lite::future::zip;
+    use futures::FutureExt;
     use maki_config::providers::base_url_env_var;
     use maki_storage::auth::{PluginAuthData, save_plugin_auth};
     use tempfile::TempDir;
@@ -1651,6 +1673,7 @@ mod tests {
     const ROW_CONTEXT: u32 = 48_000;
     const CAP_SLUG: &str = "cap-plugin";
     const UNDECLARED_BASE_URL: &str = "https://evil.test/v1";
+    /// A native built-in, which no declaration may take.
     const BUILTIN_SLUG: &str = "responses";
     const RELOAD_DROPS_STALE: &str = "a new load must not inherit the last load's entries";
     const RELOAD_KEEPS_SERVING: &str = "a load in progress must not unpublish what is serving";
@@ -1750,7 +1773,7 @@ mod tests {
         /// ahead of the hook, which is the caller's business and not the gate's.
         fn call(&self, purpose: AuthPurpose) -> BoxFuture<'_, Result<PluginAuth, AgentError>> {
             Box::pin(async move {
-                smol::future::yield_now().await;
+                tokio::task::yield_now().await;
                 let run = {
                     let mut purposes = self.purposes.lock().unwrap();
                     purposes.push(purpose);
@@ -1911,7 +1934,8 @@ mod tests {
     /// the gate trusts its counter and not a diff.
     #[test_case(true, FIRST_TOKEN, ROTATED_TOKEN ; "rotating_token")]
     #[test_case(false, CONSTANT_TOKEN, CONSTANT_TOKEN ; "unchanged_token")]
-    fn refresh_gate_single_flights_concurrent_callers(
+    #[tokio::test]
+    async fn refresh_gate_single_flights_concurrent_callers(
         rotating: bool,
         after_one: &str,
         after_two: &str,
@@ -1922,24 +1946,21 @@ mod tests {
             ..ProviderHooks::default()
         });
 
-        smol::block_on(async {
-            let (a, b) = zip(
-                entry.run_auth(AuthPurpose::Refresh),
-                entry.run_auth(AuthPurpose::Refresh),
-            )
-            .await;
-            a.unwrap();
-            b.unwrap();
+        let (a, b) = tokio::join!(
+            entry.run_auth(AuthPurpose::Refresh),
+            entry.run_auth(AuthPurpose::Refresh),
+        );
+        a.unwrap();
+        b.unwrap();
 
-            assert_eq!(hook.calls(), 1, "{ONE_HOOK_CALL}");
-            assert_eq!(token(&entry), after_one);
+        assert_eq!(hook.calls(), 1, "{ONE_HOOK_CALL}");
+        assert_eq!(token(&entry), after_one);
 
-            // A 401 on the credentials from before that refresh shows up late.
-            entry.run_auth_since(AuthPurpose::Refresh, 0).await.unwrap();
-            assert_eq!(hook.calls(), 1, "{STALE_401_REFRESHED}");
+        // A 401 on the credentials from before that refresh shows up late.
+        entry.run_auth_since(AuthPurpose::Refresh, 0).await.unwrap();
+        assert_eq!(hook.calls(), 1, "{STALE_401_REFRESHED}");
 
-            entry.run_auth(AuthPurpose::Refresh).await.unwrap();
-        });
+        entry.run_auth(AuthPurpose::Refresh).await.unwrap();
 
         assert_eq!(hook.calls(), 2, "{SINGLE_FLIGHT_RERUN}");
         assert_eq!(token(&entry), after_two);
@@ -1948,8 +1969,8 @@ mod tests {
     /// Another maki process rotated the store and so killed our token. The
     /// first refresh only reloads, to pick up the new one. Once we have seen
     /// the store, the next 401 is ours to refresh.
-    #[test]
-    fn a_refresh_after_a_foreign_rotation_reloads() {
+    #[tokio::test]
+    async fn a_refresh_after_a_foreign_rotation_reloads() {
         let _home = isolated_home();
         if let Ok(dir) = StateDir::resolve() {
             let _ = maki_storage::auth::delete_plugin_auth(&dir, "in-memory");
@@ -1960,13 +1981,11 @@ mod tests {
             ..ProviderHooks::default()
         });
 
-        smol::block_on(async {
-            entry.run_auth(AuthPurpose::Resolve).await.unwrap();
-            let dir = StateDir::resolve().unwrap();
-            save_plugin_auth(&dir, &entry.decl.slug, &PluginAuthData::default()).unwrap();
-            entry.run_auth(AuthPurpose::Refresh).await.unwrap();
-            entry.run_auth(AuthPurpose::Refresh).await.unwrap();
-        });
+        entry.run_auth(AuthPurpose::Resolve).await.unwrap();
+        let dir = StateDir::resolve().unwrap();
+        save_plugin_auth(&dir, &entry.decl.slug, &PluginAuthData::default()).unwrap();
+        entry.run_auth(AuthPurpose::Refresh).await.unwrap();
+        entry.run_auth(AuthPurpose::Refresh).await.unwrap();
 
         assert_eq!(
             hook.purposes(),
@@ -1981,18 +2000,16 @@ mod tests {
 
     /// A respawn reloads before any request, and the plugin may only do some
     /// of its work on resolve.
-    #[test]
-    fn a_reload_before_the_first_request_still_resolves() {
+    #[tokio::test]
+    async fn a_reload_before_the_first_request_still_resolves() {
         let hook = Arc::new(CountingAuth::new(true));
         let entry = entry_with(ProviderHooks {
             auth: Some(hook.clone()),
             ..ProviderHooks::default()
         });
 
-        smol::block_on(async {
-            entry.run_auth(AuthPurpose::Reload).await.unwrap();
-            entry.ensure_auth().await.unwrap();
-        });
+        entry.run_auth(AuthPurpose::Reload).await.unwrap();
+        entry.ensure_auth().await.unwrap();
 
         assert_eq!(
             hook.purposes(),
@@ -2004,8 +2021,8 @@ mod tests {
     /// One package's token must not survive being replaced by another. The
     /// same owner keeps its gate across the reload, a different one starts a
     /// fresh cell, and returning to the first does not resurrect its token.
-    #[test]
-    fn owner_changes_do_not_reuse_another_packages_auth_gate() {
+    #[tokio::test]
+    async fn owner_changes_do_not_reuse_another_packages_auth_gate() {
         const SLUG: &str = "owner-auth-test";
         const FIRST_OWNER: &str = "first-owner";
         const NEXT_OWNER: &str = "next-owner";
@@ -2041,7 +2058,7 @@ mod tests {
             .unwrap();
             commit_load();
             let provider = create(SLUG, Timeouts::default()).unwrap();
-            smol::block_on(provider.list_models()).unwrap();
+            provider.list_models().await.unwrap();
         }
         assert_eq!(first.calls(), 1);
         assert_eq!(next.calls(), 1);
@@ -2057,8 +2074,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reload_keeps_the_auth_state() {
+    #[tokio::test]
+    async fn reload_keeps_the_auth_state() {
         const SLUG: &str = "reload-plugin";
         let hook = Arc::new(CountingAuth::new(true));
         let with_hook = || {
@@ -2076,15 +2093,12 @@ mod tests {
             Arc::ptr_eq(&before.auth, &after.auth),
             "the new entry picks up the credentials the old one was using"
         );
-        smol::block_on(async {
-            let (a, b) = zip(
-                before.run_auth(AuthPurpose::Refresh),
-                after.run_auth(AuthPurpose::Refresh),
-            )
-            .await;
-            a.unwrap();
-            b.unwrap();
-        });
+        let (a, b) = tokio::join!(
+            before.run_auth(AuthPurpose::Refresh),
+            after.run_auth(AuthPurpose::Refresh),
+        );
+        a.unwrap();
+        b.unwrap();
 
         assert_eq!(hook.calls(), 1, "{ONE_HOOK_CALL}");
     }
@@ -2318,8 +2332,8 @@ mod tests {
     /// A refresh spends a single-use token, so the caller going away (an Esc,
     /// a turn that timed out) must not abandon it halfway: the hook runs to
     /// the end, what it minted lands, and the gate stays shut until it has.
-    #[test]
-    fn a_refresh_outlives_the_caller_that_started_it() {
+    #[tokio::test]
+    async fn a_refresh_outlives_the_caller_that_started_it() {
         const MINT_DROPPED: &str = "what the abandoned refresh minted never landed";
         let (entered_tx, entered) = flume::bounded(1);
         let (release, released) = flume::bounded(1);
@@ -2333,14 +2347,11 @@ mod tests {
             ..ProviderHooks::default()
         });
 
-        smol::block_on(async {
-            let abandoned =
-                futures_lite::future::poll_once(entry.run_auth(AuthPurpose::Refresh)).await;
-            assert!(abandoned.is_none());
-            entered.recv_async().await.unwrap();
-            release.send(()).unwrap();
-            let _gate = entry.auth.gate.lock.lock().await;
-        });
+        let abandoned = entry.run_auth(AuthPurpose::Refresh).now_or_never();
+        assert!(abandoned.is_none());
+        entered.recv_async().await.unwrap();
+        release.send(()).unwrap();
+        let _gate = entry.auth.gate.lock.lock().await;
 
         assert_eq!(hook.calls.load(Ordering::Acquire), 1, "{ONE_HOOK_CALL}");
         assert_eq!(token(&entry), FIRST_TOKEN, "{MINT_DROPPED}");
@@ -2353,7 +2364,12 @@ mod tests {
     /// there instead of spending another.
     #[test_case("hookless-401-plugin", false, 1 ; "hookless_does_not_replay")]
     #[test_case("hooked-401-plugin", true, 2 ; "hooked_refreshes_once")]
-    fn a_401_is_replayed_only_on_fresh_credentials(slug: &str, hooked: bool, expected: usize) {
+    #[tokio::test]
+    async fn a_401_is_replayed_only_on_fresh_credentials(
+        slug: &str,
+        hooked: bool,
+        expected: usize,
+    ) {
         const KEY_ENV: &str = "MAKI_TEST_401_KEY";
         const KEY: &str = "sk-rejected";
         const PROMPT: &str = "read a.txt";
@@ -2381,15 +2397,17 @@ mod tests {
         let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
         let messages = [Message::user(PROMPT.to_owned())];
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(provider.stream_message(
-            &model,
-            &messages,
-            "",
-            &serde_json::json!([]),
-            &tx,
-            RequestOptions::default(),
-            None,
-        ));
+        let result = provider
+            .stream_message(
+                &model,
+                &messages,
+                "",
+                &serde_json::json!([]),
+                &tx,
+                RequestOptions::default(),
+                None,
+            )
+            .await;
 
         assert!(
             result.as_ref().err().is_some_and(AgentError::is_auth_error),
@@ -2401,7 +2419,8 @@ mod tests {
     /// Anthropic and Google know their vendor's host, so before they took the
     /// declared origin a key meant for a gateway went to the vendor instead.
     #[test_case(Protocol::OpenaiResponses, "responses-origin-plugin" ; "responses")]
-    fn every_codec_posts_to_the_declared_origin(protocol: Protocol, slug: &str) {
+    #[tokio::test]
+    async fn every_codec_posts_to_the_declared_origin(protocol: Protocol, slug: &str) {
         const ENV_VAR: &str = "MAKI_TEST_CODEC_ORIGIN_KEY";
         const KEY: &str = "sk-gateway";
         const PROMPT: &str = "hi";
@@ -2425,15 +2444,17 @@ mod tests {
         let provider = create(slug, Timeouts::default()).unwrap();
         let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
         let (tx, _rx) = flume::unbounded();
-        let _ = smol::block_on(provider.stream_message(
-            &model,
-            &[Message::user(PROMPT.to_owned())],
-            "",
-            &serde_json::json!([]),
-            &tx,
-            RequestOptions::default(),
-            None,
-        ));
+        let _ = provider
+            .stream_message(
+                &model,
+                &[Message::user(PROMPT.to_owned())],
+                "",
+                &serde_json::json!([]),
+                &tx,
+                RequestOptions::default(),
+                None,
+            )
+            .await;
 
         assert_eq!(requests.lock().unwrap().len(), 1, "{MISSED_ORIGIN}");
     }
@@ -2518,7 +2539,7 @@ mod tests {
             (
                 row.accepts_arbitrary_models,
                 row.fallback_max_output,
-                row.fallback_context_window
+                row.fallback_context_window,
             ),
             expected
         );
@@ -2626,9 +2647,6 @@ mod tests {
         assert!(serde_json::from_value::<ProviderDecl>(authored).is_err());
     }
 
-    /// A dialect is named, not spelled out: it resolves by name, an unknown
-    /// name says which names there are, and a decl dumps the name it came
-    /// from rather than storing it twice.
     fn bad_slug(reg: &mut Registration) {
         reg.decl.slug = "has.dot".to_string();
     }
@@ -2731,6 +2749,7 @@ mod tests {
         register_loaded_as(registration(SLUG), DeclAuthority::Config, &[]).expect(REGISTERED);
         assert!(is_registered(SLUG), "{REGISTERED}");
     }
+
     const UPSTREAM_SAID_NO: &str = "upstream said no";
     /// A status maki never retries, so a mapping that changes nothing is
     /// visible in `retry_kind` as well as in the status.
@@ -2745,11 +2764,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn map_error_absent_leaves_the_error_untouched() {
+    #[tokio::test]
+    async fn map_error_absent_leaves_the_error_untouched() {
         let provider = provider_with(ProviderHooks::default());
-        let error =
-            smol::block_on(provider.mapped::<()>(Err(api_error(NOT_RETRYABLE, None)))).unwrap_err();
+        let error = provider
+            .mapped::<()>(Err(api_error(NOT_RETRYABLE, None)))
+            .await
+            .unwrap_err();
         assert!(matches!(
             error,
             AgentError::Api {
@@ -2762,8 +2783,8 @@ mod tests {
 
     /// The hook restates status and message. Retryability and `Retry-After`
     /// stay maki's to decide.
-    #[test]
-    fn map_error_remaps_the_status_only() {
+    #[tokio::test]
+    async fn map_error_remaps_the_status_only() {
         const RETRY_AFTER: Duration = Duration::from_secs(7);
         const REMAPPED: &str = "slow down";
         let provider = provider_with(ProviderHooks {
@@ -2774,9 +2795,10 @@ mod tests {
             ..ProviderHooks::default()
         });
 
-        let error =
-            smol::block_on(provider.mapped::<()>(Err(api_error(NOT_RETRYABLE, Some(RETRY_AFTER)))))
-                .unwrap_err();
+        let error = provider
+            .mapped::<()>(Err(api_error(NOT_RETRYABLE, Some(RETRY_AFTER))))
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(&error, AgentError::Api { status: RATE_LIMITED, message, .. } if message == REMAPPED)
@@ -2851,7 +2873,8 @@ mod tests {
     #[test_case(false, true, None ; "an_unminted_slug_takes_the_fresh_declaration")]
     #[test_case(true, true, Some(OTHER_BASE_URL) ; "a_leased_origin_survives_the_reload")]
     #[test_case(true, false, None ; "narrowing_the_hosts_drops_an_origin_they_no_longer_cover")]
-    fn a_reload_re_reads_the_declaration(
+    #[tokio::test]
+    async fn a_reload_re_reads_the_declaration(
         minted: bool,
         still_covered: bool,
         expected: Option<&str>,
@@ -2871,7 +2894,7 @@ mod tests {
         }
         register_loaded(first).unwrap();
         if minted {
-            smol::block_on(entry(SLUG).unwrap().ensure_auth()).unwrap();
+            entry(SLUG).unwrap().ensure_auth().await.unwrap();
             assert_eq!(
                 base_url(SLUG).as_deref(),
                 Some(OTHER_BASE_URL),

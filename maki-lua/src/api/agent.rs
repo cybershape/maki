@@ -41,7 +41,8 @@ use mlua::{
     Value as LuaValue,
 };
 use serde_json::Value as JsonValue;
-use smol::lock::Mutex as AsyncMutex;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::spawn_blocking;
 use tracing::info;
 
 use crate::api::session::{not_live, required_session};
@@ -70,6 +71,7 @@ const IDLE_STATUS: &str = "idle";
 const TASK_SCOPE: &str = "task";
 const SESSION_SCOPE: &str = "session";
 const NO_REGISTRY_ERR: &str = "tool registry not available";
+const TOOLS_ARRAY_ERR: &str = "tools must be an array";
 const MCP_REACH_ERR: &str =
     "mcp = true reaches whatever its servers do, so a session of your own takes every permission";
 const TASK_REQUIRED_ERR: &str = "maki.agent.session({ session = id }) and its prompts must run \
@@ -107,6 +109,19 @@ fn model_to_lua_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
 fn dispatch_ctx<'a>(ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, String> {
     ctx.agent()
         .ok_or_else(|| ctx.cap_err(&format!("maki.agent.{method}")))
+}
+
+/// What the config and the model take away from `base`, the same for a
+/// subagent's tools as for the hints in its prompt.
+fn config_filter(base: ToolFilter, agent: &AgentContext, model: &Model) -> ToolFilter {
+    let disabled: Vec<&str> = agent
+        .config
+        .disabled_tools
+        .iter()
+        .map(String::as_str)
+        .collect();
+    base.excluding(&disabled)
+        .excluding(maki_agent::tools::capability_exclusions(model))
 }
 
 fn required_opts(opts: Option<Table>) -> LuaResult<Table> {
@@ -518,26 +533,44 @@ async fn resolve_model(
 ///     `{{instructions}}` marker.
 ///     `true` loads project instruction files.
 ///     `false` or nil omits them.
+///   `tools` (table[]?) - the definitions the session will get, as returned
+///     by `maki.agent.tools`. A plugin's hints are dropped when none of its
+///     tools are in it. Without it, the hints follow the config.
 /// @return (string?, string?) The assembled prompt string, or `(nil, err)` on failure.
 /// @example
 /// local prompt, err = maki.agent.system_prompt(ctx, {
 ///   prompt_id = "research",
 ///   instructions = true,
+///   tools = tool_defs,
 /// })
 /// if err then error(err) end
 #[lua_fn]
 async fn system_prompt(
-    _lua: Lua,
+    lua: Lua,
     ctx: mlua::UserDataRef<LuaCtx>,
     opts: Table,
 ) -> LuaResult<Pair<String>> {
-    let (slots, instructions_config, disabled_tools, tool_filter) = {
+    let (slots, instructions_config, disabled_tools, tool_filter, filter) = {
         let agent_ctx = try_pair!(dispatch_ctx(&ctx, "system_prompt"));
+        let slots = Arc::clone(&agent_ctx.prompt_slots);
+        let instructions_config = agent_ctx.config.instructions.clone();
+        let disabled_tools = agent_ctx.config.disabled_tools.clone();
+        let tool_filter = Arc::clone(&agent_ctx.tool_filter);
+        let filter = match opts.opt::<LuaValue>("tools")? {
+            Some(tools) => match lua_to_json(&lua, &tools)? {
+                defs @ JsonValue::Array(_) => Arc::clone(
+                    RequestTools::assembled(defs, &agent_ctx.config, &agent_ctx.model).filter(),
+                ),
+                _ => return Err(mlua::Error::runtime(TOOLS_ARRAY_ERR)),
+            },
+            None => Arc::new(config_filter(ToolFilter::All, agent_ctx, &agent_ctx.model)),
+        };
         (
-            Arc::clone(&agent_ctx.prompt_slots),
-            agent_ctx.config.instructions.clone(),
-            agent_ctx.config.disabled_tools.clone(),
-            Arc::clone(&agent_ctx.tool_filter),
+            slots,
+            instructions_config,
+            disabled_tools,
+            tool_filter,
+            filter,
         )
     };
     // Nothing may hold the ctx borrow across the wait: a cancel hook firing
@@ -556,16 +589,23 @@ async fn system_prompt(
     let instructions = match instructions_val {
         LuaValue::Boolean(true) => {
             let cwd = vars.apply("{cwd}").into_owned();
-            smol::unblock(move || {
+            spawn_blocking(move || {
                 maki_agent::agent::load_instruction_text(&cwd, &instructions_config)
             })
             .await
+            .map_err(mlua::Error::external)?
         }
         LuaValue::Boolean(false) | LuaValue::Nil => String::new(),
         LuaValue::String(s) => s.to_str()?.to_owned(),
         _ => return Err(mlua::Error::runtime("instructions must be bool or string")),
     };
 
+    let registry = try_pair!(
+        lua.app_data_ref::<Arc<ToolRegistry>>()
+            .map(|registry| Arc::clone(&registry))
+            .ok_or(NO_REGISTRY_ERR)
+    );
+    let slots = slots.for_tools(&registry, &filter);
     let is_enabled = |name: &str| {
         if prompt_id != maki_agent::prompt::PromptId::System && name == "task" {
             return false;
@@ -641,16 +681,8 @@ async fn tools(
         (_, Some(e)) => ToolFilter::AllExcept(e),
         _ => ToolFilter::All,
     };
-    let disabled: Vec<&str> = agent
-        .config
-        .disabled_tools
-        .iter()
-        .map(String::as_str)
-        .collect();
     let has_mcp = mcp_enabled && agent.mcp.is_some();
-    let filter = base
-        .excluding(&disabled)
-        .excluding(maki_agent::tools::capability_exclusions(model));
+    let filter = config_filter(base, &agent, model);
     let filter = if !has_mcp {
         filter.excluding(&["library_help"])
     } else {
@@ -1024,7 +1056,7 @@ async fn session(
     let mut tools_json = match tools_val {
         Some(val) => match lua_to_json(&lua, &val)? {
             JsonValue::Array(defs) => defs,
-            _ => return Err(mlua::Error::runtime("tools must be an array")),
+            _ => return Err(mlua::Error::runtime(TOOLS_ARRAY_ERR)),
         },
         None => vec![],
     };
@@ -1147,14 +1179,13 @@ async fn session(
     {
         let _ = sink.send(ToolLive::Task(ui_id.clone()));
     }
-    smol::spawn(relay_session_events(
+    tokio::spawn(relay_session_events(
         sub_events,
         upstream.clone(),
         Arc::clone(&subagent_info),
         done_tx,
         agent_ctx.live_sink.clone(),
-    ))
-    .detach();
+    ));
 
     // The session owns its trigger and the map only a handle: the run reaches
     // an unmoved session through the call's token anyway, and draining the
@@ -1737,14 +1768,26 @@ fn cut_short_err(result: &Result<DoneReason, AgentError>, stopped_by_user: bool)
 }
 
 /// The notices that wake the session's next turn, or `None` once none of its
-/// moved calls is still out and nothing they reported is left unread. `Err`
+/// moved calls is still out and nothing they reported is left unread. A sent
+/// message wakes it with no notices while a moved call is still out. `Err`
 /// when the session or the caller is cancelled first.
 async fn next_wake(
     mailbox: &SessionMailbox,
+    inbox: &SubagentInbox,
     session: &CancelToken,
     caller: Option<&CancelToken>,
 ) -> Result<Option<Vec<Message>>, String> {
-    let wake = session.race(mailbox.next_wake_before_answer());
+    let sent = async {
+        inbox.wait_nonempty().await;
+        Some(Vec::new())
+    };
+    let wake = session.race(async {
+        tokio::select! {
+            biased;
+            wake = mailbox.next_wake_before_answer() => wake,
+            wake = sent => wake,
+        }
+    });
     match caller {
         Some(caller) => caller.race(wake).await?,
         None => wake.await,
@@ -1827,11 +1870,10 @@ impl SessionCancellation {
     fn end_mailbox_on_cancel(&self, token: CancelToken) {
         let registry = self.registry.clone();
         let mailbox = self.mailbox.clone();
-        smol::spawn(async move {
+        tokio::spawn(async move {
             token.cancelled().await;
             registry.end_mailbox(&mailbox);
-        })
-        .detach();
+        });
     }
 }
 
@@ -1845,12 +1887,12 @@ impl Drop for LuaSession {
     fn drop(&mut self) {
         self.cancellation.cancel();
         match self.inner.try_lock() {
-            Some(mut s) => s.close(),
+            Ok(mut s) => s.close(),
             // Prompt still in flight: close asynchronously so history
             // and cancel entry are never silently leaked.
-            None => {
+            Err(_) => {
                 let inner = Arc::clone(&self.inner);
-                smol::spawn(async move { inner.lock().await.close() }).detach();
+                tokio::spawn(async move { inner.lock().await.close() });
             }
         }
     }
@@ -2040,7 +2082,14 @@ async fn prompt(
             break Some(err);
         }
         let caller_cancel = watch.as_ref().map(|(caller_cancel, _)| caller_cancel);
-        match next_wake(&s.cancellation.mailbox, &s.child_cancel, caller_cancel).await {
+        match next_wake(
+            &s.cancellation.mailbox,
+            &inbox,
+            &s.child_cancel,
+            caller_cancel,
+        )
+        .await
+        {
             Ok(Some(notices)) => {
                 if let Some((_, settle)) = &mut watch {
                     settle.outcome = Some(cancelled_run());
@@ -2111,11 +2160,11 @@ async fn prompt(
     Ok((Some(tbl), None))
 }
 
-/// Hand the subagent a message without waiting, the way a user typing in its
-/// tab does. A running `:prompt()` picks it up at its next turn boundary, once
-/// the current reply and its tool calls finish, and the model reads it as a
-/// user interrupt. The tab draws it when it lands. Messages sent in a burst
-/// land together.
+/// Hand the subagent a message without waiting, delivered the same way as a
+/// message typed in its tab. A running `:prompt()` picks it up at its next turn boundary, once
+/// the current reply and its tool calls finish, and the model reads it as an
+/// interrupt from its parent, not the user. The tab draws it when it lands.
+/// Messages sent in a burst land together.
 ///
 /// With no prompt running, or one already past its last turn, the message
 /// waits. The next `:prompt()` sends it in the same request as its own
@@ -2136,8 +2185,8 @@ fn send(_lua: &Lua, this: &LuaSession, message: String) -> LuaResult<Pair<bool>>
     // holds it until the prompt unwinds. Without the fallback its message
     // would queue for a run that never reads it.
     let refusal = match this.inner.try_lock() {
-        Some(s) => s.refusal(),
-        None => this.cancellation.refusal(),
+        Ok(s) => s.refusal(),
+        Err(_) => this.cancellation.refusal(),
     };
     if let Some(refusal) = refusal {
         return Ok(err_pair(refusal));
@@ -2208,9 +2257,10 @@ fn call_local_tool(
 #[cfg(test)]
 mod tests {
     use flume::Sender;
-    use futures_lite::future::poll_once;
-    use maki_agent::prompt::{PromptId, ResolvedPrompts};
-    use maki_agent::tools::test_support::{stub_ctx_with, stub_seed};
+    use futures::FutureExt;
+    use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
+    use maki_agent::tools::test_support::{mock_tool, stub_ctx_with, stub_seed};
+    use maki_agent::tools::{ToolAudience, ToolSource};
     use maki_agent::{BackgroundNotice, DoneReason, SessionMailbox, TaskEnd, TurnCompleteEvent};
     use maki_config::ToolKey;
     use maki_providers::model::ThinkingSupport;
@@ -2224,6 +2274,7 @@ mod tests {
     use mlua::AnyUserData;
     use serde_json::json;
     use test_case::test_case;
+    use tokio::time::timeout;
 
     use super::*;
     use crate::runtime::{TaskCell, TaskScope};
@@ -2243,6 +2294,10 @@ mod tests {
     const WOKEN_REPLY: &str = "The build passed.";
     const MOVED_CALL_ID: &str = "toolu_moved";
     const NOTICE_TEXT: &str = "Background bash toolu_moved (cargo build) finished:\n\nok";
+    const SENT_MESSAGE: &str = "Wrap up now.";
+    const HINTED_TOOL: &str = "hinted_tool";
+    const OTHER_TOOL: &str = "other_tool";
+    const TOOL_HINT: &str = "Call hinted_tool first.";
 
     #[test_case(ThinkingConfig::Effort(Effort::Low), json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Low) ; "toggle_keeps_ancestor_effort_ceiling")]
     #[test_case(ThinkingConfig::Adaptive, json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Max) ; "explicit_adaptive_stays_unbounded")]
@@ -2326,49 +2381,48 @@ mod tests {
 
     #[test_case(false ; "close")]
     #[test_case(true ; "dispose")]
-    fn closing_a_session_leaves_its_siblings_running(dispose: bool) {
+    #[tokio::test]
+    async fn closing_a_session_leaves_its_siblings_running(dispose: bool) {
         let lua = Lua::new();
         let ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
-        smol::block_on(async {
-            let first = native_session(&lua, &ctx).await;
-            let sibling = native_session(&lua, &ctx).await;
-            if dispose {
-                drop(first.take::<LuaSession>().unwrap());
-            } else {
-                close(lua.clone(), first.borrow().unwrap()).await.unwrap();
-                close(lua.clone(), first.borrow().unwrap()).await.unwrap();
-            }
-            let replacement = native_session(&lua, &ctx).await;
-            if !dispose {
-                close(lua.clone(), first.borrow().unwrap()).await.unwrap();
-            }
-            for session in [sibling, replacement] {
-                assert!(
-                    !session
-                        .borrow::<LuaSession>()
-                        .unwrap()
-                        .inner
-                        .lock()
-                        .await
-                        .child_cancel
-                        .is_cancelled()
-                );
-                close(lua.clone(), session.borrow().unwrap()).await.unwrap();
-            }
-        });
+        let first = native_session(&lua, &ctx).await;
+        let sibling = native_session(&lua, &ctx).await;
+        if dispose {
+            drop(first.take::<LuaSession>().unwrap());
+        } else {
+            close(lua.clone(), first.borrow().unwrap()).await.unwrap();
+            close(lua.clone(), first.borrow().unwrap()).await.unwrap();
+        }
+        let replacement = native_session(&lua, &ctx).await;
+        if !dispose {
+            close(lua.clone(), first.borrow().unwrap()).await.unwrap();
+        }
+        for session in [sibling, replacement] {
+            assert!(
+                !session
+                    .borrow::<LuaSession>()
+                    .unwrap()
+                    .inner
+                    .lock()
+                    .await
+                    .child_cancel
+                    .is_cancelled()
+            );
+            close(lua.clone(), session.borrow().unwrap()).await.unwrap();
+        }
     }
 
     #[test_case(false ; "close_during_prompt")]
     #[test_case(true ; "dispose_during_prompt")]
-    fn session_close_does_not_wait_for_the_prompt_lock(dispose: bool) {
+    #[tokio::test]
+    async fn session_close_does_not_wait_for_the_prompt_lock(dispose: bool) {
         let lua = Lua::new();
         let (started_tx, started_rx) = flume::unbounded();
         let (event_tx, events) = flume::unbounded();
         let event_tx = EventSender::new(event_tx, RUN_ID);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(PARENT_ID));
         ctx.provider = Arc::new(PendingProvider(started_tx));
-        smol::block_on(futures_lite::future::or(
-            async {
+        timeout(SESSION_TIMEOUT, async {
                 let sess = native_session(&lua, &ctx).await;
                 let (result, ()) = futures::future::join(
                     prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into()),
@@ -2425,12 +2479,9 @@ mod tests {
                         .try_iter()
                         .any(|event| matches!(event.event, AgentEvent::SubagentHistory { .. }))
                 );
-            },
-            async {
-                smol::Timer::after(SESSION_TIMEOUT).await;
-                panic!("session close waited for the active prompt");
-            },
-        ));
+            })
+        .await
+        .expect("session close waited for the active prompt");
     }
 
     use crate::runtime::SpawnedTasks;
@@ -2475,9 +2526,55 @@ mod tests {
         }
     }
 
+    #[test_case(&[], None, true ; "tool_enabled")]
+    #[test_case(&[HINTED_TOOL], None, false ; "tool_disabled")]
+    #[test_case(&[], Some(&[HINTED_TOOL]), true ; "tool_sent")]
+    #[test_case(&[], Some(&[OTHER_TOOL]), false ; "tool_left_out_of_the_sent_array")]
+    #[tokio::test]
+    async fn subagent_prompt_drops_hints_of_tools_it_does_not_get(
+        disabled: &[&str],
+        sent: Option<&[&str]>,
+        hinted: bool,
+    ) {
+        let lua = Lua::new();
+        let registry = ToolRegistry::new();
+        let source = ToolSource::Lua {
+            plugin: PLUGIN.into(),
+        };
+        registry
+            .register(mock_tool(HINTED_TOOL, ToolAudience::all()), source)
+            .unwrap();
+        lua.set_app_data(Arc::new(registry));
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        ctx.config.disabled_tools = disabled.iter().map(|name| (*name).to_owned()).collect();
+        let mut prompts = ResolvedPrompts::default();
+        let entry = SlotEntry {
+            plugin: PLUGIN.into(),
+            content: TOOL_HINT.into(),
+        };
+        prompts.insert(PromptId::Research, Slot::ToolUsage, entry);
+        ctx.prompt_slots = Arc::new(prompts);
+
+        let ctx = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("prompt_id", "research").unwrap();
+        if let Some(names) = sent {
+            let defs: Vec<JsonValue> = names.iter().map(|name| json!({ "name": name })).collect();
+            opts.set("tools", json_to_lua(&lua, &json!(defs)).unwrap())
+                .unwrap();
+        }
+        let (system, error) = system_prompt(lua.clone(), ctx.borrow().unwrap(), opts)
+            .await
+            .unwrap();
+
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(system.unwrap().contains(TOOL_HINT), hinted);
+    }
+
     #[test_case("research", PromptId::Research ; "research_child")]
     #[test_case("general", PromptId::General ; "general_child")]
-    fn child_session_receives_the_parent_prompt_policy(name: &str, id: PromptId) {
+    #[tokio::test]
+    async fn child_session_receives_the_parent_prompt_policy(name: &str, id: PromptId) {
         let lua = Lua::new();
         lua.set_app_data(SpawnedTasks::default());
         lua.set_app_data(Arc::new(ToolRegistry::new()));
@@ -2487,34 +2584,32 @@ mod tests {
         let mut prompts = ResolvedPrompts::default();
         prompts.set_template(id, CHILD_SYSTEM.into());
         ctx.prompt_slots = Arc::new(prompts);
-        smol::block_on(async {
-            let ctx = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
-            let opts = lua.create_table().unwrap();
-            opts.set("prompt_id", name).unwrap();
-            opts.set("instructions", CHILD_INSTRUCTIONS).unwrap();
-            let (system, error) = system_prompt(lua.clone(), ctx.borrow().unwrap(), opts)
-                .await
-                .unwrap();
-            assert!(error.is_none(), "{error:?}");
-            let opts = lua.create_table().unwrap();
-            opts.set("system", system.unwrap()).unwrap();
-            let (sess, error) = session(
-                lua.clone(),
-                Arc::from("test"),
-                PluginPermissions::trusted(),
-                LuaEither::Left(ctx.borrow().unwrap()),
-                Some(opts),
-            )
+        let ctx = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("prompt_id", name).unwrap();
+        opts.set("instructions", CHILD_INSTRUCTIONS).unwrap();
+        let (system, error) = system_prompt(lua.clone(), ctx.borrow().unwrap(), opts)
             .await
             .unwrap();
-            assert!(error.is_none(), "{error:?}");
-            let sess = sess.unwrap();
-            let (_, error) = prompt(lua.clone(), sess.borrow().unwrap(), CHILD_REQUEST.into())
-                .await
-                .unwrap();
-            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
-            assert!(error.is_none(), "{error:?}");
-        });
+        assert!(error.is_none(), "{error:?}");
+        let opts = lua.create_table().unwrap();
+        opts.set("system", system.unwrap()).unwrap();
+        let (sess, error) = session(
+            lua.clone(),
+            Arc::from("test"),
+            PluginPermissions::trusted(),
+            LuaEither::Left(ctx.borrow().unwrap()),
+            Some(opts),
+        )
+        .await
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        let sess = sess.unwrap();
+        let (_, error) = prompt(lua.clone(), sess.borrow().unwrap(), CHILD_REQUEST.into())
+            .await
+            .unwrap();
+        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        assert!(error.is_none(), "{error:?}");
         assert_eq!(
             requests.recv().unwrap(),
             format!("You analyse evidence.\n{CHILD_INSTRUCTIONS}")
@@ -2522,7 +2617,7 @@ mod tests {
     }
 
     const NUDGE: &str = "new finding, hurry up";
-    const INTERRUPT_OPEN: &str = "<user-interrupt>";
+    const INTERRUPT_OPEN: &str = "<parent-interrupt>";
 
     /// Hands the texts of each request's closing user messages to the test,
     /// then holds the reply until the test lets it go.
@@ -2577,7 +2672,8 @@ mod tests {
     /// same event a message typed there would raise.
     #[test_case(false ; "before_prompt")]
     #[test_case(true ; "while_prompt_runs")]
-    fn send_reaches_the_child(mid_prompt: bool) {
+    #[tokio::test]
+    async fn send_reaches_the_child(mid_prompt: bool) {
         let lua = Lua::new();
         let (requests_tx, requests) = flume::unbounded();
         let (release, release_rx) = flume::unbounded();
@@ -2623,10 +2719,9 @@ mod tests {
                 assert_eq!(requests_seen, [[NUDGE, SESSION_PROMPT]]);
             }
         };
-        smol::block_on(futures_lite::future::or(run, async {
-            smol::Timer::after(SESSION_TIMEOUT).await;
-            panic!("the prompt never finished");
-        }));
+        timeout(SESSION_TIMEOUT, run)
+            .await
+            .expect("the prompt never finished");
         assert!(requests.is_empty());
         assert!(events.drain().any(|envelope| {
             matches!(&envelope.event, AgentEvent::QueueItemConsumed { text, .. } if text == NUDGE)
@@ -2663,8 +2758,8 @@ mod tests {
         assert!(wrong.contains("expected string"), "got: {wrong}");
     }
 
-    #[test]
-    fn ctx_less_session_needs_a_task_and_a_live_session() {
+    #[tokio::test]
+    async fn ctx_less_session_needs_a_task_and_a_live_session() {
         let lua = Lua::new();
         let agent =
             create_agent_table(&lua, Arc::from(PLUGIN), PluginPermissions::trusted()).unwrap();
@@ -2677,12 +2772,9 @@ mod tests {
         };
         let task = TaskScope::new(&lua, TaskCell::new(CancelToken::none(), None, None));
 
+        assert_eq!(open().await.unwrap().as_deref(), Some(TASK_REQUIRED_ERR));
         assert_eq!(
-            smol::block_on(open()).unwrap().as_deref(),
-            Some(TASK_REQUIRED_ERR)
-        );
-        assert_eq!(
-            smol::block_on(task.scope_future(open())).unwrap(),
+            task.scope_future(open()).await.unwrap(),
             Some(not_live(session))
         );
     }
@@ -2690,17 +2782,17 @@ mod tests {
     /// A prompt cut short leaves its run's `Done` unread. The next prompt must
     /// read past it and keep waiting for its own, even when it gets dropped
     /// halfway and asked again.
-    #[test]
-    fn next_prompt_waits_past_a_leftover_done() {
+    #[tokio::test]
+    async fn next_prompt_waits_past_a_leftover_done() {
         let (tx, rx) = flume::unbounded();
         let mut dones = RunDones::new(rx);
         dones.expect_one();
         tx.send(()).unwrap();
         dones.expect_one();
-        assert!(smol::block_on(poll_once(dones.caught_up())).is_none());
+        assert!(dones.caught_up().now_or_never().is_none());
 
         tx.send(()).unwrap();
-        assert_eq!(smol::block_on(dones.caught_up()), Ok(()));
+        assert_eq!(dones.caught_up().await, Ok(()));
         assert!(tx.is_empty());
     }
 
@@ -2850,7 +2942,8 @@ mod tests {
     #[test_case(|| AgentEvent::AuthRequired, String::new(), false ; "unwatched_auth")]
     #[test_case(permission_ask, unattended_permission(), true ; "watched_permission")]
     #[test_case(|| AgentEvent::AuthRequired, String::new(), true ; "watched_auth")]
-    fn relay_answers_an_ask_only_when_nobody_watches(
+    #[tokio::test]
+    async fn relay_answers_an_ask_only_when_nobody_watches(
         ask: fn() -> AgentEvent,
         unattended: String,
         watched: bool,
@@ -2875,13 +2968,7 @@ mod tests {
         guard.sender(RUN_ID).send(ask()).unwrap();
         drop(guard);
 
-        smol::block_on(relay_session_events(
-            sub_events,
-            upstream,
-            info,
-            flume::unbounded().0,
-            None,
-        ));
+        relay_session_events(sub_events, upstream, info, flume::unbounded().0, None).await;
 
         let (answers, shown) = if watched {
             (Vec::new(), event_names(&[ask(), AgentEvent::StreamClosed]))
@@ -2898,19 +2985,20 @@ mod tests {
     /// passing it on would end the *parent's* stream at the first subagent.
     /// The parent hears neither `Error` nor `Done`: both reach it through the
     /// tool result.
-    #[test]
-    fn relay_to_parent_reports_each_turn_and_keeps_run_ends_behind() {
+    #[tokio::test]
+    async fn relay_to_parent_reports_each_turn_and_keeps_run_ends_behind() {
         let (upstream, parent_rx) = parent_upstream();
         let (done_tx, done_rx) = flume::unbounded();
         let (live_tx, live_rx) = flume::unbounded();
 
-        smol::block_on(relay_session_events(
+        relay_session_events(
             relayed_run(),
             upstream,
             subagent_info(),
             done_tx,
             Some(live_tx),
-        ));
+        )
+        .await;
 
         let expected_live = [
             tokens(100, 20).format_sum_cost(Some(0.25)),
@@ -2973,19 +3061,20 @@ mod tests {
     /// the error, the run's `Done` (its task goes idle on it) and, once the
     /// guard drops, `StreamClosed` (its task is done). Every event names the
     /// owning plugin and chat session.
-    #[test]
-    fn relay_to_chat_forwards_run_ends_and_closes_the_task() {
+    #[tokio::test]
+    async fn relay_to_chat_forwards_run_ends_and_closes_the_task() {
         let session = MakiId::generate();
         let (done_tx, done_rx) = flume::unbounded();
         let (ui_tx, ui_rx) = flume::unbounded();
 
-        smol::block_on(relay_session_events(
+        relay_session_events(
             relayed_run(),
             chat_upstream(session, ui_tx),
             subagent_info(),
             done_tx,
             None,
-        ));
+        )
+        .await;
 
         assert_eq!(done_rx.try_recv(), Ok(()));
         assert_eq!(
@@ -3058,8 +3147,8 @@ mod tests {
     /// foreground. Everything after the move goes to the chat, in order, and
     /// the run's bill so far lands on the moved call's entry, whose id a
     /// top-level `task` shares.
-    #[test]
-    fn relay_follows_a_moved_call_to_its_chat_in_order() {
+    #[tokio::test]
+    async fn relay_follows_a_moved_call_to_its_chat_in_order() {
         let (chat, _mailbox, _seed) = live_chat();
         let (_run_trigger, run) = CancelToken::new();
         let call = Arc::new(CallScope::new(PARENT_ID.into(), &run));
@@ -3094,10 +3183,11 @@ mod tests {
             (before, trigger)
         };
 
-        let ((before, _trigger), ()) = smol::block_on(futures::future::join(
+        let ((before, _trigger), ()) = futures::future::join(
             moving,
             relay_session_events(sub_events, upstream, subagent_info(), done_tx, None),
-        ));
+        )
+        .await;
 
         assert!(matches!(before.event, AgentEvent::TurnComplete(_)));
         assert_eq!(before.run_id, RUN_ID);
@@ -3119,8 +3209,8 @@ mod tests {
     /// no `Done` comes. The tab must still hear the run ended, or its task
     /// stays working, and the relay must not count that as the run's `Done`.
     /// The error bills what the run spent before the cancel.
-    #[test]
-    fn dropped_background_prompt_still_ends_the_run_in_its_tab() {
+    #[tokio::test]
+    async fn dropped_background_prompt_still_ends_the_run_in_its_tab() {
         let (guard, sub_events) = event_stream();
         let background = Background {
             registry: BackgroundTasks::default(),
@@ -3136,13 +3226,14 @@ mod tests {
         let (done_tx, done_rx) = flume::unbounded();
         let (ui_tx, ui_rx) = flume::unbounded();
 
-        smol::block_on(relay_session_events(
+        relay_session_events(
             sub_events,
             chat_upstream(MakiId::generate(), ui_tx),
             subagent_info(),
             done_tx,
             None,
-        ));
+        )
+        .await;
 
         assert!(done_rx.is_empty());
         let events = ui_rx
@@ -3317,11 +3408,12 @@ mod tests {
     /// leave a session alone once its call moved.
     #[test_case(false ; "an_unmoved_session_ends_with_the_run")]
     #[test_case(true ; "a_moved_session_outlives_the_run")]
-    fn run_end_reaches_a_session_only_until_its_call_moves(moved: bool) {
+    #[tokio::test]
+    async fn run_end_reaches_a_session_only_until_its_call_moves(moved: bool) {
         let lua = Lua::new();
         let (run_trigger, run) = CancelToken::new();
         let (ctx, call) = call_ctx(&run, Some(CALL_ID));
-        let sess = smol::block_on(native_session(&lua, &ctx));
+        let sess = native_session(&lua, &ctx).await;
         let _call_trigger = moved.then(|| call.move_to(home(MakiId::generate(), CALL_ID)).unwrap());
 
         ctx.subagent_cancels.cancel_all();
@@ -3333,13 +3425,14 @@ mod tests {
     /// Esc on a subagent's row cancels its id, before or after it opened.
     #[test_case(true ; "cancelled_before_it_opens")]
     #[test_case(false ; "cancelled_while_open")]
-    fn cancelling_its_id_stops_a_session(before_open: bool) {
+    #[tokio::test]
+    async fn cancelling_its_id_stops_a_session(before_open: bool) {
         let lua = Lua::new();
         let ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
         if before_open {
             ctx.subagent_cancels.cancel(PARENT_ID.to_owned());
         }
-        let sess = smol::block_on(native_session(&lua, &ctx));
+        let sess = native_session(&lua, &ctx).await;
         if !before_open {
             ctx.subagent_cancels.cancel(PARENT_ID.to_owned());
         }
@@ -3348,7 +3441,8 @@ mod tests {
 
     #[test_case(false ; "a_watched_call")]
     #[test_case(true ; "work_already_in_the_background")]
-    fn a_session_honours_plan_mode_once_its_call_moves(inherited: bool) {
+    #[tokio::test]
+    async fn a_session_honours_plan_mode_once_its_call_moves(inherited: bool) {
         let lua = Lua::new();
         let (_run_trigger, run) = CancelToken::new();
         let (mut ctx, call) = call_ctx(&run, Some(CALL_ID));
@@ -3356,7 +3450,7 @@ mod tests {
         if inherited {
             ctx.background_for = BackgroundFor::Chat(owner);
         }
-        let sess = smol::block_on(native_session(&lua, &ctx));
+        let sess = native_session(&lua, &ctx).await;
         let blocked_by = || session_state(&sess, |state| state.params.background_for.chat());
         assert_eq!(blocked_by(), inherited.then_some(owner));
 
@@ -3368,14 +3462,14 @@ mod tests {
     /// Esc in the adopted tab of a subagent a moved `batch` runs.
     #[test_case(Opened::BeforeTheMove ; "opened_before_the_move")]
     #[test_case(Opened::AfterTheMove ; "opened_after_the_move")]
-    fn a_nested_session_under_a_moved_call_stops_by_its_own_id(opened: Opened) {
+    #[tokio::test]
+    async fn a_nested_session_under_a_moved_call_stops_by_its_own_id(opened: Opened) {
         let lua = Lua::new();
         let (chat, _mailbox, _seed) = live_chat();
         let (_run_trigger, run) = CancelToken::new();
         let (ctx, call) = call_ctx(&run, None);
         let registry = BackgroundTasks::of(&lua);
-        let (sess, _call_trigger) =
-            smol::block_on(open_under_moved_call(&lua, &ctx, &call, chat, opened));
+        let (sess, _call_trigger) = open_under_moved_call(&lua, &ctx, &call, chat, opened).await;
         let id = session_ui_id(&sess);
         let kinds = registry
             .list(chat)
@@ -3396,7 +3490,8 @@ mod tests {
     #[test_case(Some(CALL_ID), Opened::AfterTheMove, 1 ; "top_level_opened_after_the_move")]
     #[test_case(None, Opened::BeforeTheMove, 2 ; "nested_opened_before_the_move")]
     #[test_case(None, Opened::AfterTheMove, 2 ; "nested_opened_after_the_move")]
-    fn closing_an_adopted_session_leaves_the_call_entry(
+    #[tokio::test]
+    async fn closing_an_adopted_session_leaves_the_call_entry(
         tool_use_id: Option<&str>,
         opened: Opened,
         while_open: usize,
@@ -3407,12 +3502,9 @@ mod tests {
         let (ctx, call) = call_ctx(&run, tool_use_id);
         let registry = BackgroundTasks::of(&lua);
         registry.register(call_entry(chat, CALL_ID)).unwrap();
-        smol::block_on(async {
-            let (sess, _call_trigger) =
-                open_under_moved_call(&lua, &ctx, &call, chat, opened).await;
-            assert_eq!(registry.list(chat).len(), while_open);
-            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
-        });
+        let (sess, _call_trigger) = open_under_moved_call(&lua, &ctx, &call, chat, opened).await;
+        assert_eq!(registry.list(chat).len(), while_open);
+        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
         let kinds = registry
             .list(chat)
             .into_iter()
@@ -3431,12 +3523,13 @@ mod tests {
     /// never prompted has no chat yet and opens on its first event.
     #[test_case(true ; "one_that_already_ran")]
     #[test_case(false ; "one_not_prompted_yet")]
-    fn a_move_opens_the_tab_of_a_nested_session_that_ran(prompted: bool) {
+    #[tokio::test]
+    async fn a_move_opens_the_tab_of_a_nested_session_that_ran(prompted: bool) {
         let lua = Lua::new();
         let (chat, _mailbox, _seed) = live_chat();
         let (_run_trigger, run) = CancelToken::new();
         let (ctx, call) = call_ctx(&run, None);
-        let sess = smol::block_on(native_session(&lua, &ctx));
+        let sess = native_session(&lua, &ctx).await;
         if prompted {
             let info = subagent_info().get().cloned().unwrap();
             session_state(&sess, |state| state.subagent_info.set(info).unwrap());
@@ -3575,107 +3668,132 @@ mod tests {
     #[test_case(false, true ; "without_moved_calls_returns_after_its_run")]
     #[test_case(true, true ; "with_a_moved_call_returns_the_woken_turn")]
     #[test_case(true, false ; "with_a_stopped_call_returns_the_woken_turn")]
-    fn a_prompt_waits_for_the_calls_its_session_moved(moved: bool, wake: bool) {
+    #[tokio::test]
+    async fn a_prompt_waits_for_the_calls_its_session_moved(moved: bool, wake: bool) {
         let lua = Lua::new();
         let (ctx, requests) = scripted_ctx();
-        smol::block_on(async {
-            let sess = native_session(&lua, &ctx).await;
-            let mailbox = session_mailbox(&sess);
+        let sess = native_session(&lua, &ctx).await;
+        let mailbox = session_mailbox(&sess);
+        if moved {
+            mailbox.track(MOVED_CALL_ID);
+        }
+        let ((text, error), first) = futures::future::join(prompt_text(&lua, &sess), async {
+            let first = requests.recv_async().await.unwrap();
             if moved {
-                mailbox.track(MOVED_CALL_ID);
+                mailbox.settle(MOVED_CALL_ID, Some(moved_call_notice(wake)));
             }
-            let ((text, error), first) = futures::future::join(prompt_text(&lua, &sess), async {
-                let first = requests.recv_async().await.unwrap();
-                if moved {
-                    mailbox.settle(MOVED_CALL_ID, Some(moved_call_notice(wake)));
-                }
-                first
-            })
-            .await;
-            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+            first
+        })
+        .await;
+        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
 
-            assert!(error.is_none(), "{error:?}");
-            let later = requests.drain().collect::<Vec<_>>();
-            if !moved {
-                assert_eq!(text.as_deref(), Some(FIRST_REPLY));
-                assert!(later.is_empty());
-                return;
-            }
-            assert_eq!(text.as_deref(), Some(WOKEN_REPLY));
-            let [woken] = later.as_slice() else {
-                panic!("expected one woken request, got {}", later.len());
-            };
-            assert_append_only(&first, woken);
-            let appended = texts(&woken.messages[first.messages.len()..]);
-            assert_eq!(appended.first(), Some(&FIRST_REPLY));
-            assert!(
-                appended
-                    .last()
-                    .is_some_and(|text| text.contains(NOTICE_TEXT))
-            );
-            assert!(mailbox.unsettled().is_empty());
-        });
+        assert!(error.is_none(), "{error:?}");
+        let later = requests.drain().collect::<Vec<_>>();
+        if !moved {
+            assert_eq!(text.as_deref(), Some(FIRST_REPLY));
+            assert!(later.is_empty());
+            return;
+        }
+        assert_eq!(text.as_deref(), Some(WOKEN_REPLY));
+        let [woken] = later.as_slice() else {
+            panic!("expected one woken request, got {}", later.len());
+        };
+        assert_append_only(&first, woken);
+        let appended = texts(&woken.messages[first.messages.len()..]);
+        assert_eq!(appended.first(), Some(&FIRST_REPLY));
+        assert!(
+            appended
+                .last()
+                .is_some_and(|text| text.contains(NOTICE_TEXT))
+        );
+        assert!(mailbox.unsettled().is_empty());
+    }
+
+    /// A call moved to the background may never end, so a message sent while
+    /// the prompt waits on it has to wake the prompt by itself.
+    #[tokio::test]
+    async fn a_message_sent_while_waiting_for_moved_calls_wakes_the_prompt() {
+        let lua = Lua::new();
+        let (ctx, requests) = scripted_ctx();
+        let sess = native_session(&lua, &ctx).await;
+        let mailbox = session_mailbox(&sess);
+        mailbox.track(MOVED_CALL_ID);
+        let ((text, error), woken) = futures::future::join(prompt_text(&lua, &sess), async {
+            requests.recv_async().await.unwrap();
+            let session = sess.borrow::<LuaSession>().unwrap();
+            let (sent, _) = send(&lua, &session, SENT_MESSAGE.into()).unwrap();
+            assert_eq!(sent, Some(true));
+            let woken = requests.recv_async().await.unwrap();
+            mailbox.settle(MOVED_CALL_ID, None);
+            woken
+        })
+        .await;
+        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(text.as_deref(), Some(WOKEN_REPLY));
+        assert!(
+            texts(&woken.messages)
+                .iter()
+                .any(|text| text.contains(SENT_MESSAGE))
+        );
     }
 
     /// Its token fired with no prompt left to notice, so nothing would ever
     /// read what the call it moved reports.
     #[test_case(false ; "between_prompts")]
     #[test_case(true ; "after_its_prompt_was_dropped")]
-    fn a_fired_session_token_stops_its_moved_calls(prompted: bool) {
+    #[tokio::test]
+    async fn a_fired_session_token_stops_its_moved_calls(prompted: bool) {
         let lua = Lua::new();
         let (ctx, requests) = scripted_ctx();
         let (chat, _chat_mailbox, _seed) = live_chat();
-        smol::block_on(async {
-            let sess = native_session(&lua, &ctx).await;
-            let (work_trigger, work) = CancelToken::new();
-            BackgroundTasks::of(&lua)
-                .register(BackgroundTask {
-                    cancel: Fire::Owned(work_trigger),
-                    mailbox: Some(session_mailbox(&sess)),
-                    ..call_entry(chat, MOVED_CALL_ID)
-                })
-                .unwrap();
-            if prompted {
-                let prompt = pin!(prompt_text(&lua, &sess));
-                let first_request = pin!(requests.recv_async());
-                let _ = select(prompt, first_request).await;
-            }
+        let sess = native_session(&lua, &ctx).await;
+        let (work_trigger, work) = CancelToken::new();
+        BackgroundTasks::of(&lua)
+            .register(BackgroundTask {
+                cancel: Fire::Owned(work_trigger),
+                mailbox: Some(session_mailbox(&sess)),
+                ..call_entry(chat, MOVED_CALL_ID)
+            })
+            .unwrap();
+        if prompted {
+            let prompt = pin!(prompt_text(&lua, &sess));
+            let first_request = pin!(requests.recv_async());
+            let _ = select(prompt, first_request).await;
+        }
 
-            ctx.subagent_cancels.cancel(PARENT_ID.to_owned());
-            work.cancelled().await;
-            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
-        });
+        ctx.subagent_cancels.cancel(PARENT_ID.to_owned());
+        work.cancelled().await;
+        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
     }
 
-    #[test]
-    fn cancelling_a_session_ends_its_prompt_waiting_for_moved_calls() {
+    #[tokio::test]
+    async fn cancelling_a_session_ends_its_prompt_waiting_for_moved_calls() {
         let lua = Lua::new();
         let (ctx, requests) = scripted_ctx();
-        smol::block_on(async {
-            let sess = native_session(&lua, &ctx).await;
-            session_mailbox(&sess).track(MOVED_CALL_ID);
-            let ((_, error), ()) = futures::future::join(prompt_text(&lua, &sess), async {
-                requests.recv_async().await.unwrap();
-                ctx.subagent_cancels.cancel(PARENT_ID.to_owned());
-            })
-            .await;
-            assert_eq!(error.as_deref(), Some(CANCELLED_MSG));
-            assert!(requests.is_empty());
-            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
-        });
+        let sess = native_session(&lua, &ctx).await;
+        session_mailbox(&sess).track(MOVED_CALL_ID);
+        let ((_, error), ()) = futures::future::join(prompt_text(&lua, &sess), async {
+            requests.recv_async().await.unwrap();
+            ctx.subagent_cancels.cancel(PARENT_ID.to_owned());
+        })
+        .await;
+        assert_eq!(error.as_deref(), Some(CANCELLED_MSG));
+        assert!(requests.is_empty());
+        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
     }
 
-    #[test]
-    fn a_caller_cancel_ends_the_wait_for_moved_calls() {
+    #[tokio::test]
+    async fn a_caller_cancel_ends_the_wait_for_moved_calls() {
         let mailbox = SessionMailbox::register(MakiId::generate());
         mailbox.track(MOVED_CALL_ID);
         let session = CancelToken::none();
         let (caller_trigger, caller) = CancelToken::new();
-        smol::block_on(async {
-            let mut wake = pin!(next_wake(&mailbox, &session, Some(&caller)));
-            assert!(poll_once(&mut wake).await.is_none());
-            caller_trigger.cancel();
-            assert!(wake.await.is_err());
-        });
+        let inbox = SubagentInbox::default();
+        let mut wake = pin!(next_wake(&mailbox, &inbox, &session, Some(&caller)));
+        assert!((&mut wake).now_or_never().is_none());
+        caller_trigger.cancel();
+        assert!(wake.await.is_err());
     }
 }

@@ -19,6 +19,8 @@ use maki_agent::{
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, ContextGauge, Message, Model};
+use tokio::sync::Mutex;
+use tokio::task::spawn_blocking;
 use tracing::error;
 
 use super::ModelSlot;
@@ -56,7 +58,7 @@ pub(super) struct AgentLoop {
     gauge: ContextGauge,
     cancels: Arc<RunCancels>,
     agent_tx: flume::Sender<Envelope>,
-    answer_rx: Arc<smol::lock::Mutex<flume::Receiver<String>>>,
+    answer_rx: Arc<Mutex<flume::Receiver<String>>>,
     queue: Arc<QueueReceiver>,
     mailbox: SessionMailbox,
     lua_handle: EventHandle,
@@ -104,7 +106,7 @@ impl AgentLoop {
             gauge: ContextGauge::restored(resumed.context_size),
             cancels,
             agent_tx,
-            answer_rx: Arc::new(smol::lock::Mutex::new(answer_rx)),
+            answer_rx: Arc::new(Mutex::new(answer_rx)),
             queue,
             mailbox,
             lua_handle,
@@ -199,12 +201,11 @@ impl AgentLoop {
         if let Some(ref mcp) = self.seed.mcp {
             let mcp_clone = mcp.clone();
             let teardown_clone = teardown.clone();
-            smol::spawn(async move {
+            tokio::spawn(async move {
                 if teardown_clone.race(mcp_clone.ready()).await.is_ok() {
                     spawn_oauth_for_needs_auth(&mcp_clone);
                 }
-            })
-            .detach();
+            });
         }
         !teardown.is_cancelled()
     }
@@ -307,7 +308,7 @@ impl AgentLoop {
                     message: e.to_string(),
                 })?;
             for pm in messages {
-                let text = pm.content.text.unwrap_or_default();
+                let text = pm.text;
                 let msg = match pm.role {
                     PromptRole::Assistant => Message {
                         role: maki_providers::Role::Assistant,
@@ -373,7 +374,9 @@ impl AgentLoop {
     async fn reload_instructions(&mut self) {
         let cwd = self.vars.apply("{cwd}").into_owned();
         let config = self.seed.config.instructions.clone();
-        self.instructions = smol::unblock(move || agent::load_instructions(&cwd, &config)).await;
+        self.instructions = spawn_blocking(move || agent::load_instructions(&cwd, &config))
+            .await
+            .expect("instructions load task panicked");
         // Background sessions started from the seed read its list, so it has
         // to follow every reload, the startup one included.
         self.seed
@@ -403,7 +406,7 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
         let www_auth = url.clone();
         let oauth = info.oauth.clone();
         let ca_file = info.ca_file.clone();
-        smol::spawn(async move {
+        tokio::spawn(async move {
             let storage = match maki_storage::StateDir::resolve() {
                 Ok(s) => s,
                 Err(e) => {
@@ -429,7 +432,6 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
                 server: server_name.clone(),
             });
             tracing::info!(server = %server_name, "MCP server authenticated via OAuth");
-        })
-        .detach();
+        });
     }
 }

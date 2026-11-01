@@ -146,7 +146,7 @@ struct Launch<'a> {
 /// The one construction path for a generation: first startup passes
 /// `fallback: None` (fail-fast); `/reload` passes the last-good config and
 /// model so a broken config reopens the UI with a warning instead of exiting.
-fn build_stack(
+async fn build_stack(
     launch: &Launch<'_>,
     trust: &ProjectDecision,
     fallback: Option<(Config, Model)>,
@@ -181,7 +181,8 @@ fn build_stack(
             );
             config_or_fallback(loaded, fallback_config, warnings)
         },
-    )?;
+    )
+    .await?;
 
     let commands = discover_commands(cli.no_commands, launch.cwd, &config);
 
@@ -249,7 +250,7 @@ fn should_load_project_env(was_trusted: bool, now_trusted: bool) -> bool {
 /// project environment, because the ordering is the whole safety argument: the
 /// old plugin host's thread must be joined before `load_env_files` touches the
 /// process env, and the env must be in place before the new host reads config.
-fn rebuild(
+async fn rebuild(
     launch: &Launch<'_>,
     mut stack: Stack,
     teardown: &mut Teardown,
@@ -274,22 +275,25 @@ fn rebuild(
     } else {
         teardown.defer(move || drop(stack));
     }
-    let pack_report = pack.map(maki_lua::apply_pack_plan);
+    let pack_report = match pack {
+        Some(plan) => Some(maki_lua::apply_pack_plan(plan).await),
+        None => None,
+    };
 
     if load_env {
         // This calls `std::env::set_var`. On the startup grant path nothing
         // long-lived exists yet, so the join above is the whole story. The only
         // site that reaches it with threads alive is `/trust`, a rare explicit
-        // action, and only after the join: smol's worker pool and any telemetry
-        // exporter may still be parked.
+        // action, and only after the join: tokio's worker threads and any
+        // telemetry exporter may still be parked.
         load_env_files(&trust.project_config);
     }
 
-    let (stack, warnings) = build_stack(launch, trust, fallback)?;
+    let (stack, warnings) = build_stack(launch, trust, fallback).await?;
     Ok((stack, warnings, pack_report))
 }
 
-pub fn run(mut cli: Cli) -> Result<()> {
+pub async fn run(mut cli: Cli) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
@@ -320,7 +324,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         storage: &storage,
         interaction,
     };
-    let (mut stack, mut startup_warnings) = build_stack(&launch, &trust, None)?;
+    let (mut stack, mut startup_warnings) = build_stack(&launch, &trust, None).await?;
 
     // The card owns the terminal, so it is drawn before logging, telemetry and
     // the panic hook claim it, and while the process is still single-threaded.
@@ -360,7 +364,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     was_trusted,
                     None,
                     None,
-                )?;
+                )
+                .await?;
             } else {
                 startup_warnings.extend(trust.warning.clone());
             }
@@ -414,6 +419,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             lua_handle: stack.plugin_host.event_handle(),
             project_config: trust.project_config.clone(),
         })
+        .await
         .context("run sdk mode")?;
         drop(stack.plugin_host);
         teardown.join();
@@ -445,6 +451,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             program_status: stack.config.ui.program_status,
             background_wait,
         })
+        .await
         .context("run print mode")?;
         drop(stack.plugin_host);
         teardown.join();
@@ -520,6 +527,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             },
             initial_prompt.take(),
         )
+        .await
         .context("run UI")?;
 
         match outcome {
@@ -569,7 +577,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     was_trusted,
                     pack,
                     Some(last_good),
-                )?;
+                )
+                .await?;
                 tabs = reloaded;
                 if tabs.is_empty() {
                     let replacement = Resolved::fresh(&storage);

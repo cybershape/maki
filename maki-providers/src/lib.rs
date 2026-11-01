@@ -1,5 +1,6 @@
 mod child_env;
 pub(crate) mod error;
+pub mod http;
 pub(crate) mod image;
 pub(crate) mod manifest;
 pub mod model;
@@ -25,6 +26,7 @@ pub use model::{
     ModelTier, ThinkingOption, ThinkingSupport, TokenUsage, format_tokens,
 };
 pub use pricing::{model_cost, settle_session};
+pub use providers::client_builder;
 pub use providers::custom;
 pub use providers::plugin;
 pub use providers::responses::{
@@ -34,7 +36,9 @@ pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 pub use providers::{Timeouts, user_agent};
 
 pub fn warm_catalog() {}
-pub fn refresh_catalog() {}
+pub fn refresh_catalog() -> Result<(), AgentError> {
+    Ok(())
+}
 pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
 pub use types::{
     CONTEXT_UPDATE_WITHOUT_FACTS, ContentBlock, DEFER_LOADING_KEY, EMPTY_RESPONSE_MARKER, Effort,

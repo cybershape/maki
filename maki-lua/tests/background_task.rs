@@ -32,7 +32,7 @@ const GUARDED_TOOL: &str = "guarded";
 const NAME: &str = "find the answer";
 const PROMPT: &str = "Find the answer";
 const RESULT: &str = "background answer";
-const MOVED_RECEIPT: &str = "Subagent find the answer moved to the background";
+const MOVED_RECEIPT: &str = "Subagent find the answer";
 const MOVER_RECEIPT: &str = "mover moved";
 const MOVER_FINAL: &str = "true: nil";
 const DEFAULT_SLOTS: u64 = 8;
@@ -42,7 +42,7 @@ const MESSAGE_CALL_ID: &str = "toolu_message";
 const MESSAGE: &str = "the user added an IOC, check it too";
 const QUEUED: &str = "Message queued for find the answer.";
 const NOT_RUNNING: &str = "no running background subagent with id";
-const INTERRUPT_OPEN: &str = "<user-interrupt>";
+const INTERRUPT_OPEN: &str = "<parent-interrupt>";
 const INIT: &str = include_str!("../../plugins/task/init.lua");
 const RUNNER: &str = include_str!("../../plugins/task/runner.lua");
 
@@ -323,7 +323,7 @@ fn a_background_subagent_asks_for_permission_instead_of_being_denied() {
         Arc::default(),
     ));
     let (_answer_tx, answer_rx) = flume::unbounded::<String>();
-    ctx.user_response_rx = Some(Arc::new(smol::lock::Mutex::new(answer_rx)));
+    ctx.user_response_rx = Some(Arc::new(tokio::sync::Mutex::new(answer_rx)));
 
     assert!(exec(&reg, TASK_TOOL, task_input(), &ctx).backgrounded);
 
@@ -435,7 +435,7 @@ fn ctx_background_without_a_seed_names_the_cause(session_up: bool, reason: &str)
 }
 
 /// The receipt names the id `task_message` takes, and the subagent reads the
-/// message as a user interrupt once its current turn ends.
+/// message as an interrupt from its parent once its current turn ends.
 #[test]
 fn a_message_reaches_a_running_background_task_at_its_next_turn() {
     let host = Host::task(Arc::new(ToolRegistry::new()));

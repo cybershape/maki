@@ -101,15 +101,17 @@ impl App {
     /// Copies the clicked row out of the transcript, so output landing later
     /// cannot move the text the reader is looking at.
     fn open_compact_detail(&mut self, target: crate::components::compact_detail::CompactTarget) {
-        use std::sync::Arc;
-        use maki_agent::ToolOutput;
         use crate::components::compact_detail::Shown;
         use crate::components::tool_group::extract_batch_child_output;
         use crate::components::{CompactDetail, DisplayRole, GroupEntry};
+        use maki_agent::ToolOutput;
+        use std::sync::Arc;
 
-        let Some(msg) = self.chats[self.active_chat].messages().iter().rfind(
-            |m| matches!(&m.role, DisplayRole::ToolGroup(g) if g.id == target.group_id),
-        ) else {
+        let Some(msg) = self.chats[self.active_chat]
+            .messages()
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::ToolGroup(g) if g.id == target.group_id))
+        else {
             return;
         };
         let DisplayRole::ToolGroup(group) = &msg.role else {
@@ -134,11 +136,12 @@ impl App {
                             selected_idx = child_target_idx;
                         }
                         let mut child_entry = child.clone();
-                        if child_entry.detail.is_none() && let Some(parent_detail) = &tool.detail {
-                            let child_output = parent_detail
-                                .output
-                                .as_ref()
-                                .and_then(|out| extract_batch_child_output(&out.as_display_text(), c_idx));
+                        if child_entry.detail.is_none()
+                            && let Some(parent_detail) = &tool.detail
+                        {
+                            let child_output = parent_detail.output.as_ref().and_then(|out| {
+                                extract_batch_child_output(&out.as_display_text(), c_idx)
+                            });
                             if let Some(out_str) = child_output {
                                 child_entry.detail = Some(CompactDetail {
                                     raw_input: child_entry.raw_input.clone(),

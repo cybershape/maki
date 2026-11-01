@@ -1,8 +1,8 @@
 pub(crate) mod alert_modal;
-pub(crate) mod compact_detail;
 pub(crate) mod btw_modal;
 pub(crate) mod code_view;
 pub mod command;
+pub(crate) mod compact_detail;
 pub(crate) mod file_picker;
 pub(crate) mod form;
 pub(crate) mod help_modal;
@@ -37,9 +37,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
-use maki_agent::{
-    BufferSnapshot, TaskEnd, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
-};
+use maki_agent::{BufferSnapshot, TaskEnd, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent};
 use maki_lua::{PackCommand, PackPlan};
 use maki_providers::{ImageSource, Message, ModelTier};
 use ratatui::text::{Line, Span};

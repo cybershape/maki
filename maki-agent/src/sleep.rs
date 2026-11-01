@@ -33,7 +33,9 @@ impl SleepDetector {
     pub fn check(&mut self) -> Option<Duration> {
         let now_wall = SystemTime::now();
         let now_mono = Instant::now();
-        let wall_delta = now_wall.duration_since(self.last_wall).unwrap_or(Duration::ZERO);
+        let wall_delta = now_wall
+            .duration_since(self.last_wall)
+            .unwrap_or(Duration::ZERO);
         let mono_delta = now_mono.saturating_duration_since(self.last_mono);
         self.last_wall = now_wall;
         self.last_mono = now_mono;
@@ -54,7 +56,7 @@ impl SleepDetector {
 pub async fn watch_for_sleep(poll_interval: Duration, threshold: Duration) -> Duration {
     let mut detector = SleepDetector::with_threshold(threshold);
     loop {
-        smol::Timer::after(poll_interval).await;
+        tokio::time::sleep(poll_interval).await;
         if let Some(slept) = detector.check() {
             return slept;
         }

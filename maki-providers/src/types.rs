@@ -831,6 +831,11 @@ pub(crate) const FALLBACK_MAX_THINKING_BUDGET: u32 = 32_768;
 /// generation early, at 4.7; the other families joined at 5.
 const ADAPTIVE_SINCE: (u32, u32) = (5, 0);
 const ADAPTIVE_SINCE_OPUS: (u32, u32) = (4, 7);
+/// From 5 on every Claude model thinks when `thinking` is left out. Opus 5.5,
+/// Fable and Mythos can't turn it off at all, and for the rest Anthropic
+/// advises a low effort over `disabled`, which can make Opus 5 write its tool
+/// calls as plain text.
+const THINKS_BY_DEFAULT_SINCE: (u32, u32) = (5, 0);
 const GEMINI_LEVEL_SINCE: u32 = 3;
 const OPUS: &str = "opus";
 const CLAUDE: &str = "claude";
@@ -880,6 +885,18 @@ fn requires_adaptive(model_id: &str) -> bool {
     })
 }
 
+/// Read off the id like [`requires_adaptive`], so `off` is gone for these
+/// models on every provider that serves them.
+pub(crate) fn thinks_by_default(model_id: &str) -> bool {
+    claude_version(model_id).is_some_and(|(_, version)| version >= THINKS_BY_DEFAULT_SINCE)
+}
+
+/// The releases that made thinking adaptive-only also reject any sampling
+/// parameter (`top_p`, `temperature`) with a 400, even with thinking off.
+#[allow(dead_code)]
+pub(crate) fn rejects_sampling(model_id: &str) -> bool {
+    requires_adaptive(model_id)
+}
 /// Gemini 3+ and the `-latest` aliases take `thinkingLevel` (`low`, `medium`,
 /// `high`) in place of `thinkingBudget`. Only the 2.x series speaks budgets;
 /// `minimal` is omitted from the dialect because Pro and Gemini 4 reject it
@@ -1470,16 +1487,21 @@ impl ThinkingConfig {
     /// one it goes out as. Declared fields keep `Adaptive` separate because
     /// their level fragments can differ from the provider fallback.
     pub fn shown(self, model: &Model) -> Self {
+        let config = if self.is_enabled() {
+            self
+        } else {
+            self.clamped(model)
+        };
         let fields = model.effective_thinking_fields();
         if let Some((fields, fallback)) = fields
-            && let Some(shown) = declared_thinking(fields, self, model, fallback)
+            && let Some(shown) = declared_thinking(fields, config, model, fallback)
         {
             return shown;
         }
-        if self == Self::Adaptive && fields.is_some_and(|(fields, _)| !fields.levels.is_empty()) {
-            return self;
+        if config == Self::Adaptive && fields.is_some_and(|(fields, _)| !fields.levels.is_empty()) {
+            return config;
         }
-        model.thinking_sent(self)
+        model.thinking_sent(config)
     }
 
     pub fn level(self) -> Option<Effort> {
@@ -1940,13 +1962,13 @@ mod tests {
         }
     }
 
-    fn adapt(model: &Model, content: Vec<ContentBlock>) -> Vec<ContentBlock> {
+    async fn adapt(model: &Model, content: Vec<ContentBlock>) -> Vec<ContentBlock> {
         let messages = vec![Message {
             role: Role::User,
             content,
             ..Default::default()
         }];
-        smol::block_on(adapt_images_for_model(model, &messages))[0]
+        adapt_images_for_model(model, &messages).await[0]
             .content
             .clone()
     }
@@ -1958,8 +1980,8 @@ mod tests {
             .count()
     }
 
-    #[test]
-    fn adapt_images_borrows_when_nothing_has_to_change() {
+    #[tokio::test]
+    async fn adapt_images_borrows_when_nothing_has_to_change() {
         let model = clamp_test_model(anthropic_spec());
         let with_image = vec![Message {
             role: Role::User,
@@ -1967,7 +1989,7 @@ mod tests {
             ..Default::default()
         }];
         assert!(matches!(
-            smol::block_on(adapt_images_for_model(&model, &with_image)),
+            adapt_images_for_model(&model, &with_image).await,
             Cow::Borrowed(_)
         ));
 
@@ -1975,7 +1997,7 @@ mod tests {
         text_only_model.supports_vision_override = Some(false);
         let no_images = vec![Message::user("hi".into())];
         assert!(matches!(
-            smol::block_on(adapt_images_for_model(&text_only_model, &no_images)),
+            adapt_images_for_model(&text_only_model, &no_images).await,
             Cow::Borrowed(_)
         ));
     }
@@ -1983,8 +2005,8 @@ mod tests {
     /// A repaired image is repaired for the rest of the session, so this path
     /// is walked on every later turn: the messages the repair does not reach
     /// must come out of it untouched, and history must keep its own pixels.
-    #[test]
-    fn adapt_images_rebuilds_only_the_messages_that_change() {
+    #[tokio::test]
+    async fn adapt_images_rebuilds_only_the_messages_that_change() {
         const CAPTION: &str = "look";
         const OVERSIZED: u32 = 2600;
         let model = clamp_test_model(anthropic_spec());
@@ -2015,7 +2037,7 @@ mod tests {
             ]),
         ];
 
-        let adapted = smol::block_on(adapt_images_for_model(&model, &history));
+        let adapted = adapt_images_for_model(&model, &history).await;
         assert!(matches!(adapted, Cow::Owned(_)), "the repair needs a copy");
         assert_eq!(adapted[0].first_user_text(), Some(CAPTION));
         let ContentBlock::Image { source } = &adapted[1].content[0] else {
@@ -2039,8 +2061,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn adapt_images_shrinks_what_a_provider_would_refuse() {
+    #[tokio::test]
+    async fn adapt_images_shrinks_what_a_provider_would_refuse() {
         let model = clamp_test_model(anthropic_spec());
         let oversized = ContentBlock::Image {
             source: ImageSource::new(
@@ -2051,7 +2073,7 @@ mod tests {
         let text = ContentBlock::Text {
             text: "look".into(),
         };
-        let blocks = adapt(&model, vec![text, oversized]);
+        let blocks = adapt(&model, vec![text, oversized]).await;
         assert!(matches!(&blocks[0], ContentBlock::Text { .. }));
         let ContentBlock::Image { source } = &blocks[1] else {
             panic!("an image block must stay an image block");
@@ -2067,16 +2089,16 @@ mod tests {
     /// bound to them. So each new image must leave the request an append of
     /// the one before, except at most once per step when the oldest images
     /// make way, and the API cap is never crossed.
-    #[test]
-    fn adapt_images_moves_the_prefix_once_per_step() {
+    #[tokio::test]
+    async fn adapt_images_moves_the_prefix_once_per_step() {
         const LAST_TOTAL: usize = MAX_IMAGES + 2 * IMAGE_EVICTION_STEP + 1;
         let model = clamp_test_model(anthropic_spec());
         let images: Vec<ContentBlock> = (1..=LAST_TOTAL).map(png_block).collect();
         let wire = |blocks: &[ContentBlock]| serde_json::to_value(blocks).unwrap();
-        let mut before = adapt(&model, images[..MAX_IMAGES].to_vec());
+        let mut before = adapt(&model, images[..MAX_IMAGES].to_vec()).await;
         let mut last_move: Option<usize> = None;
         for total in MAX_IMAGES + 1..=LAST_TOTAL {
-            let after = adapt(&model, images[..total].to_vec());
+            let after = adapt(&model, images[..total].to_vec()).await;
             let kept = image_count(&after);
             assert!(kept <= MAX_IMAGES, "{kept} images sent");
             assert!(
@@ -2103,8 +2125,8 @@ mod tests {
     /// Readability must not decide what is evicted: an unreadable image that
     /// freed its slot would pull an evicted one back in, editing an early
     /// message outside the step schedule.
-    #[test]
-    fn adapt_images_evicts_the_same_images_whatever_decodes() {
+    #[tokio::test]
+    async fn adapt_images_evicts_the_same_images_whatever_decodes() {
         let model = clamp_test_model(anthropic_spec());
         let readable: Vec<ContentBlock> = (1..=MAX_IMAGES + 1).map(png_block).collect();
         let mut content = readable.clone();
@@ -2119,19 +2141,19 @@ mod tests {
                 .map(|(i, _)| i)
                 .collect()
         };
-        let blocks = adapt(&model, content);
-        assert_eq!(evicted(&blocks), evicted(&adapt(&model, readable)));
+        let blocks = adapt(&model, content).await;
+        assert_eq!(evicted(&blocks), evicted(&adapt(&model, readable).await));
         assert!(
             matches!(&blocks[MAX_IMAGES], ContentBlock::Text { text } if text == IMAGE_UNUSABLE_NOTE)
         );
     }
 
-    #[test]
-    fn adapt_images_replaces_blocks_for_text_only_model() {
+    #[tokio::test]
+    async fn adapt_images_replaces_blocks_for_text_only_model() {
         let mut model = clamp_test_model(anthropic_spec());
         model.supports_vision_override = Some(false);
         let tool_result = ContentBlock::tool_result("t1", "[image: pic.png 1KB]", false);
-        let blocks = adapt(&model, vec![tool_result, unreadable_block()]);
+        let blocks = adapt(&model, vec![tool_result, unreadable_block()]).await;
         assert_eq!(blocks.len(), 2);
         assert!(matches!(&blocks[0], ContentBlock::ToolResult { .. }));
         assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == IMAGE_OMITTED_NOTE));
@@ -2734,6 +2756,34 @@ mod tests {
             fast: false,
         };
         assert_eq!(opts.clamped(&model).thinking, expected);
+    }
+
+    #[test_case("claude-opus-5.5", ThinkingConfig::Effort(Minimal) ; "copilot_opus_5_5")]
+    #[test_case("anthropic.claude-opus-5", ThinkingConfig::Effort(Minimal) ; "bedrock_opus_5")]
+    #[test_case("claude-sonnet-5.5", ThinkingConfig::Effort(Minimal) ; "sonnet_5_5")]
+    #[test_case("claude-fable-5-1", ThinkingConfig::Effort(Minimal) ; "fable")]
+    #[test_case("claude-opus-4.8", ThinkingConfig::Off ; "opus_4_8_turns_it_off")]
+    fn off_rises_to_minimal_where_the_model_thinks_by_default(
+        model_id: &str,
+        expected: ThinkingConfig,
+    ) {
+        let mut model = thinking_model(model_id);
+        model.thinking_override = Some(Support::Yes);
+
+        assert_eq!(ThinkingConfig::Off.clamped(&model), expected);
+        assert_eq!(ThinkingConfig::Off.shown(&model), expected);
+    }
+
+    #[test]
+    fn a_spelled_off_survives_where_the_model_thinks_by_default() {
+        let mut model = native_thinking_model(
+            "claude-opus-5",
+            json!({"off": {"thinking": {"type": "disabled"}}}),
+        );
+        model.thinking_override = Some(Support::Yes);
+
+        assert_eq!(ThinkingConfig::Off.clamped(&model), ThinkingConfig::Off);
+        assert_eq!(ThinkingConfig::Off.shown(&model), ThinkingConfig::Off);
     }
 
     #[test_case(ThinkingConfig::Adaptive,    ThinkingConfig::Adaptive     ; "adaptive_stays")]

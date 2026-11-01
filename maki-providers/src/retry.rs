@@ -156,7 +156,8 @@ impl RetryState {
     }
 
     pub fn is_in_wake_grace(&self) -> bool {
-        self.wake_grace_until.is_some_and(|until| Instant::now() < until)
+        self.wake_grace_until
+            .is_some_and(|until| Instant::now() < until)
     }
 
     pub fn policy(&self) -> &RetryPolicy {

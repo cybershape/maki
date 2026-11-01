@@ -3,10 +3,12 @@
 //! renders and receives input. `SpawnCtx` carries the shared resources needed
 //! to spawn session runtimes at any point.
 //!
-//! Terminal input arrives on a channel (see [`InputReader`]), so the loop
-//! waits on every event source at once and wakes the moment a plugin action,
-//! agent event, or keypress arrives instead of sleeping in `event::poll`.
+//! The loop is async and selects over every event source at once (terminal
+//! input through [`InputReader`], plugin actions, agent events, timers), so
+//! it wakes the moment any of them has something and never blocks a worker:
+//! it runs under `block_on` on the main thread.
 
+use std::future::{pending, ready};
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -20,6 +22,7 @@ use crate::app::tasks::TaskStatus;
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
+use futures::future::{LocalBoxFuture, select_all};
 use maki_agent::agent::SessionExport;
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
@@ -52,6 +55,10 @@ use maki_storage::sessions::normalize_title;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use serde_json::json;
+use tokio::runtime::Handle;
+use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::time::timeout;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, info, warn};
 
 use crate::agent::{
@@ -552,7 +559,7 @@ pub(crate) struct EventLoop<'t> {
     /// without this a second `/packupdate` would race the first over the same
     /// clones and locks.
     pack_running: bool,
-    _model_fetch_task: smol::Task<()>,
+    _model_fetch_task: AbortOnDropHandle<()>,
     program_status_enabled: bool,
     last_program_status: Option<crate::program_status::ProgramStatusReport>,
     sleep_detector: SleepDetector,
@@ -578,13 +585,42 @@ enum Wake {
     ModelsDiscovered,
 }
 
+/// A value from the channel, or never, once it is closed: a closed channel
+/// is not an event.
+async fn recv_or_pending<T>(rx: &flume::Receiver<T>) -> T {
+    match rx.recv_async().await {
+        Ok(value) => value,
+        Err(_) => pending().await,
+    }
+}
+
+/// The first agent envelope or shell event from any session.
+async fn session_wake(sessions: &[SessionRuntime]) -> Wake {
+    let waits: Vec<LocalBoxFuture<'_, Wake>> = sessions
+        .iter()
+        .enumerate()
+        .flat_map(|(i, rt)| {
+            [
+                Box::pin(async move {
+                    Wake::Agent(i, Box::new(recv_or_pending(&rt.handles.agent_rx).await))
+                }) as LocalBoxFuture<'_, Wake>,
+                Box::pin(async move { Wake::Shell(i, recv_or_pending(&rt.shell_rx).await) }),
+            ]
+        })
+        .collect();
+    if waits.is_empty() {
+        return pending().await;
+    }
+    select_all(waits).await.0
+}
+
 struct BackgroundModels {
     available: Arc<ArcSwapOption<ModelList>>,
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     models_rx: flume::Receiver<()>,
     models_tx: flume::Sender<()>,
-    task: smol::Task<()>,
+    task: AbortOnDropHandle<()>,
 }
 
 /// The one way discovery starts, so startup and `/models refresh` cannot drift
@@ -597,8 +633,8 @@ fn fetch_models(
     policy: Arc<ModelPolicy>,
     warn_tx: flume::Sender<String>,
     models_tx: flume::Sender<()>,
-) -> smol::Task<()> {
-    smol::spawn(async move {
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
         fetch_all_models_cached(&policy, |list, warnings| {
             for w in warnings {
                 let _ = warn_tx.try_send(w);
@@ -614,12 +650,12 @@ fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
     let available: Arc<ArcSwapOption<ModelList>> = Arc::new(ArcSwapOption::empty());
     let (warn_tx, warn_rx) = flume::unbounded::<String>();
     let (models_tx, models_rx) = flume::bounded::<()>(1);
-    let task = fetch_models(
+    let task = AbortOnDropHandle::new(fetch_models(
         Arc::clone(&available),
         policy,
         warn_tx.clone(),
         models_tx.clone(),
-    );
+    ));
     BackgroundModels {
         available,
         warn_rx,
@@ -631,7 +667,7 @@ fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
 }
 
 impl<'t> EventLoop<'t> {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         terminal: &'t mut ratatui::DefaultTerminal,
         params: EventLoopParams,
     ) -> Result<Self> {
@@ -689,7 +725,7 @@ impl<'t> EventLoop<'t> {
         });
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd, project_config));
+        let (mcp_handle, mcp_config_errors) = mcp::start(&cwd, project_config).await;
 
         let provider: Arc<dyn Provider> = if needs_login {
             Arc::from(maki_providers::provider::from_model_fallback(
@@ -776,7 +812,7 @@ impl<'t> EventLoop<'t> {
             notifier,
             ctx,
             slots,
-            input: InputReader::spawn(),
+            input: InputReader::new().context("watch terminal input")?,
             warn_rx: bg.warn_rx,
             warn_tx: bg.warn_tx,
             models_rx: bg.models_rx,
@@ -830,7 +866,7 @@ impl<'t> EventLoop<'t> {
         Ok(())
     }
 
-    pub(crate) fn run(mut self, initial_prompt: Option<String>) -> Result<ShutdownReport> {
+    pub(crate) async fn run(mut self, initial_prompt: Option<String>) -> Result<ShutdownReport> {
         if let Some(prompt) = initial_prompt {
             let sub = Submission {
                 text: prompt,
@@ -845,7 +881,7 @@ impl<'t> EventLoop<'t> {
         let result = loop {
             dirty |= self.tick();
             dirty |= self.check_resize_debounce();
-            match self.drain_channels() {
+            match self.drain_channels().await {
                 Ok(d) => dirty |= d,
                 Err(e) => break Err(e),
             }
@@ -858,9 +894,7 @@ impl<'t> EventLoop<'t> {
             } else {
                 dirty.take()
             };
-            if should_paint
-                && let Err(e) = self.paint()
-            {
+            if should_paint && let Err(e) = self.paint() {
                 break Err(e);
             }
 
@@ -891,7 +925,7 @@ impl<'t> EventLoop<'t> {
             if let Some(ref debounce) = self.resize_debounce {
                 timeout = timeout.min(debounce.deadline.saturating_duration_since(Instant::now()));
             }
-            match self.next_wake(timeout) {
+            match self.next_wake(timeout).await {
                 // Any event can change the screen, so paint after handling it
                 // rather than asking every handler to prove it did.
                 Some(wake) => match self.handle_wake(wake) {
@@ -911,43 +945,42 @@ impl<'t> EventLoop<'t> {
         };
         // Fatal errors still save every session, kill MCP process groups,
         // and drain the storage writer before the process exits.
-        let report = self.shutdown();
+        let report = self.shutdown().await;
         result.map(|()| report)
     }
 
     /// Wait for the next event from any source, or time out so animations
-    /// and periodic polls keep running. `Duration::ZERO` drains whatever is
-    /// already pending.
-    fn next_wake(&self, timeout: Duration) -> Option<Wake> {
-        let mut sel = flume::Selector::new().recv(self.input.receiver(), |res| match res {
-            Ok(ev) => Some(Wake::Input(ev)),
-            Err(_) => Some(Wake::InputGone),
-        });
-        if !self.ui_action_rx.is_disconnected() {
-            sel = sel.recv(&self.ui_action_rx, |res| res.ok().map(Wake::Ui));
+    /// and periodic polls keep running.
+    async fn next_wake(&mut self, wait: Duration) -> Option<Wake> {
+        timeout(wait, self.wake()).await.ok()
+    }
+
+    /// An event that is already pending, checked once. A zero timeout would
+    /// still arm a timer and wait for its next tick. A `select!` rather than
+    /// `now_or_never`, so the poll carries the loop's own waker: crossterm's
+    /// reader thread keeps whatever waker it is first polled with.
+    async fn pending_wake(&mut self) -> Option<Wake> {
+        tokio::select! {
+            biased;
+            wake = self.wake() => Some(wake),
+            () = ready(()) => None,
         }
-        if !self.ui_wake_rx.is_disconnected() {
-            sel = sel.recv(&self.ui_wake_rx, |res| {
-                res.ok().map(|()| Wake::PluginWindow)
-            });
+    }
+
+    /// Terminal input first, then plugin UI actions, then the rest, so a
+    /// keypress is never queued behind a burst of agent events.
+    async fn wake(&mut self) -> Wake {
+        tokio::select! {
+            biased;
+            event = self.input.next() => event.map_or(Wake::InputGone, Wake::Input),
+            action = recv_or_pending(&self.ui_action_rx) => Wake::Ui(action),
+            () = recv_or_pending(&self.ui_wake_rx) => Wake::PluginWindow,
+            () = recv_or_pending(decor_worker::wakes()) => Wake::Decor,
+            warning = recv_or_pending(&self.warn_rx) => Wake::Warn(warning),
+            preparation = recv_or_pending(&self.pack_rx) => Wake::Pack(preparation),
+            () = recv_or_pending(&self.models_rx) => Wake::ModelsDiscovered,
+            wake = session_wake(&self.sessions) => wake,
         }
-        sel = sel.recv(decor_worker::wakes(), |res| res.ok().map(|()| Wake::Decor));
-        sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
-        sel = sel.recv(&self.pack_rx, |res| res.ok().map(Wake::Pack));
-        sel = sel.recv(&self.models_rx, |res| {
-            res.ok().map(|()| Wake::ModelsDiscovered)
-        });
-        for (i, rt) in self.sessions.iter().enumerate() {
-            if !rt.handles.agent_rx.is_disconnected() {
-                sel = sel.recv(&rt.handles.agent_rx, move |res| {
-                    res.ok().map(|env| Wake::Agent(i, Box::new(env)))
-                });
-            }
-            sel = sel.recv(&rt.shell_rx, move |res| {
-                res.ok().map(|ev| Wake::Shell(i, ev))
-            });
-        }
-        sel.wait_timeout(timeout).ok().flatten()
     }
 
     fn note_resize(&mut self) -> Dirty {
@@ -1109,11 +1142,11 @@ impl<'t> EventLoop<'t> {
         self.dispatch(idx, actions);
     }
 
-    fn drain_channels(&mut self) -> Result<Dirty> {
+    async fn drain_channels(&mut self) -> Result<Dirty> {
         let mut dirty = Dirty::NO;
         // Leftovers beyond the budget are picked up right after the next draw.
         for _ in 0..DRAIN_BUDGET {
-            match self.next_wake(Duration::ZERO) {
+            match self.pending_wake().await {
                 Some(wake) => {
                     dirty |= self.handle_wake(wake)?;
                 }
@@ -1563,14 +1596,13 @@ impl<'t> EventLoop<'t> {
         match req {
             SessionRequest::List => {
                 let storage = self.ctx.storage.clone();
-                smol::unblock(move || {
+                spawn_blocking(move || {
                     let cwd = std::env::current_dir().unwrap_or_default();
                     let reply = AppSession::list(&cwd.to_string_lossy(), &storage)
                         .map_err(|e| e.to_string())
                         .and_then(|list| serde_json::to_value(list).map_err(|e| e.to_string()));
                     let _ = reply_tx.send(reply);
-                })
-                .detach();
+                });
             }
             // Deletes run on the storage writer thread after any queued
             // flushes, so the loop never blocks on disk and a queued save
@@ -1823,11 +1855,10 @@ impl<'t> EventLoop<'t> {
         };
         if prompt.is_none() && !focus {
             let storage = self.ctx.storage.clone();
-            smol::unblock(move || {
+            spawn_blocking(move || {
                 let reply = open.store(&storage).map(|id| json!(id));
                 let _ = reply_tx.send(reply.map_err(|e| e.to_string()));
-            })
-            .detach();
+            });
             return;
         }
         // An inherited model's slot is already built and sitting right here.
@@ -1860,13 +1891,12 @@ impl<'t> EventLoop<'t> {
         answer: impl FnOnce(AppSession) -> Result<T, String> + Send + 'static,
     ) {
         let storage = self.ctx.storage.clone();
-        smol::unblock(move || {
+        spawn_blocking(move || {
             let reply = AppSession::read_only(id, &storage)
                 .map_err(|e| e.to_string())
                 .and_then(answer);
             let _ = reply_tx.send(reply);
-        })
-        .detach();
+        });
     }
 
     fn position(&self, id: MakiId) -> Option<usize> {
@@ -2072,7 +2102,7 @@ impl<'t> EventLoop<'t> {
     fn aggregate_scroll(&self, first: CtMouseEvent, scroll_lines: u32) -> (Msg, Option<Event>) {
         let mut delta = scroll_delta(first.kind, scroll_lines);
         let mut leftover = None;
-        while let Ok(next) = self.input.receiver().try_recv() {
+        while let Some(next) = self.input.try_next() {
             match next {
                 Event::Mouse(m)
                     if matches!(
@@ -2102,7 +2132,7 @@ impl<'t> EventLoop<'t> {
     /// drained along the way is returned so it isn't lost.
     fn coalesce_drag(&self, mut latest: CtMouseEvent) -> (CtMouseEvent, Option<Event>) {
         let mut leftover = None;
-        while let Ok(next) = self.input.receiver().try_recv() {
+        while let Some(next) = self.input.try_next() {
             match next {
                 Event::Mouse(m) if matches!(m.kind, MouseEventKind::Drag(MouseButton::Left)) => {
                     latest = m;
@@ -2331,12 +2361,13 @@ impl<'t> EventLoop<'t> {
         self.sessions[idx].app.flash(PACK_PREPARING.to_owned());
         let handle = self.ctx.lua_event_handle.clone();
         let tx = self.pack_tx.clone();
+        let runtime = Handle::current();
         std::thread::spawn(move || {
             // Without this a panic drops the sender with no answer, and
             // `pack_running` stays set for the rest of the process, so every
             // later package command reports "already running".
             let preparation = catch_unwind(AssertUnwindSafe(|| match handle.package_context() {
-                Ok(context) => maki_lua::prepare_pack_command(&command, &context),
+                Ok(context) => runtime.block_on(maki_lua::prepare_pack_command(&command, &context)),
                 Err(error) => PackPreparation::failed(error),
             }))
             .unwrap_or_else(|_| PackPreparation::failed(PACK_PANIC_ERR.to_owned()));
@@ -2359,8 +2390,7 @@ impl<'t> EventLoop<'t> {
             Arc::clone(&self.ctx.model_policy),
             self.warn_tx.clone(),
             self.models_tx.clone(),
-        )
-        .detach();
+        );
     }
 
     fn refresh_usage(&mut self) {
@@ -2368,15 +2398,14 @@ impl<'t> EventLoop<'t> {
         let provider = Arc::clone(&rt.slot.load().provider);
         let slot = Arc::clone(&rt.app.usage_slot);
         slot.store(Some(Arc::new(UsageFetchState::Loading)));
-        smol::spawn(async move {
+        tokio::spawn(async move {
             let state = match provider.fetch_usage().await {
                 Ok(Some(usage)) => UsageFetchState::Ready(usage),
                 Ok(None) => UsageFetchState::Unsupported,
                 Err(e) => UsageFetchState::Error(e.user_message()),
             };
             slot.store(Some(Arc::new(state)));
-        })
-        .detach();
+        });
     }
 
     /// Re-login rebuilds the provider for every tab on it, not just the focused
@@ -2397,7 +2426,7 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn shutdown(mut self) -> ShutdownReport {
+    async fn shutdown(mut self) -> ShutdownReport {
         let started = Instant::now();
         let mut phase_start = started;
         let mut lap = || {
@@ -2447,10 +2476,10 @@ impl<'t> EventLoop<'t> {
             agent_tasks.push(handles.into_task());
         }
         let save_sessions_ms = lap();
-        crate::agent::join_all(agent_tasks, AGENT_SHUTDOWN_TIMEOUT);
+        crate::agent::join_all(agent_tasks, AGENT_SHUTDOWN_TIMEOUT).await;
         let join_agents_ms = lap();
         if let Some(ref h) = self.ctx.mcp_handle {
-            smol::block_on(h.shutdown());
+            h.shutdown().await;
         }
         let mcp_shutdown_ms = lap();
         let unsaved = match Arc::try_unwrap(self.ctx.storage_writer) {

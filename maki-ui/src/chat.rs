@@ -1434,11 +1434,7 @@ mod tests {
 
         let notices = notice_lines(&chat);
         assert_eq!(notices.len(), 1);
-        assert!(
-            notices[0].contains("◷ 10s / 7.5s"),
-            "got: {}",
-            notices[0]
-        );
+        assert!(notices[0].contains("◷ 10s / 7.5s"), "got: {}", notices[0]);
     }
 
     fn notice_lines(chat: &Chat) -> Vec<&str> {

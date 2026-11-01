@@ -105,11 +105,16 @@ mod tests {
             )])),
             ..TelemetryConfig::default()
         });
+        unsafe { std::env::remove_var(env) };
         assert_eq!(value(&resource, KEY_SERVICE_NAME), Some(ENV_NAME.into()));
     }
 
     #[test]
     fn lua_service_name_beats_lua_attributes() {
+        unsafe {
+            std::env::remove_var("OTEL_SERVICE_NAME");
+            std::env::remove_var("OTEL_RESOURCE_ATTRIBUTES");
+        }
         let resource = build(&TelemetryConfig {
             service_name: Some(LUA_NAME.to_string()),
             resource_attributes: Some(BTreeMap::from([

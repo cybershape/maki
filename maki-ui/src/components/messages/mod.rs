@@ -11,13 +11,13 @@ use self::render::RenderCursor;
 use self::scroll::Layout;
 use self::segment::{Segment, SegmentCache};
 
+use super::compact_detail::CompactTarget;
 use super::tool_display::{
     MOVABLE_HINT, RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info,
     assistant_style, build_instructions_lines, build_tool_lines, done_style, error_style,
     format_timestamp_now, hint_columns, instructions_search_text, notice_style, outcome_glyph,
     search_text_for, thinking_style, truncate_to_header, user_style,
 };
-use super::compact_detail::CompactTarget;
 use super::{
     BackgroundBadge, BackgroundOutcome, CompactDetail, DisplayMessage, DisplayRole, GroupEntry,
     GroupThinkingEntry, GroupToolEntry, IMAGE_PLACEHOLDER, ToolGroupRole, ToolRole, ToolStatus,
@@ -44,8 +44,8 @@ use super::scrollbar::{self, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
 use super::thinking;
 use maki_agent::{
-    BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND, SharedBuf,
-    ToolDoneEvent, ToolOutput, ToolStartEvent,
+    BufWatch, BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND,
+    SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use maki_lua::{EventHandle, LuaCommandInfo, WARM_TOOL_CAP, WinView};
 use maki_storage::id::{MakiId, SessionRef};
@@ -108,12 +108,12 @@ pub struct MessagesPanel {
     expanded_tools: HashMap<String, SectionFlags>,
     /// Per-tool log of post-completion click rows, replayed on restore.
     lua_clicks: HashMap<String, Vec<usize>>,
-    live_bufs: HashMap<String, Arc<SharedBuf>>,
+    live_bufs: HashMap<String, BufWatch>,
     /// Bufs of finished tools we keep polling so runtime-side warm
     /// clicks stay visible. Purely local: every finished-tool click
     /// carries a restore fallback, so we never track the runtime's
     /// warm cache.
-    watched_bufs: VecDeque<(String, Arc<SharedBuf>)>,
+    watched_bufs: VecDeque<(String, BufWatch)>,
     tool_output_lines: ToolOutputLines,
     lua_event_handle: EventHandle,
     restore_event_tx: Option<EventSender>,
@@ -512,8 +512,9 @@ impl MessagesPanel {
                         entry.summary = summary.clone();
                         entry.raw_input = event.raw_input.clone();
                         entry.receiving_args = false;
-                        let detail =
-                            entry.detail.get_or_insert_with(|| CompactDetail::from_start(&event));
+                        let detail = entry
+                            .detail
+                            .get_or_insert_with(|| CompactDetail::from_start(&event));
                         detail.input = event.input.clone();
                         detail.raw_input = event.raw_input.clone();
                         detail.annotation = event.annotation.clone();
@@ -727,9 +728,6 @@ impl MessagesPanel {
             }
         }
         let had_live_buf = self.retire_live_buf(&event.id);
-        if event.backgrounded {
-            self.stop_watching(&event.id);
-        }
         let Some(msg) = self
             .messages
             .iter_mut()
@@ -745,11 +743,8 @@ impl MessagesPanel {
             };
         }
         msg.movable = false;
-        if event.backgrounded {
-            msg.render_snapshot = None;
-            if msg.background.is_none() {
-                msg.background = Some(BackgroundBadge::moved(&event));
-            }
+        if event.backgrounded && msg.background.is_none() {
+            msg.background = Some(BackgroundBadge::moved(&event));
         }
         truncate_to_header(&mut msg.text);
         let done_annotation = event
@@ -836,12 +831,14 @@ impl MessagesPanel {
 
     /// The buf a running tool streams into, live or still watched.
     pub fn live_buf(&self, tool_id: &str) -> Option<Arc<SharedBuf>> {
-        self.live_bufs.get(tool_id).cloned().or_else(|| {
-            self.watched_bufs
-                .iter()
-                .find(|(id, _)| id == tool_id)
-                .map(|(_, buf)| Arc::clone(buf))
-        })
+        self.live_bufs
+            .get(tool_id)
+            .or_else(|| {
+                self.watched_bufs
+                    .iter()
+                    .find_map(|(id, watch)| (id == tool_id).then_some(watch))
+            })
+            .map(|watch| Arc::clone(watch.buf()))
     }
 
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
@@ -1351,10 +1348,7 @@ impl MessagesPanel {
         let hidden = if group.expanded {
             0
         } else {
-            group
-                .entries
-                .len()
-                .saturating_sub(self.compact_lines)
+            group.entries.len().saturating_sub(self.compact_lines)
         };
         let mut cursor = 1 + usize::from(hidden > 0);
         for (entry_idx, entry) in group.entries.iter().enumerate().skip(hidden) {
@@ -1882,15 +1876,15 @@ impl MessagesPanel {
     /// watched set keeps what `tick` polls bounded.
     /// Returns whether a live buf existed for this id.
     fn retire_live_buf(&mut self, id: &str) -> bool {
-        let Some(buf) = self.live_bufs.remove(id) else {
+        let Some(mut watch) = self.live_bufs.remove(id) else {
             return false;
         };
-        if let Some(lines) = buf.read_if_dirty() {
-            self.store_snapshot(id, BufferSnapshot::from_arc(lines), false, None);
+        if let Some(snapshot) = watch.changed() {
+            self.store_snapshot(id, snapshot, false, None);
         }
         // A part's tab registers the same buf again on every report.
         self.watched_bufs.retain(|(watched, _)| watched != id);
-        self.watched_bufs.push_back((id.to_owned(), buf));
+        self.watched_bufs.push_back((id.to_owned(), watch));
         if self.watched_bufs.len() > WARM_TOOL_CAP {
             self.watched_bufs.pop_front();
         }
@@ -2095,16 +2089,14 @@ impl MessagesPanel {
         }
     }
 
-    /// The dirty flag has a single reader. When another panel already read
-    /// this buf, as the row a call moved out of does, waiting for the flag
-    /// would leave this one blank until the tool writes again. So it draws
-    /// what the buf holds now.
     pub fn register_live_buf(&mut self, id: String, body: Arc<SharedBuf>) {
-        let lines = body.read();
-        if !lines.is_empty() && self.find_tool_msg(&id).is_some() {
-            self.store_snapshot(&id, BufferSnapshot::from_arc(lines), false, None);
+        let mut watch = BufWatch::new(body);
+        if self.find_tool_msg(&id).is_some()
+            && let Some(snapshot) = watch.changed()
+        {
+            self.store_snapshot(&id, snapshot, false, None);
         }
-        self.live_bufs.insert(id, body);
+        self.live_bufs.insert(id, watch);
     }
 
     /// Snapshots are baked at the last width `view` saw, and a resize
@@ -2113,13 +2105,17 @@ impl MessagesPanel {
     fn poll_live_bufs(&mut self) -> Dirty {
         let updated: Vec<_> = self
             .live_bufs
-            .iter()
-            .chain(self.watched_bufs.iter().map(|(id, buf)| (id, buf)))
-            .filter_map(|(id, buf)| buf.read_if_dirty().map(|lines| (id.clone(), lines)))
+            .iter_mut()
+            .chain(
+                self.watched_bufs
+                    .iter_mut()
+                    .map(|(id, watch)| (&*id, watch)),
+            )
+            .filter_map(|(id, watch)| watch.changed().map(|snapshot| (id.clone(), snapshot)))
             .collect();
         let dirty = Dirty::from(!updated.is_empty());
-        for (tool_id, lines) in updated {
-            self.store_snapshot(&tool_id, BufferSnapshot::from_arc(lines), false, None);
+        for (tool_id, snapshot) in updated {
+            self.store_snapshot(&tool_id, snapshot, false, None);
         }
         dirty
     }

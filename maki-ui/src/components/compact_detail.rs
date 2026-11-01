@@ -1,19 +1,20 @@
 use std::sync::Arc;
 
+use super::keybindings::key;
+use super::modal::Modal;
+use super::scrollbar::render_vertical_scrollbar;
+use super::tool_display::resolve_span_style;
+use super::{
+    CompactDetail, GroupThinkingEntry, GroupToolEntry, ModalScroll, Overlay, ToolStatus,
+    hint_footer,
+};
+use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_agent::{BufferSnapshot, SnapshotLine, ToolInput, ToolOutput};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
-use super::keybindings::key;
-use super::modal::Modal;
-use super::scrollbar::render_vertical_scrollbar;
-use super::tool_display::resolve_span_style;
-use super::{
-    CompactDetail, GroupThinkingEntry, GroupToolEntry, ModalScroll, Overlay, ToolStatus, hint_footer,
-};
-use crate::theme;
 
 const TITLE_PAD: &str = " ";
 const SECTION_GAP: &str = "";
@@ -234,7 +235,12 @@ fn tool_lines(entry: &GroupToolEntry) -> Vec<Line<'static>> {
         None if entry.receiving_args => {
             lines.push(Line::from(Span::styled(RECEIVING, theme.tool_dim)))
         }
-        None => push_json(&mut lines, detail.and_then(|d| d.raw_input.as_ref()).or(entry.raw_input.as_ref())),
+        None => push_json(
+            &mut lines,
+            detail
+                .and_then(|d| d.raw_input.as_ref())
+                .or(entry.raw_input.as_ref()),
+        ),
     }
 
     lines.push(Line::from(SECTION_GAP));
@@ -260,7 +266,11 @@ fn thinking_lines(entry: &GroupThinkingEntry) -> Vec<Line<'static>> {
     lines
 }
 
-fn push_output(lines: &mut Vec<Line<'static>>, entry: &GroupToolEntry, detail: Option<&CompactDetail>) {
+fn push_output(
+    lines: &mut Vec<Line<'static>>,
+    entry: &GroupToolEntry,
+    detail: Option<&CompactDetail>,
+) {
     let Some(detail) = detail else {
         lines.push(Line::from(Span::styled(EMPTY, theme::current().tool_dim)));
         return;
@@ -349,8 +359,8 @@ mod tests {
     use super::*;
     use crate::components::key as key_ev;
     use maki_agent::{BufferSnapshot, ToolOutput};
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     const CLOSE: &str = "esc closes the popup";
     const OUTPUT_TEXT: &str = "compiled 12 crates";
@@ -450,7 +460,10 @@ mod tests {
         }));
         let text = draw(&mut modal, 20);
         assert!(text.lines().any(|line| line.contains("abcdefghij")));
-        assert!(text.lines().all(|line| line.chars().count() <= SCREEN as usize));
+        assert!(
+            text.lines()
+                .all(|line| line.chars().count() <= SCREEN as usize)
+        );
     }
 
     #[test]
@@ -538,16 +551,20 @@ mod tests {
 
         let text = draw(&mut modal, 20);
         // Find a line that has borders
-        let border_line = text.lines().find(|l| l.contains("Input")).expect("Input line");
+        let border_line = text
+            .lines()
+            .find(|l| l.contains("Input"))
+            .expect("Input line");
         // With H_PAD = 1, inside border there is a space before "Input"
-        assert!(border_line.contains("│ Input") || border_line.contains("│  Input"), "{border_line}");
+        assert!(
+            border_line.contains("│ Input") || border_line.contains("│  Input"),
+            "{border_line}"
+        );
     }
 
     #[test]
     fn modal_defaults_to_top_when_scroll_needed() {
-        let lines: Vec<_> = (0..100)
-            .map(|n| format!("output line {n}"))
-            .collect();
+        let lines: Vec<_> = (0..100).map(|n| format!("output line {n}")).collect();
         let full_text = lines.join("\n");
         let mut modal = CompactDetailModal::new();
         modal.open_tool(tool(CompactDetail {
@@ -573,7 +590,9 @@ mod tests {
             SnapshotLine::plain("last visible line".to_string()),
         ];
         modal.open_tool(tool(CompactDetail {
-            output: Some(Arc::new(ToolOutput::Plain("line 1\nline 2\nline 3\nline 4\nline 5\nlast line".into()))),
+            output: Some(Arc::new(ToolOutput::Plain(
+                "line 1\nline 2\nline 3\nline 4\nline 5\nlast line".into(),
+            ))),
             render_snapshot: Some(BufferSnapshot::from_arc(Arc::new(snapshot_lines))),
             ..CompactDetail::default()
         }));

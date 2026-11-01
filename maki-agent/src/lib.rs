@@ -15,16 +15,14 @@ pub mod headless;
 pub mod live_session;
 pub mod mcp;
 pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus};
-pub use mcp::protocol::PromptRole;
+pub use mcp::transport::PromptRole;
 pub use mcp::{
     McpCommand, McpFunctionInfo, McpHandle, McpModuleInfo, McpPromptArg, McpPromptInfo, McpSession,
     McpSnapshot, McpSnapshotReader,
 };
 pub mod inbox;
 pub mod session;
-pub use inbox::SubagentInbox;
 pub mod sleep;
-pub(crate) mod task_set;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, DisplayItem, History, HistorySnapshot, Instructions,
     LoadedInstructions, ModelSlot, RunContext, RunContextBuilder, SharedMessages, Transcript,
@@ -33,6 +31,7 @@ pub use agent::{
 };
 pub use call_scope::{AlreadyMoved, CallGuard, CallScope, SessionStub, TaskHome};
 pub use cancel::{CancelHandle, CancelMap, CancelToken, CancelTrigger};
+pub use inbox::SubagentInbox;
 pub use live_session::{
     AgentSeed, BackgroundNotice, MailboxError, SessionMailbox, TaskLabel, receipt_tag,
     result_notice,
@@ -56,7 +55,7 @@ pub use maki_providers::{
     EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, TaskEnd, ThinkingConfig,
 };
 pub use types::{
-    AgentEvent, BufferSnapshot, CallRecord, CostTally, DoneReason, Envelope, EventSender,
+    AgentEvent, BufWatch, BufferSnapshot, CallRecord, CostTally, DoneReason, Envelope, EventSender,
     EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND,
     PartStatus, RunLedger, RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine,
     SnapshotSpan, SpanColor, SpanStyle, SteerKind, SubagentInfo, TextOutput, ToolDoneEvent,

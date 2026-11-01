@@ -1534,6 +1534,9 @@ prompt for a subagent session.
     `{{instructions}}` marker.
     `true` loads project instruction files.
     `false` or nil omits them.
+  - `tools` (`table[]?`) the definitions the session will get, as returned
+    by `maki.agent.tools`. A plugin's hints are dropped when none of its
+    tools are in it. Without it, the hints follow the config.
 
 **Returns:** (`string?`, `string?`) The assembled prompt string, or `(nil, err)` on failure.
 
@@ -1543,6 +1546,7 @@ prompt for a subagent session.
 local prompt, err = maki.agent.system_prompt(ctx, {
   prompt_id = "research",
   instructions = true,
+  tools = tool_defs,
 })
 if err then error(err) end
 ```
@@ -1919,11 +1923,11 @@ print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
 Session:send({message})
 ```
 
-Hand the subagent a message without waiting, the way a user typing in its
-tab does. A running `:prompt()` picks it up at its next turn boundary, once
-the current reply and its tool calls finish, and the model reads it as a
-user interrupt. The tab draws it when it lands. Messages sent in a burst
-land together.
+Hand the subagent a message without waiting, delivered the same way as a
+message typed in its tab. A running `:prompt()` picks it up at its next turn boundary, once
+the current reply and its tool calls finish, and the model reads it as an
+interrupt from its parent, not the user. The tab draws it when it lands.
+Messages sent in a burst land together.
 
 With no prompt running, or one already past its last turn, the message
 waits. The next `:prompt()` sends it in the same request as its own
@@ -2574,7 +2578,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
     for each stdout line, the stream name third as in Neovim (which
     passes a list of lines where maki passes one). `bytes` is the line's
     length before `max_line_bytes` cut it, so it equals `#line` unless
-    the line was cut.
+    the line was cut. Bytes that are not UTF-8 arrive as U+FFFD.
   - `on_stderr` (`function?`) called with `(job_id, line, "stderr", bytes)`
     for each stderr line.
   - `on_exit` (`function?`) called with `(job_id, code)` when the process finishes.
@@ -8345,21 +8349,28 @@ buf:lines({
 ### `Buf:set_lines()` {#Buf-set_lines}
 
 ```lua
-Buf:set_lines({lines})
+Buf:set_lines({lines}, {opts?})
 ```
 
 Replaces every line in the buffer with {lines}. Use this when you
 want to redraw the whole buffer, for example after the user toggles
 a view.
 
+`head` counts the leading lines that say what the buffer is about, like
+the command above a bash output. When the tool call moves to the
+background, its row in the chat keeps only those lines, because the rest
+streams in the task's tab. Without a head the row keeps just its title.
+
 **Parameters:**
 
 - `{lines}` (`table`) Sequence of line values, each the same format accepted by `buf:line`.
+- `{opts?}` (`table|nil`) Options: `head` = number of leading lines (default 0).
 
 **Example:**
 
 ```lua
 buf:set_lines({ "new content", "replaces everything" })
+buf:set_lines({ "cargo test", "──────", "running 3 tests" }, { head = 1 })
 ```
 
 ---

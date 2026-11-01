@@ -785,7 +785,9 @@ mod tests {
             expanded: false,
         };
         if followed_by_tool {
-            group.entries.push(GroupEntry::Tool(Box::new(child.clone())));
+            group
+                .entries
+                .push(GroupEntry::Tool(Box::new(child.clone())));
         }
         if preceded_by_tool {
             group.entries.insert(0, GroupEntry::Tool(Box::new(child)));

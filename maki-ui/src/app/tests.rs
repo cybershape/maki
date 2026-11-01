@@ -70,6 +70,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use test_case::test_case;
+use tokio::runtime::EnterGuard;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_OUTPUT_CAP: u32 = 8192;
@@ -248,6 +249,12 @@ fn build_app_with_session(
 
 fn test_writer(dir: StateDir) -> StorageWriter {
     StorageWriter::new(dir, flume::unbounded().0)
+}
+
+/// A synchronous test that spawns tasks or blocks on them the way the UI
+/// thread does holds this for its whole body.
+pub(crate) fn enter_runtime() -> EnterGuard<'static> {
+    maki_lua::test_support::runtime().enter()
 }
 
 pub(crate) fn test_app() -> App {
@@ -9872,6 +9879,19 @@ fn set_thinking_toggles_on_blank_input() {
     let mut app = test_app();
     assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Adaptive);
     assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Off);
+}
+
+#[test]
+fn set_thinking_toggles_back_on_where_off_rises_to_minimal() {
+    let mut app = test_app();
+    app.state.model.id = "claude-opus-5".into();
+
+    assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Adaptive);
+    assert_eq!(
+        app.set_thinking("").unwrap(),
+        ThinkingConfig::Effort(Effort::Minimal)
+    );
+    assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Adaptive);
 }
 
 #[test_case(true, "garbage", THINKING_USAGE ; "unknown_word")]

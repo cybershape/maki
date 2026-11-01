@@ -32,11 +32,11 @@ use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
 use crate::components::alert_modal::AlertModal;
-use crate::components::compact_detail::CompactDetailModal;
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{
     CommandAction, CommandPalette, ParsedCommand, PluginAccess, SUBMITS_PROMPT,
 };
+use crate::components::compact_detail::CompactDetailModal;
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Placeholder, Submission, sent_text};
@@ -956,7 +956,12 @@ impl App {
         if !self.state.model.supports_thinking() {
             return Err(THINKING_UNSUPPORTED_MSG.into());
         }
-        self.state.thinking = ThinkingConfig::parse(input.trim(), self.state.thinking)
+        // A model that can't turn thinking off stores `off` as its floor, which
+        // a toggle has to read as off again or it never turns thinking back on.
+        let current = Some(self.state.thinking)
+            .filter(|&thinking| thinking != ThinkingConfig::Off.clamped(&self.state.model))
+            .unwrap_or(ThinkingConfig::Off);
+        self.state.thinking = ThinkingConfig::parse(input.trim(), current)
             .map_err(str::to_owned)?
             .clamped(&self.state.model);
         self.state.pending_thinking = None;

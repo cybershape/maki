@@ -31,7 +31,11 @@ impl Deadline {
     }
 
     fn inner(&self) -> Option<MutexGuard<'_, DeadlineInner>> {
-        let mut guard = self.0.as_deref()?.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self
+            .0
+            .as_deref()?
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(slept) = guard.detector.check() {
             guard.at += slept;
         }
@@ -110,13 +114,13 @@ mod tests {
         assert_eq!(expired.check().unwrap_err(), DEADLINE_EXCEEDED);
     }
 
-    #[test]
-    fn a_wait_pushes_every_clone_back_by_its_length() {
+    #[tokio::test]
+    async fn a_wait_pushes_every_clone_back_by_its_length() {
         let deadline = Deadline::after(BUDGET);
         let before = deadline.at().unwrap();
         let clone = deadline.clone();
 
-        smol::block_on(deadline.paused_while(smol::Timer::after(WAIT)));
+        deadline.paused_while(tokio::time::sleep(WAIT)).await;
 
         assert!(clone.at().unwrap() - before >= WAIT);
     }

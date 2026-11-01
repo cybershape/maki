@@ -2,7 +2,7 @@ use std::any::Any;
 use std::fmt::Write;
 use std::ops::AddAssign;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
@@ -886,10 +886,10 @@ impl UiWaker {
 }
 
 /// Append-only buffer for streaming tool output to the UI. Writers append
-/// under a Mutex, readers get a cheap Arc clone via `read_if_dirty()`.
+/// under a Mutex, readers get a cheap Arc clone through a [`BufWatch`].
 pub struct SharedBuf {
-    committed: Mutex<Arc<Vec<SnapshotLine>>>,
-    dirty: AtomicBool,
+    committed: Mutex<BufferSnapshot>,
+    version: AtomicU64,
     /// Only a buffer shown in a plugin window gets one, since the UI reads
     /// those on a tick. A tool body is repainted by the agent events that
     /// carry it.
@@ -905,8 +905,8 @@ pub struct SharedBuf {
 impl SharedBuf {
     pub fn new() -> Self {
         Self {
-            committed: Mutex::new(Arc::new(Vec::new())),
-            dirty: AtomicBool::new(false),
+            committed: Mutex::default(),
+            version: AtomicU64::new(0),
             waker: OnceLock::new(),
             on_change: Mutex::new(None),
             click: Mutex::new(None),
@@ -966,17 +966,28 @@ impl SharedBuf {
 
     pub fn append(&self, line: SnapshotLine) {
         let mut guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
-        Arc::make_mut(&mut guard).push(line);
+        Arc::make_mut(&mut guard.lines).push(line);
         drop(guard);
-        self.dirty.store(true, Ordering::Release);
-        self.notify_change();
+        self.changed();
     }
 
     pub fn set_lines(&self, lines: Vec<SnapshotLine>) {
+        self.set_lines_with_head(lines, 0);
+    }
+
+    /// See [`BufferSnapshot::head`].
+    pub fn set_lines_with_head(&self, lines: Vec<SnapshotLine>, head: usize) {
         let mut guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Arc::new(lines);
+        *guard = BufferSnapshot {
+            lines: Arc::new(lines),
+            head,
+        };
         drop(guard);
-        self.dirty.store(true, Ordering::Release);
+        self.changed();
+    }
+
+    fn changed(&self) {
+        self.version.fetch_add(1, Ordering::Release);
         self.notify_change();
     }
 
@@ -984,6 +995,7 @@ impl SharedBuf {
         self.committed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .lines
             .len()
     }
 
@@ -992,25 +1004,42 @@ impl SharedBuf {
     }
 
     pub fn read(&self) -> Arc<Vec<SnapshotLine>> {
-        let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
-        Arc::clone(&guard)
+        self.take().lines
     }
 
-    pub fn read_if_dirty(&self) -> Option<Arc<Vec<SnapshotLine>>> {
-        if !self.dirty.swap(false, Ordering::AcqRel) {
-            return None;
-        }
-        let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
-        Some(Arc::clone(&guard))
-    }
-
-    /// A copy for a tool reply. Leaves the dirty flag alone: only the UI
-    /// clears it, and a reply can die on the way there (a cancelled run's
-    /// events are stale), which would strand the last repaint a tool made
-    /// on its way out. Re-reading the same lines once costs nothing.
     pub fn take(&self) -> BufferSnapshot {
-        let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
-        BufferSnapshot::from_arc(Arc::clone(&guard))
+        self.committed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+/// One reader of a [`SharedBuf`]. A moved call streams into one buf that two
+/// places draw, the row it left and its task tab. So every reader keeps its
+/// own mark, and one reading never hides a change from the other.
+pub struct BufWatch {
+    buf: Arc<SharedBuf>,
+    seen: u64,
+}
+
+impl BufWatch {
+    pub fn new(buf: Arc<SharedBuf>) -> Self {
+        Self { buf, seen: 0 }
+    }
+
+    pub fn buf(&self) -> &Arc<SharedBuf> {
+        &self.buf
+    }
+
+    /// The buf's lines, if they changed since this watch last looked. The
+    /// copy may already hold a later change, which the next look reads again.
+    pub fn changed(&mut self) -> Option<BufferSnapshot> {
+        let version = self.buf.version.load(Ordering::Acquire);
+        (version != self.seen).then(|| {
+            self.seen = version;
+            self.buf.take()
+        })
     }
 }
 
@@ -1032,14 +1061,28 @@ impl Serialize for SharedBuf {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct BufferSnapshot {
     pub lines: Arc<Vec<SnapshotLine>>,
+    /// How many leading lines say what the buffer is about, like the command
+    /// above a bash output. A tool row that moved to the background keeps
+    /// only these, because the rest now streams in the task's tab.
+    #[serde(skip)]
+    pub head: usize,
 }
 
 impl BufferSnapshot {
     pub fn from_arc(lines: Arc<Vec<SnapshotLine>>) -> Self {
-        Self { lines }
+        Self { lines, head: 0 }
+    }
+
+    /// The [`Self::head`] lines alone, or `None` when there are none.
+    pub fn head_only(&self) -> Option<Self> {
+        let head = self.head.min(self.lines.len());
+        (head > 0).then(|| Self {
+            lines: Arc::new(self.lines[..head].to_vec()),
+            head,
+        })
     }
 
     pub fn plain_text(text: String) -> Self {
@@ -1327,7 +1370,7 @@ pub struct SubagentInfo {
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
     /// Where a host queues messages for this subagent. Its loop drains the
-    /// queue between turns, so a message lands as a user interrupt.
+    /// queue between turns, so a message lands as an interrupt.
     #[serde(skip)]
     pub inbox: Option<Arc<crate::SubagentInbox>>,
     /// The model's call this session runs under when that is not its own
@@ -1467,8 +1510,9 @@ impl SessionEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_lite::future::poll_once;
     use std::pin::pin;
+
+    use futures::FutureExt;
     use test_case::test_case;
 
     #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 line")      ; "plain_short_annotates")]
@@ -1823,28 +1867,19 @@ mod tests {
     }
 
     #[test]
-    fn shared_buf_lifecycle() {
-        let buf = SharedBuf::new();
+    fn every_watch_sees_each_change_once() {
+        let buf = Arc::new(SharedBuf::new());
+        let mut row = BufWatch::new(Arc::clone(&buf));
+        let mut tab = BufWatch::new(Arc::clone(&buf));
+        assert!(row.changed().is_none(), "an untouched buf has nothing new");
 
-        assert!(buf.is_empty());
-        assert!(buf.read_if_dirty().is_none());
+        buf.append(line("a"));
+        buf.append(line("b"));
 
-        for i in 0..3 {
-            buf.append(line(&format!("l{i}")));
+        for watch in [&mut row, &mut tab] {
+            assert_eq!(watch.changed().unwrap().text(), "a\nb");
+            assert!(watch.changed().is_none());
         }
-        assert_eq!(buf.len(), 3);
-
-        let snap = buf.read_if_dirty().expect("dirty after appends");
-        assert_eq!(snap.len(), 3);
-        assert_eq!(snap[0].spans[0].text, "l0");
-        assert!(buf.read_if_dirty().is_none(), "clean after read");
-
-        buf.append(line("l3"));
-        let _ = buf.take();
-        assert!(
-            buf.read_if_dirty().is_some(),
-            "take must leave the flag for the UI"
-        );
     }
 
     #[test]
@@ -1852,11 +1887,10 @@ mod tests {
         let buf = SharedBuf::new();
         buf.append(line("a"));
         buf.append(line("b"));
-        let snap = buf.read_if_dirty().unwrap();
+        let snap = buf.read();
         buf.append(line("c"));
         assert_eq!(snap.len(), 2, "held Arc must not see new appends");
-        let snap2 = buf.read_if_dirty().unwrap();
-        assert_eq!(snap2.len(), 3);
+        assert_eq!(buf.read().len(), 3);
     }
 
     #[test]
@@ -1873,25 +1907,20 @@ mod tests {
 
     #[test]
     fn buffer_snapshot_first_line_text() {
-        let empty = BufferSnapshot {
-            lines: Arc::new(vec![]),
-        };
-        assert_eq!(empty.first_line_text(), "");
+        assert_eq!(BufferSnapshot::default().first_line_text(), "");
 
-        let multi = BufferSnapshot {
-            lines: Arc::new(vec![SnapshotLine {
-                spans: vec![
-                    SnapshotSpan {
-                        text: "hello ".into(),
-                        style: SpanStyle::Default,
-                    },
-                    SnapshotSpan {
-                        text: "world".into(),
-                        style: SpanStyle::Named("bold".into()),
-                    },
-                ],
-            }]),
-        };
+        let multi = BufferSnapshot::from_arc(Arc::new(vec![SnapshotLine {
+            spans: vec![
+                SnapshotSpan {
+                    text: "hello ".into(),
+                    style: SpanStyle::Default,
+                },
+                SnapshotSpan {
+                    text: "world".into(),
+                    style: SpanStyle::Named("bold".into()),
+                },
+            ],
+        }]));
         assert_eq!(multi.first_line_text(), "hello world");
     }
 
@@ -2155,55 +2184,54 @@ mod tests {
     const STILL_PENDING: &str = "an empty stream must not resolve `next()`";
     const NO_LATE_EVENTS: &str = "events queued after the marker must stay invisible";
 
-    fn drain(events: &mut SessionEvents) -> Vec<u64> {
-        smol::block_on(async {
-            let mut seen = Vec::new();
-            while let Some(envelope) = events.next().await {
-                seen.push(envelope.run_id);
-            }
-            seen
-        })
+    async fn drain(events: &mut SessionEvents) -> Vec<u64> {
+        let mut seen = Vec::new();
+        while let Some(envelope) = events.next().await {
+            seen.push(envelope.run_id);
+        }
+        seen
     }
 
     /// The ordering the whole design rests on: the marker rides the same FIFO
     /// as the events, so nothing queued before it is lost. The first `next()`
     /// is polled on an empty queue and then dropped, the way a `select!` arm
     /// in the SDK pump does, and it must not swallow what lands afterwards.
-    #[test]
-    fn queued_events_arrive_in_order_before_the_close() {
+    #[tokio::test]
+    async fn queued_events_arrive_in_order_before_the_close() {
         let (guard, mut events) = event_stream();
-        smol::block_on(async {
+        {
             let mut pending = pin!(events.next());
-            assert!(
-                poll_once(pending.as_mut()).await.is_none(),
-                "{STILL_PENDING}"
-            );
+            assert!(pending.as_mut().now_or_never().is_none(), "{STILL_PENDING}");
             for run_id in STREAM_RUN_IDS {
                 guard.sender(run_id).send(AgentEvent::Nudge).unwrap();
             }
-        });
+        }
         drop(guard);
-        assert_eq!(drain(&mut events), STREAM_RUN_IDS);
+        assert_eq!(drain(&mut events).await, STREAM_RUN_IDS);
     }
 
     /// The marker is a point of no return, even for a reader that has not
     /// polled yet. A Lua tool context parks a sender on an idle VM forever, so
     /// its late send has to look fine to it and stay invisible to the reader.
-    #[test]
-    fn events_sent_after_the_close_are_never_observed() {
+    #[tokio::test]
+    async fn events_sent_after_the_close_are_never_observed() {
         let (guard, mut events) = event_stream();
         let retained = guard.sender(STREAM_RUN_IDS[0]);
         retained.send(AgentEvent::Nudge).unwrap();
         drop(guard);
         retained.send(AgentEvent::Nudge).unwrap();
-        assert_eq!(drain(&mut events), [STREAM_RUN_IDS[0]], "{NO_LATE_EVENTS}");
-        assert!(smol::block_on(events.next()).is_none(), "{NO_LATE_EVENTS}");
+        assert_eq!(
+            drain(&mut events).await,
+            [STREAM_RUN_IDS[0]],
+            "{NO_LATE_EVENTS}"
+        );
+        assert!(events.next().await.is_none(), "{NO_LATE_EVENTS}");
     }
 
     /// A derived sender is just another clone: it stamps its own run id on the
     /// same FIFO, and dropping it neither ends nor extends the stream.
-    #[test]
-    fn with_run_id_restamps_without_forking_the_stream() {
+    #[tokio::test]
+    async fn with_run_id_restamps_without_forking_the_stream() {
         let (guard, mut events) = event_stream();
         let original = guard.sender(STREAM_RUN_IDS[0]);
         let derived = original.with_run_id(STREAM_RUN_IDS[1]);
@@ -2212,7 +2240,7 @@ mod tests {
         original.send(AgentEvent::Nudge).unwrap();
         drop(guard);
         assert_eq!(
-            drain(&mut events),
+            drain(&mut events).await,
             [STREAM_RUN_IDS[1], STREAM_RUN_IDS[0]],
             "{NO_LATE_EVENTS}"
         );

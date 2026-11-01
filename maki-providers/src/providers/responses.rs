@@ -4,9 +4,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
-use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
-use isahc::{HttpClient, Request};
+use reqwest::Client;
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tracing::{debug, warn};
 
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
     StreamResponse, ThinkingConfig, TokenUsage, dialect,
 };
-use futures_lite::AsyncReadExt;
+
 use maki_config::providers::ProvidersConfig;
 use maki_storage::id::SessionRef;
 
@@ -238,7 +238,7 @@ fn strip_summary(body: &mut Value) {
 }
 
 pub(crate) async fn do_stream(
-    client: &HttpClient,
+    client: &Client,
     model: &crate::model::Model,
     body: &Value,
     event_tx: &Sender<ProviderEvent>,
@@ -265,7 +265,7 @@ pub(crate) async fn do_stream(
 
 #[allow(clippy::too_many_arguments)]
 async fn post_responses(
-    client: &HttpClient,
+    client: &Client,
     model: &crate::model::Model,
     body: &Value,
     event_tx: &Sender<ProviderEvent>,
@@ -277,13 +277,13 @@ async fn post_responses(
 
     let request = auth
         .configure_request(
-            Request::builder()
-                .method("POST")
-                .uri(format!("{base}{RESPONSES_PATH}"))
+            client
+                .post(format!("{base}{RESPONSES_PATH}"))
                 .header("content-type", "application/json")
                 .header("user-agent", super::user_agent()),
         )
-        .body(json_body)?;
+        .body(json_body)
+        .build()?;
 
     debug!(
         model = %model.id,
@@ -291,19 +291,14 @@ async fn post_responses(
         "sending Responses API request"
     );
 
-    let response = client.send_async(request).await?;
-    let status = response.status().as_u16();
-
-    if status == 200 {
-        parse_sse(
-            BufReader::new(response.into_body()),
-            event_tx,
-            stream_timeout,
-        )
-        .await
-    } else {
-        Err(AgentError::from_response(response).await)
-    }
+    super::send_request(client, request, |response| async move {
+        if response.status().as_u16() == 200 {
+            parse_sse(super::body_reader(response), event_tx, stream_timeout).await
+        } else {
+            Err(AgentError::from_response(response).await)
+        }
+    })
+    .await
 }
 
 pub struct ResponsesProvider {
@@ -312,7 +307,7 @@ pub struct ResponsesProvider {
     pub system_prefix: Option<String>,
     auth: Arc<Mutex<ResolvedAuth>>,
     timeouts: Timeouts,
-    client: HttpClient,
+    client: Client,
     body_hook: Option<Arc<dyn super::codec::BodyHook>>,
 }
 
@@ -504,28 +499,22 @@ impl ResponsesProvider {
             let url = format!("{base}/models");
             if let Ok(req) = auth
                 .configure_request(
-                    Request::builder()
-                        .method("GET")
-                        .uri(&url)
+                    self.client
+                        .get(&url)
                         .header("user-agent", super::user_agent()),
                 )
-                .body(())
-                && let Ok(mut resp) = self.client.send_async(req).await
-                && resp.status().as_u16() == 200
+                .build()
+                && let Ok(text) = super::ok_text(&self.client, req).await
+                && let Ok(val) = serde_json::from_str::<Value>(&text)
             {
-                let mut text = String::new();
-                if resp.body_mut().read_to_string(&mut text).await.is_ok()
-                    && let Ok(val) = serde_json::from_str::<Value>(&text)
-                {
-                    let raw_items = val["data"].as_array().or_else(|| val["models"].as_array());
-                    if let Some(data) = raw_items {
-                        let mut models: Vec<ModelInfo> =
-                            data.iter().filter_map(parse_model_info).collect();
-                        models.sort_by(|a, b| a.id.cmp(&b.id));
-                        if !models.is_empty() {
-                            crate::model_registry::set_known_models(&self.slug, models.clone());
-                            return Ok(models);
-                        }
+                let raw_items = val["data"].as_array().or_else(|| val["models"].as_array());
+                if let Some(data) = raw_items {
+                    let mut models: Vec<ModelInfo> =
+                        data.iter().filter_map(parse_model_info).collect();
+                    models.sort_by(|a, b| a.id.cmp(&b.id));
+                    if !models.is_empty() {
+                        crate::model_registry::set_known_models(&self.slug, models.clone());
+                        return Ok(models);
                     }
                 }
             }
@@ -1004,8 +993,8 @@ fn parse_usage(u: &Value) -> TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_lite::io::Cursor;
     use serde_json::json;
+    use std::io::Cursor;
     use test_case::test_case;
 
     use crate::test_support::sse_event;
@@ -1065,43 +1054,41 @@ mod tests {
     #[test_case("response.completed", "completed", StopReason::EndTurn, json!({"total_nano_aiu": COPILOT_NANO_AIU as f64}), Some(COPILOT_USD) ; "float_total")]
     #[test_case("response.completed", "completed", StopReason::EndTurn, json!({"total_nano_aiu": "375000"}), None ; "string_total")]
     #[test_case("response.completed", "completed", StopReason::EndTurn, json!("billed"), None ; "not_an_object")]
-    fn parse_sse_copilot_usage_prices_the_turn(
+    #[tokio::test]
+    async fn parse_sse_copilot_usage_prices_the_turn(
         event: &str,
         status: &str,
         stop: StopReason,
         copilot_usage: Value,
         cost: Option<f64>,
     ) {
-        smol::block_on(async {
-            let sse = sse_event(
-                event,
-                &json!({
-                    "copilot_usage": copilot_usage,
-                    "response": {"status": status, "usage": {"input_tokens": 100, "output_tokens": 10}},
-                }),
-            );
+        let sse = sse_event(
+            event,
+            &json!({
+                "copilot_usage": copilot_usage,
+                "response": {"status": status, "usage": {"input_tokens": 100, "output_tokens": 10}},
+            }),
+        );
 
-            let (resp, _events) = run_sse(&sse).await;
-            let resp = resp.unwrap();
+        let (resp, _events) = run_sse(&sse).await;
+        let resp = resp.unwrap();
 
-            assert_eq!(
-                resp.usage,
-                TokenUsage {
-                    input: 100,
-                    output: 10,
-                    cache_creation: 0,
-                    cache_read: 0,
-                    cost,
-                }
-            );
-            assert_eq!(resp.stop_reason, Some(stop));
-        })
+        assert_eq!(
+            resp.usage,
+            TokenUsage {
+                input: 100,
+                output: 10,
+                cache_creation: 0,
+                cache_read: 0,
+                cost,
+            }
+        );
+        assert_eq!(resp.stop_reason, Some(stop));
     }
 
-    #[test]
-    fn parse_sse_text_and_usage() {
-        smol::block_on(async {
-            let sse = "\
+    #[tokio::test]
+    async fn parse_sse_text_and_usage() {
+        let sse = "\
 event: response.output_text.delta\n\
 data: {\"delta\":\"Hello\"}\n\
 \n\
@@ -1112,32 +1099,30 @@ event: response.completed\n\
 data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":40}}}}\n\
 \n";
 
-            let (resp, events) = run_sse(sse).await;
-            let resp = resp.unwrap();
+        let (resp, events) = run_sse(sse).await;
+        let resp = resp.unwrap();
 
-            assert_eq!(resp.usage.input, 60);
-            assert_eq!(resp.usage.output, 10);
-            assert_eq!(resp.usage.cache_read, 40);
-            assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
-            assert!(
-                matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "Hello world")
-            );
+        assert_eq!(resp.usage.input, 60);
+        assert_eq!(resp.usage.output, 10);
+        assert_eq!(resp.usage.cache_read, 40);
+        assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
+        assert!(
+            matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "Hello world")
+        );
 
-            let deltas: Vec<_> = events
-                .iter()
-                .filter_map(|e| match e {
-                    ProviderEvent::TextDelta { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(deltas, vec!["Hello", " world"]);
-        })
+        let deltas: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["Hello", " world"]);
     }
 
-    #[test]
-    fn parse_sse_tool_calls() {
-        smol::block_on(async {
-            let sse = "\
+    #[tokio::test]
+    async fn parse_sse_tool_calls() {
+        let sse = "\
 event: response.output_item.added\n\
 data: {\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\
 \n\
@@ -1154,26 +1139,25 @@ event: response.completed\n\
 data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\
 \n";
 
-            let (resp, events) = run_sse(sse).await;
-            let resp = resp.unwrap();
+        let (resp, events) = run_sse(sse).await;
+        let resp = resp.unwrap();
 
-            let tools: Vec<_> = resp.message.tool_uses().collect();
-            assert_eq!(tools.len(), 2);
-            assert_eq!((tools[0].0, tools[0].1), ("c1", "bash"));
-            assert_eq!(tools[0].2["command"], "ls");
-            assert_eq!((tools[1].0, tools[1].1), ("c2", "read"));
-            assert_eq!(tools[1].2["path"], "/tmp");
-            assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 2);
+        assert_eq!((tools[0].0, tools[0].1), ("c1", "bash"));
+        assert_eq!(tools[0].2["command"], "ls");
+        assert_eq!((tools[1].0, tools[1].1), ("c2", "read"));
+        assert_eq!(tools[1].2["path"], "/tmp");
+        assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
 
-            let starts: Vec<_> = events
-                .iter()
-                .filter_map(|e| match e {
-                    ProviderEvent::ToolUseStart { id, name } => Some((id.as_str(), name.as_str())),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(starts, vec![("c1", "bash"), ("c2", "read")]);
-        })
+        let starts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::ToolUseStart { id, name } => Some((id.as_str(), name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, vec![("c1", "bash"), ("c2", "read")]);
     }
 
     // Codex hides an overload in `code` on an otherwise healthy 200 stream, so these tags are what
@@ -1181,45 +1165,42 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"ou
     #[test_case("service_unavailable_error", "server_is_overloaded", OVERLOAD_MESSAGE, 529, true ; "codex_overload")]
     #[test_case("overloaded_error", "", OVERLOAD_MESSAGE, 529, true                              ; "overload_without_code")]
     #[test_case("invalid_request_error", "invalid_value", BAD_REQUEST_MESSAGE, 400, false        ; "bad_request")]
-    fn parse_sse_error_event(
+    #[tokio::test]
+    async fn parse_sse_error_event(
         error_type: &str,
         code: &str,
         message: &str,
         status: u16,
         retryable: bool,
     ) {
-        smol::block_on(async {
-            let data = json!({
-                "type": "error",
-                "error": { "type": error_type, "code": code, "message": message },
-            });
+        let data = json!({
+            "type": "error",
+            "error": { "type": error_type, "code": code, "message": message },
+        });
 
-            let (result, _) = run_sse(&format!("event: error\ndata: {data}\n\n")).await;
-            let err = result.unwrap_err();
-            assert_eq!(err.to_string(), format!("API error ({status}): {message}"));
-            assert_eq!(err.is_retryable(), retryable);
-        })
+        let (result, _) = run_sse(&format!("event: error\ndata: {data}\n\n")).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), format!("API error ({status}): {message}"));
+        assert_eq!(err.is_retryable(), retryable);
     }
 
     #[test_case("rate_limit_exceeded", RATE_LIMIT_MESSAGE, 429 ; "rate_limit")]
     #[test_case("server_is_overloaded", OVERLOAD_MESSAGE, 529  ; "overload")]
-    fn parse_sse_response_failed(code: &str, message: &str, status: u16) {
-        smol::block_on(async {
-            let data = json!({
-                "response": { "error": { "code": code, "message": message } },
-            });
+    #[tokio::test]
+    async fn parse_sse_response_failed(code: &str, message: &str, status: u16) {
+        let data = json!({
+            "response": { "error": { "code": code, "message": message } },
+        });
 
-            let (result, _) = run_sse(&format!("event: response.failed\ndata: {data}\n\n")).await;
-            let err = result.unwrap_err();
-            assert_eq!(err.to_string(), format!("API error ({status}): {message}"));
-            assert!(err.is_retryable());
-        })
+        let (result, _) = run_sse(&format!("event: response.failed\ndata: {data}\n\n")).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), format!("API error ({status}): {message}"));
+        assert!(err.is_retryable());
     }
 
-    #[test]
-    fn parse_sse_incomplete_response() {
-        smol::block_on(async {
-            let sse = "\
+    #[tokio::test]
+    async fn parse_sse_incomplete_response() {
+        let sse = "\
 event: response.output_text.delta\n\
 data: {\"delta\":\"partial\"}\n\
 \n\
@@ -1227,13 +1208,12 @@ event: response.incomplete\n\
 data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
 \n";
 
-            let (resp, _) = run_sse(sse).await;
-            let resp = resp.unwrap();
-            assert_eq!(resp.stop_reason, Some(StopReason::MaxTokens));
-            assert!(
-                matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "partial")
-            );
-        })
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
+        assert_eq!(resp.stop_reason, Some(StopReason::MaxTokens));
+        assert!(
+            matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "partial")
+        );
     }
 
     #[test]
@@ -1279,10 +1259,9 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
         assert_eq!(items[3]["output"], "file.txt");
     }
 
-    #[test]
-    fn parse_sse_reasoning_text_delta() {
-        smol::block_on(async {
-            let sse = "\
+    #[tokio::test]
+    async fn parse_sse_reasoning_text_delta() {
+        let sse = "\
 event: response.output_item.added\n\
 data: {\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"content\":[],\"encrypted_content\":\"\",\"status\":\"in_progress\"}}\n\
 \n\
@@ -1302,45 +1281,43 @@ event: response.completed\n\
 data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":20,\"input_tokens_details\":{\"cached_tokens\":10},\"output_tokens_details\":{\"reasoning_tokens\":5}}}}\n\
 \n";
 
-            let (resp, events) = run_sse(sse).await;
-            let resp = resp.unwrap();
+        let (resp, events) = run_sse(sse).await;
+        let resp = resp.unwrap();
 
-            assert_eq!(resp.usage.input, 90);
-            assert_eq!(resp.usage.output, 20);
-            assert_eq!(resp.usage.cache_read, 10);
+        assert_eq!(resp.usage.input, 90);
+        assert_eq!(resp.usage.output, 20);
+        assert_eq!(resp.usage.cache_read, 10);
 
-            assert_eq!(resp.message.content.len(), 2);
-            assert!(
-                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Let me think about this")
-            );
-            assert!(
-                matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hello world")
-            );
+        assert_eq!(resp.message.content.len(), 2);
+        assert!(
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Let me think about this")
+        );
+        assert!(
+            matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hello world")
+        );
 
-            let thinking_deltas: Vec<_> = events
-                .iter()
-                .filter_map(|e| match e {
-                    ProviderEvent::ThinkingDelta { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(thinking_deltas, vec!["Let me think", " about this"]);
+        let thinking_deltas: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::ThinkingDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking_deltas, vec!["Let me think", " about this"]);
 
-            let text_deltas: Vec<_> = events
-                .iter()
-                .filter_map(|e| match e {
-                    ProviderEvent::TextDelta { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(text_deltas, vec!["Hello world"]);
-        })
+        let text_deltas: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text_deltas, vec!["Hello world"]);
     }
 
-    #[test]
-    fn parse_sse_reasoning_summary_text_delta() {
-        smol::block_on(async {
-            let sse = "\
+    #[tokio::test]
+    async fn parse_sse_reasoning_summary_text_delta() {
+        let sse = "\
 event: response.reasoning_summary_text.delta\n\
 data: {\"delta\":\"Summary part\"}\n\
 \n\
@@ -1351,28 +1328,26 @@ event: response.completed\n\
 data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
 \n";
 
-            let (resp, events) = run_sse(sse).await;
-            let resp = resp.unwrap();
+        let (resp, events) = run_sse(sse).await;
+        let resp = resp.unwrap();
 
-            assert!(
-                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Summary part")
-            );
+        assert!(
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Summary part")
+        );
 
-            let thinking_deltas: Vec<_> = events
-                .iter()
-                .filter_map(|e| match e {
-                    ProviderEvent::ThinkingDelta { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(thinking_deltas, vec!["Summary part"]);
-        })
+        let thinking_deltas: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::ThinkingDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking_deltas, vec!["Summary part"]);
     }
 
-    #[test]
-    fn parse_sse_reasoning_only_no_text() {
-        smol::block_on(async {
-            let sse = "\
+    #[tokio::test]
+    async fn parse_sse_reasoning_only_no_text() {
+        let sse = "\
 event: response.reasoning_text.delta\n\
 data: {\"delta\":\"Thinking only\"}\n\
 \n\
@@ -1380,21 +1355,19 @@ event: response.completed\n\
 data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":5}}}}\n\
 \n";
 
-            let (resp, _) = run_sse(sse).await;
-            let resp = resp.unwrap();
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
 
-            assert_eq!(resp.message.content.len(), 1);
-            assert!(
-                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Thinking only")
-            );
-            assert_eq!(resp.usage.output, 5);
-        })
+        assert_eq!(resp.message.content.len(), 1);
+        assert!(
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Thinking only")
+        );
+        assert_eq!(resp.usage.output, 5);
     }
 
-    #[test]
-    fn parse_sse_malformed_tool_json_yields_empty_object() {
-        smol::block_on(async {
-            let sse = "\
+    #[tokio::test]
+    async fn parse_sse_malformed_tool_json_yields_empty_object() {
+        let sse = "\
 event: response.output_item.added\n\
 data: {\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\
 \n\
@@ -1405,22 +1378,20 @@ event: response.completed\n\
 data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\
 \n";
 
-            let (resp, _) = run_sse(sse).await;
-            let resp = resp.unwrap();
-            let tools: Vec<_> = resp.message.tool_uses().collect();
-            assert_eq!(tools.len(), 1);
-            assert_eq!(tools[0].1, "bash");
-            assert_eq!(*tools[0].2, Value::Object(Default::default()));
-        })
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].1, "bash");
+        assert_eq!(*tools[0].2, Value::Object(Default::default()));
     }
 
     // llama.cpp's /v1/responses endpoint omits output_index in SSE events
     // (see https://github.com/ggml-org/llama.cpp/issues/20607)
 
-    #[test]
-    fn parse_sse_tool_call_without_output_index() {
-        smol::block_on(async {
-            let sse = "\
+    #[tokio::test]
+    async fn parse_sse_tool_call_without_output_index() {
+        let sse = "\
 event: response.output_item.added\n\
 data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\
 \n\
@@ -1431,23 +1402,21 @@ event: response.completed\n\
 data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\
 \n";
 
-            let (resp, _) = run_sse(sse).await;
-            let resp = resp.unwrap();
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
 
-            let tools: Vec<_> = resp.message.tool_uses().collect();
-            assert_eq!(tools.len(), 1);
-            assert_eq!(tools[0].0, "c1");
-            assert_eq!(tools[0].1, "bash");
-            assert_eq!(tools[0].2["command"], "ls");
-            assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
-        })
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].0, "c1");
+        assert_eq!(tools[0].1, "bash");
+        assert_eq!(tools[0].2["command"], "ls");
+        assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
     }
 
-    #[test]
-    fn parse_sse_sequential_tool_calls_without_output_index() {
-        smol::block_on(async {
-            // Simulates llama.cpp streaming two sequential tool calls without output_index
-            let sse = "\
+    #[tokio::test]
+    async fn parse_sse_sequential_tool_calls_without_output_index() {
+        // Simulates llama.cpp streaming two sequential tool calls without output_index
+        let sse = "\
 event: response.output_item.added\n\
 data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\
 \n\
@@ -1470,23 +1439,21 @@ event: response.completed\n\
 data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\
 \n";
 
-            let (resp, _) = run_sse(sse).await;
-            let resp = resp.unwrap();
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
 
-            let tools: Vec<_> = resp.message.tool_uses().collect();
-            assert_eq!(tools.len(), 2);
-            assert_eq!((tools[0].0, tools[0].1), ("c1", "bash"));
-            assert_eq!(tools[0].2["command"], "ls");
-            assert_eq!((tools[1].0, tools[1].1), ("c2", "read"));
-            assert_eq!(tools[1].2["path"], "/tmp");
-        })
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 2);
+        assert_eq!((tools[0].0, tools[0].1), ("c1", "bash"));
+        assert_eq!(tools[0].2["command"], "ls");
+        assert_eq!((tools[1].0, tools[1].1), ("c2", "read"));
+        assert_eq!(tools[1].2["path"], "/tmp");
     }
 
-    #[test]
-    fn parse_sse_tool_done_without_output_index_updates_last_acc() {
-        smol::block_on(async {
-            // done event without output_index should update the last accumulator
-            let sse = "\
+    #[tokio::test]
+    async fn parse_sse_tool_done_without_output_index_updates_last_acc() {
+        // done event without output_index should update the last accumulator
+        let sse = "\
 event: response.output_item.added\n\
 data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"glob\"}}\n\
 \n\
@@ -1500,21 +1467,19 @@ event: response.completed\n\
 data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\
 \n";
 
-            let (resp, _) = run_sse(sse).await;
-            let resp = resp.unwrap();
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
 
-            let tools: Vec<_> = resp.message.tool_uses().collect();
-            assert_eq!(tools.len(), 1);
-            assert_eq!(tools[0].1, "glob");
-            assert_eq!(tools[0].2["pattern"], "*.rs");
-            assert_eq!(tools[0].2["path"], "src");
-        })
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].1, "glob");
+        assert_eq!(tools[0].2["pattern"], "*.rs");
+        assert_eq!(tools[0].2["path"], "src");
     }
 
-    #[test]
-    fn parse_sse_prompt_progress_events() {
-        smol::block_on(async {
-            let sse = "\
+    #[tokio::test]
+    async fn parse_sse_prompt_progress_events() {
+        let sse = "\
 event: response.in_progress\n\
 data: {\"prompt_progress\":{\"processed\":100,\"total\":1000,\"cache\":50}}\n\
 \n\
@@ -1528,27 +1493,25 @@ event: response.completed\n\
 data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10}}}\n\
 \n";
 
-            let (_resp, events) = run_sse(sse).await;
+        let (_resp, events) = run_sse(sse).await;
 
-            let progress: Vec<_> = events
-                .iter()
-                .filter_map(|e| match e {
-                    ProviderEvent::PromptProgress {
-                        processed,
-                        total,
-                        cache,
-                    } => Some((*processed, *total, *cache)),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(progress, vec![(100, 1000, 50), (500, 1000, 50)]);
-        })
+        let progress: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::PromptProgress {
+                    processed,
+                    total,
+                    cache,
+                } => Some((*processed, *total, *cache)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(progress, vec![(100, 1000, 50), (500, 1000, 50)]);
     }
 
-    #[test]
-    fn parse_sse_done_arguments_as_json_object() {
-        smol::block_on(async {
-            let sse = "\
+    #[tokio::test]
+    async fn parse_sse_done_arguments_as_json_object() {
+        let sse = "\
 event: response.output_item.added\n\
 data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\"}}\n\
 \n\
@@ -1560,20 +1523,18 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"ou
 \
 \n";
 
-            let (resp, _) = run_sse(sse).await;
-            let resp = resp.unwrap();
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
 
-            let tools: Vec<_> = resp.message.tool_uses().collect();
-            assert_eq!(tools.len(), 1);
-            assert_eq!(tools[0].1, "read");
-            assert_eq!(tools[0].2["path"], "/tmp/file.txt");
-        })
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].1, "read");
+        assert_eq!(tools[0].2["path"], "/tmp/file.txt");
     }
 
-    #[test]
-    fn parse_sse_reasoning_summary_part_added() {
-        smol::block_on(async {
-            let sse = "\
+    #[tokio::test]
+    async fn parse_sse_reasoning_summary_part_added() {
+        let sse = "\
 event: response.reasoning_summary_part.added\n\
 data: {\"id\":\"sp_1\"}\n\
 \n\
@@ -1593,19 +1554,17 @@ event: response.completed\n\
 data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
 \n";
 
-            let (resp, _) = run_sse(sse).await;
-            let resp = resp.unwrap();
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
 
-            assert!(
-                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "First part\n\nSecond part")
-            );
-        })
+        assert!(
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "First part\n\nSecond part")
+        );
     }
 
-    #[test]
-    fn parse_sse_delta_arguments_as_json_object() {
-        smol::block_on(async {
-            let sse = "\
+    #[tokio::test]
+    async fn parse_sse_delta_arguments_as_json_object() {
+        let sse = "\
 event: response.output_item.added\n\
 data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"grep\"}}\n\
 \n\
@@ -1617,21 +1576,19 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"ou
 \
 \n";
 
-            let (resp, _) = run_sse(sse).await;
-            let resp = resp.unwrap();
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
 
-            let tools: Vec<_> = resp.message.tool_uses().collect();
-            assert_eq!(tools.len(), 1);
-            assert_eq!(tools[0].1, "grep");
-            assert_eq!(tools[0].2["pattern"], "TODO");
-            assert_eq!(tools[0].2["path"], "src");
-        })
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].1, "grep");
+        assert_eq!(tools[0].2["pattern"], "TODO");
+        assert_eq!(tools[0].2["path"], "src");
     }
 
-    #[test]
-    fn parse_sse_done_object_args_overrides_empty_delta() {
-        smol::block_on(async {
-            let sse = "\
+    #[tokio::test]
+    async fn parse_sse_done_object_args_overrides_empty_delta() {
+        let sse = "\
 event: response.output_item.added\n\
 data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"edit\"}}\n\
 \n\
@@ -1643,22 +1600,20 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"ou
 \
 \n";
 
-            let (resp, _) = run_sse(sse).await;
-            let resp = resp.unwrap();
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
 
-            let tools: Vec<_> = resp.message.tool_uses().collect();
-            assert_eq!(tools.len(), 1);
-            assert_eq!(tools[0].1, "edit");
-            assert_eq!(tools[0].2["path"], "foo.rs");
-            assert_eq!(tools[0].2["old_string"], "a");
-            assert_eq!(tools[0].2["new_string"], "b");
-        })
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].1, "edit");
+        assert_eq!(tools[0].2["path"], "foo.rs");
+        assert_eq!(tools[0].2["old_string"], "a");
+        assert_eq!(tools[0].2["new_string"], "b");
     }
 
-    #[test]
-    fn parse_sse_no_reasoning_tokens_in_usage() {
-        smol::block_on(async {
-            let sse = "\
+    #[tokio::test]
+    async fn parse_sse_no_reasoning_tokens_in_usage() {
+        let sse = "\
 event: response.output_text.delta\n\
 data: {\"delta\":\"Hello\"}\n\
 \n\
@@ -1666,13 +1621,12 @@ event: response.completed\n\
 data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":40}}}}\n\
 \n";
 
-            let (resp, _) = run_sse(sse).await;
-            let resp = resp.unwrap();
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
 
-            assert_eq!(resp.usage.input, 60);
-            assert_eq!(resp.usage.output, 10);
-            assert_eq!(resp.usage.cache_read, 40);
-        })
+        assert_eq!(resp.usage.input, 60);
+        assert_eq!(resp.usage.output, 10);
+        assert_eq!(resp.usage.cache_read, 40);
     }
 
     #[test_case(ThinkingConfig::Adaptive, "gpt-5.3-codex", "medium" ; "adaptive_codex")]

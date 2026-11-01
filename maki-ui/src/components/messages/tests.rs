@@ -3484,7 +3484,8 @@ fn compact_batch_children_follow_snapshots(restored: bool, cancelled: bool) {
         assert_eq!(batch.duration, Some(Duration::from_millis(1234)));
         assert_eq!(group.total_duration(), Duration::from_millis(1234));
     }
-    let rows = tool_group::build_tool_group_lines(group, VIEW_WIDTH, 0, tool_group::DEFAULT_COMPACT_LINES);
+    let rows =
+        tool_group::build_tool_group_lines(group, VIEW_WIDTH, 0, tool_group::DEFAULT_COMPACT_LINES);
     assert!(rows.lines[2].to_string().ends_with("(1.23s)"));
     assert_eq!(
         batch.children[0].status,
@@ -3995,6 +3996,8 @@ const MOVABLE_ID: &str = "t1";
 const NARROW_WIDTH: u16 = 24;
 const RECEIPT: &str = "Moved to the background. Last 2 lines: Running unittests";
 const STREAMED: &str = "streamed output";
+const COMMAND: &str = "cargo test";
+const NEW_COMMAND: &str = "cargo test --workspace";
 const CLICK_HINT: &str = "click to open";
 const ELAPSED_MINUTE: &str = "1m";
 const ELAPSED_SECS: u64 = 72;
@@ -4107,37 +4110,28 @@ fn a_moved_row_takes_no_toggle() {
     assert_eq!(panel.toggle_click(0, view_area()), ClickOutcome::None);
 }
 
-/// A moved call's tab shares the buf of the row it left, and that row
-/// already read the change. A quiet command never writes again, so the tab
-/// draws what is there now.
+/// The row keeps the lines that say what runs, from the move on. The colored
+/// command can land after the move, so the row keeps following the buf.
 #[test]
-fn a_registered_buf_shows_what_it_holds_even_if_read_elsewhere() {
+fn a_moved_row_keeps_its_head_and_follows_it() {
     let buf = Arc::new(maki_agent::SharedBuf::new());
-    buf.set_lines(vec![snap_line(STREAMED)]);
-    assert!(buf.read_if_dirty().is_some());
+    buf.set_lines_with_head(vec![snap_line(COMMAND), snap_line(STREAMED)], 1);
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start(MOVABLE_ID, BASH_TOOL_NAME));
-
-    panel.register_live_buf(MOVABLE_ID.into(), buf);
-
-    assert!(view_text(&mut panel).contains(STREAMED));
-}
-
-#[test]
-fn backgrounded_tool_done_hides_the_receipt_and_shows_moved_indicator() {
-    let buf = Arc::new(maki_agent::SharedBuf::new());
-    buf.set_lines(vec![snap_line(STREAMED)]);
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.register_live_buf(MOVABLE_ID.into(), buf);
-    panel.tool_start(start(MOVABLE_ID, BASH_TOOL_NAME));
+    panel.register_live_buf(MOVABLE_ID.into(), Arc::clone(&buf));
     panel.tool_done(backgrounded_done(RECEIPT));
 
     let text = view_text(&mut panel);
+    assert!(text.contains(COMMAND), "{text}");
     assert!(!text.contains(RECEIPT), "{text}");
     assert!(!text.contains(STREAMED), "{text}");
     assert!(text.contains(BACKGROUND_INDICATOR.trim()), "{text}");
     assert!(!text.contains(TOOL_INDICATOR.trim()), "{text}");
     assert!(text.contains(CLICK_HINT), "{text}");
+
+    buf.set_lines_with_head(vec![snap_line(NEW_COMMAND), snap_line(STREAMED)], 1);
+    assert_eq!(panel.tick(), Dirty::YES);
+    assert!(view_text(&mut panel).contains(NEW_COMMAND));
 }
 
 fn unstruck_cancelled(theme: &Theme) -> Style {
@@ -4219,7 +4213,9 @@ fn compact_row_click_names_the_call_and_skips_the_title() {
     let tool = panel.compact_target_at(1, view_area()).expect("tool row");
     assert_eq!(tool.entry, 0);
     assert_eq!(tool.child, None);
-    let thinking = panel.compact_target_at(2, view_area()).expect("thinking row");
+    let thinking = panel
+        .compact_target_at(2, view_area())
+        .expect("thinking row");
     assert_eq!(thinking.entry, 1);
     assert_eq!(thinking.child, None);
     assert_eq!(

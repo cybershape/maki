@@ -10,6 +10,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_agent::{AgentEvent, EventSender, SpanStyle};
 use maki_config::ToolOutputLines;
 use maki_highlight::highlight_code;
+use maki_lua::test_support::runtime;
 use maki_lua::{PluginHost, RestoreReason, Split, UiAction};
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::{Value, json};
@@ -22,8 +23,12 @@ const COMMAND_WORD: &str = "echo";
 const BATCH_SRC: &str = include_str!("../../plugins/batch/init.lua");
 const TODO_SRC: &str = include_str!("../../plugins/todo_write/init.lua");
 const READ_SRC: &str = include_str!("../../plugins/read/init.lua");
+/// Deeper than the 200 lines of context the read plugin highlights.
 const READ_PADDING_LINES: usize = 300;
-const READ_PADDING_BYTES: usize = 128;
+/// Kept short, so the context stays far below the highlighter's 16 KiB
+/// prefix cut, which `maki-highlight` tests on its own. Long lines made a
+/// loaded CI runner miss the 10 s restore deadline and lose the colors.
+const READ_PADDING_BYTES: usize = 8;
 const READ_COMMENT: &str = "/* comment";
 const READ_EXCERPT: &str = "let value = 1;";
 const READ_LANG: &str = "rust";
@@ -407,7 +412,7 @@ fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) ->
         .tool
         .parse(&input)
         .expect("parse failed");
-    let result = smol::block_on(async { inv.execute(&ctx).await });
+    let result = runtime().block_on(inv.execute(&ctx));
     host.load_source("live_barrier", "").unwrap();
     let mut body = String::new();
     for env in rx.drain() {
@@ -549,7 +554,7 @@ fn todo_panel_opens_in_the_tab_of_each_writing_session() {
     for session in sessions {
         let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
         ctx.session_id = Some(SessionRef::from_id(session));
-        smol::block_on(tool.parse(&input).unwrap().execute(&ctx));
+        runtime().block_on(tool.parse(&input).unwrap().execute(&ctx));
     }
 
     let owners: Vec<_> = host

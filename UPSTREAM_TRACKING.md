@@ -10,16 +10,16 @@
 - **上游跟踪分支**: `upstream/main`
 - **当前本地分支**: `main`（跟踪 `origin/main`: `git@github.com:cybershape/maki.git`）
 - **最新同步的上游 Commit**:
-  - **Commit SHA**: `7ae4c5d10eb353ae41f67e5b7a5767fa7800fc51`
-  - **Commit 日期**: `Fri Oct 30 20:35:58 2026 +0200`
-  - **Commit 作者**: `Tony Solomonik <tony.solomonik@gmail.com>`
-  - **Commit 信息**: `fix(background): make moved tasks read clearly in the chat and \`/tasks\``
+  - **Commit SHA**: `1a5d0fe850cbc74733e6e34ca533090572d75708`
+  - **Commit 日期**: `Fri Oct 23 11:04:40 2026 +0200`
+  - **Commit 作者**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
+  - **Commit 信息**: `fix(prompt): drop a plugin's hints when none of its tools are sent`
 - **初始分叉点 (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit 日期**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit 信息**: `chore(deps): move monty to crates.io 1.x`
 
-> 本次已成功合并 `upstream/main`（至 commit `7ae4c5d1`）。
+> 本次已成功合并 `upstream/main`（至 commit `1a5d0fe8`）。
 
 ---
 
@@ -108,6 +108,22 @@
 | `51d9955f` | `docs: describe MCP-through-code_execution and old-session incompatibility` | 文档描述通过代码执行使用 MCP 工具的机制及旧 session 兼容性说明 |
 | `0e1f3227` | `fix(session): keep message timestamps across a headless resume` | 修复 headless 恢复会话时保留消息时间戳 |
 | `ce0c8984` | `Merge branch 'upstream/main' into main` | 合并上游提交（至 `7ae4c5d1`），包含 slow tool call 后台任务管理（Ctrl+B）、`/tasks` 嵌套展示与交互优化、bash 输出行数/体积限制及全量日志落盘、Lua 插件任务隔离调度等 |
+| `e289e9e1` | `docs: update upstream tracking record to 7ae4c5d1` | 更新上游跟踪记录文档至 `7ae4c5d1` |
+| `502c0545` | `build: configure release profile with thin LTO, strip, and panic abort` | 配置 release 构建 profile 采用 thin LTO、strip 及 panic abort |
+| `c33902f9` | `feat: simplify toolcall_reason description and add usage rule` | 精简 `toolcall_reason` 描述并添加使用规则 |
+| `33f1dcd3` | `feat(ui): open compact tool rows in a popup` | 紧凑工具行支持弹窗展开查看详情 |
+| `924c6de0` | `fix(code_execution): preserve files.inspect capability when list_dir is disabled` | 禁用 `list_dir` 时保留 Python 沙箱内 `files.inspect` 能力 |
+| `55e0b38e` | `fix(ui): occlude wide characters at popup left edge to prevent border corruption` | 弹窗左边界裁剪遮蔽宽字符，避免边框渲染错乱 |
+| `2d9d0864` | `feat(ui): improve compact group expansion and detail popup interactions` | 改进紧凑组展开与详情弹窗交互体验 |
+| `798e20aa` | `feat(agent): improve standby and sleep recovery resilience` | 增强系统待机与睡眠唤醒后的网络与任务恢复能力 |
+| `ddf287bb` | `feat(ui): add compact_lines config to control visible entries in compact groups` | 新增 `compact_lines` 配置项控制紧凑组默认可见行数 |
+| `161a4c53` | `feat(ui): preselect recent entry in model picker when present` | 模型选择器优先高亮最近使用过的模型 |
+| `53be365d` | `feat(ui): debounce viewport resize rendering` | 终端窗口缩放渲染防抖优化 |
+| `d1f3bd7d` | `fix(code_execution): document monty syntax and iterator limitations in description` | 代码沙箱工具描述补充 Monty 语法与迭代器限制说明 |
+| `f4910029` | `feat(ui): use compact single-width unicode symbols in turn stats line` | 每 turn 统计行采用紧凑单宽 Unicode 符号展示 |
+| `2a669f8e` | `feat(ui): use ↵ newline separator for compact thinking preview` | 紧凑思考预览采用换行符 `↵` 作为多行分隔符 |
+| `48ca0d2f` | `feat(ui): merge total and thinking time in turn stats line` | 每 turn 统计行合并总耗时与思考耗时展示 |
+| `[pending]` | `Merge branch 'upstream/main' into main` | 合并上游提交（至 `1a5d0fe8`），包括 `smol` 到 `tokio` 异步运行时迁移、`isahc` 到 `reqwest` HTTP 栈迁移、版本升至 0.7.0、事件循环异步化等，保留本 fork 核心定制（Responses API 独立 Provider、toolcall_reason、代码执行沙箱等） |
 
 ---
 

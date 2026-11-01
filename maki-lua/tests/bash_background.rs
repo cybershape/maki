@@ -21,6 +21,7 @@ use maki_agent::{
     SessionMailbox, SharedBuf,
 };
 use maki_config::{PluginFileConfig, PluginsConfig};
+use maki_lua::test_support::runtime;
 use maki_lua::{EventHandle, MoveOutcome, PluginHost};
 use maki_storage::id::MakiId;
 use maki_storage::paths::{session_task_logs_dir, state_dir};
@@ -157,7 +158,7 @@ impl Run {
                 if !ctx.permissions.is_yolo() {
                     ctx.permissions.toggle_yolo();
                 }
-                let done = smol::block_on(tool_dispatch::run(
+                let done = runtime().block_on(tool_dispatch::run(
                     call_id,
                     &tool,
                     &input,
@@ -311,6 +312,23 @@ fn the_background_param_moves_the_command_at_once() {
     run.release();
     let notice = run.final_notice();
     assert!(notice.contains(FINISHED_LATE), "{notice}");
+}
+
+/// The chat row a call moved out of shows only the head of its buf, so the
+/// head must be the command, nothing more and nothing less.
+#[test]
+fn a_moved_command_is_the_head_of_its_buf() {
+    let gate = Gate::closed();
+    let command = gate.command(READY_COMMAND, "true");
+    let mut input = json!({ "command": command });
+    input[BACKGROUND_PARAM] = json!(true);
+    let mut run = Run::launch(json!({}), BASH_TOOL, input, gate);
+    run.reply().expect("a receipt is a success");
+
+    run.wait_for_output(READY_LINE);
+
+    let snapshot = run.live.as_ref().unwrap().take();
+    assert_eq!(snapshot.head_only().map(|head| head.text()), Some(command));
 }
 
 #[test]

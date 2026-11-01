@@ -41,8 +41,8 @@ use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::{SessionClaim, SessionError, StoredThinking};
 use serde::Serialize;
 use serde_json::Value;
-use smol::Task;
-use smol::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::task::{JoinHandle, spawn_blocking};
 use tracing::{debug, info, warn};
 
 use crate::{AcpParams, SessionEndHook, elicitation, methods, permissions, translate};
@@ -133,7 +133,7 @@ enum Incoming {
 pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     let (out_tx, out_rx) = flume::unbounded::<Value>();
 
-    let writer_task = smol::spawn(async move {
+    let writer_task = tokio::spawn(async move {
         let stdout = std::io::stdout();
         while let Ok(msg) = out_rx.recv_async().await {
             let mut handle = stdout.lock();
@@ -157,7 +157,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     let (models_tx, models_rx) = flume::unbounded::<Vec<String>>();
     // Weak, so a discovery still in flight cannot keep the loop alive once stdin closes.
     discover_models(Arc::clone(&params.model_policy), models_tx.downgrade());
-    let reader_task = smol::spawn(read_stdin(lines_tx));
+    let reader_task = tokio::spawn(read_stdin(lines_tx));
 
     let mut server = Server {
         out_tx,
@@ -172,20 +172,12 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     };
 
     while !params.stop.is_cancelled() {
-        let incoming_fut = smol::future::race(
-            async {
-                match lines_rx.recv_async().await {
-                    Ok(line) => Some(Incoming::Line(line)),
-                    Err(_) => None,
-                }
-            },
-            async {
-                match models_rx.recv_async().await {
-                    Ok(specs) => Some(Incoming::Models(specs)),
-                    Err(_) => smol::future::pending().await,
-                }
-            },
-        );
+        let incoming_fut = async {
+            tokio::select! {
+                line = lines_rx.recv_async() => line.ok().map(Incoming::Line),
+                specs = models_rx.recv_async() => specs.ok().map(Incoming::Models),
+            }
+        };
         let incoming = match params.stop.race(incoming_fut).await {
             Ok(inc) => inc,
             Err(_) => break,
@@ -200,12 +192,15 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
 
     close_session(&mut server, SessionEndReason::Shutdown).await;
     drop(server);
-    writer_task.await;
+    writer_task.await.context("stdout writer")?;
     // A stop leaves stdin open, so its read would never end.
     if params.stop.is_cancelled() {
-        reader_task.cancel().await;
+        reader_task.abort();
     } else {
-        reader_task.await.context("read stdin")?;
+        reader_task
+            .await
+            .context("stdin reader")?
+            .context("read stdin")?;
     }
 
     Ok(())
@@ -214,7 +209,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
 /// Lives in its own task because `read_line` is not cancel safe: the main loop
 /// waits on discovery too, and a dropped read would eat half a line.
 async fn read_stdin(tx: Sender<String>) -> std::io::Result<()> {
-    let mut reader = smol::io::BufReader::new(smol::Unblock::new(std::io::stdin()));
+    let mut reader = BufReader::new(tokio::io::stdin());
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).await? == 0 {
@@ -228,17 +223,15 @@ async fn read_stdin(tx: Sender<String>) -> std::io::Result<()> {
 
 /// Static manifests miss providers that only list their models over the wire
 /// (OpenRouter and friends), so the same discovery the TUI runs happens here,
-/// in the background. The on-disk cache replays first, followed by live batches.
 fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Vec<String>>) {
-    smol::spawn(async move {
+    tokio::spawn(async move {
         fetch_all_models_cached(&policy, |list, _warnings| {
             if let Some(tx) = tx.upgrade() {
                 let _ = tx.send(list.specs);
             }
         })
         .await;
-    })
-    .detach();
+    });
 }
 
 /// Discovery lands in batches after the client built its selector from the
@@ -295,21 +288,15 @@ async fn wait_for_models_on_first_run(srv: &mut Server) {
     let Some(models_rx) = srv.models_rx.clone() else {
         return;
     };
-    let timer = smol::Timer::after(FIRST_RUN_DISCOVERY_TIMEOUT);
-    smol::future::race(
-        async {
-            while let Ok(specs) = models_rx.recv_async().await {
-                let before = srv.model_specs.len();
-                refresh_models(srv, specs);
-                if srv.model_specs.len() > before {
-                    break;
-                }
+    let _ = tokio::time::timeout(FIRST_RUN_DISCOVERY_TIMEOUT, async {
+        while let Ok(specs) = models_rx.recv_async().await {
+            let before = srv.model_specs.len();
+            refresh_models(srv, specs);
+            if srv.model_specs.len() > before {
+                break;
             }
-        },
-        async {
-            timer.await;
-        },
-    )
+        }
+    })
     .await;
     while let Ok(specs) = models_rx.try_recv() {
         refresh_models(srv, specs);
@@ -545,12 +532,14 @@ async fn list_sessions(raw: &Value, storage: &StateDir) -> Result<AgentResponse,
     // The scan stats every session file and tail-reads those with a cold
     // cache, so it runs on a blocking thread, like the TUI picker.
     let storage = storage.clone();
-    let summaries = smol::unblock(move || match req.cwd {
+    let internal = |e: &dyn std::fmt::Display| AcpError::internal_error().data(json_str(&e));
+    let summaries = spawn_blocking(move || match req.cwd {
         Some(cwd) => StoredSession::list(&cwd.to_string_lossy(), &storage),
         None => StoredSession::list_all(&storage),
     })
     .await
-    .map_err(|e| AcpError::internal_error().data(json_str(&e)))?;
+    .map_err(|e| internal(&e))?
+    .map_err(|e| internal(&e))?;
     let sessions = summaries
         .into_iter()
         .map(|s| {
@@ -624,6 +613,7 @@ fn start_session(
         claim: claim.clone(),
         storage: params.storage.clone(),
         yolo: params.yolo,
+        unattended: false,
         system_prompt_override: None,
         append_system_prompt: None,
         defaults: params.defaults,
@@ -656,8 +646,7 @@ fn start_session(
         project_trusted,
         initial_cost,
         Arc::clone(&usage),
-    )
-    .detach();
+    );
     srv.session = Some(SessionState {
         handle,
         mcp,
@@ -845,7 +834,8 @@ async fn close_session(srv: &mut Server, reason: SessionEndReason) {
     }
     // Only after the hook, which stops the session's background work, so the
     // track this drops saves the full bill.
-    state.handle.task.cancel().await;
+    state.handle.task.abort();
+    let _ = state.handle.task.await;
     if let Some(mcp) = state.mcp {
         mcp.shutdown().await;
     }
@@ -1189,8 +1179,8 @@ fn start_event_pump(
     project_trusted: bool,
     initial_cost: Option<f64>,
     usage: SharedUsage,
-) -> Task<()> {
-    smol::spawn(async move {
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
         let mut cost = CostTally::starting_at(initial_cost);
         // A permission request only carries scopes, which are matching keys and
@@ -1429,10 +1419,12 @@ mod tests {
     use maki_storage::StateDir;
     use maki_storage::sessions::{Session, StoredTokenUsage};
     use maki_storage::trusted_folders::{CanonicalFolder, TrustStatus, TrustedFolders};
-    use smol::Timer;
-    use smol::future;
+    use std::future;
+
     use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::time::timeout;
+    use tokio_util::task::AbortOnDropHandle;
 
     use super::*;
 
@@ -1669,7 +1661,7 @@ mod tests {
                 ProjectConfig::for_project(Path::new("/project")),
                 Arc::default(),
             )),
-            task: smol::spawn(async { SessionEnd::default() }),
+            task: AbortOnDropHandle::new(tokio::spawn(async { SessionEnd::default() })),
             spend: Arc::default(),
         };
         let server = Server {
@@ -1727,7 +1719,8 @@ mod tests {
     /// would otherwise answer "no active session".
     #[test_case(false ; "a session that does not exist")]
     #[test_case(true ; "a session another maki holds")]
-    fn a_failed_load_leaves_the_running_session_alone(held_elsewhere: bool) {
+    #[tokio::test]
+    async fn a_failed_load_leaves_the_running_session_alone(held_elsewhere: bool) {
         let tmp = TempDir::new().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let mut stored: Session<Message, TokenUsage, maki_agent::ToolOutput> =
@@ -1742,11 +1735,7 @@ mod tests {
         let (mut srv, _answer_rx, _out_rx) = test_server();
         let running = srv.session.as_ref().unwrap().handle.session_id.clone();
 
-        let result = smol::block_on(load_session(
-            &mut srv,
-            &load_request(target),
-            &acp_params(storage),
-        ));
+        let result = load_session(&mut srv, &load_request(target), &acp_params(storage)).await;
 
         assert!(result.is_err());
         assert_eq!(
@@ -1808,7 +1797,7 @@ mod tests {
     /// These cover cost and transcript plumbing, not the trust-scoped wording
     /// of permission options.
     const PUMP_TRUSTED: bool = true;
-    fn run_pump(srv: &Server, initial_cost: Option<f64>, feed: impl FnOnce(&EventSender)) {
+    async fn run_pump(srv: &Server, initial_cost: Option<f64>, feed: impl FnOnce(&EventSender)) {
         let session = srv.session.as_ref().expect("a session is installed");
         let (guard, events) = maki_agent::event_stream();
         let pump = start_event_pump(
@@ -1825,7 +1814,7 @@ mod tests {
         let sender = guard.sender(0);
         feed(&sender);
         drop(guard);
-        smol::block_on(pump);
+        pump.await.unwrap();
     }
 
     fn turn_complete(cost: f64) -> Box<TurnCompleteEvent> {
@@ -1890,7 +1879,8 @@ mod tests {
 
     #[test_case(false ; "answers_reach_the_agent_that_asked_even_out_of_order")]
     #[test_case(true ; "cancel_keeps_the_asks_a_moved_call_may_wait_on")]
-    fn concurrent_subagent_permissions(cancel: bool) {
+    #[tokio::test]
+    async fn concurrent_subagent_permissions(cancel: bool) {
         let (srv, main_rx, out_rx) = test_server();
         let children = [flume::unbounded(), flume::unbounded()];
         run_pump(&srv, None, |sender| {
@@ -1912,7 +1902,8 @@ mod tests {
                 }
             }
             sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
-        });
+        })
+        .await;
 
         let requests: Vec<_> = out_rx.try_iter().collect();
         assert_eq!(
@@ -1969,8 +1960,8 @@ mod tests {
 
     /// Without a channel of its own a child's answer would land in the main
     /// agent's, and the main agent's next wait would eat it as its own.
-    #[test]
-    fn a_subagent_permission_without_an_answer_channel_is_never_asked() {
+    #[tokio::test]
+    async fn a_subagent_permission_without_an_answer_channel_is_never_asked() {
         let (srv, main_rx, out_rx) = test_server();
         run_pump(&srv, None, |sender| {
             sender
@@ -1980,7 +1971,8 @@ mod tests {
                     run_id: 0,
                 })
                 .unwrap();
-        });
+        })
+        .await;
 
         assert!(out_rx.is_empty(), "the client is never asked");
         assert!(main_rx.is_empty(), "the main agent keeps its own turn");
@@ -1994,7 +1986,7 @@ mod tests {
     /// answer channel. Whatever is queued when this is called is what the
     /// waiter finds, which is the shape of the bug: answers outlive the turn
     /// that asked for them.
-    fn wait_for_permission(
+    async fn wait_for_permission(
         srv: &Server,
         answer_rx: &flume::Receiver<String>,
         request_id: &str,
@@ -2002,21 +1994,25 @@ mod tests {
         let session = srv.session.as_ref().expect("a session is installed");
         let (guard, _events) = maki_agent::event_stream();
         let event_tx = guard.sender(0);
-        let rx = smol::lock::Mutex::new(answer_rx.clone());
-        smol::block_on(session.handle.permissions.enforce(
-            &ToolKey::native(NEXT_TURN_TOOL),
-            &PermissionScopes::single(NEXT_TURN_SCOPE.to_owned()),
-            None,
-            &event_tx,
-            Some(&rx),
-            request_id,
-            &CancelToken::none(),
-            None,
-            None,
-            None,
-        ))
-        // No layers here, so nothing can have answered in a plugin's name.
-        .map(|_| ())
+        let rx = tokio::sync::Mutex::new(answer_rx.clone());
+        session
+            .handle
+            .permissions
+            .enforce(
+                &ToolKey::native(NEXT_TURN_TOOL),
+                &PermissionScopes::single(NEXT_TURN_SCOPE.to_owned()),
+                None,
+                &event_tx,
+                Some(&rx),
+                request_id,
+                &CancelToken::none(),
+                None,
+                None,
+                None,
+            )
+            .await
+            // No layers here, so nothing can have answered in a plugin's name.
+            .map(|_| ())
     }
 
     fn queue_answer(srv: &Server, request_id: &str, answer: PermissionAnswer) {
@@ -2044,13 +2040,14 @@ mod tests {
     /// envelope is still queued in the pump, so the pump still asks and the
     /// client answers it for real. With nobody parked, that answer waits in
     /// the channel for the next turn.
-    #[test]
-    fn an_answer_for_a_cancelled_ask_is_not_consumed_by_the_next_turn() {
+    #[tokio::test]
+    async fn an_answer_for_a_cancelled_ask_is_not_consumed_by_the_next_turn() {
         let (srv, answer_rx, out_rx) = test_server();
         handle_notification(&srv, "session/cancel");
         run_pump(&srv, None, |sender| {
             sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
-        });
+        })
+        .await;
 
         let request = out_rx.try_recv().expect("the pump still asked the client");
         handle_incoming_response(
@@ -2062,7 +2059,7 @@ mod tests {
         );
 
         queue_answer(&srv, NEXT_TURN_TOOL_USE_ID, PermissionAnswer::Deny);
-        let outcome = wait_for_permission(&srv, &answer_rx, NEXT_TURN_TOOL_USE_ID);
+        let outcome = wait_for_permission(&srv, &answer_rx, NEXT_TURN_TOOL_USE_ID).await;
 
         assert!(outcome.is_err(), "{STALE_ALLOW}");
         assert!(!next_turn_is_allowed(&srv), "{STALE_ALLOW}");
@@ -2075,13 +2072,13 @@ mod tests {
     /// A mismatched answer is dropped without ending the wait: the tool is
     /// still blocked on the ask the user was shown, and only that ask's answer
     /// may end it.
-    #[test]
-    fn an_answer_naming_another_ask_is_discarded_and_the_wait_continues() {
+    #[tokio::test]
+    async fn an_answer_naming_another_ask_is_discarded_and_the_wait_continues() {
         let (srv, answer_rx, ..) = test_server();
         queue_answer(&srv, PARENT_TOOL_USE_ID, PermissionAnswer::Deny);
         queue_answer(&srv, NEXT_TURN_TOOL_USE_ID, PermissionAnswer::AllowOnce);
 
-        let outcome = wait_for_permission(&srv, &answer_rx, NEXT_TURN_TOOL_USE_ID);
+        let outcome = wait_for_permission(&srv, &answer_rx, NEXT_TURN_TOOL_USE_ID).await;
 
         assert!(
             outcome.is_ok(),
@@ -2095,11 +2092,12 @@ mod tests {
 
     #[test_case(PermissionAnswer::AllowSession, true ; "allow_applies_the_decision")]
     #[test_case(PermissionAnswer::Deny, false ; "deny_applies_the_decision")]
-    fn a_matching_answer_is_applied(answer: PermissionAnswer, allowed: bool) {
+    #[tokio::test]
+    async fn a_matching_answer_is_applied(answer: PermissionAnswer, allowed: bool) {
         let (srv, answer_rx, ..) = test_server();
         queue_answer(&srv, NEXT_TURN_TOOL_USE_ID, answer);
 
-        let outcome = wait_for_permission(&srv, &answer_rx, NEXT_TURN_TOOL_USE_ID);
+        let outcome = wait_for_permission(&srv, &answer_rx, NEXT_TURN_TOOL_USE_ID).await;
 
         assert_eq!(outcome.is_ok(), allowed);
         assert_eq!(next_turn_is_allowed(&srv), allowed);
@@ -2108,8 +2106,8 @@ mod tests {
     /// The close marker rides the same FIFO as the events, so a turn still
     /// streaming when the session got replaced is reported in full and the
     /// client's outstanding `session/prompt` is answered instead of hanging.
-    #[test]
-    fn event_pump_delivers_everything_queued_before_the_close() {
+    #[tokio::test]
+    async fn event_pump_delivers_everything_queued_before_the_close() {
         let (srv, .., out_rx) = test_server();
         pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
         run_pump(&srv, None, |sender| {
@@ -2119,7 +2117,8 @@ mod tests {
                 })
                 .unwrap();
             sender.send(done_event()).unwrap();
-        });
+        })
+        .await;
 
         let chunk = out_rx.try_recv().expect("the queued text reaches the wire");
         let update = &chunk["params"]["update"];
@@ -2136,8 +2135,8 @@ mod tests {
     /// the agent sent it, and the turn's permission and answer routing stay as
     /// they were. A host notice is not sent, and a child's line stays in the
     /// child, like the rest of its stream.
-    #[test]
-    fn an_accepted_notice_reaches_the_client_in_stream_order() {
+    #[tokio::test]
+    async fn an_accepted_notice_reaches_the_client_in_stream_order() {
         let (srv, .., out_rx) = test_server();
         pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
         run_pump(&srv, None, |sender| {
@@ -2172,7 +2171,8 @@ mod tests {
             sender.send(write_tool_start(PARENT_TOOL_USE_ID)).unwrap();
             sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
             sender.send(done_event()).unwrap();
-        });
+        })
+        .await;
 
         let wire: Vec<Value> = out_rx.try_iter().collect();
         let text = serde_json::to_value(translate::text_delta(QUEUED_TEXT)).unwrap();
@@ -2199,7 +2199,8 @@ mod tests {
     /// must not come back as a generic failure.
     #[test_case(true, AcpError::auth_required() ; "auth_error_asks_for_a_login")]
     #[test_case(false, AcpError::internal_error() ; "other_error_is_internal")]
-    fn a_failed_turn_answers_the_prompt_with_its_error_kind(auth: bool, expected: AcpError) {
+    #[tokio::test]
+    async fn a_failed_turn_answers_the_prompt_with_its_error_kind(auth: bool, expected: AcpError) {
         let (srv, .., out_rx) = test_server();
         pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
         run_pump(&srv, None, |sender| {
@@ -2210,7 +2211,8 @@ mod tests {
                     totals: RunTotals::default(),
                 })
                 .unwrap();
-        });
+        })
+        .await;
 
         let answer = out_rx.try_recv().expect("the pending prompt is answered");
         assert_eq!(answer["id"], PROMPT_ID);
@@ -2224,7 +2226,8 @@ mod tests {
     #[test_case(None, true ; "a_live_turn_shows_the_file_its_tool_call_named")]
     #[test_case(Some(done_event()), false ; "a_finished_turn_releases_its_tool_inputs")]
     #[test_case(Some(AgentEvent::Error { message: TURN_ERROR.to_owned(), auth: false, totals: RunTotals::default() }), false ; "a_failed_turn_releases_its_tool_inputs")]
-    fn a_terminal_event_releases_the_turns_tool_inputs(
+    #[tokio::test]
+    async fn a_terminal_event_releases_the_turns_tool_inputs(
         terminal: Option<AgentEvent>,
         keeps_input: bool,
     ) {
@@ -2235,7 +2238,8 @@ mod tests {
                 sender.send(event).unwrap();
             }
             sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
-        });
+        })
+        .await;
 
         let request = out_rx
             .try_iter()
@@ -2250,8 +2254,8 @@ mod tests {
     /// Ids are only unique inside one run, so a child can ask about a call whose
     /// id the parent already cached. The dialog has to stay title only, or it
     /// would name a file the subagent is not touching.
-    #[test]
-    fn a_subagent_permission_ignores_a_colliding_cached_input() {
+    #[tokio::test]
+    async fn a_subagent_permission_ignores_a_colliding_cached_input() {
         let (srv, .., out_rx) = test_server();
         let (answer_tx, _answer_rx) = flume::unbounded();
         run_pump(&srv, None, |sender| {
@@ -2265,7 +2269,8 @@ mod tests {
                     run_id: 0,
                 })
                 .unwrap();
-        });
+        })
+        .await;
 
         let request = out_rx
             .try_iter()
@@ -2282,7 +2287,8 @@ mod tests {
 
     #[test_case(Some(ESCALATION_REASON), ESCALATED_PERMISSION_TITLE ; "a_plugin_reason_leads_the_title")]
     #[test_case(None, MAIN_PERMISSION_TITLE ; "no_reason_keeps_the_plain_title")]
-    fn permission_title_carries_the_escalation_reason(reason: Option<&str>, title: &str) {
+    #[tokio::test]
+    async fn permission_title_carries_the_escalation_reason(reason: Option<&str>, title: &str) {
         let (srv, .., out_rx) = test_server();
         run_pump(&srv, None, |sender| {
             sender
@@ -2293,7 +2299,8 @@ mod tests {
                     reason: reason.map(str::to_owned),
                 })
                 .unwrap();
-        });
+        })
+        .await;
 
         let request = out_rx
             .try_recv()
@@ -2304,8 +2311,8 @@ mod tests {
 
     /// A resumed session opens with a bill, and subagent turns spend against it
     /// even though their events never enter the transcript.
-    #[test]
-    fn event_pump_folds_restored_and_subagent_cost_into_the_usage_update() {
+    #[tokio::test]
+    async fn event_pump_folds_restored_and_subagent_cost_into_the_usage_update() {
         let (srv, .., out_rx) = test_server();
         run_pump(&srv, Some(RECORDED_COST), |sender| {
             sender
@@ -2318,7 +2325,8 @@ mod tests {
             sender
                 .send(AgentEvent::TurnComplete(turn_complete(TURN_COST)))
                 .unwrap();
-        });
+        })
+        .await;
 
         let usage = out_rx.try_recv().expect("the session's own turn reports");
         let update = &usage["params"]["update"];
@@ -2338,7 +2346,8 @@ mod tests {
     /// up to.
     #[test_case(false ; "a_finished_run")]
     #[test_case(true ; "a_failed_run")]
-    fn event_pump_settles_a_run_on_its_ledger(failed: bool) {
+    #[tokio::test]
+    async fn event_pump_settles_a_run_on_its_ledger(failed: bool) {
         let (srv, .., out_rx) = test_server();
         let ledger = RunTotals {
             cost: Some(LEDGER_COST),
@@ -2369,7 +2378,8 @@ mod tests {
             sender
                 .send(AgentEvent::TurnComplete(turn_complete(TURN_COST)))
                 .unwrap();
-        });
+        })
+        .await;
 
         let last = out_rx.try_iter().last().expect("the next turn reports");
         assert_eq!(
@@ -2381,27 +2391,24 @@ mod tests {
     /// Results ride the next prompt and nothing wakes a turn, so a session
     /// closed with work out stops it rather than waiting on it. The task that
     /// never ends stands in for that work.
-    #[test]
-    fn close_session_returns_at_once_with_background_work_out() {
+    #[tokio::test]
+    async fn close_session_returns_at_once_with_background_work_out() {
         let (mut srv, ..) = test_server();
-        srv.session.as_mut().unwrap().handle.task = smol::spawn(future::pending());
+        srv.session.as_mut().unwrap().handle.task =
+            AbortOnDropHandle::new(tokio::spawn(future::pending()));
 
-        let closed = smol::block_on(future::or(
-            async {
-                close_session(&mut srv, SessionEndReason::Shutdown).await;
-                true
-            },
-            async {
-                Timer::after(STDIN_DEADLOCK_TIMEOUT).await;
-                false
-            },
-        ));
+        let closed = timeout(
+            STDIN_DEADLOCK_TIMEOUT,
+            close_session(&mut srv, SessionEndReason::Shutdown),
+        )
+        .await
+        .is_ok();
 
         assert!(closed, "{CLOSE_WAITED}");
     }
 
-    #[test]
-    fn close_session_awaits_the_session_end_hook() {
+    #[tokio::test]
+    async fn close_session_awaits_the_session_end_hook() {
         let (mut srv, ..) = test_server();
         let ended = srv.session.as_ref().unwrap().handle.session_id.id();
         let (ended_tx, ended_rx) = flume::bounded(1);
@@ -2412,7 +2419,7 @@ mod tests {
             })
         }));
 
-        smol::block_on(close_session(&mut srv, SessionEndReason::Replaced));
+        close_session(&mut srv, SessionEndReason::Replaced).await;
 
         assert_eq!(
             ended_rx.try_recv().ok(),
@@ -2427,7 +2434,8 @@ mod tests {
     #[test_case(Value::from(ANSWERED_ID), true ; "a_numeric_id_answers_the_ask")]
     #[test_case(Value::from(ANSWERED_ID.to_string()), true ; "a_string_id_answers_the_same_ask")]
     #[test_case(Value::from(UNANSWERABLE_ID), false ; "an_id_matching_no_ask_answers_nothing")]
-    fn a_response_is_delivered_whatever_shape_its_id_has(id: Value, delivered: bool) {
+    #[tokio::test]
+    async fn a_response_is_delivered_whatever_shape_its_id_has(id: Value, delivered: bool) {
         let (srv, answer_rx, ..) = server_with_ask(permission_ask(None));
 
         handle_incoming_response(
@@ -2451,8 +2459,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn only_the_outstanding_request_id_is_answered() {
+    #[tokio::test]
+    async fn only_the_outstanding_request_id_is_answered() {
         let (srv, answer_rx, ..) = server_with_ask(permission_ask(None));
 
         handle_incoming_response(&srv, &allow_once(UNKNOWN_ID));
@@ -2471,8 +2479,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn elicitation_response_forwards_the_raw_result() {
+    #[tokio::test]
+    async fn elicitation_response_forwards_the_raw_result() {
         let (srv, answer_rx, ..) = server_with_ask(Ask::Elicitation);
         let raw = serde_json::json!({
             "id": ANSWERED_ID,
@@ -2487,8 +2495,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn discovered_models_are_pushed_to_the_client() {
+    #[tokio::test]
+    async fn discovered_models_are_pushed_to_the_client() {
         let (mut srv, .., out_rx) = test_server();
         srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
         let batch = vec![DISCOVERED_SPEC.to_owned()];
@@ -2512,8 +2520,8 @@ mod tests {
         assert!(out_rx.is_empty(), "a batch adding nothing is not announced");
     }
 
-    #[test]
-    fn refresh_models_announces_when_options_change_without_new_specs() {
+    #[tokio::test]
+    async fn refresh_models_announces_when_options_change_without_new_specs() {
         let (mut srv, .., out_rx) = test_server();
         let target_spec = "responses/model-with-name";
         srv.model_specs = vec![target_spec.to_owned()];
@@ -2550,7 +2558,8 @@ mod tests {
 
     #[test_case(true ; "without_session")]
     #[test_case(false ; "with_session")]
-    fn refresh_models_merges_into_specs(has_session: bool) {
+    #[tokio::test]
+    async fn refresh_models_merges_into_specs(has_session: bool) {
         let (mut srv, .., out_rx) = test_server();
         if !has_session {
             srv.session = None;
@@ -2569,8 +2578,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn wait_for_models_on_first_run_merges_and_clears_flag() {
+    #[tokio::test]
+    async fn wait_for_models_on_first_run_merges_and_clears_flag() {
         let (mut srv, .., _out_rx) = test_server();
         srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
         srv.should_wait_models = true;
@@ -2579,13 +2588,13 @@ mod tests {
 
         models_tx.send(vec![DISCOVERED_SPEC.to_owned()]).unwrap();
 
-        smol::block_on(wait_for_models_on_first_run(&mut srv));
+        wait_for_models_on_first_run(&mut srv).await;
         assert!(srv.model_specs.contains(&DISCOVERED_SPEC.to_owned()));
         assert!(!srv.should_wait_models);
     }
 
-    #[test]
-    fn wait_for_models_times_out_when_disconnected() {
+    #[tokio::test]
+    async fn wait_for_models_times_out_when_disconnected() {
         let (mut srv, .., _out_rx) = test_server();
         srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
         srv.should_wait_models = true;
@@ -2593,7 +2602,7 @@ mod tests {
         srv.models_rx = Some(models_rx);
 
         drop(_models_tx);
-        smol::block_on(wait_for_models_on_first_run(&mut srv));
+        wait_for_models_on_first_run(&mut srv).await;
         assert_eq!(srv.model_specs, vec![OFFLINE_SPEC.to_owned()]);
         assert!(!srv.should_wait_models);
     }
@@ -2696,8 +2705,8 @@ mod tests {
     /// Editor clients call `session/list` to offer resuming a session. The
     /// response must contain only the requested project's stored sessions,
     /// with the fields the picker renders (title, ISO 8601 updated_at).
-    #[test]
-    fn list_sessions_returns_stored_sessions_for_their_cwd() {
+    #[tokio::test]
+    async fn list_sessions_returns_stored_sessions_for_their_cwd() {
         use std::str::FromStr as _;
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
@@ -2714,8 +2723,7 @@ mod tests {
             .unwrap();
 
         let raw = serde_json::json!({ "params": { "cwd": "/project" } });
-        let AgentResponse::ListSessionsResponse(list) =
-            smol::block_on(list_sessions(&raw, &dir)).unwrap()
+        let AgentResponse::ListSessionsResponse(list) = list_sessions(&raw, &dir).await.unwrap()
         else {
             panic!("session/list must answer ListSessionsResponse");
         };
@@ -2734,8 +2742,8 @@ mod tests {
 
     /// `session/list` must work with no live session. An omitted cwd
     /// applies no filter: sessions of every project are listed.
-    #[test]
-    fn session_list_dispatches_with_no_session_and_no_cwd() {
+    #[tokio::test]
+    async fn session_list_dispatches_with_no_session_and_no_cwd() {
         let tmp = TempDir::new().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let cwd = std::env::current_dir().unwrap();
@@ -2762,13 +2770,14 @@ mod tests {
         srv.session = None;
         let params = acp_params(storage);
         let raw = serde_json::json!({ "params": {} });
-        smol::block_on(handle_request(
+        handle_request(
             &mut srv,
             "session/list",
             RequestId::Number(7),
             &raw,
             &params,
-        ));
+        )
+        .await;
         let resp = out_rx.recv().unwrap();
         let resp = resp.to_string();
         assert!(
@@ -2943,8 +2952,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn set_config_updates_thought_level_and_aliases() {
+    #[tokio::test]
+    async fn set_config_updates_thought_level_and_aliases() {
         use agent_client_protocol_schema::v1::{SessionConfigKind, SessionConfigOptionCategory};
 
         let (mut srv, .., _out_rx) = test_server();
@@ -3006,8 +3015,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn set_config_rejects_invalid_thought_level() {
+    #[tokio::test]
+    async fn set_config_rejects_invalid_thought_level() {
         let (mut srv, .., _out_rx) = test_server();
         srv.session.as_mut().unwrap().current_model = SELECTED_SPEC.to_string();
 
@@ -3022,8 +3031,8 @@ mod tests {
         assert_eq!(err.code, AcpError::invalid_params().code);
     }
 
-    #[test]
-    fn handle_prompt_carries_session_thinking() {
+    #[tokio::test]
+    async fn handle_prompt_carries_session_thinking() {
         let (mut srv, .., _out_rx) = test_server();
         let (input_tx, input_rx) = flume::unbounded();
         srv.session.as_mut().unwrap().handle.input_tx = input_tx;
@@ -3046,8 +3055,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn new_session_emits_response_then_initial_usage_update() {
+    #[tokio::test]
+    async fn new_session_emits_response_then_initial_usage_update() {
         let (mut srv, _answer_rx, out_rx) = test_server();
         srv.session = None;
         let tmp = TempDir::new().unwrap();
@@ -3056,13 +3065,7 @@ mod tests {
         let raw = serde_json::json!({
             "params": { "cwd": "/project", "mcpServers": [] }
         });
-        smol::block_on(handle_request(
-            &mut srv,
-            "session/new",
-            RequestId::Number(1),
-            &raw,
-            &params,
-        ));
+        handle_request(&mut srv, "session/new", RequestId::Number(1), &raw, &params).await;
 
         let resp = out_rx.recv().expect("new session response");
         assert_eq!(resp["id"], 1);
@@ -3078,8 +3081,8 @@ mod tests {
         assert!(update.get("cost").is_none());
     }
 
-    #[test]
-    fn load_session_emits_restored_usage_update() {
+    #[tokio::test]
+    async fn load_session_emits_restored_usage_update() {
         let (mut srv, _answer_rx, out_rx) = test_server();
         srv.session = None;
         let tmp = TempDir::new().unwrap();
@@ -3099,13 +3102,14 @@ mod tests {
             .unwrap();
 
         let raw = load_request(session.id);
-        smol::block_on(handle_request(
+        handle_request(
             &mut srv,
             "session/load",
             RequestId::Number(2),
             &raw,
             &params,
-        ));
+        )
+        .await;
 
         let mut found_usage = None;
         let mut found_response = false;
@@ -3124,8 +3128,8 @@ mod tests {
         assert_eq!(usage["size"], params.model.context_window);
     }
 
-    #[test]
-    fn set_config_option_model_emits_usage_update() {
+    #[tokio::test]
+    async fn set_config_option_model_emits_usage_update() {
         let (mut srv, _answer_rx, out_rx) = test_server();
         let (model_tx, _model_rx) = flume::unbounded();
         srv.session.as_mut().unwrap().handle.model_tx = model_tx;
@@ -3157,8 +3161,8 @@ mod tests {
         assert_eq!(update["size"], 300_000);
     }
 
-    #[test]
-    fn compaction_done_emits_usage_update() {
+    #[tokio::test]
+    async fn compaction_done_emits_usage_update() {
         let (srv, _answer_rx, out_rx) = test_server();
         run_pump(&srv, Some(0.05), |sender| {
             let _ = sender.send(AgentEvent::CompactionDone {
@@ -3167,7 +3171,8 @@ mod tests {
                 context_window: 200_000,
                 summary: "summary".to_string(),
             });
-        });
+        })
+        .await;
 
         let mut found_usage = None;
         while let Ok(msg) = out_rx.try_recv() {
@@ -3183,8 +3188,8 @@ mod tests {
         assert_eq!(update["cost"]["amount"], 0.05);
     }
 
-    #[test]
-    fn refresh_models_emits_usage_update_when_context_window_resolved() {
+    #[tokio::test]
+    async fn refresh_models_emits_usage_update_when_context_window_resolved() {
         let (mut srv, _answer_rx, out_rx) = test_server();
         let target_spec = "responses/custom-large";
         srv.session.as_mut().unwrap().current_model = target_spec.to_string();

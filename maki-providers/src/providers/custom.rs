@@ -225,14 +225,14 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
     TierLookup::NoModelForTier
 }
 
-pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
+pub async fn discover_models(timeouts: Timeouts) -> Vec<String> {
     let config = ProvidersConfig::load();
     let mut slugs: Vec<_> = config.providers.keys().collect();
     slugs.sort();
     let mut all_specs = Vec::new();
     for slug in slugs {
         if let Ok(provider) = create(slug, timeouts)
-            && let Ok(models) = smol::block_on(provider.list_models())
+            && let Ok(models) = provider.list_models().await
         {
             crate::model_registry::set_known_models(slug, models.clone());
             for m in models {

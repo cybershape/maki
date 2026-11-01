@@ -1,4 +1,4 @@
-//! Single-threaded ratatui event loop; the agent runs on smol tasks in a separate thread.
+//! Single-threaded ratatui event loop; the agent runs on tokio tasks off the UI thread.
 //! `AgentHandles` bundles all flume channels to the agent. `dispatch()` processes
 //! `Action`s returned by `App::update()`. Scroll and drag events are coalesced from
 //! the queue to avoid jank.
@@ -118,12 +118,12 @@ pub enum RunOutcome {
     },
 }
 
-pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<RunOutcome> {
+pub async fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<RunOutcome> {
     let report = {
         let (_guard, mut terminal) = terminal::TerminalGuard::init()?;
         color_compat::init();
-        let el = event_loop::EventLoop::new(&mut terminal, params)?;
-        el.run(initial_prompt)?
+        let el = event_loop::EventLoop::new(&mut terminal, params).await?;
+        el.run(initial_prompt).await?
     };
     // Nothing is going to ask for a file list after the last frame, and a walk
     // of a large tree has no business burning cores through teardown.

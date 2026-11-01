@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use flume::Sender;
 use serde_json::Value;
+use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 
 use maki_config::ModelPolicy;
@@ -148,7 +149,7 @@ pub async fn from_model_async(
 ) -> Result<Box<dyn Provider>, AgentError> {
     let slug = Arc::clone(&model.provider);
     let id = model.id.clone();
-    let provider = smol::unblock(move || provider_for_slug(&slug, timeouts)).await?;
+    let provider = spawn_blocking(move || provider_for_slug(&slug, timeouts)).await??;
     provider.adjust_model(model);
     debug!(provider = %model.provider, model = %id, "provider created");
     Ok(provider)
@@ -192,13 +193,16 @@ pub async fn fetch_all_models(
 
     for spec in ProviderRegistry::all() {
         let slug = spec.slug;
-        let Ok(provider) = smol::unblock(move || provider_for_slug(slug, timeouts)).await else {
+        let Ok(provider) = spawn_blocking(move || provider_for_slug(slug, timeouts))
+            .await
+            .expect("provider construction panicked")
+        else {
             warn!(provider = slug, "failed to create provider, skipping");
             continue;
         };
         let display_name = spec.display_name;
         let tx = tx.clone();
-        smol::spawn(async move {
+        tokio::spawn(async move {
             let batch = match provider.list_models().await {
                 Ok(models) => {
                     let mut specs: Vec<String> =
@@ -227,19 +231,16 @@ pub async fn fetch_all_models(
                         .collect();
                     ModelBatch {
                         models: fallback,
-                        warnings: vec![format!(
-                            "{display_name}: {e} (using static fallback)"
-                        )],
+                        warnings: vec![format!("{display_name}: {e} (using static fallback)")],
                     }
                 }
             };
             let _ = tx.send_async(batch).await;
-        })
-        .detach();
+        });
     }
 
     let tx_custom = tx.clone();
-    smol::spawn(async move {
+    tokio::spawn(async move {
         let declared = custom::declared_model_specs();
         if !declared.is_empty() {
             let _ = tx_custom
@@ -249,7 +250,7 @@ pub async fn fetch_all_models(
                 })
                 .await;
         }
-        let custom_specs = smol::unblock(move || custom::discover_models(timeouts)).await;
+        let custom_specs = custom::discover_models(timeouts).await;
         if !custom_specs.is_empty() {
             let _ = tx_custom
                 .send_async(ModelBatch {
@@ -258,8 +259,7 @@ pub async fn fetch_all_models(
                 })
                 .await;
         }
-    })
-    .detach();
+    });
 
     drop(tx);
 
