@@ -123,7 +123,7 @@
 | `f4910029` | `feat(ui): use compact single-width unicode symbols in turn stats line` | 每 turn 统计行采用紧凑单宽 Unicode 符号展示 |
 | `2a669f8e` | `feat(ui): use ↵ newline separator for compact thinking preview` | 紧凑思考预览采用换行符 `↵` 作为多行分隔符 |
 | `48ca0d2f` | `feat(ui): merge total and thinking time in turn stats line` | 每 turn 统计行合并总耗时与思考耗时展示 |
-| `[pending]` | `Merge branch 'upstream/main' into main` | 合并上游提交（至 `1a5d0fe8`），包括 `smol` 到 `tokio` 异步运行时迁移、`isahc` 到 `reqwest` HTTP 栈迁移、版本升至 0.7.0、事件循环异步化等，保留本 fork 核心定制（Responses API 独立 Provider、toolcall_reason、代码执行沙箱等） |
+| `f11423b7` | `Merge branch 'upstream/main' into main` | 合并上游提交（至 `1a5d0fe8`），包括 `smol` 到 `tokio` 异步运行时迁移、`isahc` 到 `reqwest` HTTP 栈迁移、版本升至 0.7.0、事件循环异步化等，保留本 fork 核心定制（Responses API 独立 Provider、toolcall_reason、代码执行沙箱等） |
 
 ---
 
