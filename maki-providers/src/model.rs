@@ -260,7 +260,7 @@ pub struct ModelEntry {
     pub supports_thinking: Option<bool>,
     #[serde(default)]
     pub requires_thinking: bool,
-    /// Gates vision tools (image viewing via `read`) and image blocks at request time.
+    /// Gates vision-only tools (`view_image`) and image blocks at request time.
     #[serde(default)]
     pub supports_vision: Option<bool>,
     /// Whether the model can load deferred tools (see

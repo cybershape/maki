@@ -6,7 +6,7 @@ use crate::agent::tool_dispatch;
 use super::{CallOrigin, ToolContext};
 
 pub const IMAGE_NOT_VISIBLE_NOTE: &str =
-    "image pixels are not visible from here; call the read tool directly";
+    "image pixels are not visible from here; call the view_image tool directly";
 
 pub async fn dispatch(ctx: &ToolContext, name: &str, input: &Value) -> Result<String, String> {
     ctx.deadline.check()?;

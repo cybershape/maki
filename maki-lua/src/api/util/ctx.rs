@@ -184,7 +184,6 @@ enum Caps {
         workflow: bool,
         audience: ToolAudience,
         output_mode: ToolOutputMode,
-        supports_vision: bool,
     },
     Restore {
         state: Option<serde_json::Value>,
@@ -232,7 +231,6 @@ impl LuaCtx {
                 workflow: ctx.workflow,
                 audience: ctx.audience,
                 output_mode: ctx.output_mode,
-                supports_vision: ctx.model.supports_vision(),
             },
         )
     }
@@ -306,16 +304,6 @@ impl LuaCtx {
         self.task_id.as_deref().unwrap_or(MAIN_TASK_ID)
     }
 
-    fn supports_vision(&self) -> bool {
-        match &self.caps {
-            Caps::Handler { agent } => agent.model.supports_vision(),
-            Caps::Start {
-                supports_vision, ..
-            } => *supports_vision,
-            Caps::Restore { .. } => false,
-        }
-    }
-
     fn state(&self) -> Option<&serde_json::Value> {
         match &self.caps {
             Caps::Restore { state, .. } => state.as_ref(),
@@ -345,10 +333,6 @@ impl UserData for LuaCtx {
         methods.add_method("cancelled", |_, this, ()| Ok(this.cancel.is_cancelled()));
 
         methods.add_method("output_mode", |_, this, ()| Ok(this.output_mode().as_str()));
-
-        methods.add_method("supports_vision", |_, this, ()| {
-            Ok(this.supports_vision())
-        });
 
         methods.add_method("workflow", |_, this, ()| {
             let Some(workflow) = this.workflow() else {

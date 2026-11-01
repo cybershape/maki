@@ -3,130 +3,25 @@ local shorten_path = require("maki.shorten_path")
 local output_limits = require("maki.output_limits")
 
 local HIGHLIGHT_CONTEXT_LINES = 200
-local MAX_RAW_BYTES = 3 * 1024 * 1024
-local MAX_EDGE = 1568
-local MAX_INPUT_BYTES = 50 * 1024 * 1024
 
-local MEDIA_TYPES = {
-  png = "image/png",
-  jpeg = "image/jpeg",
-  gif = "image/gif",
-  webp = "image/webp",
-}
-
-local IMAGE_EXTS = {
-  png = true,
-  jpg = true,
-  jpeg = true,
-  gif = true,
-  webp = true,
-}
-
-local DESCRIPTION = [[Read a file (text or image).
+local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed).
 
 - Supports absolute, relative, and ~/ paths.
-- For text files: returns contents with line numbers (1-indexed).
-  - **offset** (default 1) and **limit** (default 0 = read to end, capped at 2000 lines).
-  - Use the **index** tool or **grep** tool first to find the offset and limit.
-  - Only read the sections you actually need.
-  - Use `wc -l` to check total number of lines before reading to decide a reasonable limit.
-  - Use truncation hints (e.g. "truncated lines X-Y") to continue with the correct offset.
-  - Do not reread the same range (same file and same offset).
-  - Prefer grep to locate content instead of scanning full files.
-  - Call in parallel when reading multiple files.
-  - Avoid tiny repeated slices - read a larger window if you need more context.
-- For image files (png, jpeg, gif, webp): returns vision input so you can inspect the image.
-  - Oversized images are downscaled automatically (animated gif/webp keep only the first frame).
-  - offset and limit are ignored for images.]]
+- **offset** and **limit** are required. Use offset=1 to read from the first line.
+- Use limit=0 to read until the end of file (capped at 2000 lines).
+- Use the **index** tool or **grep** tool first to find the offset and limit.
+- Only read the sections you actually need.
+- Use `wc -l` to check total number of lines before reading to decide a reasonable limit.
+- Use truncation hints (e.g. "truncated lines X-Y") to continue with the correct offset.
+- Do not reread the same range (same file and same offset).
+- Prefer grep to locate content instead of scanning full files.
+- Call in parallel when reading multiple files.
+- Avoid tiny repeated slices - read a larger window if you need more context.]]
 
 local opts = maki.api.register_options({
   max_line_bytes = { default = 500, min = 80, desc = "Truncate lines the model sees at this many bytes." },
   max_output_lines = output_limits.specs.max_output_lines,
 })
-
-local function format_size(bytes)
-  if bytes >= 1024 * 1024 then
-    return string.format("%.1fMB", bytes / (1024 * 1024))
-  end
-  return string.format("%dKB", math.ceil(bytes / 1024))
-end
-
-local function caption(path, bytes, width, height, note)
-  return string.format("[image: %s %s %dx%d%s]", shorten_path(path), format_size(bytes), width, height, note or "")
-end
-
-local function fail(msg)
-  return { llm_output = msg, is_error = true }
-end
-
-local function load_image(path, ctx)
-  if ctx and ctx.supports_vision and not ctx:supports_vision() then
-    return fail("cannot view " .. path .. ": current model does not support vision")
-  end
-
-  local bytes, read_err = maki.fs.read_bytes(path)
-  if not bytes then
-    return fail("cannot read " .. path .. ": " .. (read_err or "unknown error"))
-  end
-  local size = buffer.len(bytes)
-  if size > MAX_INPUT_BYTES then
-    return fail(
-      string.format("%s is too large to view (%s; limit %s)", path, format_size(size), format_size(MAX_INPUT_BYTES))
-    )
-  end
-
-  local info, probe_err = maki.image.probe(bytes)
-  if not info then
-    return fail(path .. " is not an image (" .. (probe_err or "unrecognized format") .. ")")
-  end
-  if not MEDIA_TYPES[info.format] then
-    return fail("unsupported image format " .. info.format .. ": only png, jpeg, gif, and webp can be viewed")
-  end
-
-  local img, decode_err = maki.image.decode(bytes)
-  if not img then
-    return fail("cannot decode " .. path .. ": " .. (decode_err or "unknown error"))
-  end
-
-  if size <= MAX_RAW_BYTES and math.max(info.width, info.height) <= MAX_EDGE then
-    return {
-      llm_output = caption(path, size, info.width, info.height),
-      image = img,
-    }
-  end
-
-  local resized = math.max(info.width, info.height) > MAX_EDGE
-  if resized then
-    img = img:resize(MAX_EDGE, MAX_EDGE)
-  end
-
-  local out_format = info.format == "jpeg" and "jpeg" or "png"
-  local encoded = img:encode(out_format)
-  if #encoded > MAX_RAW_BYTES and out_format == "png" then
-    out_format = "jpeg"
-    encoded = img:encode(out_format)
-  end
-  if #encoded > MAX_RAW_BYTES then
-    return fail(
-      string.format(
-        "%s is too large to view (%s after downscaling; limit %s)",
-        path,
-        format_size(#encoded),
-        format_size(MAX_RAW_BYTES)
-      )
-    )
-  end
-
-  local note = resized and string.format(", downscaled from %dx%d", info.width, info.height) or ", re-encoded"
-  if info.format == "gif" or info.format == "webp" then
-    note = note .. ", first frame only"
-  end
-
-  return {
-    llm_output = caption(path, #encoded, img:width(), img:height(), note),
-    image = { media_type = MEDIA_TYPES[out_format], data = maki.base64.encode(encoded) },
-  }
-end
 
 local function read_view_opts(ctx)
   local tol = ctx:tool_output_lines()
@@ -149,6 +44,11 @@ local function apply_highlights(view, lines, ext, prefix)
   view:flush()
 end
 
+-- We also read some lines above `start`, so the highlighter knows when the
+-- window opens inside a block comment or a string. Everything comes from one
+-- `read_lines` call, so the window, its context and the total always agree.
+-- Lines arrive already cut to `max_line_bytes`, so even a huge file or line
+-- never fills the Lua heap that all plugins share.
 local function read_window(path, start, limit, count, ctx)
   local first = math.max(start - HIGHLIGHT_CONTEXT_LINES, 1)
   local context_len = start - first
@@ -259,7 +159,7 @@ end
 maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = [[
-- When using the **read** tool on text files, only read the sections you actually need.
+- When using the **read** tool, only read the sections you actually need.
 - Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit.]],
 })
 
@@ -274,17 +174,19 @@ maki.api.register_tool({
     properties = {
       path = {
         type = "string",
-        description = "Path to the file to read (text or image)",
+        description = "Absolute path to the file",
         required = true,
         alias = "file_path",
       },
       offset = {
         type = "integer",
-        description = "Line number to start from (1-indexed). Defaults to 1. Ignored for images.",
+        description = "Line number to start from (1-indexed). Use 1 for the first line.",
+        required = true,
       },
       limit = {
         type = "integer",
-        description = "Max number of lines to read. Use 0 or omit to read until end of file (capped at 2000 lines). Ignored for images.",
+        description = "Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines).",
+        required = true,
       },
     },
   },
@@ -292,22 +194,17 @@ maki.api.register_tool({
   header = function(input)
     local buf = maki.ui.buf()
     local s = shorten_path(input.path or "")
-    if input.offset then
-      local start = input.offset
-      if input.limit and input.limit > 0 then
-        s = s .. ":" .. start .. "-" .. (start + input.limit - 1)
-      else
-        s = s .. ":" .. start
-      end
+    local start = input.offset or 1
+    if input.limit and input.limit > 0 then
+      s = s .. ":" .. start .. "-" .. (start + input.limit - 1)
+    else
+      s = s .. ":" .. start
     end
     buf:line({ { s, "path" } })
     return buf
   end,
 
   restore = function(input, output, _is_error, ctx)
-    if output:match("^%[image: ") then
-      return {}
-    end
     local lines, start_line, total_lines = {}, nil, nil
     for _, raw in ipairs(maki.split(output, "\n")) do
       local nr, text = raw:match("^%s*(%d+): (.*)$")
@@ -327,6 +224,10 @@ maki.api.register_tool({
     start_line = start_line or 1
     total_lines = total_lines or (start_line + #lines - 1)
     local path = input.path or ""
+    -- The llm text starts at `offset`, so the context above it can only
+    -- come from the file as it is now, and a file edited since the call may
+    -- colour the window differently than the live call did. Restore runs on
+    -- every load and re-render, so read just those lines and not a whole log.
     local above = start_line > 1 and read_window(path, start_line, 0, false, ctx)
     return build_file_view(lines, start_line, total_lines, path, ctx, above and above.context)
   end,
@@ -344,26 +245,6 @@ maki.api.register_tool({
     if meta.is_dir then
       return { llm_output = "error: path is a directory, use the list tool instead", is_error = true }
     end
-
-    local ext = path:match("%.([^%.]+)$")
-    local lower_ext = ext and ext:lower()
-    if lower_ext and IMAGE_EXTS[lower_ext] then
-      return load_image(path, ctx)
-    end
-
-    local offset = input.offset or 1
-    local limit = input.limit or 0
-    local res = read_file(path, offset, limit, ctx)
-    if res.is_error and (res.llm_output:find("non%-utf8") or res.llm_output:find("UTF%-8")) then
-      local bytes = maki.fs.read_bytes(path, { len = 1024 })
-      if bytes then
-        local info = maki.image.probe(bytes)
-        if info and MEDIA_TYPES[info.format] then
-          return load_image(path, ctx)
-        end
-      end
-      return { llm_output = "read error: " .. path .. " is a binary file and not a supported image format", is_error = true }
-    end
-    return res
+    return read_file(path, input.offset, input.limit, ctx)
   end,
 })
