@@ -6702,16 +6702,10 @@ fn call_tool_flattens_image_output_with_not_visible_note() {
 }
 
 #[test]
-fn view_image_tool_returns_image_output() {
+fn read_tool_returns_image_output() {
     use base64::Engine as _;
 
     let (reg, _host) = builtins_host();
-
-    // The code_execution bridge flattens output to text, so view_image is
-    // pointless from the interpreter.
-    let audience = reg.get("view_image").unwrap().tool.audience();
-    assert!(audience.contains(maki_agent::tools::ToolAudience::MAIN));
-    assert!(!audience.contains(maki_agent::tools::ToolAudience::INTERPRETER));
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tiny.png");
@@ -6721,7 +6715,7 @@ fn view_image_tool_returns_image_output() {
 
     let out = exec_tool_output(
         &reg,
-        "view_image",
+        "read",
         serde_json::json!({"path": path.to_str().unwrap()}),
     )
     .unwrap();
@@ -6738,18 +6732,21 @@ fn view_image_tool_returns_image_output() {
 }
 
 #[test]
-fn view_image_tool_rejects_non_image() {
+fn read_tool_rejects_non_image_binary() {
     let (reg, _host) = builtins_host();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("notes.txt");
-    std::fs::write(&path, "plain text").unwrap();
+    let path = dir.path().join("blob.bin");
+    std::fs::write(&path, [0xff, 0xfe, 0x00, 0x12, 0x34, 0x56]).unwrap();
     let err = exec_tool_output(
         &reg,
-        "view_image",
+        "read",
         serde_json::json!({"path": path.to_str().unwrap()}),
     )
     .unwrap_err();
-    assert!(err.contains("not an image"), "got: {err}");
+    assert!(
+        err.contains("binary file and not a supported image format"),
+        "got: {err}"
+    );
 }
 
 fn probe_output(data: &str) -> (image::ImageFormat, u32, u32) {
@@ -6766,7 +6763,7 @@ fn probe_output(data: &str) -> (image::ImageFormat, u32, u32) {
 }
 
 #[test]
-fn view_image_downscales_oversized_png_with_honest_caption() {
+fn read_downscales_oversized_png_with_honest_caption() {
     let (reg, _host) = builtins_host();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wide.png");
@@ -6776,7 +6773,7 @@ fn view_image_downscales_oversized_png_with_honest_caption() {
 
     let out = exec_tool_output(
         &reg,
-        "view_image",
+        "read",
         serde_json::json!({"path": path.to_str().unwrap()}),
     )
     .unwrap();
@@ -6795,7 +6792,7 @@ fn view_image_downscales_oversized_png_with_honest_caption() {
 }
 
 #[test]
-fn view_image_oversized_gif_reencodes_to_png_first_frame() {
+fn read_oversized_gif_reencodes_to_png_first_frame() {
     let (reg, _host) = builtins_host();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("banner.gif");
@@ -6805,7 +6802,7 @@ fn view_image_oversized_gif_reencodes_to_png_first_frame() {
 
     let out = exec_tool_output(
         &reg,
-        "view_image",
+        "read",
         serde_json::json!({"path": path.to_str().unwrap()}),
     )
     .unwrap();
@@ -6821,7 +6818,7 @@ fn view_image_oversized_gif_reencodes_to_png_first_frame() {
 }
 
 #[test]
-fn view_image_small_gif_passes_through_unchanged() {
+fn read_small_gif_passes_through_unchanged() {
     use base64::Engine as _;
 
     let (reg, _host) = builtins_host();
@@ -6833,7 +6830,7 @@ fn view_image_small_gif_passes_through_unchanged() {
 
     let out = exec_tool_output(
         &reg,
-        "view_image",
+        "read",
         serde_json::json!({"path": path.to_str().unwrap()}),
     )
     .unwrap();
@@ -6941,36 +6938,33 @@ fn job_callbacks_fire_while_command_handler_parked() {
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "job:hi"));
 }
 
-/// read tool requires offset and limit; missing fields should fail schema validation.
-mod read_tool_required_params {
+/// read tool requires path; offset and limit are optional and default to 1 and 0.
+mod read_tool_params {
     use super::*;
 
-    const MISSING_OFFSET_ERR: &str = "invalid parameter 'offset': required";
-    const MISSING_LIMIT_ERR: &str = "invalid parameter 'limit': required";
+    const MISSING_PATH_ERR: &str = "invalid parameter 'path': required";
     const MAX_OUTPUT_LINES: i32 = 2000;
 
     #[test]
-    fn missing_offset_fails_parse() {
+    fn missing_path_fails_parse() {
         let (reg, _host) = builtins_host();
         let entry = reg.get("read").expect("read registered");
         let err = entry
             .tool
-            .parse(&serde_json::json!({ "path": "/tmp/foo.txt", "limit": 10 }))
+            .parse(&serde_json::json!({ "offset": 1, "limit": 10 }))
             .err()
-            .expect("missing offset should fail");
-        assert!(err.to_string().contains(MISSING_OFFSET_ERR), "got: {err}");
+            .expect("missing path should fail");
+        assert!(err.to_string().contains(MISSING_PATH_ERR), "got: {err}");
     }
 
     #[test]
-    fn missing_limit_fails_parse() {
+    fn path_only_parses() {
         let (reg, _host) = builtins_host();
         let entry = reg.get("read").expect("read registered");
-        let err = entry
-            .tool
-            .parse(&serde_json::json!({ "path": "/tmp/foo.txt", "offset": 1 }))
-            .err()
-            .expect("missing limit should fail");
-        assert!(err.to_string().contains(MISSING_LIMIT_ERR), "got: {err}");
+        let result = entry.tool.parse(&serde_json::json!({
+            "path": "/tmp/foo.txt",
+        }));
+        assert!(result.is_ok(), "path-only input should parse");
     }
 
     #[test]
@@ -6983,6 +6977,25 @@ mod read_tool_required_params {
             "limit": 10
         }));
         assert!(result.is_ok(), "valid input should parse");
+    }
+
+    #[test]
+    fn omitted_offset_and_limit_reads_whole_file() {
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "line 1\nline 2\nline 3").unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+            }),
+        )
+        .expect("read should succeed");
+        assert!(out.contains("1: line 1"));
+        assert!(out.contains("3: line 3"));
     }
 
     #[test]

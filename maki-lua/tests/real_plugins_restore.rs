@@ -616,19 +616,18 @@ fn batch_child_restore_sees_the_chat_and_reason() {
     }
 }
 
-const VIEW_IMAGE_SRC: &str = include_str!("../../plugins/view_image/init.lua");
 const IMAGE_PATH: &str = "/tmp/diagram.png";
 
 #[test]
-fn header_only_tool_emits_header_snapshot_on_restore() {
+fn read_image_emits_header_snapshot_and_empty_body_on_restore() {
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-    host.load_source("view_image", VIEW_IMAGE_SRC).unwrap();
+    host.load_source("read", READ_SRC).unwrap();
 
     let r = restore(
         &host,
-        "view_image",
+        "read",
         json!({ "path": IMAGE_PATH }),
-        "",
+        "[image: diagram.png 10KB 100x100]",
         None,
         Vec::new(),
     );

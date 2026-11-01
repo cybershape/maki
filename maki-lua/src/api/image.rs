@@ -456,7 +456,7 @@ mod tests {
     }
 
     /// Bytes from outside may be oversized, so asking for their own format
-    /// still re-encodes at defaults. That is how `view_image` shrinks them.
+    /// still re-encodes at defaults. That is how image viewing shrinks them.
     #[test_case(true ; "decoded")]
     #[test_case(false ; "from_source")]
     fn same_format_encode_reencodes_external_bytes(decoded: bool) {

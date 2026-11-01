@@ -153,7 +153,7 @@ supports_vision = false
 | `supports_thinking` | bool | protocol default | |
 | `requires_thinking` | bool | false | For APIs that reject requests with thinking disabled. Implies `supports_thinking` and raises thinking to minimal effort when off (including compaction). On generic `openai` entries without `thinking_fields` its only wire effect is that the `disabled` block is never sent |
 | `thinking_fields` | table | unset | How this model spells each thinking mode on the wire. The only thinking control on generic `openai` entries, and it implies `supports_thinking` |
-| `supports_vision` | bool | protocol default | When false, image input and `view_image` are off |
+| `supports_vision` | bool | protocol default | When false, image input and image viewing via `read` are off |
 | `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
 | `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
 | `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |
@@ -288,7 +288,7 @@ A row matches every model id that starts with one of its `prefixes`, and the lon
 | `max_output_tokens` | number | provider's | Max completion tokens |
 | `supports_thinking` | bool | unset | |
 | `requires_thinking` | bool | `false` | For APIs that reject a request with thinking off. Implies `supports_thinking` and raises thinking to minimal effort when off |
-| `supports_vision` | bool | unset | When false, image input and `view_image` are off for this model |
+| `supports_vision` | bool | unset | When false, image input and image viewing via `read` are off for this model |
 | `supports_tool_examples` | bool | unset | |
 | `pricing` | table | unset | `input`, `output`, `cache_write`, `cache_read`, in dollars per 1M tokens |
 | `thinking_fields` | table | unset | How this model spells each thinking mode on the wire |

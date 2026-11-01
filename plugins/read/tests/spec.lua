@@ -1,6 +1,5 @@
--- Exercises the maki.image / maki.base64 primitives view_image is built
--- from. The full tool path is covered by the view_image tests in
--- maki-lua/tests/plugin_host.rs.
+-- Exercises the maki.image / maki.base64 primitives read tool uses for images.
+-- The full tool path is covered by the read tests in maki-lua/tests/plugin_host.rs.
 
 local failures = {}
 

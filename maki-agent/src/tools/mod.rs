@@ -307,14 +307,9 @@ impl RequestTools {
     }
 }
 
-/// One gate for every definitions builder (main loop, headless, Lua): a model
-/// without vision never learns `view_image` exists.
-pub fn capability_exclusions(model: &Model) -> &'static [&'static str] {
-    if model.supports_vision() {
-        &[]
-    } else {
-        &[VIEW_IMAGE_TOOL_NAME]
-    }
+/// Capability exclusions: models without specific capabilities can have tools excluded.
+pub fn capability_exclusions(_model: &Model) -> &'static [&'static str] {
+    &[]
 }
 
 /// A tool is enabled unless named in `disabled_tools` (config, or the raw
@@ -333,7 +328,6 @@ pub const QUESTION_TOOL_NAME: &str = "question";
 pub const READ_TOOL_NAME: &str = "read";
 pub const TASK_TOOL_NAME: &str = "task";
 pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
-pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
 pub const WRITE_TOOL_NAME: &str = "write";
 
 pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
@@ -975,16 +969,15 @@ mod tests {
         assert_eq!(tools.filter().matches(WRITE_TOOL_NAME), write_matches);
     }
 
-    #[test_case(true  ; "vision_model_keeps_view_image")]
-    #[test_case(false ; "text_only_model_loses_view_image")]
-    fn from_config_gates_view_image_on_vision(vision: bool) {
+    #[test_case(true  ; "vision_model_keeps_read")]
+    #[test_case(false ; "text_only_model_keeps_read")]
+    fn from_config_keeps_read_regardless_of_vision(vision: bool) {
         let mut model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
         model.supports_vision_override = Some(vision);
         let filter = ToolFilter::from_config(&AgentConfig::default(), &model, &[]);
-        assert_eq!(filter.matches(VIEW_IMAGE_TOOL_NAME), vision);
         assert!(
             filter.matches(READ_TOOL_NAME),
-            "unrelated tools stay enabled"
+            "read tool stays enabled"
         );
     }
 

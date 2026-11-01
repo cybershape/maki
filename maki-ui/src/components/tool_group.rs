@@ -205,15 +205,19 @@ pub fn format_compact_summary(
         "read" => {
             let path = input.get("path").and_then(Value::as_str).map(shorten_path);
             if let Some(p) = path.filter(|s| !s.is_empty()) {
-                let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(1);
-                let orig_summary = if let Some(limit) = input
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    .filter(|&l| l > 0)
-                {
-                    format!("{p}:{offset}-{}", offset + limit - 1)
-                } else {
-                    format!("{p}:{offset}")
+                let orig_summary = match input.get("offset").and_then(Value::as_u64) {
+                    Some(offset) => {
+                        if let Some(limit) = input
+                            .get("limit")
+                            .and_then(Value::as_u64)
+                            .filter(|&l| l > 0)
+                        {
+                            format!("{p}:{offset}-{}", offset + limit - 1)
+                        } else {
+                            format!("{p}:{offset}")
+                        }
+                    }
+                    None => p,
                 };
                 format!("{reason}{REASON_SEP}{orig_summary}")
             } else if !default_summary.is_empty() && default_summary != reason {
@@ -1568,6 +1572,7 @@ mod tests {
 
     #[test_case("read", Some(serde_json::json!({"path": "src/main.rs", "offset": 10, "limit": 20, "toolcall_reason": "reading main"})), "fallback", "reading main · src/main.rs:10-29" ; "read_with_offset_and_limit")]
     #[test_case("read", Some(serde_json::json!({"path": "src/main.rs", "offset": 5, "toolcall_reason": "reading main"})), "fallback", "reading main · src/main.rs:5" ; "read_with_offset_only")]
+    #[test_case("read", Some(serde_json::json!({"path": "src/main.rs", "toolcall_reason": "reading main"})), "fallback", "reading main · src/main.rs" ; "read_with_path_only")]
     #[test_case("write", Some(serde_json::json!({"path": "src/lib.rs", "toolcall_reason": "writing lib"})), "fallback", "writing lib · src/lib.rs" ; "write_with_path")]
     #[test_case("edit", Some(serde_json::json!({"path": "src/app.rs", "toolcall_reason": "editing app"})), "fallback", "editing app · src/app.rs" ; "edit_with_path")]
     #[test_case("multiedit", Some(serde_json::json!({"path": "src/app.rs", "toolcall_reason": "multiediting app"})), "fallback", "multiediting app · src/app.rs" ; "multiedit_with_path")]
