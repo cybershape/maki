@@ -11,7 +11,7 @@ use unicode_width::UnicodeWidthStr;
 /// The border, in cells, on each axis.
 pub const BORDER: u16 = 2;
 
-fn percent_of(total: u16, percent: u16) -> u16 {
+pub(crate) fn percent_of(total: u16, percent: u16) -> u16 {
     (u32::from(total) * u32::from(percent) / 100) as u16
 }
 

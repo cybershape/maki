@@ -8,9 +8,11 @@ use super::{
     CompactDetail, GroupThinkingEntry, GroupToolEntry, ModalScroll, Overlay, ToolStatus,
     hint_footer,
 };
+use crate::highlight;
 use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_agent::{BufferSnapshot, SnapshotLine, ToolInput, ToolOutput};
+use maki_highlight::Highlighter;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -28,6 +30,7 @@ const RUNNING: &str = "Running…";
 /// picked that column out of the screen.
 const WIDTH_PERCENT: u16 = 90;
 const MIN_WIDTH: u16 = 48;
+const MIN_HEIGHT_PERCENT: u16 = 50;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 const H_PAD: u16 = 1;
 const MULTI_HINTS: &[(&str, &str)] = &[("↑/↓", "scroll"), ("j/k", "prev/next"), ("Esc", "close")];
@@ -53,6 +56,7 @@ pub struct CompactDetailModal {
     items: Vec<Shown>,
     current: usize,
     scroll: ModalScroll,
+    watermark_height: u16,
 }
 
 impl CompactDetailModal {
@@ -61,6 +65,7 @@ impl CompactDetailModal {
             items: Vec::new(),
             current: 0,
             scroll: ModalScroll::new_top(),
+            watermark_height: 0,
         }
     }
 
@@ -82,6 +87,7 @@ impl CompactDetailModal {
         } else {
             current.min(self.items.len() - 1)
         };
+        self.watermark_height = 0;
     }
 
     pub fn is_open(&self) -> bool {
@@ -92,6 +98,7 @@ impl CompactDetailModal {
         self.items.clear();
         self.current = 0;
         self.scroll.reset();
+        self.watermark_height = 0;
     }
 
     pub fn next_item(&mut self) {
@@ -186,7 +193,17 @@ impl CompactDetailModal {
             .saturating_sub(super::modal::BORDER + H_PAD * 2);
         let wrapped = Paragraph::new(lines).wrap(Wrap { trim: false });
         let total = wrapped.line_count(padded_width) as u16;
-        let (popup, inner) = modal.render_with_footer(frame, area, total, Some(hint_footer(hints)));
+
+        let max_h = super::modal::percent_of(area.height, MAX_HEIGHT_PERCENT);
+        let min_h = super::modal::percent_of(area.height, MIN_HEIGHT_PERCENT)
+            .min(max_h)
+            .max(super::modal::BORDER + 1);
+        let item_h = (total + super::modal::BORDER).max(min_h).min(max_h);
+        self.watermark_height = self.watermark_height.max(item_h).min(max_h).max(min_h);
+
+        let content_h = self.watermark_height.saturating_sub(super::modal::BORDER);
+        let (popup, inner) =
+            modal.render_with_footer(frame, area, content_h, Some(hint_footer(hints)));
         let padded = super::modal::inset(inner, H_PAD);
         let total = wrapped.line_count(padded.width) as u16;
         self.scroll.update_dimensions(total, padded.height);
@@ -228,19 +245,29 @@ fn tool_lines(entry: &GroupToolEntry) -> Vec<Line<'static>> {
     }
 
     lines.push(section_label(INPUT_LABEL));
-    match detail.and_then(|d| d.input.as_ref()) {
-        Some(ToolInput::Code { code, .. } | ToolInput::Script { code, .. }) => {
-            push_text(&mut lines, code)
+    if entry.name.as_ref() == "code_execution" {
+        if let Some(code) = extract_code_execution_code(entry, detail) {
+            push_highlighted_code(&mut lines, "python", code);
+        } else if entry.receiving_args {
+            lines.push(Line::from(Span::styled(RECEIVING, theme.tool_dim)));
+        } else {
+            lines.push(Line::from(Span::styled(EMPTY, theme.tool_dim)));
         }
-        None if entry.receiving_args => {
-            lines.push(Line::from(Span::styled(RECEIVING, theme.tool_dim)))
+    } else {
+        match detail.and_then(|d| d.input.as_ref()) {
+            Some(ToolInput::Code { code, .. } | ToolInput::Script { code, .. }) => {
+                push_text(&mut lines, code)
+            }
+            None if entry.receiving_args => {
+                lines.push(Line::from(Span::styled(RECEIVING, theme.tool_dim)))
+            }
+            None => push_json(
+                &mut lines,
+                detail
+                    .and_then(|d| d.raw_input.as_ref())
+                    .or(entry.raw_input.as_ref()),
+            ),
         }
-        None => push_json(
-            &mut lines,
-            detail
-                .and_then(|d| d.raw_input.as_ref())
-                .or(entry.raw_input.as_ref()),
-        ),
     }
 
     lines.push(Line::from(SECTION_GAP));
@@ -350,6 +377,50 @@ fn push_text(lines: &mut Vec<Line<'static>>, text: &str) {
     }
 }
 
+fn extract_code_execution_code<'a>(
+    entry: &'a GroupToolEntry,
+    detail: Option<&'a CompactDetail>,
+) -> Option<&'a str> {
+    if entry.name.as_ref() != "code_execution" {
+        return None;
+    }
+    if let Some(ToolInput::Code { code, .. } | ToolInput::Script { code, .. }) =
+        detail.and_then(|d| d.input.as_ref())
+    {
+        return Some(code);
+    }
+    let raw = detail
+        .and_then(|d| d.raw_input.as_ref())
+        .or(entry.raw_input.as_ref())?;
+    raw.get("code")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            raw.get("parameters")
+                .and_then(|p| p.get("code"))
+                .and_then(serde_json::Value::as_str)
+        })
+}
+
+fn push_highlighted_code(lines: &mut Vec<Line<'static>>, lang: &str, code: &str) {
+    if code.is_empty() {
+        lines.push(Line::from(Span::styled(EMPTY, theme::current().tool_dim)));
+        return;
+    }
+    let mut hl = Highlighter::for_token(lang);
+    for line in code.lines() {
+        let with_nl = format!("{line}\n");
+        let spans: Vec<Span<'static>> = highlight::highlight_line(&mut hl, &with_nl)
+            .into_iter()
+            .filter(|span| !span.content.is_empty())
+            .collect();
+        if spans.is_empty() {
+            lines.push(Line::default());
+        } else {
+            lines.push(Line::from(spans));
+        }
+    }
+}
+
 fn section_label(label: &str) -> Line<'static> {
     Line::from(Span::styled(label.to_owned(), theme::current().panel_title))
 }
@@ -399,6 +470,18 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn render_popup(modal: &mut CompactDetailModal, height: u16) -> Rect {
+        let backend = TestBackend::new(SCREEN, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut popup = Rect::default();
+        terminal
+            .draw(|frame| {
+                popup = modal.view(frame, frame.area());
+            })
+            .unwrap();
+        popup
     }
 
     #[test]
@@ -601,5 +684,133 @@ mod tests {
         assert!(!text.contains("hidden"), "{text}");
         assert!(text.contains("line 1"), "{text}");
         assert!(text.contains("last line"), "{text}");
+    }
+
+    #[test]
+    fn popup_has_minimum_height_of_fifty_percent() {
+        let mut modal = CompactDetailModal::new();
+        modal.open_tool(tool(CompactDetail::default()));
+        let popup = render_popup(&mut modal, 40);
+        assert_eq!(popup.height, 20);
+    }
+
+    #[test]
+    fn popup_height_watermark_non_decreasing_on_switch() {
+        let mut modal = CompactDetailModal::new();
+        let short1 = tool(CompactDetail::default());
+        let tall_output = (0..26)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tall = tool(CompactDetail {
+            output: Some(Arc::new(ToolOutput::Plain(tall_output.into()))),
+            ..CompactDetail::default()
+        });
+        let short2 = tool(CompactDetail::default());
+
+        modal.open_group(
+            vec![
+                Shown::Tool(Box::new(short1.clone())),
+                Shown::Tool(Box::new(tall)),
+                Shown::Tool(Box::new(short2)),
+            ],
+            0,
+        );
+
+        let p1 = render_popup(&mut modal, 40);
+        assert_eq!(p1.height, 20);
+
+        // Switch to tall item: height increases
+        assert!(modal.handle_key(key_ev(KeyCode::Char('j'))));
+        let p2 = render_popup(&mut modal, 40);
+        assert!(p2.height > 20);
+        let tall_height = p2.height;
+
+        // Switch to short item: height does not decrease
+        assert!(modal.handle_key(key_ev(KeyCode::Char('j'))));
+        let p3 = render_popup(&mut modal, 40);
+        assert_eq!(p3.height, tall_height);
+
+        // Switch back to first short item: height stays at watermark
+        assert!(modal.handle_key(key_ev(KeyCode::Char('k'))));
+        assert!(modal.handle_key(key_ev(KeyCode::Char('k'))));
+        let p4 = render_popup(&mut modal, 40);
+        assert_eq!(p4.height, tall_height);
+
+        // Close and reopen: watermark resets back to 50%
+        modal.close();
+        modal.open_tool(short1);
+        let p5 = render_popup(&mut modal, 40);
+        assert_eq!(p5.height, 20);
+    }
+
+    #[test]
+    fn code_execution_input_highlights_python_without_json() {
+        let mut entry = tool(CompactDetail {
+            raw_input: Some(serde_json::json!({
+                "code": "def solve():\n    return 42",
+                "toolcall_reason": "run script"
+            })),
+            ..CompactDetail::default()
+        });
+        entry.name = Arc::from("code_execution");
+
+        let lines = tool_lines(&entry);
+        let full_text = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(full_text.contains("def solve():"), "{full_text}");
+        assert!(full_text.contains("return 42"), "{full_text}");
+        assert!(!full_text.contains("toolcall_reason"), "{full_text}");
+        assert!(!full_text.contains("{\"code\":"), "{full_text}");
+
+        let def_span = lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .find(|s| s.content.as_ref() == "def")
+            .expect("def span");
+        assert_ne!(def_span.style, theme::current().tool);
+    }
+
+    #[test]
+    fn code_execution_input_empty_and_receiving() {
+        let mut empty_entry = tool(CompactDetail::default());
+        empty_entry.name = Arc::from("code_execution");
+        let empty_lines = tool_lines(&empty_entry);
+        let empty_text = empty_lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(empty_text.contains(EMPTY), "{empty_text}");
+
+        let mut receiving_entry = tool(CompactDetail::default());
+        receiving_entry.name = Arc::from("code_execution");
+        receiving_entry.receiving_args = true;
+        let receiving_lines = tool_lines(&receiving_entry);
+        let receiving_text = receiving_lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(receiving_text.contains(RECEIVING), "{receiving_text}");
     }
 }
