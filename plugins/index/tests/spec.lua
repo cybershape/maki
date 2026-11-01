@@ -85,6 +85,7 @@ require("tests.lang.toml")
 require("tests.lang.tsx")
 require("tests.lang.typescript")
 require("tests.lang.v")
+require("tests.lang.vue")
 require("tests.lang.yaml")
 require("tests.lang.zig")
 

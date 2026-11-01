@@ -51,6 +51,7 @@ local EXT_TO_LANG = {
   bb = "clojure",
   bzl = "bazel_bzl",
   v = "v",
+  vue = "vue",
   zig = "zig",
   nix = "nix",
   dart = "dart",

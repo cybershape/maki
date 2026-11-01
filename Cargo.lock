@@ -3410,6 +3410,7 @@ dependencies = [
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "tree-sitter-vlang",
+ "tree-sitter-vue-next",
  "tree-sitter-yaml",
  "tree-sitter-zig",
  "unicode-width",
@@ -7359,6 +7360,16 @@ name = "tree-sitter-vlang"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e22804e42ca480463edd90c9645b5f50aeeb83f3e33f57662b96b224f85e9f34"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-vue-next"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9ac89acaa8165aaabfa8ae9683aa423b0d2bf42c815dae5ca031a36a75525f1"
 dependencies = [
  "cc",
  "tree-sitter-language",

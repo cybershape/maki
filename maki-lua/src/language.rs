@@ -40,6 +40,7 @@ pub enum Language {
     Json,
     Make,
     Clojure,
+    Vue,
 }
 
 impl Language {
@@ -81,6 +82,7 @@ impl Language {
             "json" => Some(Self::Json),
             "make" => Some(Self::Make),
             "clojure" => Some(Self::Clojure),
+            "vue" => Some(Self::Vue),
             _ => None,
         }
     }
@@ -122,6 +124,7 @@ impl Language {
             "json" => Some(Self::Json),
             "mk" => Some(Self::Make),
             "clj" | "cljs" | "cljc" | "bb" => Some(Self::Clojure),
+            "vue" => Some(Self::Vue),
             _ => None,
         }
     }
@@ -164,6 +167,7 @@ impl Language {
             Self::Json => tree_sitter_json::LANGUAGE.into(),
             Self::Make => tree_sitter_make::LANGUAGE.into(),
             Self::Clojure => tree_sitter_clojure_orchard::LANGUAGE.into(),
+            Self::Vue => tree_sitter_vue_next::LANGUAGE.into(),
         }
     }
 }
@@ -218,6 +222,14 @@ mod tests {
         assert!(parses_cleanly(
             Language::from_extension(ext).unwrap(),
             "(ns a.b (:require [c.d :as e]))\n(defn f [x] (inc x))"
+        ));
+    }
+
+    #[test]
+    fn vue_extension_parses_cleanly() {
+        assert!(parses_cleanly(
+            Language::from_extension("vue").unwrap(),
+            "<template><div>{{ msg }}</div></template>\n<script setup lang=\"ts\">\nconst msg = 'hello';\n</script>"
         ));
     }
 }
