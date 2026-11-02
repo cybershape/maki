@@ -1,10 +1,29 @@
-local DESCRIPTION = [[Execute a command through Windows PowerShell.
-
+local BASE = [[
 - Commands run in the configured working directory or the current directory.
 - Use `workdir` instead of `Set-Location`.
 - Interactive commands are not supported.
 - Use `tail` to return only the last N output lines.
 - Provide a short `toolcall_reason` (3-5 words).]]
+
+local V5_NOTE = "Do not use `&&` or `||`. Windows PowerShell 5.1 rejects them. Run one statement per call, or separate statements with `;`."
+
+local V7_NOTE = [[PowerShell 7 or newer. `&&` and `||` work (`$?` is the previous statement, not the previous pipeline).
+- `&&` and `||` have lower precedence than `|`. Parenthesize a chain used as pipeline input: `(@(1) && @(2)) | Measure-Object`.
+- Ternary `?:` and null-coalescing `??` / `??=` work.
+- `ForEach-Object -Parallel` runs script blocks on other runspaces. It does not see variables unless you pass them with `$using:name`.]]
+
+local function description_for(modern)
+  local note = modern and V7_NOTE or V5_NOTE
+  return "Execute a command through Windows PowerShell. " .. note .. "\n" .. BASE
+end
+
+-- `pwsh.exe` is the PowerShell 7+ binary. Finding it is enough; do not launch
+-- it to read a version. Checked once at load, so a later PATH change is missed.
+local shell = "powershell.exe"
+local modern = maki.fn.executable("pwsh.exe") == 1
+if modern then
+  shell = "pwsh.exe"
+end
 
 local opts = maki.api.register_options({
   timeout_secs = {
@@ -24,7 +43,7 @@ maki.api.register_tool({
     end
     return { scopes = { input.command }, force_prompt = false }
   end,
-  description = DESCRIPTION,
+  description = description_for(modern),
   schema = {
     type = "object",
     properties = {
@@ -90,10 +109,11 @@ maki.api.register_tool({
       ctx:finish({ llm_output = result, is_error = code ~= 0 })
     end
 
-    -- A pipe has no console code page, so PowerShell 5.1 emits the ANSI
+    -- A pipe has no console code page, so Windows PowerShell 5.1 emits the ANSI
     -- code page. The job reader decodes UTF-8, which turns that into mojibake.
+    -- Harmless on pwsh, which is already UTF-8.
     local job_id = maki.fn.jobstart({
-      "powershell.exe",
+      shell,
       "-NoLogo",
       "-NoProfile",
       "-ExecutionPolicy",
