@@ -20,7 +20,8 @@ use color_eyre::eyre::{Context, eyre};
 
 use crate::app::tasks::TaskStatus;
 use crossterm::event::{
-    Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent as CtMouseEvent,
+    MouseEventKind,
 };
 use futures::future::{LocalBoxFuture, select_all};
 use maki_agent::agent::SessionExport;
@@ -2067,6 +2068,14 @@ impl<'t> EventLoop<'t> {
             // key no notation names passes through untouched: nothing to
             // normalize, and `text_buffer` still reads its SUPER bit.
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                // ConPTY delivers `?1003` motion as `ESC[<35;col;rowM`. Its
+                // reader flushes a half-read CSI once the queue looks empty,
+                // so the tail arrives as Alt+`[` plus the rest of the report
+                // and lands in the composer. A real key never starts that way.
+                if let Some(fragment) = sgr_fragment_start(key) {
+                    self.swallow_sgr_fragment(fragment);
+                    return (None, None);
+                }
                 self.focus.note_input();
                 (
                     Some(Msg::Key(Key::from_event(key).map_or(key, KeyEvent::from))),
@@ -2083,6 +2092,22 @@ impl<'t> EventLoop<'t> {
                 self.translate_mouse(mouse)
             }
             _ => (None, None),
+        }
+    }
+
+    /// Drops the keys a split SGR mouse report turned into, through its `M`
+    /// or `m`. Anything else stops the swallow, so a real keystroke after a
+    /// truncated report is not eaten.
+    fn swallow_sgr_fragment(&self, first: char) {
+        let mut pending = String::from(first);
+        while !sgr_fragment_done(&pending) {
+            let Some(Event::Key(key)) = self.input.try_next() else {
+                break;
+            };
+            let Some(c) = sgr_fragment_char(key) else {
+                break;
+            };
+            pending.push(c);
         }
     }
 
@@ -2514,6 +2539,32 @@ impl<'t> EventLoop<'t> {
     }
 }
 
+/// `Alt+[` is the first key a flushed `ESC[<…M` leaves behind.
+fn sgr_fragment_start(key: KeyEvent) -> Option<char> {
+    (key.code == KeyCode::Char('[') && key.modifiers == KeyModifiers::ALT).then_some('[')
+}
+
+/// A later byte of the same report, with no modifiers of its own.
+fn sgr_fragment_char(key: KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(c @ ('<' | '0'..='9' | ';' | 'M' | 'm')) if key.modifiers.is_empty() => {
+            Some(c)
+        }
+        _ => None,
+    }
+}
+
+/// True once `pending` is `<digits;digits;digits` ended by `M` or `m`.
+fn sgr_fragment_done(pending: &str) -> bool {
+    let Some(rest) = pending.strip_prefix("[<") else {
+        return false;
+    };
+    let (body, last) = rest.split_at(rest.len().saturating_sub(1));
+    matches!(last, "M" | "m")
+        && body.split(';').count() == 3
+        && body.split(';').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
     if kind == MouseEventKind::ScrollUp {
         lines as i32
@@ -2693,6 +2744,42 @@ mod tests {
 
         let text = preamble.iter().map(Message::user_text).collect::<Vec<_>>();
         assert_eq!(text, [Some(SHELL_RESULT), Some(OBSERVATION)]);
+    }
+
+    fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test_case("[<35;33;37M", true ; "motion_report")]
+    #[test_case("[<0;1;2M", true ; "button_press")]
+    #[test_case("[<0;1;2m", true ; "button_release")]
+    #[test_case("[<35;33M", false ; "too_few_fields")]
+    #[test_case("[<35;33;37", false ; "missing_terminator")]
+    #[test_case("[<35;33;37X", false ; "wrong_terminator")]
+    #[test_case("[35;33;37M", false ; "not_sgr")]
+    #[test_case("[<35;x;37M", false ; "non_digit_field")]
+    fn sgr_fragment_matches_only_a_complete_report(text: &str, done: bool) {
+        assert_eq!(sgr_fragment_done(text), done);
+    }
+
+    #[test]
+    fn sgr_fragment_starts_only_on_alt_bracket() {
+        assert_eq!(
+            sgr_fragment_start(press(KeyCode::Char('['), KeyModifiers::ALT)),
+            Some('[')
+        );
+        assert_eq!(
+            sgr_fragment_start(press(KeyCode::Char('['), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            sgr_fragment_char(press(KeyCode::Char('<'), KeyModifiers::NONE)),
+            Some('<')
+        );
+        assert_eq!(
+            sgr_fragment_char(press(KeyCode::Char('a'), KeyModifiers::NONE)),
+            None
+        );
     }
 
     #[test]
