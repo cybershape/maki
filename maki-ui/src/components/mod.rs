@@ -1,6 +1,8 @@
+pub(crate) mod alert_modal;
 pub(crate) mod btw_modal;
 pub(crate) mod code_view;
 pub mod command;
+pub(crate) mod compact_detail;
 pub(crate) mod file_picker;
 pub(crate) mod form;
 pub(crate) mod help_modal;
@@ -25,7 +27,9 @@ pub(crate) mod split_layout;
 pub mod status_bar;
 pub(crate) mod streaming_content;
 pub(crate) mod theme_picker;
+pub(crate) mod thinking;
 pub(crate) mod tool_display;
+pub(crate) mod tool_group;
 pub(crate) mod usage_modal;
 
 use std::sync::Arc;
@@ -33,10 +37,13 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
-use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
+use maki_agent::{BufferSnapshot, TaskEnd, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent};
 use maki_lua::{PackCommand, PackPlan};
 use maki_providers::{ImageSource, Message, ModelTier};
 use ratatui::text::{Line, Span};
+use serde_json::Value;
+
+use crate::OpenSession;
 
 pub(crate) use maki_providers::IMAGE_PLACEHOLDER;
 
@@ -49,6 +56,10 @@ pub(crate) fn chevron_span() -> ratatui::text::Span<'static> {
 pub(crate) trait Overlay {
     fn is_open(&self) -> bool;
     fn close(&mut self);
+    /// Whether it is up and answers a single key on its own, like `y` on a
+    /// permission prompt. Keys typed before one opened must never answer it,
+    /// so each overlay has to say.
+    fn is_prompting(&self) -> bool;
     /// Modal overlays block mouse interaction behind them.
     fn is_modal(&self) -> bool {
         true
@@ -62,10 +73,25 @@ pub(crate) trait Overlay {
 }
 
 pub(crate) fn hint_line<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> {
+    Line::from(hint_spans(pairs, "  "))
+}
+
+/// The same hints, sized for a bottom border: tighter gaps, and a space at
+/// each end so they never touch a corner.
+pub(crate) fn hint_footer<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> {
+    let mut spans = hint_spans(pairs, " ");
+    spans.push(Span::raw(" "));
+    Line::from(spans).right_aligned()
+}
+
+fn hint_spans<K: AsRef<str>, V: AsRef<str>>(
+    pairs: &[(K, V)],
+    gap: &'static str,
+) -> Vec<Span<'static>> {
     let t = crate::theme::current();
-    let mut spans = Vec::with_capacity(pairs.len() * 3);
+    let mut spans = Vec::with_capacity(pairs.len() * 3 + 1);
     for (key, desc) in pairs {
-        spans.push(Span::raw("  "));
+        spans.push(Span::raw(gap));
         for (i, part) in key.as_ref().split('/').enumerate() {
             if i > 0 {
                 spans.push(Span::styled("/", t.tool_dim));
@@ -74,7 +100,7 @@ pub(crate) fn hint_line<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<
         }
         spans.push(Span::styled(format!(" {}", desc.as_ref()), t.tool_dim));
     }
-    Line::from(spans)
+    spans
 }
 
 pub(crate) fn apply_scroll_delta(offset: u16, delta: i32) -> u16 {
@@ -94,6 +120,7 @@ pub(crate) struct ModalScroll {
     max_offset: u16,
     viewport_h: u16,
     auto_scroll: bool,
+    top_pinned: bool,
 }
 
 impl ModalScroll {
@@ -103,20 +130,26 @@ impl ModalScroll {
             max_offset: 0,
             viewport_h: 0,
             auto_scroll: true,
+            top_pinned: false,
         }
     }
 
     pub fn new_top() -> Self {
         Self {
             auto_scroll: false,
+            top_pinned: true,
             ..Self::new()
         }
     }
 
     pub fn reset(&mut self) {
-        let auto_scroll = self.auto_scroll;
-        *self = Self::new();
-        self.auto_scroll = auto_scroll;
+        if self.top_pinned {
+            *self = Self::new_top();
+        } else {
+            let auto_scroll = self.auto_scroll;
+            *self = Self::new();
+            self.auto_scroll = auto_scroll;
+        }
     }
 
     pub fn offset(&self) -> u16 {
@@ -126,7 +159,9 @@ impl ModalScroll {
     pub fn update_dimensions(&mut self, total: u16, viewport_h: u16) {
         self.viewport_h = viewport_h;
         self.max_offset = total.saturating_sub(viewport_h);
-        if self.auto_scroll {
+        if self.top_pinned {
+            self.clamp();
+        } else if self.auto_scroll {
             self.offset = self.max_offset;
         } else {
             self.clamp();
@@ -139,7 +174,9 @@ impl ModalScroll {
     pub fn scroll(&mut self, delta: i32) {
         self.offset = apply_scroll_delta(self.offset, delta);
         self.clamp();
-        self.auto_scroll = self.offset >= self.max_offset;
+        if !self.top_pinned {
+            self.auto_scroll = self.offset >= self.max_offset;
+        }
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> bool {
@@ -195,9 +232,17 @@ pub enum Action {
     CancelSubagent {
         tool_use_id: String,
     },
+    /// Esc in a plugin task's tab: closes the plugin session behind it.
+    CancelPluginTask {
+        id: String,
+        /// Read at the stop: a rewind drops the tab before this runs.
+        plugin: Arc<str>,
+    },
     /// The history under this runtime changed (reset, load, rewind), so the
     /// agent has to be respawned on it.
     RestartAgent(Vec<Message>),
+    /// A copy of this session, to run beside it and take the focus.
+    OpenFork(Box<OpenSession>),
     ChangeModel(String),
     RefreshProvider {
         slug: String,
@@ -297,7 +342,62 @@ pub struct DisplayMessage {
     pub render_snapshot: Option<BufferSnapshot>,
     pub render_header: Option<BufferSnapshot>,
     pub snapshot_theme_gen: u64,
-    pub thinking_collapsed: bool,
+    /// Only a click sets it, so thinking starts the way `ui.thinking_lines`
+    /// says however the message got here.
+    pub thinking_expanded: bool,
+    /// A running row a Ctrl+B press would move now.
+    pub movable: bool,
+    /// Set once the call moved: the row keeps its receipt and follows the task.
+    pub background: Option<BackgroundBadge>,
+    /// The full body behind a one-line notice, shown when the row expands.
+    pub detail: Option<String>,
+    /// Whether [`Self::detail`] is shown. Only a click sets it, so a notice
+    /// starts collapsed however it got here.
+    pub detail_expanded: bool,
+    /// On a notice that answers a background task: how the task ended.
+    pub task_end: Option<BackgroundOutcome>,
+}
+
+/// How a moved call's row tracks its background task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundBadge {
+    pub id: String,
+    /// `None` after a restore: the row shows a neutral marker.
+    pub started_at: Option<Instant>,
+    pub outcome: Option<BackgroundOutcome>,
+}
+
+impl BackgroundBadge {
+    /// The badge {receipt} puts on its row. It counts from the call's start,
+    /// as the call's own marks do, not from the move.
+    pub fn moved(receipt: &ToolDoneEvent) -> Self {
+        let now = Instant::now();
+        Self {
+            id: receipt.id.clone(),
+            started_at: Some(now.checked_sub(receipt.ran_for()).unwrap_or(now)),
+            outcome: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundOutcome {
+    Done,
+    Error,
+    Cancelled,
+    /// The task died with the maki that ran it and never reported back.
+    Lost,
+}
+
+impl From<TaskEnd> for BackgroundOutcome {
+    fn from(end: TaskEnd) -> Self {
+        match end {
+            TaskEnd::Finished => Self::Done,
+            TaskEnd::Failed => Self::Error,
+            TaskEnd::Cancelled => Self::Cancelled,
+            TaskEnd::Lost => Self::Lost,
+        }
+    }
 }
 
 impl DisplayMessage {
@@ -318,7 +418,12 @@ impl DisplayMessage {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            thinking_expanded: false,
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
         }
     }
 
@@ -351,7 +456,12 @@ impl DisplayMessage {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            thinking_expanded: false,
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
         }
     }
 
@@ -368,14 +478,150 @@ pub struct ToolRole {
     pub name: Arc<str>,
 }
 
+#[derive(Debug, Clone)]
+pub struct GroupToolEntry {
+    pub id: String,
+    pub name: Arc<str>,
+    pub summary: String,
+    pub raw_input: Option<Value>,
+    pub children: Vec<GroupToolEntry>,
+    pub status: ToolStatus,
+    pub receiving_args: bool,
+    pub started_at: Option<Instant>,
+    pub duration: Option<Duration>,
+    /// What the compact row collapses. A click opens it; the row itself stays
+    /// one line. `None` on a batch child, which has no call of its own.
+    pub detail: Option<CompactDetail>,
+}
+
+/// The call a compact row stands for, kept so a click can show it in full.
+#[derive(Debug, Clone, Default)]
+pub struct CompactDetail {
+    pub input: Option<ToolInput>,
+    pub raw_input: Option<Value>,
+    pub output: Option<Arc<ToolOutput>>,
+    pub annotation: Option<String>,
+    pub render_header: Option<BufferSnapshot>,
+    pub render_snapshot: Option<BufferSnapshot>,
+    pub live_output: Option<String>,
+    pub truncated_lines: usize,
+}
+
+impl PartialEq for CompactDetail {
+    fn eq(&self, other: &Self) -> bool {
+        self.input == other.input
+            && self.raw_input == other.raw_input
+            && self.annotation == other.annotation
+            && self.render_header == other.render_header
+            && self.render_snapshot == other.render_snapshot
+            && self.live_output == other.live_output
+            && self.truncated_lines == other.truncated_lines
+            && match (&self.output, &other.output) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl PartialEq for GroupToolEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.name == other.name
+            && self.summary == other.summary
+            && self.raw_input == other.raw_input
+            && self.children == other.children
+            && self.status == other.status
+            && self.receiving_args == other.receiving_args
+            && self.started_at == other.started_at
+            && self.duration == other.duration
+            && self.detail == other.detail
+    }
+}
+
+impl CompactDetail {
+    pub fn from_start(event: &ToolStartEvent) -> Self {
+        Self {
+            input: event.input.clone(),
+            raw_input: event.raw_input.clone(),
+            output: event.output.clone().map(Arc::new),
+            annotation: event.annotation.clone(),
+            render_header: event.render_header.clone(),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupThinkingEntry {
+    pub id: usize,
+    pub text: String,
+    pub tokens: usize,
+    pub active: bool,
+    pub started_at: Option<Instant>,
+    pub duration: Option<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GroupEntry {
+    Tool(Box<GroupToolEntry>),
+    Thinking(GroupThinkingEntry),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolGroupRole {
+    pub id: String,
+    pub sealed: bool,
+    pub entries: Vec<GroupEntry>,
+    pub started_at: Option<Instant>,
+    pub duration: Option<Duration>,
+    pub waiting_since: Option<Instant>,
+    pub expanded: bool,
+}
+
+impl ToolGroupRole {
+    pub fn total_duration(&self) -> Duration {
+        if let Some(dur) = self.duration {
+            return dur;
+        }
+        let tool_sum: Duration = self
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                GroupEntry::Tool(t) => t.duration.or_else(|| t.started_at.map(|st| st.elapsed())),
+                GroupEntry::Thinking(th) => {
+                    th.duration.or_else(|| th.started_at.map(|st| st.elapsed()))
+                }
+            })
+            .sum();
+        if !tool_sum.is_zero() {
+            return tool_sum;
+        }
+        self.started_at.map_or(Duration::ZERO, |st| st.elapsed())
+    }
+
+    pub fn waiting_duration(&self) -> Option<Duration> {
+        self.waiting_since.map(|ws| ws.elapsed()).or_else(|| {
+            if self.entries.is_empty() {
+                self.started_at.map(|st| st.elapsed())
+            } else {
+                None
+            }
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DisplayRole {
     User,
     Assistant,
     Thinking,
     Tool(Box<ToolRole>),
+    ToolGroup(Box<ToolGroupRole>),
     Error,
     Done,
+    /// One dim line about what the host told the model on the user's behalf.
+    Notice,
 }
 
 impl DisplayRole {
@@ -402,13 +648,15 @@ pub(crate) fn test_pricing() -> ModelPricing {
 pub(crate) fn test_model() -> maki_providers::Model {
     maki_providers::Model {
         id: "test-model".into(),
-        provider: std::sync::Arc::<str>::from("anthropic"),
+        name: None,
+        provider: std::sync::Arc::<str>::from("responses"),
         tier: maki_providers::ModelTier::Medium,
-        family: maki_providers::ModelFamily::Claude,
+        family: maki_providers::ModelFamily::Gpt,
         supports_tool_examples_override: None,
         thinking_override: None,
         supports_vision_override: Some(true),
         supports_fast_override: None,
+        supports_deferred_tools_override: None,
         pricing: test_pricing(),
         subsidised_by: None,
         discovered_free: false,

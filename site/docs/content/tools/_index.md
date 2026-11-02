@@ -7,24 +7,24 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 21 built-in tools in this reference (20 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 24 built-in tools in this reference (23 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
 ### `bash` {#bash}
 
 Execute a bash command.
-Commands run in <cwd> by default.
+Commands run in the session's working directory (see Environment) by default.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
+| `background` | boolean | no |  | Run in the background. The result arrives as a message when it ends. |
 | `command` | string | yes |  | The bash command to execute |
-| `description` | string | no |  | Short description (3-5 words) of what the command does |
-| `tail` | integer | no |  | Return only the last N lines |
+| `description` | string | no |  | What the command does in 3-5 words, not the command itself |
 | `timeout` | integer | no | 120 | Timeout in seconds |
 | `workdir` | string | no | cwd | Working directory |
 
-### `list` {#list}
+### `list_dir` {#list_dir}
 
 List directory contents. Returns entry names sorted alphabetically, directories first with a trailing /.
 
@@ -48,6 +48,7 @@ Write content to a file, replacing existing content.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `append` | boolean | no | Add content to the end of the file instead of replacing it |
 | `content` | string | yes | The complete file content to write |
 | `path` | string | yes | Absolute path to the file |
 
@@ -150,6 +151,15 @@ Execute Python in a sandbox where every tool is an async function.
 | `code` | string | yes |  | Python code. Tools return strings, not objects, and you MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. |
 | `timeout` | integer | no | 30 | Script execution timeout in seconds |
 
+### `library_help` {#library_help}
+
+Retrieve the Python function signature, parameter types, and docstring documentation for an external library function before calling it in code_execution.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `function_name` | string | yes | The function name to inspect (e.g. "create_issue"). |
+| `library_name` | string | yes | The external library name (e.g. "github"). |
+
 ### `question` {#question}
 
 Use this tool when you need to ask the user questions during execution. This allows you to:
@@ -170,12 +180,30 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `background` | boolean | no | Run in the background and continue other work: the call returns immediately and the result arrives later as a message. Launch every background task in one parallel batch, never as sequential calls, and don't sleep or poll for it; end your turn once nothing else is left. |
 | `description` | string | yes | Short (3-5 words) description of the task |
 | `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |
-| `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
+| `output_schema` | object | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default) or "general" (can modify files) |
-| `thinking` | string | no | Thinking: off\|adaptive\|minimal\|low\|medium\|high\|xhigh\|max\|int budget. Omit to inherit parent; capped at parent. |
+| `thinking` | any | no | Thinking: off\|adaptive\|minimal\|low\|medium\|high\|xhigh\|max\|int budget. Omit to inherit parent; capped at parent. |
+
+### `task_stop` {#task_stop}
+
+Stop a background task by id.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Task id from its receipt |
+
+### `task_message` {#task_message}
+
+Message a running background subagent by id, e.g. a new fact, a changed scope or "wrap up now". It reads it after its current step.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | yes | Task id from its receipt |
+| `message` | string | yes | What the subagent should know or do |
 
 ### `todo_write` {#todo_write}
 

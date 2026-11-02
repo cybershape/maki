@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::env;
 use std::path::Path;
 use std::sync::Arc;
@@ -10,11 +11,13 @@ use crate::animation::spinner_frame;
 use crate::theme;
 
 use maki_providers::format_tokens;
+use notify::{Config, Error, Event, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use tracing::warn;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::repaint::{Cadence, Dirty};
@@ -26,6 +29,11 @@ const WORKFLOW_LABEL: &str = " [workflow]";
 const RESTRICTED_LABEL: &str = " [restricted]";
 const YOLO_LABEL: &str = " [yolo]";
 const YOLO_DIM_FACTOR: f32 = 0.15;
+const CONTEXT_BAR_FILLED: &str = "█";
+const CONTEXT_BAR_UNFILLED: &str = "░";
+const CONTEXT_BAR_WIDTH: usize = 10;
+const CONTEXT_BAR_PREFIX: &str = "  [";
+const CONTEXT_BAR_SUFFIX: &str = "]";
 
 pub struct UsageStats {
     /// The whole session's bill, drawn next to the focused chat's own once
@@ -43,15 +51,24 @@ pub struct UsageStats {
     pub show_global: bool,
 }
 
+/// Everything on the bar that moves with the clock. The view draws from it and
+/// the cadence asks for frames from it, so a spinner can't freeze and an idle
+/// bar can't keep painting.
+pub struct Motion<'a> {
+    pub working: bool,
+    pub restoring: bool,
+    pub retry: Option<&'a RetryInfo>,
+}
+
 pub struct StatusBarContext<'a> {
     pub status: &'a Status,
+    pub motion: Motion<'a>,
     pub mode_label: Cow<'static, str>,
     pub mode_style: Style,
     pub model_id: &'a str,
     pub stats: UsageStats,
     pub auto_scroll: bool,
     pub chat_name: Option<&'a str>,
-    pub retry_info: Option<&'a RetryInfo>,
     pub thinking_label: Option<Cow<'static, str>>,
     pub fast: bool,
     pub workflow: bool,
@@ -60,29 +77,50 @@ pub struct StatusBarContext<'a> {
     /// with no `.maki` at all.
     pub restricted: bool,
     pub yolo: bool,
-    pub restoring: bool,
 }
 
 pub struct StatusBar {
     flash: Option<(String, Instant)>,
+    /// Messages waiting for the line, oldest first.
+    queued: VecDeque<String>,
     started_at: Instant,
     cwd_branch: String,
     pub flash_duration: Duration,
     branch_update_rx: Option<flume::Receiver<()>>,
+    /// Nobody reads this. It is here so it dies with the bar, and dropping it
+    /// stops notify's event thread and closes the inotify fd. Every session
+    /// builds its own bar, so a watcher that outlives it leaks a thread.
+    _branch_watcher: Option<RecommendedWatcher>,
 }
 
 impl StatusBar {
     pub fn new(flash_duration: Duration) -> Self {
+        let (branch_update_rx, branch_watcher) = watch_branch().unzip();
         Self {
             flash: None,
+            queued: VecDeque::new(),
             started_at: Instant::now(),
             cwd_branch: cwd_branch_label(),
             flash_duration,
-            branch_update_rx: spawn_branch_watcher(),
+            branch_update_rx,
+            _branch_watcher: branch_watcher,
         }
     }
 
+    /// Shows {msg} now, replacing whatever was showing. It answers something
+    /// the user just did, and they want the latest state, not the one before.
     pub fn flash(&mut self, msg: String) {
+        self.flash = Some((msg, Instant::now()));
+    }
+
+    /// Shows {msg} once the line is free, behind anything already waiting.
+    /// Startup warnings come in a batch, and [`Self::flash`] would keep only
+    /// the last of them.
+    pub fn queue_flash(&mut self, msg: String) {
+        if self.flash.is_some() {
+            self.queued.push_back(msg);
+            return;
+        }
         self.flash = Some((msg, Instant::now()));
     }
 
@@ -93,6 +131,7 @@ impl StatusBar {
 
     pub fn refresh_cwd(&mut self) {
         self.cwd_branch = cwd_branch_label();
+        (self.branch_update_rx, self._branch_watcher) = watch_branch().unzip();
     }
 
     pub fn poll_branch_update(&mut self) -> Dirty {
@@ -108,8 +147,11 @@ impl StatusBar {
         Dirty::from(changed)
     }
 
+    /// Takes down what is showing and hands the line to the next waiting
+    /// message. The queue is kept on purpose: a turn ending makes a hint like
+    /// "press esc again" stale, but not a startup warning nobody read yet.
     pub fn clear_flash(&mut self) {
-        self.flash = None;
+        self.show_next();
     }
 
     pub fn clear_expired_hint(&mut self) -> Dirty {
@@ -120,16 +162,21 @@ impl StatusBar {
         {
             return Dirty::NO;
         }
-        self.flash = None;
+        self.show_next();
         Dirty::YES
     }
 
-    /// The bar spins for a whole turn, again while a restore is in flight, and
-    /// it counts a retry down by the second. It sits next to [`Self::view`] so
-    /// a new moving span cannot forget to claim its frames.
-    pub fn cadence(status: &Status, restoring: bool, retrying: bool) -> Cadence {
+    /// The one way a message leaves the line, so none can leave it without
+    /// handing it to the next.
+    fn show_next(&mut self) {
+        self.flash = self.queued.pop_front().map(|msg| (msg, Instant::now()));
+    }
+
+    /// A queue claims frames too. Startup fills it and then the UI sits idle,
+    /// so without frames the next message would never get its turn.
+    pub fn cadence(&self, motion: &Motion) -> Cadence {
         Cadence::when(
-            *status == Status::Streaming || restoring || retrying,
+            motion.working || motion.restoring || motion.retry.is_some() || !self.queued.is_empty(),
             Cadence::SPINNER,
         )
     }
@@ -137,12 +184,12 @@ impl StatusBar {
     pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) {
         let mut left_spans = Vec::new();
 
-        if *ctx.status == Status::Streaming {
+        if ctx.motion.working {
             let ch = spinner_frame(self.started_at.elapsed().as_millis());
             left_spans.push(Span::styled(format!(" {ch}"), theme::current().spinner));
         }
 
-        if ctx.restoring {
+        if ctx.motion.restoring {
             let ch = spinner_frame(self.started_at.elapsed().as_millis());
             left_spans.push(Span::styled(
                 format!(" {ch}"),
@@ -166,7 +213,7 @@ impl StatusBar {
             ));
         }
 
-        if let Some(retry) = ctx.retry_info {
+        if let Some(retry) = ctx.motion.retry {
             left_spans.push(Span::styled(
                 format!(" {}", retry.message),
                 theme::current().status_retry_error,
@@ -191,6 +238,13 @@ impl StatusBar {
 
         let mut right_spans = Vec::new();
 
+        // A flash answers what the user just did, while the path and the
+        // model sit there all day. So they shrink to make room for it.
+        let flash_span = self
+            .flash
+            .as_ref()
+            .map(|(msg, _)| Span::styled(format!(" {msg}"), theme::current().status_notice));
+
         // An error takes the whole bar over. The label saying the agent
         // approves everything has to survive that, so it is built out here
         // and both arms place it.
@@ -207,11 +261,15 @@ impl StatusBar {
                 right_spans.extend(yolo_span);
             }
             _ => {
-                let pct = if ctx.stats.context_window > 0 {
-                    (ctx.stats.context_size as f64 / ctx.stats.context_window as f64 * 100.0) as u32
+                let (ratio, pct) = if ctx.stats.context_window > 0 {
+                    let r = ctx.stats.context_size as f64 / ctx.stats.context_window as f64;
+                    (r, r * 100.0)
                 } else {
-                    0
+                    (0.0, 0.0)
                 };
+                let filled =
+                    ((ratio * CONTEXT_BAR_WIDTH as f64).round() as usize).min(CONTEXT_BAR_WIDTH);
+                let unfilled = CONTEXT_BAR_WIDTH.saturating_sub(filled);
 
                 let mut rest_spans = Vec::new();
 
@@ -233,27 +291,38 @@ impl StatusBar {
                 }
                 rest_spans.extend(yolo_span);
 
-                let context_text = format!(
-                    "  {}/{} ({}%)",
-                    format_tokens(ctx.stats.context_size),
-                    format_tokens(ctx.stats.context_window),
-                    pct,
-                );
-                let rest_text = match (
+                let dim_style = theme::current().status_dim;
+                let fg_style = Style::new().fg(theme::current().foreground);
+                rest_spans.push(Span::styled(CONTEXT_BAR_PREFIX, dim_style));
+                if filled > 0 {
+                    rest_spans.push(Span::styled(
+                        CONTEXT_BAR_FILLED.repeat(filled),
+                        theme::current().progress_bar,
+                    ));
+                }
+                if unfilled > 0 {
+                    rest_spans.push(Span::styled(
+                        CONTEXT_BAR_UNFILLED.repeat(unfilled),
+                        dim_style,
+                    ));
+                }
+                rest_spans.push(Span::styled(CONTEXT_BAR_SUFFIX, dim_style));
+
+                let window = format_tokens(ctx.stats.context_window).to_uppercase();
+                rest_spans.push(Span::styled(format!(" {pct:.1}%/{window}"), dim_style));
+
+                let cost_text = match (
                     ctx.stats.cost,
                     ctx.stats.list_cost,
                     &ctx.stats.subsidy_source,
                 ) {
                     (Some(cost), Some(list), Some(source)) if list > 0.0 => {
-                        format!("{context_text} ${cost:.3} (~${list:.3} {source}) ")
+                        format!(" ${cost:.3} (~${list:.3} {source}) ")
                     }
-                    (Some(cost), _, _) => format!("{context_text} ${cost:.3} "),
-                    (None, _, _) => format!("{context_text} "),
+                    (Some(cost), _, _) => format!(" ${cost:.3} "),
+                    (None, _, _) => " ".to_string(),
                 };
-                rest_spans.push(Span::styled(
-                    rest_text,
-                    Style::new().fg(theme::current().foreground),
-                ));
+                rest_spans.push(Span::styled(cost_text, fg_style));
 
                 if let Some(global) = ctx.stats.global_cost.filter(|_| ctx.stats.show_global) {
                     let global_text = format!(" \u{03a3}${global:.3} ");
@@ -266,26 +335,28 @@ impl StatusBar {
                 let reserved = left_spans
                     .iter()
                     .chain(rest_spans.iter())
+                    .chain(flash_span.iter())
                     .map(Span::width)
-                    .sum::<usize>()
-                    + CWD_MODEL_SEPARATOR.width();
+                    .sum::<usize>();
                 let available = (area.width as usize).saturating_sub(reserved);
-                let model = truncate_tail(ctx.model_id, available / 2);
-                let cwd = truncate_tail(&self.cwd_branch, available.saturating_sub(model.width()));
-
-                right_spans.push(Span::styled(cwd, theme::current().status_dim));
-                right_spans.push(Span::raw(CWD_MODEL_SEPARATOR));
-                right_spans.push(Span::styled(model, theme::current().status_dim));
+                if available >= CWD_MODEL_SEPARATOR.width() + 4 {
+                    let content_available = available - CWD_MODEL_SEPARATOR.width();
+                    let model = truncate_tail(ctx.model_id, content_available / 2);
+                    let cwd = truncate_tail(
+                        &self.cwd_branch,
+                        content_available.saturating_sub(model.width()),
+                    );
+                    if !cwd.is_empty() || !model.is_empty() {
+                        right_spans.push(Span::styled(cwd, theme::current().status_dim));
+                        right_spans.push(Span::raw(CWD_MODEL_SEPARATOR));
+                        right_spans.push(Span::styled(model, theme::current().status_dim));
+                    }
+                }
                 right_spans.append(&mut rest_spans);
             }
         }
 
-        if let Some((ref msg, _)) = self.flash {
-            left_spans.push(Span::styled(
-                format!(" {msg}"),
-                theme::current().status_notice,
-            ));
-        }
+        left_spans.extend(flash_span);
 
         let [left_area, right_area] = Layout::horizontal([
             Constraint::Min(0),
@@ -304,6 +375,9 @@ impl StatusBar {
 fn truncate_tail(s: &str, max_width: usize) -> Cow<'_, str> {
     if s.width() <= max_width {
         return Cow::Borrowed(s);
+    }
+    if max_width < TRUNCATE_PREFIX.width() {
+        return Cow::Borrowed("");
     }
     let budget = max_width.saturating_sub(TRUNCATE_PREFIX.width());
     let mut used = 0;
@@ -358,31 +432,43 @@ fn find_git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
         if git.is_dir() {
             return Some(git);
         }
+        if let Ok(contents) = std::fs::read_to_string(&git) {
+            let path = contents.trim().strip_prefix("gitdir: ")?.trim_start();
+            let path = Path::new(path);
+            return Some(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                dir.join(path)
+            });
+        }
         dir = dir.parent()?;
     }
 }
 
-fn spawn_branch_watcher() -> Option<flume::Receiver<()>> {
-    use notify::{RecursiveMode, Watcher};
-
+/// Access events are left out. Reading `HEAD` is one, so a watcher that
+/// took them would wake the poll that reads it, and that read would wake
+/// it again, every tick for as long as the app runs.
+fn watch_branch() -> Option<(flume::Receiver<()>, RecommendedWatcher)> {
     let cwd = env::current_dir().ok()?;
     let git_dir = find_git_dir(&cwd)?;
     let (tx, rx) = flume::bounded(1);
-
-    std::thread::spawn(move || {
-        let Ok(mut watcher) = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
-            if res.is_ok_and(|e| e.paths.iter().any(|p| p.ends_with("HEAD"))) {
-                let _ = tx.try_send(());
-            }
-        }) else {
-            return;
-        };
-        if watcher.watch(&git_dir, RecursiveMode::NonRecursive).is_ok() {
-            std::thread::park();
+    let on_event = move |res: Result<Event, _>| {
+        if res.is_ok_and(|e| e.paths.iter().any(|p| p.ends_with("HEAD"))) {
+            let _ = tx.try_send(());
         }
-    });
-
-    Some(rx)
+    };
+    let config = Config::default().with_event_kinds(EventKindMask::CORE);
+    let unavailable = |e: &Error| {
+        warn!(error = %e, git_dir = %git_dir.display(), "git branch watcher unavailable");
+    };
+    let mut watcher = RecommendedWatcher::new(on_event, config)
+        .inspect_err(unavailable)
+        .ok()?;
+    watcher
+        .watch(&git_dir, RecursiveMode::NonRecursive)
+        .inspect_err(unavailable)
+        .ok()?;
+    Some((rx, watcher))
 }
 
 #[cfg(test)]
@@ -391,12 +477,22 @@ mod tests {
 
     use super::*;
     use crate::repaint::expect::QUIET;
+    use ratatui::style::Color;
     use tempfile::TempDir;
     use test_case::test_case;
 
     const FLASH_TTL: Duration = Duration::from_secs(3600);
     const FLASH_MSG: &str = "Copied";
+    const EXPECT_FLASH: &str = "a queued message has to reach the bar";
+    const EXPECT_EVERY_MESSAGE: &str = "every flashed message has to be shown, in order";
+    const EXPECT_DRAINS: &str = "the bar has to end up empty";
+    const EXPECT_IDLE: &str = "nothing waiting means no frames to claim";
+    const EXPECT_TICKING: &str = "a waiting message has to claim the frames that advance it";
+    const EXPECT_NEWEST: &str = "a flash answers the user's last action, not an earlier one";
     const STALE_BRANCH: &str = "/nowhere:gone";
+    const LONG_CWD: &str = "~/projects/a/rather/deep/folder/for/this/repository:feature/branch";
+    const LONG_FLASH: &str =
+        "a plugin wrote part of this shell line: retype it yourself in a fresh input";
     const BAR_WIDTH: u16 = 120;
     const MODEL_ID: &str = "test-model";
     const CONTEXT_SIZE: u32 = 12_000;
@@ -408,6 +504,11 @@ mod tests {
     const RETRY_MESSAGE: &str = "rate limited";
     const RETRY_ATTEMPT: u32 = 2;
     const COUNTDOWN: &str = "retrying in";
+    const STILL: Motion = Motion {
+        working: false,
+        restoring: false,
+        retry: None,
+    };
     /// Long enough that the countdown cannot lapse mid-render.
     const RETRY_DELAY: Duration = Duration::from_secs(600);
 
@@ -425,7 +526,10 @@ mod tests {
     }
 
     fn draw(ctx: &StatusBarContext<'_>) -> String {
-        let bar = StatusBar::new(FLASH_TTL);
+        draw_bar(&StatusBar::new(FLASH_TTL), ctx)
+    }
+
+    fn draw_bar(bar: &StatusBar, ctx: &StatusBarContext<'_>) -> String {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
         terminal.draw(|f| bar.view(f, f.area(), ctx)).unwrap();
@@ -440,6 +544,7 @@ mod tests {
     ) -> StatusBarContext<'a> {
         StatusBarContext {
             status,
+            motion: STILL,
             mode_label: "build".into(),
             mode_style: Style::new(),
             model_id: MODEL_ID,
@@ -454,13 +559,11 @@ mod tests {
             },
             auto_scroll: true,
             chat_name: None,
-            retry_info: None,
             thinking_label: None,
             fast: false,
             workflow: false,
             restricted: false,
             yolo,
-            restoring: false,
         }
     }
 
@@ -488,14 +591,27 @@ mod tests {
         show_global: bool,
     ) -> bool {
         let text = render(global_cost, show_global, false);
-        assert_eq!(text.matches(CHAT_COST_TEXT).count(), 1, "{text}");
-        let shown = text.matches(SESSION_COST_TEXT).count() == 1;
-        assert_eq!(
-            text.contains(SIGMA),
-            shown,
-            "a sigma carrying another number is a misrender: {text}"
+        text.contains(SESSION_COST_TEXT)
+    }
+
+    #[test]
+    fn status_bar_omits_cost_when_stats_have_no_cost() {
+        let with_cost = context(&Status::Idle, None, false, false);
+        assert!(draw(&with_cost).contains(CHAT_COST_TEXT));
+
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.stats.cost = None;
+        ctx.stats.list_cost = None;
+        ctx.stats.global_cost = None;
+        let drawn = draw(&ctx);
+        assert!(
+            !drawn.contains('$'),
+            "drawn status bar should not contain '$': {drawn}"
         );
-        shown
+        assert!(
+            !drawn.contains(SIGMA),
+            "drawn status bar should not contain sigma: {drawn}"
+        );
     }
 
     /// Yolo now outlives the process that turned it on, so the one-shot flash
@@ -504,6 +620,19 @@ mod tests {
     #[test_case(false => false ; "a_prompting_session_stays_quiet")]
     fn the_bar_advertises_yolo(yolo: bool) -> bool {
         render(None, false, yolo).contains(YOLO_LABEL.trim())
+    }
+
+    /// The path and the model are there all day, so a message answering
+    /// what the user just did is read in full before them.
+    #[test]
+    fn a_flash_pushes_the_path_and_model_aside() {
+        let mut bar = StatusBar::new(FLASH_TTL);
+        bar.cwd_branch = LONG_CWD.into();
+        bar.flash(LONG_FLASH.into());
+
+        let text = draw_bar(&bar, &context(&Status::Idle, None, false, false));
+
+        assert!(text.contains(LONG_FLASH), "{text}");
     }
 
     #[test]
@@ -544,6 +673,22 @@ mod tests {
         (dir, path)
     }
 
+    #[test]
+    fn detect_branch_from_worktree() {
+        let dir = TempDir::new().unwrap();
+        let wt_head = dir.path().join("main/.git/worktrees/wt");
+        fs::create_dir_all(&wt_head).unwrap();
+        fs::write(dir.path().join("main/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(wt_head.join("HEAD"), "ref: refs/heads/db/worktree-branch\n").unwrap();
+        let wt = dir.path().join("wt");
+        fs::create_dir(&wt).unwrap();
+        fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_head.display())).unwrap();
+        assert_eq!(
+            detect_branch(&wt.to_string_lossy()),
+            Some("db/worktree-branch".to_string())
+        );
+    }
+
     #[test_case(Some("ref: refs/heads/feature/foo\n"), Some("feature/foo") ; "regular_ref")]
     #[test_case(Some("abc1234deadbeef\n"),            Some("abc1234")      ; "detached_head")]
     #[test_case(None,                                 None                 ; "no_git_dir")]
@@ -579,6 +724,63 @@ mod tests {
         let first = bar.clear_expired_hint();
         assert_eq!(bar.clear_expired_hint(), Dirty::NO, "{QUIET}");
         first
+    }
+
+    /// A toggle says what just happened, and the user is looking when it
+    /// does. Queuing these would answer the press before last.
+    #[test]
+    fn flashing_replaces_what_is_showing() {
+        let mut bar = StatusBar::new(FLASH_TTL);
+
+        bar.flash("enabled".into());
+        bar.flash("disabled".into());
+
+        assert_eq!(bar.flash_text(), Some("disabled"), "{EXPECT_NEWEST}");
+        assert_eq!(bar.cadence(&STILL), Cadence::IDLE, "{EXPECT_IDLE}");
+    }
+
+    #[test]
+    fn every_queued_message_gets_its_turn() {
+        let mut bar = StatusBar::new(Duration::ZERO);
+        let msgs = ["first", "second", "third"];
+
+        for msg in msgs {
+            bar.queue_flash((*msg).into());
+        }
+
+        let mut seen = Vec::new();
+        for _ in 0..msgs.len() {
+            seen.push(bar.flash_text().expect(EXPECT_FLASH).to_owned());
+            let _ = bar.clear_expired_hint();
+        }
+
+        assert_eq!(seen, msgs, "{EXPECT_EVERY_MESSAGE}");
+        assert_eq!(bar.flash_text(), None, "{EXPECT_DRAINS}");
+    }
+
+    #[test]
+    fn a_queue_claims_frames() {
+        let mut bar = StatusBar::new(FLASH_TTL);
+        bar.queue_flash(FLASH_MSG.into());
+        assert_eq!(bar.cadence(&STILL), Cadence::IDLE, "{EXPECT_IDLE}");
+
+        bar.queue_flash(FLASH_MSG.into());
+
+        assert_eq!(bar.cadence(&STILL), Cadence::SPINNER, "{EXPECT_TICKING}");
+    }
+
+    #[test]
+    fn clearing_hands_the_line_to_what_is_waiting() {
+        let mut bar = StatusBar::new(FLASH_TTL);
+        bar.queue_flash("first".into());
+        bar.queue_flash("second".into());
+
+        bar.clear_flash();
+        assert_eq!(bar.flash_text(), Some("second"), "{EXPECT_EVERY_MESSAGE}");
+
+        bar.clear_flash();
+        assert_eq!(bar.flash_text(), None, "{EXPECT_DRAINS}");
+        assert_eq!(bar.cadence(&STILL), Cadence::IDLE, "{EXPECT_IDLE}");
     }
 
     /// The watcher fires for any write near `.git/HEAD`, most of which leave
@@ -620,7 +822,7 @@ mod tests {
             deadline: Instant::now() + delay,
         };
         let mut ctx = context(&Status::Streaming, None, false, false);
-        ctx.retry_info = Some(&retry);
+        ctx.motion.retry = Some(&retry);
 
         let text = draw(&ctx);
         assert!(text.contains(RETRY_MESSAGE), "{text}");
@@ -631,11 +833,85 @@ mod tests {
         text.contains(COUNTDOWN)
     }
 
+    #[test_case(false, false ; "still")]
+    #[test_case(true,  false ; "working")]
+    #[test_case(false, true  ; "restoring")]
+    fn a_spinner_is_drawn_exactly_while_the_bar_claims_frames(working: bool, restoring: bool) {
+        let bar = StatusBar::new(FLASH_TTL);
+        let still = context(&Status::Idle, None, false, false);
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.motion = Motion {
+            working,
+            restoring,
+            retry: None,
+        };
+        let drawn = draw_bar(&bar, &ctx) != draw_bar(&bar, &still);
+        let ticking = bar.cadence(&ctx.motion) == Cadence::SPINNER;
+        let moving = working || restoring;
+        assert_eq!((drawn, ticking), (moving, moving));
+    }
+
     #[test]
     fn clear_flash_removes_flash() {
         let mut bar = StatusBar::new(Duration::from_secs(999));
         bar.flash("Copied".into());
         bar.clear_flash();
         assert!(bar.flash.is_none());
+    }
+
+    #[test]
+    fn status_bar_renders_model_name() {
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.model_id = "GPT-6.1 Sol";
+        let text = draw(&ctx);
+        assert!(text.contains("GPT-6.1 Sol"), "{text}");
+    }
+
+    #[test_case(0, 1_000_000, "[░░░░░░░░░░] 0.0%/1.0M"         ; "empty")]
+    #[test_case(745_000, 1_000_000, "[███████░░░] 74.5%/1.0M"     ; "three_quarters")]
+    #[test_case(1_000_000, 1_000_000, "[██████████] 100.0%/1.0M" ; "full")]
+    fn context_bar_renders_progress_and_percentage(size: u32, window: u32, expected: &str) {
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.stats.context_size = size;
+        ctx.stats.context_window = window;
+        let text = draw(&ctx);
+        assert!(text.contains(expected), "{text}");
+    }
+
+    #[test]
+    fn context_bar_uses_theme_styles() {
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.stats.context_size = 500_000;
+        ctx.stats.context_window = 1_000_000;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
+        terminal
+            .draw(|f| StatusBar::new(FLASH_TTL).view(f, f.area(), &ctx))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let progress_fg = theme::current().progress_bar.fg.unwrap_or(Color::Reset);
+        let dim_fg = theme::current().status_dim.fg.unwrap_or(Color::Reset);
+
+        let has_progress_bar = (0..buffer.area.width).any(|x| {
+            let cell = buffer.cell((x, 0)).unwrap();
+            cell.symbol() == CONTEXT_BAR_FILLED && cell.fg == progress_fg
+        });
+        let has_bracket = (0..buffer.area.width).any(|x| {
+            let cell = buffer.cell((x, 0)).unwrap();
+            cell.symbol() == "[" && cell.fg == dim_fg
+        });
+        let has_percentage_dim = (0..buffer.area.width).any(|x| {
+            let cell = buffer.cell((x, 0)).unwrap();
+            cell.symbol() == "%" && cell.fg == dim_fg
+        });
+        let has_cost_fg = (0..buffer.area.width).any(|x| {
+            let cell = buffer.cell((x, 0)).unwrap();
+            cell.symbol() == "$" && cell.fg == theme::current().foreground
+        });
+
+        assert!(has_progress_bar);
+        assert!(has_bracket);
+        assert!(has_percentage_dim);
+        assert!(has_cost_fg);
     }
 }

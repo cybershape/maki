@@ -1,29 +1,7 @@
-//! Allocation-free line wrap measuring.
-//!
-//! Replays ratatui's `WordWrapper` (`ratatui-widgets/src/reflow.rs`) for the
-//! `Wrap { trim: false }` case maki always uses, so row counts match what
-//! `Paragraph` really draws without cloning a single line or span. With `trim`
-//! pinned to false the machine shrinks to a few scalars plus the queue of
-//! pending whitespace widths, the only scratch we keep.
-
-use std::mem;
-
 use ratatui::buffer::CellWidth;
 use ratatui::style::Style;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 
-/// Why a row ended: `Word` when the renderer swallowed whitespace at the
-/// boundary, `Char` when the break cut through a word.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Break {
-    Word,
-    Char,
-}
-
-/// Rows `lines` occupy at `width`. A zero width reports one row per line where
-/// ratatui reports nothing, because that is what maki's layout expects.
-///
-/// Public so `benches/wrap.rs` can race it against `Paragraph::line_count`.
 pub fn total_rows(lines: &[Line<'_>], width: u16) -> u16 {
     let mut measure = Measure::new(width);
     lines
@@ -31,310 +9,218 @@ pub fn total_rows(lines: &[Line<'_>], width: u16) -> u16 {
         .fold(0, |rows, line| rows.saturating_add(measure.rows(line)))
 }
 
-/// Measures one line at a time, keeping the scan machine between them, so a
-/// caller that walks a segment in pieces pays for measuring it once instead of
-/// once per piece.
 pub(crate) struct Measure {
-    /// Absent at zero width, where every line counts as one row.
-    scan: Option<Scan>,
+    width: u16,
 }
 
 impl Measure {
     pub(crate) fn new(width: u16) -> Self {
-        Self {
-            scan: (width > 0).then(|| Scan::new(u32::from(width))),
-        }
+        Self { width }
     }
 
     pub(crate) fn rows(&mut self, line: &Line<'_>) -> u16 {
-        self.scan
-            .as_mut()
-            .map_or(1, |scan| scan.run(line, &mut |_| {}))
+        scan(line, self.width, |_, _, _| {}, |_| {})
     }
 }
 
-/// Calls `on_break` once per row boundary inside `line`, so exactly one less
-/// than the rows the line draws as.
-///
-/// The scan reports one break too many when a row ends on whitespace the
-/// renderer swallows: that break closes the line instead of opening a row, so a
-/// caller walking rows would run ahead of what is drawn. Only the last break can
-/// be spurious and the row count is what gives it away, so every break waits
-/// here until the next one vouches for it. This stays out of [`Scan::run`]
-/// because [`total_rows`] runs on every resize and pays nothing for it.
-pub(crate) fn breaks(line: &Line<'_>, width: u16, mut on_break: impl FnMut(Break)) {
-    if width == 0 {
-        return;
-    }
-    let mut pending = None;
-    let mut seen = 0;
-    let rows = Scan::new(u32::from(width)).run(line, &mut |kind| {
-        seen += 1;
-        if let Some(prev) = pending.replace(kind) {
-            on_break(prev);
-        }
-    });
-    if let Some(kind) = pending
-        && seen < rows
-    {
-        on_break(kind);
-    }
+pub(crate) fn row_widths(line: &Line<'_>, width: u16, on_row: impl FnMut(u16)) {
+    scan(line, width, |_, _, _| {}, on_row);
 }
 
-/// The whitespace widths ratatui parks in a `VecDeque`, plus the scalars its
-/// `process_input` keeps on the stack. The `_empty` flags stand in for
-/// `Vec::is_empty` on ratatui's grapheme buffers, which is not the same as a
-/// zero width: a zero width grapheme fills no cell yet still fills a buffer.
-struct Scan {
-    whitespace: Vec<u32>,
-    whitespace_width: u32,
-    word_width: u32,
-    word_empty: bool,
-    line_width: u32,
-    line_empty: bool,
-    prev_was_word: bool,
-    max: u32,
-}
-
-impl Scan {
-    fn new(max: u32) -> Self {
-        Self {
-            whitespace: Vec::new(),
-            whitespace_width: 0,
-            word_width: 0,
-            word_empty: true,
-            line_width: 0,
-            line_empty: true,
-            prev_was_word: false,
-            max,
+pub(crate) fn visible_lines<'a>(
+    lines: &'a [Line<'_>],
+    width: u16,
+    mut skip: u16,
+    height: u16,
+) -> Vec<Line<'a>> {
+    let mut result = Vec::new();
+    for line in lines {
+        if result.len() >= usize::from(height) {
+            break;
         }
-    }
-
-    /// Fresh machine for the next line, reusing the whitespace allocation.
-    fn reset(&mut self) {
-        let mut scratch = mem::take(&mut self.whitespace);
-        scratch.clear();
-        *self = Self {
-            whitespace: scratch,
-            ..Self::new(self.max)
-        };
-    }
-
-    fn run(&mut self, line: &Line<'_>, on_break: &mut impl FnMut(Break)) -> u16 {
-        self.reset();
-
-        let mut rows = 0u16;
-        let mut broke = |kind| {
-            rows = rows.saturating_add(1);
-            on_break(kind);
-        };
-
-        for span in &line.spans {
-            let content = span.content.as_ref();
-            // Grapheme segmentation is 80x a byte walk and buys nothing here:
-            // every non control ASCII byte is one grapheme of width 1, and space
-            // is the only ASCII whitespace left after the control filter. `\r\n`
-            // is a single cluster, but it gets dropped either way.
-            if content.is_ascii() {
-                for &byte in content.as_bytes() {
-                    if !byte.is_ascii_control() {
-                        self.step(1, byte == b' ', &mut broke);
-                    }
+        let available = usize::from(height) - result.len();
+        let start = result.len();
+        let rows = scan(
+            line,
+            width,
+            |row, symbol, style| {
+                if row < skip || usize::from(row - skip) >= available {
+                    return;
                 }
-            } else {
-                for grapheme in span.styled_graphemes(Style::default()) {
-                    let width = u32::from(grapheme.symbol.cell_width());
-                    self.step(width, grapheme.is_whitespace(), &mut broke);
+                let index = start + usize::from(row - skip);
+                while result.len() <= index {
+                    result.push(Line {
+                        style: line.style,
+                        alignment: line.alignment,
+                        ..Line::default()
+                    });
                 }
-            }
-        }
-
-        if !self.line_empty || !self.whitespace.is_empty() || !self.word_empty {
-            rows = rows.saturating_add(1);
-        }
-        rows.max(1)
-    }
-
-    fn step(&mut self, symbol_width: u32, is_whitespace: bool, on_break: &mut impl FnMut(Break)) {
-        if symbol_width > self.max {
-            return;
-        }
-
-        let word_found = self.prev_was_word && is_whitespace;
-        let untrimmed_overflow =
-            self.line_empty && self.word_width + self.whitespace_width + symbol_width > self.max;
-        if word_found || untrimmed_overflow {
-            self.flush_segment();
-        }
-
-        let line_full = self.line_width >= self.max;
-        let word_overflow = symbol_width > 0
-            && self.line_width + self.whitespace_width + self.word_width >= self.max;
-        if line_full || word_overflow {
-            let mut remaining = self.max.saturating_sub(self.line_width);
-            self.line_width = 0;
-            self.line_empty = true;
-
-            // Indexed on purpose: iterating `&self.whitespace` while writing
-            // `self.whitespace_width` costs the whole scan 30%, because the
-            // live borrow stops the other fields from staying in registers.
-            let mut dropped = 0;
-            while let Some(&width) = self.whitespace.get(dropped) {
-                if width > remaining {
-                    break;
+                let spans = &mut result[index].spans;
+                if let Some(last) = spans.last_mut()
+                    && last.style == style
+                {
+                    last.content.to_mut().push_str(symbol);
+                } else {
+                    spans.push(Span::styled(symbol.to_owned(), style));
                 }
-                self.whitespace_width -= width;
-                remaining -= width;
-                dropped += 1;
-            }
-            self.whitespace.drain(..dropped);
-
-            // A row ending on whitespace swallows it, and swallows the grapheme
-            // that forced the break too when that one is whitespace as well.
-            if is_whitespace && self.whitespace.is_empty() {
-                on_break(Break::Word);
-                return;
-            }
-            on_break(if dropped > 0 {
-                Break::Word
-            } else {
-                Break::Char
+            },
+            |_| {},
+        );
+        let visible = usize::from(rows.saturating_sub(skip)).min(available);
+        while result.len() < start + visible {
+            result.push(Line {
+                style: line.style,
+                alignment: line.alignment,
+                ..Line::default()
             });
         }
+        skip = skip.saturating_sub(rows);
+    }
+    result
+}
 
-        if is_whitespace {
-            self.whitespace_width += symbol_width;
-            self.whitespace.push(symbol_width);
-        } else {
-            self.word_width += symbol_width;
-            self.word_empty = false;
+fn scan(
+    line: &Line<'_>,
+    width: u16,
+    mut on_symbol: impl FnMut(u16, &str, Style),
+    mut on_row: impl FnMut(u16),
+) -> u16 {
+    if width == 0 {
+        on_row(0);
+        return 1;
+    }
+    let mut row = 0u16;
+    let mut col = 0u16;
+    let mut push = |symbol: &str, symbol_width: u16, style| {
+        if symbol_width > width {
+            return;
         }
-        self.prev_was_word = !is_whitespace;
+        if symbol_width > width - col {
+            on_row(col);
+            row = row.saturating_add(1);
+            col = 0;
+        }
+        on_symbol(row, symbol, style);
+        col += symbol_width;
+    };
+    for span in &line.spans {
+        let content = span.content.as_ref();
+        if content.is_ascii() {
+            for (i, byte) in content.bytes().enumerate() {
+                if !byte.is_ascii_control() {
+                    push(&content[i..i + 1], 1, span.style);
+                }
+            }
+        } else {
+            for grapheme in span.styled_graphemes(Style::default()) {
+                push(
+                    grapheme.symbol,
+                    grapheme.symbol.cell_width(),
+                    grapheme.style,
+                );
+            }
+        }
     }
-
-    fn flush_segment(&mut self) {
-        self.line_width += self.whitespace_width + self.word_width;
-        self.line_empty &= self.whitespace.is_empty() && self.word_empty;
-        self.whitespace.clear();
-        self.whitespace_width = 0;
-        self.word_width = 0;
-        self.word_empty = true;
-    }
+    on_row(col);
+    row.saturating_add(1)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Break, breaks, total_rows};
+    use super::{row_widths, total_rows, visible_lines};
+    use ratatui::buffer::{Buffer, CellWidth};
+    use ratatui::layout::Rect;
+    use ratatui::style::{Color, Style};
     use ratatui::text::{Line, Span};
-    use ratatui::widgets::{Paragraph, Wrap};
-    use std::slice;
+    use ratatui::widgets::{Paragraph, Widget};
     use test_case::test_case;
 
-    const CORPUS: &[&str] = &[
-        "",
-        " ",
-        "   ",
-        "a",
-        "🎉",
-        "你",
-        "hello world",
-        "the quick brown fox jumps over the lazy dog",
-        "supercalifragilisticexpialidociousandthensome",
-        "   leading whitespace",
-        "trailing whitespace   ",
-        "many     spaces     between     words",
-        "\ttabbed\tcolumns\there",
-        "你好世界，这是一段中文文本",
-        "a你b好c世d界",
-        "emoji 🎉 party 👨‍👩‍👧‍👦 family",
-        "nbsp\u{00a0}joined\u{00a0}words",
-        "zwsp\u{200b}split\u{200b}here",
-        "ideographic\u{3000}space\u{3000}wide",
-        "mixed 漢字 and ascii words together",
-        "xx xx xx xx xx xx xx xx",
-        "control\u{7}chars\u{7f}stripped",
-        "carriage\r\nreturn cluster",
-    ];
+    const SCREENSHOT: &str = "我会新增 progress.md，在 AGENTS.md 中加入修改前回顾决策、提交时记录决策的要求，并补记本次扫码登录调整，然后一起提交并推送当前改动。";
+    const SCREENSHOT_FIRST_ROW: &str = "maki> 我会新增 progress.md，在 AGENTS.md 中加入修改前回顾决策、提交时记录决策的要求，并补记本次扫码";
 
-    fn ratatui_rows(lines: &[Line<'_>], width: u16) -> u16 {
-        Paragraph::new(lines.to_vec())
-            .wrap(Wrap { trim: false })
-            .line_count(width) as u16
-    }
-
-    fn corpus_lines() -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = CORPUS.iter().copied().map(Line::from).collect();
-        lines.push(Line::from(vec![
-            Span::raw("super"),
-            Span::raw("cali"),
-            Span::raw("fragilistic "),
-            Span::raw("expi"),
-            Span::raw("alidocious and "),
-            Span::raw("more"),
-        ]));
-        lines
-    }
-
-    /// Line by line pins the state machine, the whole corpus in one call pins
-    /// that nothing leaks from a line into the next, and every break has to open
-    /// a row, else [`crate::selection`] marks the wrong ones.
-    #[test]
-    fn matches_ratatui_wrapping() {
-        let lines = corpus_lines();
-        for width in (1..=40).chain([80, 200]) {
-            for line in &lines {
-                let rows = total_rows(slice::from_ref(line), width);
-                assert_eq!(
-                    rows,
-                    ratatui_rows(slice::from_ref(line), width),
-                    "line {line:?} at width {width}"
-                );
-                assert_eq!(
-                    kinds(line, width).len() + 1,
-                    rows as usize,
-                    "breaks of {line:?} at width {width}"
-                );
+    #[test_case("你好世界", 4, &["你好", "世界"] ; "chinese")]
+    #[test_case("a你好", 2, &["a", "你", "好"] ; "wide_character_moves_to_next_row")]
+    #[test_case("漢字漢字", 3, &["漢", "字", "漢", "字"] ; "odd_width")]
+    #[test_case("hello world", 5, &["hello", " worl", "d"] ; "english_splits_at_columns")]
+    #[test_case("AGENTS.md", 4, &["AGEN", "TS.m", "d"] ; "filename")]
+    #[test_case("a    b", 4, &["a   ", " b"] ; "spaces_preserved")]
+    #[test_case("ab\tcd", 3, &["abc", "d"] ; "controls_filtered")]
+    #[test_case("⚠\u{fe0f}你", 3, &["⚠\u{fe0f}", "你"] ; "variation_selector")]
+    #[test_case("👨‍👩‍👧‍👦a", 2, &["👨‍👩‍👧‍👦", "a"] ; "zwj_cluster")]
+    #[test_case("e\u{301}ab", 2, &["e\u{301}a", "b"] ; "combining_mark")]
+    #[test_case("你a好b", 1, &["a", "b"] ; "overwide_symbols_omitted")]
+    #[test_case("你好", 1, &[""] ; "only_overwide_symbols")]
+    #[test_case("abc", 0, &[""] ; "zero_width")]
+    #[test_case("", 5, &[""] ; "empty_line")]
+    #[test_case("abcd", 4, &["abcd"] ; "exact_width")]
+    fn wraps_at_display_columns(input: &str, width: u16, expected: &[&str]) {
+        let lines = [Line::from(input)];
+        let wrapped = visible_lines(&lines, width, 0, u16::MAX);
+        let text: Vec<String> = wrapped.iter().map(ToString::to_string).collect();
+        assert_eq!(text, expected);
+        assert_eq!(usize::from(total_rows(&lines, width)), expected.len());
+        let mut widths = Vec::new();
+        row_widths(&lines[0], width, |cols| widths.push(cols));
+        assert_eq!(widths.len(), expected.len());
+        assert!(widths.iter().all(|&cols| cols <= width));
+        if width > 0 {
+            let area = Rect::new(1, 1, width, wrapped.len() as u16);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width + 2, area.height + 2));
+            Paragraph::new(wrapped).render(area, &mut buffer);
+            for (row, expected) in expected.iter().enumerate() {
+                let mut actual = String::new();
+                let mut col = area.x;
+                while col < area.right() {
+                    let cell = &buffer[(col, area.y + row as u16)];
+                    actual.push_str(cell.symbol());
+                    col += cell.symbol().cell_width().max(1);
+                }
+                assert_eq!(actual.trim_end(), expected.trim_end());
             }
-            assert_eq!(
-                total_rows(&lines, width),
-                ratatui_rows(&lines, width),
-                "corpus at width {width}"
-            );
+            for y in 0..buffer.area.bottom() {
+                assert_eq!(buffer[(0, y)].symbol(), " ");
+                assert_eq!(buffer[(width + 1, y)].symbol(), " ");
+            }
         }
     }
 
-    /// Canaries for a ratatui change the differential test would happily follow,
-    /// plus the zero width case where we differ on purpose.
-    #[test_case(&["hello", "world"],  0, 2 ; "zero_width_returns_line_count")]
-    #[test_case(&["", "a", ""],      40, 3 ; "empty_lines_count_as_one")]
-    #[test_case(&[&"a".repeat(80)],  80, 1 ; "exactly_width_no_wrap")]
-    #[test_case(&[&"a".repeat(81)],  80, 2 ; "one_over_width_wraps")]
-    fn total_rows_cases(input: &[&str], width: u16, expected: u16) {
-        let lines: Vec<Line<'_>> = input.iter().copied().map(Line::from).collect();
-        assert_eq!(total_rows(&lines, width), expected);
-    }
-
-    #[test_case("hello world",    5, &[Break::Word] ; "space_swallowed_at_boundary")]
-    #[test_case("helloworld",     5, &[Break::Char] ; "cut_through_word")]
-    #[test_case("a    b",         4, &[Break::Word] ; "run_of_spaces_dropped")]
-    #[test_case("   ",            2, &[]            ; "swallowed_trailing_space_opens_no_row")]
-    #[test_case("ab\tcd",         3, &[Break::Char] ; "tab_is_stripped_as_control")]
-    #[test_case("漢 字字",         3, &[Break::Word] ; "cjk_with_space_word_wrap")]
-    #[test_case("漢字漢字",        3, &[Break::Char, Break::Char] ; "cjk_double_width_overflows")]
-    #[test_case("hi worldaaaaaa", 5, &[Break::Word, Break::Char, Break::Char] ; "word_then_char")]
-    fn break_kinds(input: &str, width: u16, expected: &[Break]) {
-        assert_eq!(kinds(&Line::from(input), width), expected);
-    }
-
     #[test]
-    fn breaks_see_through_span_boundaries() {
-        let line = Line::from(vec![Span::raw("hello "), Span::raw("world")]);
-        assert_eq!(kinds(&line, 6), [Break::Word]);
+    fn screenshot_uses_the_whole_first_row_and_keeps_styles() {
+        let code = Style::default().fg(Color::Magenta);
+        let base = Style::default().bg(Color::Black);
+        let line = Line::from(vec![
+            Span::raw("maki> 我会新增 "),
+            Span::styled("progress.md", code),
+            Span::raw("，在 "),
+            Span::styled("AGENTS.md", code),
+            Span::raw(SCREENSHOT.split_once("AGENTS.md").unwrap().1),
+        ])
+        .style(base);
+        let lines = [line];
+        let wrapped = visible_lines(&lines, 100, 0, 10);
+        assert_eq!(wrapped[0].to_string(), SCREENSHOT_FIRST_ROW);
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(wrapped[0].style, base);
+        assert_eq!(wrapped[0].spans[1].style, code);
+        let joined: String = wrapped.iter().map(ToString::to_string).collect();
+        assert_eq!(joined, format!("maki> {SCREENSHOT}"));
     }
 
-    fn kinds(line: &Line<'_>, width: u16) -> Vec<Break> {
-        let mut kinds = Vec::new();
-        breaks(line, width, |kind| kinds.push(kind));
-        kinds
+    #[test_case(0, 2, &["abc", "def"] ; "first_rows")]
+    #[test_case(1, 2, &["def", "ghi"] ; "scrolled_inside_line")]
+    #[test_case(2, 2, &["ghi", ""] ; "explicit_empty_line")]
+    #[test_case(3, 2, &["", "末"] ; "next_source_line")]
+    #[test_case(0, 0, &[] ; "zero_height")]
+    fn visible_rows_keep_span_and_source_boundaries(skip: u16, height: u16, expected: &[&str]) {
+        let lines = [
+            Line::from(vec![Span::raw("ab"), Span::raw("cdefghi")]),
+            Line::default(),
+            Line::from("末尾"),
+        ];
+        let actual: Vec<String> = visible_lines(&lines, 3, skip, height)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(actual, expected);
     }
 }

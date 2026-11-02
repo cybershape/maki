@@ -1,6 +1,40 @@
+> **Personal fork.** This repository ([cybershape/maki](https://github.com/cybershape/maki)) is a strongly opinionated personal fork of upstream [Maki](https://github.com/tontinton/maki). It is **not** the upstream project; providers, defaults, and UI behavior differ. For the official agent, use [tontinton/maki](https://github.com/tontinton/maki).
+
+**Changes in this fork (vs [tontinton/maki](https://github.com/tontinton/maki) `main`):**
+
+- **Providers:** Built-in and bundled provider plugins are trimmed to the OpenAI **Responses API** path only (upstream’s multi-vendor built-ins and provider Lua plugins are removed). Provider management belongs in dedicated tools such as [magpie](https://github.com/yetone/magpie), with Maki consuming a unified Responses API endpoint. The Responses integration adds fuller `/models` discovery parsing and reasoning-effort / thinking-level handling based on model capabilities and metadata; CLI auth is aligned with that stack.
+- **Tool call reasons (`toolcall_reason`):** Injects an optional `toolcall_reason` parameter into every tool schema, prompting models to provide a concise, intent-focused reason (omitting redundant file names) for invoking the tool. The reason is displayed directly on the tool header / row title in the TUI (e.g. `reading main entry point · src/main.rs:10-29`) and stripped before execution so tool handlers receive clean arguments. In `compact_tools` mode, child tools inside `batch` calls also format and display their `toolcall_reason` in the tree.
+- **Tools & prompts:**
+  - Built-in directory listing tool is renamed from `list` to `list_dir` to avoid shadowing Python’s built-in `list` in the `code_execution` sandbox. When `list_dir` is disabled, it is hidden from the tools exposed to the model and from `code_execution` callable tools, but `code_execution` preserves its underlying `files.inspect` sandbox capability for `os`/`pathlib` inspection.
+  - The `code_execution` tool description documents Monty Python subset limitations (e.g. eager generator evaluation into lists, missing `iter()`, and unsupported syntax like `:=`, `del`, or `*args` call unpacking) to prevent models from generating failing code.
+  - System prompt hints dynamically adapt when `batch`, `code_execution`, or `task` are disabled.
+  - MCP servers are not advertised as wire tools: the model calls them as Python libraries inside `code_execution` (`library_help` documents them). External MCP library and function names with non-identifier characters (such as hyphens) are normalized to valid Python identifiers across `code_execution` descriptions, sandbox namespace mounting, and `library_help`. Sessions saved by an older build stored those MCP tools on the request and will not resume on this fork; start a new session.
+  - Added Vue single-file component (`.vue`) indexing support to the `index` tool, covering top-level SFC blocks (`<template>`, `<script>`, `<style>`), template tag hierarchy with custom component detection, and script symbol extraction for Composition API and Options API.
+- **TUI & interaction:**
+  - `compact_tools` mode grouping tools and thinking blocks with durations, waiting animations, child tool summaries, single-line thinking summaries with `↵` newline separators, accurate summed thinking duration in turn completion stats, and full preservation across session restore. Visible entries before folding are configurable via `compact_lines` (default `10`, `0` folds all entries). The hidden-count line (`... (X hidden)`) expands on click to reveal all calls. Clicking a row opens a detail popup with full untruncated input and output, horizontal inner padding, a 50% minimum height with non-shrinking watermark sizing during item switching, Python syntax highlighting for `code_execution` input without raw JSON formatting, top scroll default, and `j`/`k` shortcut keys to navigate between previous and next items.
+  - Prompt queue with steer shortcut (Shift-Enter) to steer a running turn, plus recall editing for queued and previous prompts.
+  - Context-window usage progress bar in status bar using theme colors; compact single-width Unicode per-turn stats line upon completion (`◷` elapsed / thinking, `↑`/`↓` tokens, `»` speed, `t₁` TTFT, `⛁` cache).
+  - Markdown LaTeX math expression rendering via `txm`.
+  - OSC 7501 Program Status Protocol support for terminal status reporting; inline image rendering for Rex (`TERM_PROGRAM=rex`).
+  - Stylized user messages with chevron prefix and background tint.
+  - Layout and display options: `show_cost`, `prefer_model_name`, `max_width` centering (supporting column counts, viewport ratios like `0.8`, and negative offsets like `-10`), and column-boundary text wrapping.
+  - Viewport resize debouncing (50ms debounce with 200ms throttle) to prevent continuous repainting and reflow thrashing during window resize animations and dragging.
+  - Model picker (`/model`): When the current model is present in `Recent`, the dialog defaults to selecting the entry in the `Recent` section instead of jumping to the provider section.
+- **ACP server:** On-disk model cache with wait-for-discovery on first run; session `thought_level` (and aliases) for reasoning effort; `usage_update` on session load, model changes, refresh, and compaction; model display names in config options; question-tool and model-metadata fixes.
+- **Storage & history:** Timestamps recorded on session log records (`MessageRecord`, `ContentBlockRecord`); duration tracking for individual thinking blocks.
+- **Instructions:** Per-agent and global switches for which third-party instruction files (e.g. `CLAUDE.md`, `.cursorrules`) are loaded.
+- **Standby & sleep resilience:** Detects system sleep/wake transitions via cross-platform clock drift heuristics; automatically compensates tool deadlines by the sleep duration so background/foreground commands are not mistakenly killed on wake; enables TCP keepalive on HTTP connections; immediately aborts stale SSE streams on wake instead of waiting for a 30s timeout; applies a wake-up grace period so initial connection attempts during Wi-Fi re-association do not deplete the 5-retry limit; and triggers automatic HTTP MCP transport reconnection upon wake.
+- **CI & build:** Release builds run only on git tags for Windows, Linux, and macOS arm64 (no NetBSD and similar upstream targets); LTO disabled for non-release builds.
+
 <img src="./banner.png">
 
 An AI coding agent optimized for minimal use of context tokens, while providing a great user experience.
+
+## Benchmarks
+
+<img src="./site/bench.svg" alt="Maki 0.5.5 at 70% pass rate and $2.06 per pass, against the FrontierHarness Eval baselines">
+
+[FrontierHarness Eval](https://frontierharness.org/) benchmark result, [click here to download report.zip](https://github.com/tontinton/maki/releases/download/v0.5.5/frontierharness-report-2026-09-21.zip)
 
 ## Features
 
@@ -56,7 +90,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * OpenCode Go - `OPENCODE_API_KEY`. Models from the models.dev catalog.
 * Aperture - `APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.
 
-**Dynamic providers** - drop an executable script into `~/.config/maki/providers/` to add custom providers or proxies. See [docs](https://maki.sh/docs/providers/#dynamic-providers) for details.
+**Plugin providers** - a Lua plugin can register a provider with `maki.provider.register`, and its models behave like any built-in provider's. See [docs](https://maki.sh/docs/providers/#plugin-providers) for details.
 
 ## Installation
 
@@ -78,6 +112,12 @@ curl -fsSL https://maki.sh/install.sh | sh
 ```
 
 Installs to `~/.local/bin`. Override with `MAKI_INSTALL_DIR`.
+
+### Homebrew
+
+```sh
+brew install maki
+```
 
 ### Windows (PowerShell)
 
@@ -142,7 +182,7 @@ More info at the [official docs](https://maki.sh/docs).
 
 ## Community
 
-[![Discord](https://img.shields.io/discord/1543246528876126218?logo=discord&logoColor=white&label=discord&color=5865F2)](https://discord.gg/dEBhANTbX)
+[![Discord](https://img.shields.io/discord/1543246528876126218?logo=discord&logoColor=white&label=discord&color=5865F2)](https://discord.gg/8VKuA4naC3)
 
 ## Example config
 

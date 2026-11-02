@@ -8,7 +8,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 pub const TRUNCATION_PREFIX: &str = "...";
-const MIN_TRUNCATABLE_LINES: usize = 2;
+pub const EXPAND_HINT: &str = "click to expand";
+pub(crate) const MIN_TRUNCATABLE_LINES: usize = 2;
 
 /// Add `over`'s modifiers on top of `base`, keeping `base`'s colors.
 fn apply_modifiers(base: Style, over: Style) -> Style {
@@ -87,6 +88,8 @@ fn style_for_token(
             s
         }
         StyleToken::CodeBar => t.code_gutter,
+        StyleToken::Math => apply_emphasis(t.math, emphasis, false, t),
+        StyleToken::MathBar => t.math_gutter,
         StyleToken::ListMarker => t.list_marker,
         StyleToken::TableBorder => t.table_border,
         StyleToken::HorizontalRule => t.horizontal_rule,
@@ -99,6 +102,7 @@ fn paint_line(line: &RLine, text_style: Style, t: &Theme) -> Line<'static> {
     let (base, preserve_color) = match line.kind {
         LineKind::Heading => (t.heading, true),
         LineKind::Code => (Style::default(), false),
+        LineKind::Math => (t.math, false),
         _ => (text_style, false),
     };
     let spans = line
@@ -129,7 +133,7 @@ pub fn truncation_notice(count: usize) -> String {
         should_truncate(count),
         "truncation_notice called with count={count} below threshold"
     );
-    format!("{TRUNCATION_PREFIX} ({count} lines) click to expand")
+    format!("{TRUNCATION_PREFIX} ({count} lines) {EXPAND_HINT}")
 }
 
 pub struct Truncated<'a> {
@@ -361,6 +365,19 @@ mod tests {
             .find(|s| s.content.as_ref() == CODE_BAR)
             .expect("code bar span");
         assert_eq!(bar.style, theme::current().code_gutter);
+    }
+
+    #[test]
+    fn text_to_lines_renders_math_block_with_gutter() {
+        let text = "$$\\text{Cache Hit Rate} = \\frac{\\text{cache\\_read}}{\\text{total\\_input}} = \\frac{\\text{cache\\_read}}{\\text{input} + \\text{cache\\_read} + \\text{cache\\_creation}}$$";
+        let style = Style::default();
+        let lines = text_to_lines(text, "", style, style, 120);
+        let math_lines: Vec<_> = lines
+            .iter()
+            .filter(|l| l.spans.iter().any(|s| s.content.as_ref() == CODE_BAR))
+            .collect();
+        assert_eq!(math_lines.len(), 3);
+        assert_eq!(math_lines[0].spans[0].style, theme::current().math_gutter);
     }
 
     #[test]

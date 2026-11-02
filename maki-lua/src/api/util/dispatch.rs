@@ -146,28 +146,30 @@ mod tests {
         let concurrent: Vec<_> = (0..=MAX_HOOK_DEPTH)
             .map(|_| {
                 let scope = TaskScope::detached(&lua);
-                let guard = DepthGuard::enter(&lua, "test", SEAM, Reentry::Task)
-                    .expect("a fresh task starts at zero");
+                let guard = {
+                    let _active = scope.enter();
+                    DepthGuard::enter(&lua, "test", SEAM, Reentry::Task)
+                        .expect("a fresh task starts at zero")
+                };
                 (scope, guard)
             })
             .collect();
-        let nested: Vec<_> = (1..MAX_HOOK_DEPTH)
+        let (last, _) = concurrent.last().expect("at least one task");
+        let _active = last.enter();
+        let _nested: Vec<_> = (1..MAX_HOOK_DEPTH)
             .map(|_| {
                 DepthGuard::enter(&lua, "test", SEAM, Reentry::Task).expect("within the bound")
             })
             .collect();
         assert!(DepthGuard::enter(&lua, "test", SEAM, Reentry::Task).is_err());
-        drop((concurrent, nested));
     }
 
-    #[test]
-    fn call_swallowing_hides_errors_but_not_values() {
+    #[tokio::test]
+    async fn call_swallowing_hides_errors_but_not_values() {
         let lua = Lua::new();
         let bad: Function = lua.load("error('boom')").into_function().unwrap();
         let ok: Function = lua.load("return 7").into_function().unwrap();
-        smol::block_on(async {
-            assert!(call_swallowing::<i64>(&bad, (), SEAM, "p").await.is_none());
-            assert_eq!(call_swallowing::<i64>(&ok, (), SEAM, "p").await, Some(7));
-        });
+        assert!(call_swallowing::<i64>(&bad, (), SEAM, "p").await.is_none());
+        assert_eq!(call_swallowing::<i64>(&ok, (), SEAM, "p").await, Some(7));
     }
 }

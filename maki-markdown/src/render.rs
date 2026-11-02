@@ -31,6 +31,7 @@ const LONG_LINE_SUFFIX: &str = "...";
 pub enum StyleToken {
     Text,
     InlineCode,
+    Math,
     /// Syntax-highlighted token. Carries the resolved color + modifiers so the
     /// consumer doesn't need to know the language.
     Highlight {
@@ -40,6 +41,7 @@ pub enum StyleToken {
         underline: bool,
     },
     CodeBar,
+    MathBar,
     Heading,
     ListMarker,
     TableBorder,
@@ -77,6 +79,7 @@ pub enum LineKind {
     Heading,
     ListItem,
     Code,
+    Math,
     TableBorder,
     TableRow,
     HorizontalRule,
@@ -152,6 +155,15 @@ impl Renderer {
     pub fn streaming() -> Self {
         Self {
             wrap_paragraphs: false,
+            incremental: true,
+            ..Self::default()
+        }
+    }
+
+    /// [`Self::streaming`] that still wraps paragraphs, for callers that
+    /// count the rows they get back.
+    pub fn streaming_wrapped() -> Self {
+        Self {
             incremental: true,
             ..Self::default()
         }
@@ -292,6 +304,24 @@ fn render_block(
             ensure_blank_line(lines);
             state.table_idx += 1;
         }
+        Block::Math { source } => {
+            ensure_blank_line(lines);
+            let available_width = if ctx.width > 2 {
+                (ctx.width - 2) as usize
+            } else {
+                ctx.width as usize
+            };
+            let math_lines = crate::math::render_math_lines(source, available_width);
+            for ml in math_lines {
+                let mut spans = vec![Span::new(CODE_BAR, StyleToken::MathBar)];
+                spans.push(Span::new(ml, StyleToken::Math));
+                lines.push(Line {
+                    kind: LineKind::Math,
+                    spans,
+                });
+            }
+            ensure_blank_line(lines);
+        }
     }
 }
 
@@ -326,6 +356,8 @@ fn render_line_block(lb: &LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
         // code colours on top. The Lua bridge collapses to one name per span.
         let style = if sk == SpanKind::Code {
             StyleToken::InlineCode
+        } else if sk == SpanKind::Math {
+            StyleToken::Math
         } else if is_heading {
             StyleToken::Heading
         } else {
@@ -577,7 +609,14 @@ fn wrap_spans(spans: Vec<Span>, max_width: usize) -> Vec<Vec<Span>> {
 
         while !text.is_empty() {
             let fits = fit_width(text, remaining);
-            if fits == 0 {
+            let word_end = if fits == text.len() || text.as_bytes()[fits] == b' ' {
+                Some(fits)
+            } else {
+                text[..fits].rfind(' ').filter(|&sp| sp > 0)
+            };
+            // The row already holds earlier spans, so a word here that does
+            // not fit whole (inline code, say) moves down instead of being cut.
+            if fits == 0 || (word_end.is_none() && !current.is_empty()) {
                 if current.is_empty() {
                     let head = first_grapheme_len(text);
                     current.push(Span::with_emphasis(
@@ -592,14 +631,8 @@ fn wrap_spans(spans: Vec<Span>, max_width: usize) -> Vec<Vec<Span>> {
                 text = text.strip_prefix(' ').unwrap_or(text);
                 continue;
             }
-            let (take, skip) = if fits < text.len() {
-                match text[..fits].rfind(' ') {
-                    Some(sp) if sp > 0 => (sp, sp + 1),
-                    _ => (fits, fits),
-                }
-            } else {
-                (fits, fits)
-            };
+            let take = word_end.unwrap_or(fits);
+            let skip = take + usize::from(text[take..].starts_with(' '));
             current.push(Span::with_emphasis(
                 text[..take].to_owned(),
                 style.clone(),
@@ -638,6 +671,8 @@ fn cell_spans(cell: &str, header: bool) -> Vec<Span> {
                 }
                 let style = if kind == SpanKind::Code {
                     StyleToken::InlineCode
+                } else if kind == SpanKind::Math {
+                    StyleToken::Math
                 } else {
                     StyleToken::Text
                 };
@@ -1271,14 +1306,15 @@ mod tests {
     fn paragraph_wrapping_preserves_all_content() {
         const INPUT: &str = "The **quick** brown _fox_ jumps over the `lazy` dog repeatedly";
         let lines = render(INPUT, 20);
-        let rendered: String = lines
+        let rendered = lines
             .iter()
-            .flat_map(|l| &l.spans)
-            .map(|s| s.text.as_str())
-            .collect();
+            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" ");
         let expected = INPUT.replace("**", "").replace(['_', '`'], "");
         assert_eq!(
-            rendered, expected,
+            rendered.split_whitespace().collect::<Vec<_>>(),
+            expected.split_whitespace().collect::<Vec<_>>(),
             "wrapped output must preserve all visible text"
         );
     }
@@ -1330,6 +1366,23 @@ mod tests {
         assert!(wrapped.len() >= 3);
         assert_eq!(joined(&wrapped), long_word);
         assert!(wrapped.iter().all(|row| spans_width(row) <= 10));
+    }
+
+    #[test_case(&["call ", "collapsed"], 12 => vec!["call", "collapsed"] ; "span_starting_after_a_space")]
+    #[test_case(&["call", " collapsed"], 12 => vec!["call", "collapsed"] ; "span_starting_with_a_space")]
+    #[test_case(&["abcd efgh"], 4 => vec!["abcd", "efgh"] ; "space_right_after_the_fit")]
+    fn wrap_spans_keeps_words_whole(spans: &[&str], width: usize) -> Vec<String> {
+        let spans = spans
+            .iter()
+            .map(|text| Span::new(*text, StyleToken::Text))
+            .collect();
+        wrap_spans(spans, width)
+            .iter()
+            .map(|row| {
+                let text: String = row.iter().map(|s| s.text.as_str()).collect();
+                text.trim().to_owned()
+            })
+            .collect()
     }
 
     #[test_case(WARNING_CELL ; "emoji_presentation_sequence")]
@@ -1425,5 +1478,15 @@ mod tests {
             trunc.iter().any(|l| l.kind == LineKind::TableBorder),
             "table detection survives truncation (parser is lenient about missing closing |)"
         );
+    }
+
+    #[test]
+    fn render_display_math_block_emits_math_lines() {
+        let text = "$$\\text{Cache Hit Rate} = \\frac{\\text{cache\\_read}}{\\text{total\\_input}} = \\frac{\\text{cache\\_read}}{\\text{input} + \\text{cache\\_read} + \\text{cache\\_creation}}$$";
+        let lines = render(text, 120);
+        let math_lines: Vec<_> = lines.iter().filter(|l| l.kind == LineKind::Math).collect();
+        assert_eq!(math_lines.len(), 3);
+        assert_eq!(math_lines[0].spans[0].style, StyleToken::MathBar);
+        assert_eq!(math_lines[0].spans[1].style, StyleToken::Math);
     }
 }

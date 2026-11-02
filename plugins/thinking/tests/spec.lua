@@ -9,7 +9,10 @@ local MODEL_ID = "claude-opus-5"
 local WIDE = 52
 local NARROW = 30
 local MEDIUM = "medium"
+local ADAPTIVE = "adaptive"
+local HIGH = "high"
 local RAW_BUDGET = "8192"
+local TOKENS_LABEL = " tokens"
 local REJECTED = "Usage: /thinking [off|adaptive|minimal|low|medium|high|xhigh|max|<budget>]"
 local UNSUPPORTED = "Thinking requires a model that supports it"
 local CUSTOM_ROW_NAME = "custom…"
@@ -35,11 +38,29 @@ local CLAMPED_LADDER = {
   { name = "low", tokens = 1024 },
   { name = "max", tokens = 1024 },
 }
+local NATIVE_LADDER = {
+  { name = "off" },
+  { name = "adaptive" },
+  { name = "low" },
+  { name = "medium" },
+  { name = "xhigh" },
+}
+local TOGGLE_LADDER = { { name = "off" }, { name = "adaptive" } }
 
-local function model_with(thinking, options)
+-- What a model without an adaptive mode offers: the host's ladder minus that
+-- row.
+local FIXED_LADDER = {}
+for _, option in ipairs(LADDER) do
+  if option.name ~= ADAPTIVE then
+    FIXED_LADDER[#FIXED_LADDER + 1] = option
+  end
+end
+
+local function model_with(thinking, options, shown)
   return {
     id = MODEL_ID,
     thinking = thinking,
+    thinking_shown = shown or thinking,
     thinking_options = options or LADDER,
   }
 end
@@ -94,7 +115,87 @@ local function press(state, keys)
 end
 
 case("the_picker_opens_on_the_row_the_session_runs", function()
-  eq(press(picker_on(MEDIUM), { "enter" }), MEDIUM)
+  eq(press(picker_on(MEDIUM), { "<CR>" }), MEDIUM)
+end)
+
+-- The session still holds `adaptive`, but the row is gone, so the level it is
+-- sent as takes the cursor instead of the custom row.
+case("a_hidden_adaptive_opens_on_the_level_it_is_sent_as", function()
+  local state = Picker.new(model_with(ADAPTIVE, FIXED_LADDER, HIGH))
+  eq(state.rows[state.cursor].option.name, HIGH)
+end)
+
+-- Enter straight away keeps `adaptive`, so a session never stores the level
+-- without the user picking it. Once the cursor has moved, every row is a
+-- choice, the opened one included.
+case("confirming_the_opened_row_keeps_a_hidden_adaptive", function()
+  local function hidden()
+    return Picker.new(model_with(ADAPTIVE, FIXED_LADDER, HIGH))
+  end
+  eq(press(hidden(), { "<CR>" }), ADAPTIVE)
+  eq(press(hidden(), { "<Up>", "<CR>" }), MEDIUM)
+  eq(press(hidden(), { "<Up>", "<Down>", "<CR>" }), HIGH)
+  local clicked = hidden()
+  Picker.click(clicked, clicked.cursor)
+  eq(Picker.value(clicked), ADAPTIVE, "a click on the opened row is not a move")
+end)
+
+case("native_levels_skip_unsupported_choices_and_do_not_claim_token_budgets", function()
+  local state = picker_on(MEDIUM, NATIVE_LADDER)
+  eq(press(state, { "<Down>", "<CR>" }), "xhigh")
+  eq(press(state, { "<Up>", "<Up>", "<CR>" }), "low")
+  local lines = Picker.render(state, WIDE)
+  local names = {}
+  for i, row in ipairs(state.rows) do
+    if row.option then
+      names[#names + 1] = row.option.name
+      eq(line_text(lines[i]):find(TOKENS_LABEL, 1, true), nil)
+    end
+  end
+  eq(table.concat(names, ","), "off,adaptive,low,medium,xhigh")
+  eq(#level_lines(state, lines), 0)
+end)
+
+case("toggle_only_models_offer_modes_without_token_counts", function()
+  local state = picker_on(ADAPTIVE, TOGGLE_LADDER)
+  eq(state.rows[state.cursor].option.name, ADAPTIVE)
+  eq(press(state, { "<Up>", "<CR>" }), "off")
+  eq(press(state, { "<Down>", "<CR>" }), ADAPTIVE)
+  local lines = Picker.render(state, WIDE)
+  for i, row in ipairs(state.rows) do
+    if row.option then
+      eq(line_text(lines[i]):find(TOKENS_LABEL, 1, true), nil)
+    end
+  end
+  eq(press(state, { "8", "1", "9", "2", "<CR>" }), RAW_BUDGET)
+end)
+
+case("snapped_effort_opens_the_effective_row_without_rewriting_intent", function()
+  local state = Picker.new(model_with(HIGH, NATIVE_LADDER, MEDIUM))
+  eq(state.rows[state.cursor].option.name, MEDIUM)
+  eq(press(state, { "<CR>" }), HIGH)
+  eq(state.custom, "")
+  eq(press(state, { "<Up>", "<Down>", "<CR>" }), MEDIUM)
+end)
+
+case("toggle_row_keeps_the_delegation_ceiling_until_the_user_changes_it", function()
+  local state = Picker.new(model_with(HIGH, TOGGLE_LADDER, ADAPTIVE))
+  eq(state.rows[state.cursor].option.name, ADAPTIVE)
+  eq(press(state, { "<CR>" }), HIGH)
+  eq(state.custom, "")
+  eq(press(state, { "<Up>", "<Down>", "<CR>" }), ADAPTIVE)
+end)
+
+case("native_budget_opens_a_named_row_without_a_fake_token_count", function()
+  local state = Picker.new(model_with(RAW_BUDGET, NATIVE_LADDER, "xhigh"))
+  eq(state.rows[state.cursor].option.name, "xhigh")
+  eq(state.custom, "")
+  eq(press(state, { "<CR>" }), RAW_BUDGET)
+  local lines = Picker.render(state, WIDE)
+  for _, line in ipairs(lines) do
+    eq(line_text(line):find(TOKENS_LABEL, 1, true), nil)
+  end
+  eq(press(state, { "<Up>", "<Down>", "<CR>" }), "xhigh")
 end)
 
 -- The one fallback: a value no row names is a raw token budget.
@@ -102,24 +203,24 @@ case("a_raw_budget_opens_the_custom_row_pre_filled", function()
   local state = picker_on(RAW_BUDGET)
   eq(state.cursor, state.custom_row)
   th.has(line_text(Picker.render(state, WIDE)[state.custom_row]), RAW_BUDGET .. " tokens")
-  eq(press(state, { "enter" }), RAW_BUDGET)
+  eq(press(state, { "<CR>" }), RAW_BUDGET)
 end)
 
 case("keys_pick_a_value_or_dismiss_the_picker", function()
-  eq(press(picker_on(MEDIUM), { "down", "down", "enter" }), "xhigh")
-  eq(press(picker_on(MEDIUM), { "up", "enter" }), "low")
-  eq(press(picker_on(MEDIUM), { "esc" }), "cancel")
-  eq(press(picker_on(MEDIUM), { "8", "1", "9", "2", "enter" }), "8192")
-  eq(press(picker_on(MEDIUM), { "4", "0", "9", "6", "backspace", "enter" }), "409")
-  eq(press(picker_on(MEDIUM), { "4", "esc", "enter" }), "4", "esc leaves the editor, not the picker")
+  eq(press(picker_on(MEDIUM), { "<Down>", "<Down>", "<CR>" }), "xhigh")
+  eq(press(picker_on(MEDIUM), { "<Up>", "<CR>" }), "low")
+  eq(press(picker_on(MEDIUM), { "<Esc>" }), "cancel")
+  eq(press(picker_on(MEDIUM), { "8", "1", "9", "2", "<CR>" }), "8192")
+  eq(press(picker_on(MEDIUM), { "4", "0", "9", "6", "<BS>", "<CR>" }), "409")
+  eq(press(picker_on(MEDIUM), { "4", "<Esc>", "<CR>" }), "4", "esc leaves the editor, not the picker")
 end)
 
 case("the_cursor_walks_over_blank_rows_and_stops_at_the_ends", function()
   local walked = {}
   local state = picker_on("off")
-  eq(press(state, { "up" }), "off", "nothing above the first row")
+  eq(press(state, { "<Up>" }), "off", "nothing above the first row")
   for _ = 1, #LADDER + 1 do
-    Picker.handle_key(state, "down")
+    Picker.handle_key(state, "<Down>")
     walked[#walked + 1] = Picker.value(state)
   end
   -- The last step falls off the end of the list and stays on the custom row,
@@ -177,6 +278,28 @@ end)
 
 -- Proof that the ladder lives in Rust: a level this plugin has never heard of
 -- is navigable and drawn like any other.
+-- A level the model does not take stays pickable, since it is a ceiling a
+-- subagent on another model may reach, but it reads as the row it sends.
+case("a_level_the_model_does_not_take_names_the_row_it_sends", function()
+  local options = {
+    { name = "off", sends = "off" },
+    { name = "medium", tokens = 13107, sends = MEDIUM },
+    { name = "high", tokens = 19660, sends = MEDIUM },
+  }
+  local state = picker_on(MEDIUM, options)
+  local lines = Picker.render(state, WIDE)
+  local high
+  for i, row in ipairs(state.rows) do
+    if row.option and row.option.name == HIGH then
+      high = lines[i]
+    end
+  end
+  eq(high[2][2], "dim")
+  eq(line_text(high):match("sends medium") ~= nil, true, line_text(high))
+  eq(line_text(high):find(TOKENS_LABEL, 1, true), nil, "an alias claims no budget of its own")
+  eq(press(picker_on(MEDIUM, options), { "<Down>", "<CR>" }), HIGH)
+end)
+
 case("an_option_the_plugin_never_heard_of_renders_as_a_normal_row", function()
   local extended = {}
   for i, option in ipairs(LADDER) do
@@ -185,7 +308,7 @@ case("an_option_the_plugin_never_heard_of_renders_as_a_normal_row", function()
   extended[#extended + 1] = { name = "ultra", tokens = 65536 }
   local state = picker_on("max", extended)
 
-  eq(press(state, { "down", "enter" }), "ultra")
+  eq(press(state, { "<Down>", "<CR>" }), "ultra")
   local lines = Picker.render(state, WIDE)
   th.has(line_text(lines[state.cursor]), "ultra")
   th.has(line_text(lines[state.cursor]), "65.5k")
@@ -235,7 +358,7 @@ local function run(events, opts)
       if opts.reject then
         return nil, REJECTED
       end
-      return { thinking = args.thinking }
+      return { thinking = args.thinking, thinking_shown = opts.shown or args.thinking }
     end,
   }
   maki.ui = {
@@ -271,7 +394,7 @@ local function run(events, opts)
 end
 
 case("enter_sends_the_picked_value_once_and_says_so", function()
-  local result = run({ key("down"), key("down"), key("enter") })
+  local result = run({ key("<Down>"), key("<Down>"), key("<CR>") })
   eq(result.sets, "xhigh")
   eq(result.flashes, "Thinking: xhigh")
   eq(result.closed, true)
@@ -280,9 +403,9 @@ end)
 -- Nothing reaches the host until Enter, so there is never a value to undo.
 case("a_dismissed_picker_sends_nothing", function()
   for name, events in pairs({
-    esc = { key("down"), key("esc") },
-    ["external close"] = { key("down"), CLOSE },
-    ["dead channel"] = { key("down") },
+    esc = { key("<Down>"), key("<Esc>") },
+    ["external close"] = { key("<Down>"), CLOSE },
+    ["dead channel"] = { key("<Down>") },
   }) do
     local result = run(events)
     eq(result.sets, "", name)
@@ -298,11 +421,11 @@ case("a_crash_closes_the_window_and_is_reported", function()
   eq(result.sets, "")
   eq(result.closed, true)
   th.has(result.err or "", BOOM)
-  eq(run({ key("enter") }).sets, MEDIUM, "the window reopens after a crash")
+  eq(run({ key("<CR>") }).sets, MEDIUM, "the window reopens after a crash")
 end)
 
 case("a_refused_value_flashes_what_the_host_answered", function()
-  eq(run({ key("enter") }, { reject = true }).flashes, REJECTED)
+  eq(run({ key("<CR>") }, { reject = true }).flashes, REJECTED)
   eq(run({}, { direct = "nonsense", reject = true }).flashes, REJECTED)
 end)
 
@@ -311,6 +434,12 @@ case("the_direct_form_skips_the_picker", function()
   eq(result.sets, "high")
   eq(result.flashes, "Thinking: high")
   eq(result.closed, false, "nothing was opened")
+end)
+
+case("the_flash_names_the_level_a_hidden_adaptive_is_sent_as", function()
+  local result = run({}, { direct = ADAPTIVE, shown = HIGH })
+  eq(result.sets, ADAPTIVE)
+  eq(result.flashes, "Thinking: " .. HIGH)
 end)
 
 case("a_model_without_thinking_gets_the_flash_instead_of_a_picker", function()

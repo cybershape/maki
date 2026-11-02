@@ -1,5 +1,4 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::fmt::Write;
 use strum::EnumIter;
 use unicode_width::UnicodeWidthStr;
 
@@ -130,6 +129,8 @@ pub mod key {
     pub const QUIT: Bind = ctrl_bind!('c');
     pub const HELP: Bind = ctrl_bind!('h');
     pub const SESSIONS: Bind = ctrl_bind!('p');
+    pub const TASKS: Bind = ctrl_bind!('x');
+    pub const BACKGROUND: Bind = ctrl_bind!('b');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
     pub const SCROLL_HALF_DOWN: Bind = ctrl_bind!('d');
     pub const SCROLL_PAGE_UP: Bind = Bind {
@@ -145,14 +146,25 @@ pub mod key {
     pub const SCROLL_LINE_UP: Bind = ctrl_bind!('y');
     pub const SCROLL_LINE_DOWN: Bind = ctrl_bind!('e');
     pub const SCROLL_TOP: Bind = ctrl_bind!('g');
-    pub const SCROLL_BOTTOM: Bind = ctrl_bind!('b');
-    pub const POP_QUEUE: Bind = ctrl_bind!('q');
+    pub const SCROLL_BOTTOM: Bind = Bind {
+        code: KeyCode::Char('g'),
+        modifiers: KeyModifiers::CONTROL.union(KeyModifiers::ALT),
+        label: mod_key!("Alt+G"),
+    };
+    pub const POP_QUEUE: Bind = ctrl_bind!('e');
+    pub const QUEUE: Bind = ctrl_bind!('q');
+    pub const STEER: Bind = Bind {
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::CONTROL,
+        label: "Ctrl+Enter",
+    };
     pub const DELETE_WORD: Bind = ctrl_bind!('w');
     pub const SEARCH: Bind = ctrl_bind!('f');
+    pub const FORK: Bind = ctrl_bind!('f');
     pub const FILE_PICKER: Bind = ctrl_bind!('s');
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
     pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
-    pub const MODEL_PICKER: Bind = ctrl_bind!('m');
+    pub const MODEL_PICKER: Bind = ctrl_bind!('l');
     pub const REFRESH: Bind = ctrl_bind!('r');
     pub const SUSPEND: Bind = ctrl_bind!('z');
     pub const DELETE: Bind = ctrl_bind!('d');
@@ -163,6 +175,11 @@ pub mod key {
         code: KeyCode::Char('o'),
         modifiers: KeyModifiers::ALT,
         label: "Alt+O",
+    };
+    pub const UNDO: Bind = Bind {
+        code: KeyCode::Char('z'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+Z",
     };
 }
 
@@ -311,7 +328,7 @@ pub struct Keybind {
 pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::QUIT.label),
-        description: "Quit / clear input",
+        description: "Quit / clear input / copy selection",
         context: KeybindContext::General,
         platform: Platform::All,
     },
@@ -364,17 +381,20 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::MacMulti(
-            &["Shift+Enter", "Ctrl+Enter", "Ctrl+J", "Alt+Enter"],
-            &["⇧↵", "⌃↵", "⌃J", "⌥↵"],
-        ),
+        label: KeyLabel::MacMulti(&["Shift+Enter", "Ctrl+J", "Alt+Enter"], &["⇧↵", "⌃J", "⌥↵"]),
         description: "Newline",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::MacAlt(key::STEER.label, "⌃↵"),
+        description: "Steer agent",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("Tab"),
-        description: "Toggle mode",
+        description: "Switch between plan and build",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
@@ -393,6 +413,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::MacMulti(&["Alt+←", "Alt+→"], &["⌥←", "⌥→"]),
         description: "Move word left / right",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Shift+motion"),
+        description: "Select text",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
@@ -452,7 +478,13 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single(key::POP_QUEUE.label),
-        description: "Pop queue",
+        description: "Edit queued message",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::QUEUE.label),
+        description: "Queue message",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
@@ -469,6 +501,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single(key::UNDO.label),
+        description: "Undo typing / paste",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Alt("↑", "↓"),
         description: "Navigate input history",
         context: KeybindContext::Streaming,
@@ -477,6 +515,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single("Esc Esc"),
         description: "Cancel agent",
+        context: KeybindContext::Streaming,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::BACKGROUND.label),
+        description: "Move running calls to the background (tmux: press twice)",
         context: KeybindContext::Streaming,
         platform: Platform::All,
     },
@@ -535,6 +579,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single(key::FORK.label),
+        description: "Fork up to the selected prompt and switch to it",
+        context: KeybindContext::RewindPicker,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Remove item",
         context: KeybindContext::QueueFocus,
@@ -552,6 +602,12 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::ModelPicker,
         platform: Platform::All,
     },
+    Keybind {
+        label: KeyLabel::Single("%"),
+        description: "Fold or unfold provider",
+        context: KeybindContext::ModelPicker,
+        platform: Platform::All,
+    },
 ];
 
 pub fn all_contexts() -> impl Iterator<Item = KeybindContext> {
@@ -559,64 +615,10 @@ pub fn all_contexts() -> impl Iterator<Item = KeybindContext> {
     KeybindContext::iter()
 }
 
-pub(crate) fn key_event_to_string(key: &KeyEvent) -> String {
-    let mut s = String::new();
-    let mods = key.modifiers;
-    let is_char = matches!(key.code, KeyCode::Char(_));
-    if mods.contains(KeyModifiers::CONTROL) {
-        s.push_str("ctrl+");
-    }
-    if mods.contains(KeyModifiers::ALT) {
-        s.push_str("alt+");
-    }
-    if mods.contains(KeyModifiers::SHIFT) && !is_char {
-        s.push_str("shift+");
-    }
-    match key.code {
-        KeyCode::Char(' ') => s.push_str("space"),
-        KeyCode::Char(c) => s.push(c),
-        KeyCode::Enter => s.push_str("enter"),
-        KeyCode::Esc => s.push_str("esc"),
-        KeyCode::Tab => s.push_str("tab"),
-        KeyCode::BackTab => {
-            if !s.contains("shift+") {
-                s.insert_str(0, "shift+");
-            }
-            s.push_str("tab");
-        }
-        KeyCode::Backspace => s.push_str("backspace"),
-        KeyCode::Delete => s.push_str("delete"),
-        KeyCode::Up => s.push_str("up"),
-        KeyCode::Down => s.push_str("down"),
-        KeyCode::Left => s.push_str("left"),
-        KeyCode::Right => s.push_str("right"),
-        KeyCode::Home => s.push_str("home"),
-        KeyCode::End => s.push_str("end"),
-        KeyCode::PageUp => s.push_str("pageup"),
-        KeyCode::PageDown => s.push_str("pagedown"),
-        KeyCode::F(n) => write!(s, "f{n}").unwrap(),
-        KeyCode::Insert => s.push_str("insert"),
-        _ => {}
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
-    use test_case::test_case;
-
-    #[test_case(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), "ctrl+d")]
-    #[test_case(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT), "alt+x")]
-    #[test_case(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT), "shift+tab")]
-    #[test_case(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), "shift+tab")]
-    #[test_case(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), "space")]
-    #[test_case(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), "f5")]
-    #[test_case(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), "a")]
-    fn key_event_to_string_cases(input: KeyEvent, expected: &str) {
-        assert_eq!(key_event_to_string(&input), expected);
-    }
 
     #[test]
     fn bind_requires_exact_modifiers() {

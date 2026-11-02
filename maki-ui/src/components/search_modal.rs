@@ -160,7 +160,7 @@ impl SearchModal {
         }
 
         let atom = Atom::new(
-            &query,
+            query,
             CaseMatching::Smart,
             Normalization::Smart,
             AtomKind::Fuzzy,
@@ -208,6 +208,7 @@ impl SearchModal {
         let modal = Modal {
             title: MODAL_TITLE,
             width_percent: MODAL_WIDTH_PERCENT,
+            min_width: 0,
             max_height_percent: MODAL_MAX_HEIGHT_PERCENT,
         };
         let (popup, inner) = modal.render(frame, area, content_rows + SEARCH_ROW);
@@ -262,7 +263,7 @@ impl SearchModal {
     fn render_search(&self, frame: &mut Frame, area: Rect) {
         let t = theme::current();
         let query = self.search.value();
-        let cursor_byte = TextBuffer::char_to_byte(&query, self.search.x());
+        let cursor_byte = TextBuffer::char_to_byte(query, self.search.x());
         let (before, rest) = query.split_at(cursor_byte);
         let mut chars = rest.chars();
         let cursor_char = chars.next().unwrap_or(' ');
@@ -279,6 +280,10 @@ impl SearchModal {
 }
 
 impl Overlay for SearchModal {
+    fn is_prompting(&self) -> bool {
+        false
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

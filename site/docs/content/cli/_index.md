@@ -24,8 +24,9 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--yolo` | yes | yes | yes (or `--permission-mode bypassPermissions`) |
 | `--no-plugins` / `--no-commands` / `--no-jit` | yes | yes | yes |
 | `--allowed-tools` / `--disallowed-tools` | yes | yes | yes |
-| `-c` / `--continue`, `-s` / `--session` | yes | yes | yes |
+| `-c` / `--continue`, `-r` / `--resume` | yes | yes | yes |
 | `--exit-on-done` | yes | n/a (always exits) | n/a |
+| `--background-timeout` | with `--exit-on-done` | yes (turns moves on) | yes |
 | `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | no | no | yes |
@@ -40,10 +41,10 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 |------|-------------|
 | `-p`, `--print` | Non-interactive run. See [Headless Mode](/docs/headless/) |
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
-| `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used → `provider.default_model` in config → auto-detect from available providers |
+| `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used (skipped with a warning when its provider is gone or has no key) → `provider.default_model` in config → auto-detect from available providers |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
 | `-c`, `--continue` | Resume the most recent session in this directory |
-| `-s`, `--session` / `--resume <ID>` | Resume a specific session |
+| `-r`, `--resume <ID>` | Resume a specific session (aliases: `-s`, `--session`) |
 | `--output-format <text\|json\|stream-json>` | Output shape for `--print` (default `text`) |
 | `--input-format <text\|stream-json>` | With `--print`, `stream-json` enters SDK mode |
 | `--no-commands` | Skip custom commands from `.maki/commands`, `.claude/commands`, etc. |
@@ -51,10 +52,11 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--no-jit` | Run plugin Lua on the interpreter with full debug info |
 | `--yolo` | Skip permission prompts on gated tools (alias: `--dangerously-skip-permissions`). Deny rules still apply |
 | `--trust` | Load the project's `.maki` config for this run without asking, recording no decision. See [Folder Trust](/docs/folder-trust/#containers-and-ci) |
-| `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers) |
+| `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers). Waits for running background tasks, bounded by `--background-timeout` |
+| `--background-timeout <SECS>` | How long a run waits for [background tasks](/docs/background-tasks/#headless-sdk-and-acp) after it ends, at most a week. Unset, it is `600` in SDK mode and with `--exit-on-done`, and `-p` runs with background moves off. `0` turns them off everywhere. Global, so it goes before a subcommand |
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
-| `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-s` / `-c` is continuing that same session |
+| `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-r` / `-c` is continuing that same session |
 | `--fork-session` | Copy the resumed session's history under a new id, leaving the original untouched. See [Sessions](/docs/headless/#sessions) |
 | `--max-turns <N>` | Cap agent turns (SDK) |
 | `--system-prompt <TEXT>` | Replace the system prompt (SDK only) |
@@ -107,11 +109,66 @@ One spec per line, warnings on stderr. Built-in and script providers are listed 
 ```bash
 maki session list            # sessions for the current directory
 maki session list --global   # sessions from all projects
+maki session list --json     # machine-readable JSON array
 maki session delete <id>     # asks first, -f skips
+maki session export <id>     # JSON transcript to stdout
+maki session import [FILE|-] # store a transcript, print the new id
 ```
 
-Prints stored sessions as a table (id, title, project directory with `$HOME` collapsed to `~`, last update as a relative age), newest first. A listed id works with `maki --session <id>` to resume it. `delete` removes the session log along with its archives and index entries, and asks for confirmation first unless you pass `-f` / `--force`; without a terminal to ask on it refuses outright. A maki that already has the session open will not notice the delete and will lose the rest of that conversation, so close it first. Inside the TUI the same data lives behind `/sessions` (`Ctrl+P`), where `Ctrl+D` deletes.
+Prints stored sessions as a table (id, title, project directory with `$HOME` collapsed to `~`, last update as a relative age), newest first. `--json` prints one JSON array of the same summaries instead, for scripts. A listed id works with `maki -r <id>` to resume it. `delete` removes the session log along with its archives and index entries, and asks for confirmation first unless you pass `-f` / `--force`. Without a terminal to ask on, it refuses outright. A maki that already has the session open will not notice the delete and will lose the rest of that conversation, so close it first. Inside the TUI the same data lives behind `/sessions` (`Ctrl+P`), where `Ctrl+D` deletes.
 
+#### Export and import
+
+`export <SESSION_ID>` prints one JSON document to stdout. It reads the session without claiming it, so it also works for a session whose model this machine cannot run. When another maki has the session open, you get the session as last saved, and a notice on stderr says so.
+
+`import` reads the document from `FILE`, or from stdin when `FILE` is omitted or `-`. It stores the result as a new session in the current directory's project. It prints only the new id on stdout, so `id=$(maki session import < file.json)` works. Continue it with `maki -r <id>`.
+
+On failure, `import` stores nothing and exits non-zero. The error names the place in the document, such as `messages[12].content[2]`. Indexes start at 0, as in the JSON. A document with no messages left after repair is refused, such as one whose only message holds an orphan tool result.
+
+The document has these fields:
+
+| Field | Meaning |
+|-------|---------|
+| `format` | Version of the document format, currently `1` |
+| `model` | Model spec as stored. Import keeps any string and resolves it when the session opens. When it is missing or blank, no model is stored and the session opens on the default model. In the TUI, `maki.session.new` uses the focused tab's model instead |
+| `mode` | `build` or `plan` |
+| `thinking` | Thinking setting, spelled as in `/thinking` |
+| `fast` | Fast mode on or off. Off when missing |
+| `title` | Session title. Import keeps a given title and only collapses its whitespace to single spaces. When it is missing or blank, import generates one from the history |
+| `facts` | The date, working directory, model, instructions and hints the model was last told. On import the model is told what changed |
+| `messages` | The conversation in the same shape [`maki.session.messages`](/docs/lua-api/#maki-session-messages) returns |
+
+Import drops top-level fields it does not know, so keep your own metadata outside the document. A `format` newer than the importer supports fails with "exported by a newer maki". Thinking blocks and their signatures are dropped on import, because they are bound to a system prompt the new session will not have. Orphan tool results and a dangling final tool call are repaired the way a resume repairs them. A content block of a known type that does not parse, or one without a `type`, is refused. A block of a type this maki does not know is kept as it is.
+
+#### Move a session
+
+To continue a session on another machine, export it and import the file there:
+
+```bash
+maki session export <id> > session.json
+scp session.json server:
+ssh -t server 'cd ~/code/my-app && id=$(maki session import ~/session.json) && maki -r "$id"'
+```
+
+The import stores the session under the directory you run it in, with a new id. The first run there tells the model the new working directory and date, so it does not keep acting on the old ones. If the `model` in the file is not available on the target machine, the session opens with a warning and falls back like any other resume.
+
+A plugin can do the same without the CLI. `maki.session.export` returns the document as a table, and `maki.session.new` takes it back. This sends the focused session to a server and pulls it back later, with the `upload` and `download` helpers left to you:
+
+```lua
+-- hand off from the focused session
+local id = maki.session.current()
+local doc = assert(maki.session.export({ session = id }))
+doc.messages = redact(doc.messages)
+local url = assert(upload(maki.json.encode(doc)))
+maki.notify("continued at " .. url)
+
+-- pull it back
+local back = maki.json.decode(assert(download(url)))
+back.focus = true
+assert(maki.session.new(back))
+```
+
+`export` needs the `session_read` permission and `new` needs `session_write`. Let `redact` edit a copy made with [`maki.deepcopy`](/docs/lua-api/#maki-deepcopy), which keeps `maki.NIL` and empty arrays intact. Without `prompt` or `focus`, `new` only stores the session. Where settings come from and which frontends can open it are in the [`maki.session.new` reference](/docs/lua-api/#maki-session-new).
 ### `maki mcp`
 
 ```bash
@@ -168,9 +225,12 @@ Debug helper for inspecting the prompt and tool surface the agent sees. `--plan`
 
 ```bash
 maki migrate xdg
+maki migrate providers
 ```
 
-Moves data from `~/.maki/` into platform directories. Safe to re-run. See [Configuration](/docs/configuration/#directory-layout).
+`xdg` moves data from `~/.maki/` into platform directories. Safe to re-run. See [Configuration](/docs/configuration/#directory-layout).
+
+`providers` lists the old provider scripts that no Lua plugin replaces yet, and prints a prompt that asks a coding agent to port them. The prompt goes to stdout, so `maki "$(maki migrate providers)"` starts maki on it. See [Migrating from provider scripts](/docs/providers/#migrating-from-provider-scripts).
 
 ### `maki trust`
 

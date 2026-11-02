@@ -96,8 +96,8 @@ mod tests {
 
     /// A built-in provider that takes any model name and builds without
     /// credentials, so these tests never touch the catalog or the network.
-    const STARTUP_SPEC: &str = "opencode/startup";
-    const OTHER_SPEC: &str = "opencode/other";
+    const STARTUP_SPEC: &str = "responses/startup";
+    const OTHER_SPEC: &str = "responses/other";
     const UNPARSEABLE_SPEC: &str = "not-a-spec";
     const CACHED: &str = "the same spec must not be built twice";
     const NOT_REBUILT: &str = "invalidate must force a rebuild";

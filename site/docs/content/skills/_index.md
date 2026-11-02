@@ -22,6 +22,8 @@ A skill is a directory with a `SKILL.md` inside. Maki looks for them every time 
 
 So project skills beat personal ones, and a skill at the repo root beats one with the same name deeper down. The `.claude`, `.opencode` and `.agents` dirs are there so skills you already wrote for other agents keep working.
 
+Use the global [compatibility settings](/docs/configuration/#compatibility) to skip Claude or OpenCode skills, or set `compatibility.all = false` to skip all agent compatibility sources. Maki skills and `.agents/skills/` remain available.
+
 [Folder trust](/docs/folder-trust/) does not gate skills. Every project skill
 name and description is in the system prompt from startup, trusted or not, so
 read a repository's skills before you work in it.

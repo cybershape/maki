@@ -1,6 +1,7 @@
 //! Async agent loop with tools.
 
 pub mod agent;
+pub mod call_scope;
 pub mod cancel;
 pub mod child_guard;
 pub use child_guard::ChildGuard;
@@ -11,22 +12,30 @@ pub use file_index::{
     invalidate_for, on_walk_end, resolved_index,
 };
 pub mod headless;
-pub mod mailbox;
+pub mod live_session;
 pub mod mcp;
 pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus};
-pub use mcp::protocol::PromptRole;
+pub use mcp::transport::PromptRole;
 pub use mcp::{
-    McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
+    McpCommand, McpFunctionInfo, McpHandle, McpModuleInfo, McpPromptArg, McpPromptInfo, McpSession,
+    McpSnapshot, McpSnapshotReader,
 };
+pub mod inbox;
 pub mod session;
-pub(crate) mod task_set;
+pub mod sleep;
 pub use agent::{
-    Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
-    SharedMessages, UNAVAILABLE_RESULT, close_dangling_tool_calls, find_subdirectory_instructions,
-    is_instruction_file,
+    Agent, AgentParams, AgentRunParams, DisplayItem, History, HistorySnapshot, Instructions,
+    LoadedInstructions, ModelSlot, RunContext, RunContextBuilder, SharedMessages, Transcript,
+    UNAVAILABLE_RESULT, close_dangling_tool_calls, display_order, find_subdirectory_instructions,
+    is_instruction_file, observation_detail, observation_line,
 };
-pub use cancel::{CancelMap, CancelToken, CancelTrigger};
-pub use mailbox::{MailboxError, SessionMailbox};
+pub use call_scope::{AlreadyMoved, CallGuard, CallScope, SessionStub, TaskHome};
+pub use cancel::{CancelHandle, CancelMap, CancelToken, CancelTrigger};
+pub use inbox::SubagentInbox;
+pub use live_session::{
+    AgentSeed, BackgroundNotice, MailboxError, SessionMailbox, TaskLabel, receipt_tag,
+    result_notice,
+};
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub mod command;
 pub mod diff;
@@ -42,13 +51,16 @@ use std::path::{Path, PathBuf};
 
 pub use maki_providers::AgentError;
 use maki_providers::Message;
-pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
+pub use maki_providers::{
+    EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, TaskEnd, ThinkingConfig,
+};
 pub use types::{
-    AgentEvent, BufferSnapshot, DoneReason, Envelope, EventSender, EventStreamGuard, GrepFileEntry,
-    GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, RunLedger, RunTotals,
-    SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanColor, SpanStyle,
-    SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent, event_stream,
+    AgentEvent, BufWatch, BufferSnapshot, CallRecord, CostTally, DoneReason, Envelope, EventSender,
+    EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND,
+    PartStatus, RunLedger, RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine,
+    SnapshotSpan, SpanColor, SpanStyle, SteerKind, SubagentInfo, TextOutput, ToolDoneEvent,
+    ToolInput, ToolOutput, ToolPart, ToolStartEvent, TurnCompleteEvent, TurnTiming, UiWaker,
+    event_stream,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -88,16 +100,58 @@ pub struct McpPromptRef {
     pub arguments: HashMap<String, String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InputSource {
+    Tui,
+    Acp,
+    /// `maki -p` and sdk mode.
+    Headless,
+    /// A plugin prompting a session of its own, `task` subagents included.
+    Plugin,
+}
+
+impl InputSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tui => "tui",
+            Self::Acp => "acp",
+            Self::Headless => "headless",
+            Self::Plugin => "plugin",
+        }
+    }
+}
+
+/// A message queued ahead of the one that drives a run. It stays apart from
+/// the preamble so `agent.user_message` gets to judge it like any other.
+pub struct EarlierInput {
+    pub message: String,
+    pub images: Vec<ImageSource>,
+    pub preamble: Vec<Message>,
+}
+
+impl From<AgentInput> for EarlierInput {
+    fn from(input: AgentInput) -> Self {
+        Self {
+            message: input.message,
+            images: input.images,
+            preamble: input.preamble,
+        }
+    }
+}
+
 pub struct AgentInput {
     pub message: String,
     pub mode: AgentMode,
     pub images: Vec<ImageSource>,
     pub preamble: Vec<Message>,
+    /// The rest of a burst of queued messages, oldest first.
+    pub earlier: Vec<EarlierInput>,
     pub thinking: ThinkingConfig,
     pub fast: bool,
     /// No `Default` on this struct so adding a field forces every call site to update.
     pub workflow: bool,
     pub prompt: Option<Box<McpPromptRef>>,
+    pub source: InputSource,
 }
 
 impl AgentInput {
@@ -109,16 +163,19 @@ impl AgentInput {
         mode: AgentMode,
         images: Vec<ImageSource>,
         defaults: SessionDefaults,
+        source: InputSource,
     ) -> Self {
         Self {
             message,
             mode,
             images,
             preamble: Vec::new(),
+            earlier: Vec::new(),
             thinking: defaults.thinking.into(),
             fast: defaults.fast,
             workflow: defaults.workflow,
             prompt: None,
+            source,
         }
     }
 }

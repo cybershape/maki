@@ -45,8 +45,13 @@ local EXT_TO_LANG = {
   exs = "elixir",
   md = "markdown",
   markdown = "markdown",
+  clj = "clojure",
+  cljs = "clojure",
+  cljc = "clojure",
+  bb = "clojure",
   bzl = "bazel_bzl",
   v = "v",
+  vue = "vue",
   zig = "zig",
   nix = "nix",
   dart = "dart",
@@ -350,6 +355,7 @@ local SECTIONS = {
   { key = "Function", header = "fns:" },
   { key = "Class", header = "classes:" },
   { key = "Macro", header = "macros:" },
+  { key = "Form", header = "forms:" },
   { key = "Heading", header = "headings:" },
 }
 

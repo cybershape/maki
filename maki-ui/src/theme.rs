@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use arc_swap::{ArcSwap, Guard};
@@ -253,6 +253,10 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
         toml: include_str!("themes/solarized_light.toml"),
     },
     ThemeEntry {
+        name: "system",
+        toml: include_str!("themes/system.toml"),
+    },
+    ThemeEntry {
         name: "tokyonight",
         toml: include_str!("themes/tokyonight.toml"),
     },
@@ -271,6 +275,8 @@ static THEME: LazyLock<ArcSwap<Theme>> =
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
+static CURSOR_FOCUSED: AtomicBool = AtomicBool::new(true);
+
 static CURRENT_NAME: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn current() -> Guard<Arc<Theme>> {
@@ -283,6 +289,32 @@ pub fn set(theme: Theme) {
     THEME.store(Arc::new(theme));
     crate::highlight::refresh_syntax_theme();
     GENERATION.fetch_add(1, Ordering::Release);
+}
+
+/// Tracks terminal focus so the input caret can recolor itself when the user
+/// switches away. Terminals that never report focus keep the focused look.
+pub fn set_cursor_focused(focused: bool) {
+    CURSOR_FOCUSED.store(focused, Ordering::Relaxed);
+}
+
+/// The `[ui] cursor` style while focused, `[ui] cursor_unfocused` otherwise.
+pub fn cursor_style() -> Style {
+    let t = current();
+    if CURSOR_FOCUSED.load(Ordering::Relaxed) {
+        t.cursor
+    } else {
+        t.cursor_unfocused
+    }
+}
+
+/// True for a buffer cell that carries the `cursor_style()` paint, so tests
+/// assert against the theme instead of one theme's hardcoded colors.
+#[cfg(test)]
+pub(crate) fn is_caret_cell(cell: &ratatui::buffer::Cell) -> bool {
+    let cursor = cursor_style();
+    cursor.fg.is_none_or(|fg| cell.fg == fg)
+        && cursor.bg.is_none_or(|bg| cell.bg == bg)
+        && cell.modifier.contains(cursor.add_modifier)
 }
 
 pub fn generation() -> u64 {
@@ -376,6 +408,7 @@ named_styles!(t => {
     "dim" | "tool_dim" => t.tool_dim,
     "path" | "tool_path" => t.tool_path,
     "tool" => t.tool,
+    "tool_bg" => t.tool_bg,
     "tool_prefix" => t.tool_prefix,
     "tool_success" => t.tool_success,
     "tool_error" => t.tool_error,
@@ -392,6 +425,8 @@ named_styles!(t => {
     "list_marker" => t.list_marker,
     "horizontal_rule" => t.horizontal_rule,
     "code_gutter" => t.code_gutter,
+    "math" => t.math,
+    "math_gutter" => t.math_gutter,
     "table_border" => t.table_border,
     "keyword" | "index_keyword" => t.index_keyword,
     "section" | "index_section" => t.index_section,
@@ -408,10 +443,14 @@ named_styles!(t => {
     "item_selected" | "selected" => t.item_selected,
     "item_match" | "match" => t.item_match,
     "item_match_selected" | "match_selected" => t.item_match_selected,
+    "user" => t.user,
+    "user_bg" => t.user_bg,
     "cursor" => t.cursor,
+    "cursor_unfocused" => t.cursor_unfocused,
     "background" => Style::new().bg(t.background),
     "foreground" => Style::new().fg(t.foreground),
     "accent" => t.accent,
+    "shell_prefix" => t.shell_prefix,
     "active" => t.active,
     "keybind_key" => t.keybind_key,
     "keybind_desc" => t.keybind_desc,
@@ -428,9 +467,11 @@ pub struct Theme {
     pub foreground: Color,
 
     pub user: Style,
+    pub user_bg: Style,
     pub assistant: Style,
     pub assistant_prefix: Style,
     pub thinking: Style,
+    #[allow(dead_code)]
     pub tool_bg: Style,
     pub tool: Style,
     pub tool_path: Style,
@@ -447,6 +488,8 @@ pub struct Theme {
     pub inline_code: Style,
     pub code_block: Style,
     pub code_gutter: Style,
+    pub math: Style,
+    pub math_gutter: Style,
     pub strikethrough: Style,
     pub heading: Style,
     pub list_marker: Style,
@@ -474,6 +517,7 @@ pub struct Theme {
     pub panel_border: Style,
     pub panel_title: Style,
     pub cursor: Style,
+    pub cursor_unfocused: Style,
     pub input_border: Style,
     pub accent: Style,
     pub active: Style,
@@ -815,11 +859,23 @@ impl Theme {
             Modifier::BOLD,
         );
 
+        // Themes that leave `cursor` unset get a visible caret everywhere,
+        // including pickers that paint `t.cursor` directly.
+        let cursor = match style("cursor") {
+            s if s == Style::default() => Style::new().reversed(),
+            s => s,
+        };
+        let cursor_unfocused = match style("cursor_unfocused") {
+            s if s == Style::default() => cursor,
+            s => s,
+        };
+
         Ok(Self {
             background: color("background"),
             foreground: color("foreground"),
 
             user: style("user"),
+            user_bg: style_or("user_bg", "tool_bg"),
             assistant: style("assistant"),
             assistant_prefix: style("assistant_prefix"),
             thinking: brighten_toward(
@@ -855,6 +911,12 @@ impl Theme {
             code_block: style("code_block"),
             code_gutter: derived_style(
                 "code_gutter",
+                &["variable.parameter", "string"],
+                Modifier::empty(),
+            ),
+            math: derived_style("math", &["constant.numeric", "keyword"], Modifier::empty()),
+            math_gutter: derived_style(
+                "math_gutter",
                 &["variable.parameter", "string"],
                 Modifier::empty(),
             ),
@@ -910,7 +972,8 @@ impl Theme {
             },
             panel_border: style("panel_border"),
             panel_title: style("panel_title"),
-            cursor: style("cursor"),
+            cursor,
+            cursor_unfocused,
             input_border: style("input_border"),
             accent: style("accent"),
             active: {
@@ -1053,6 +1116,18 @@ mod tests {
         assert_eq!(t.code_gutter.fg, Some(Color::Rgb(0xff, 0xb8, 0x6c)));
         assert_eq!(t.list_marker.fg, Some(Color::Rgb(0x8b, 0xe9, 0xfd)));
         assert_eq!(t.bold.fg, Some(Color::Rgb(0xff, 0xb8, 0x6c)));
+    }
+
+    #[test]
+    fn system_theme_keeps_colors_symbolic() {
+        let t = load_by_name("system").expect("system theme must exist");
+        assert_eq!(t.background, Color::Reset);
+        assert_eq!(t.foreground, Color::Reset);
+        assert_eq!(t.user.fg, Some(Color::Cyan));
+        assert_eq!(
+            t.syntax.settings.background,
+            Some(SegmentColor::Default.to_syntect())
+        );
     }
 
     #[test]
@@ -1372,6 +1447,7 @@ diff_new_line_nr = { fg = "red" }
         assert_eq!(style_by_name("item"), t.item);
         assert_eq!(style_by_name("item_desc"), t.item_desc);
         assert_eq!(style_by_name("cursor"), t.cursor);
+        assert_eq!(style_by_name("cursor_unfocused"), t.cursor_unfocused);
         assert_eq!(style_by_name("accent"), t.accent);
         assert_eq!(style_by_name("active"), t.active);
         assert_eq!(style_by_name("foreground"), Style::new().fg(t.foreground));
@@ -1384,6 +1460,8 @@ diff_new_line_nr = { fg = "red" }
         assert_eq!(style_by_name("match"), t.item_match);
         assert_eq!(style_by_name("match_selected"), t.item_match_selected);
         assert_eq!(style_by_name("thinking"), t.thinking);
+        assert_eq!(style_by_name("user"), t.user);
+        assert_eq!(style_by_name("user_bg"), t.user_bg);
     }
 
     #[test_case("nonexistent_style")]
@@ -1553,6 +1631,28 @@ magenta    = "magenta"
 
         let ty = scope("type");
         assert_eq!((ty.r, ty.g, ty.b, ty.a), (0xfd, 0xa3, 0x31, 0xFF));
+    }
+
+    #[test]
+    fn cursor_unfocused_falls_back_to_cursor() {
+        let t = Theme::from_toml(
+            r##"
+[ui]
+"cursor" = { fg = "#ff0000" }
+"##,
+        )
+        .unwrap();
+        assert_eq!(t.cursor_unfocused, t.cursor);
+
+        let t = Theme::from_toml(
+            r##"
+[ui]
+"cursor"          = { fg = "#ff0000" }
+"cursor_unfocused" = { fg = "#00ff00" }
+"##,
+        )
+        .unwrap();
+        assert_eq!(t.cursor_unfocused.fg, Some(Color::Rgb(0, 255, 0)));
     }
 
     #[test]

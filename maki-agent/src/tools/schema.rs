@@ -15,6 +15,13 @@ use tracing::{debug, warn};
 
 pub(crate) const PARAM_PREVIEW_MAX: usize = 120;
 
+/// Injected into every tool schema that does not already declare it, so the
+/// model states why it is calling the tool. A short sentence, never a
+/// reasoning trace: asking a parameter for step-by-step reasoning draws a
+/// `reasoning_extraction` refusal.
+pub const TOOLCALL_REASON_FIELD: &str = "toolcall_reason";
+pub const TOOLCALL_REASON_DESCRIPTION: &str = "Why you are calling this tool and what you expect.";
+
 const PREVIEW_SUFFIX: &str = "...";
 const JSON_ENCODED_ARRAY_HINT: &str = "Pass a JSON array, not a JSON-encoded string.";
 const JSON_ENCODED_OBJECT_HINT: &str = "Pass a JSON object, not a JSON-encoded string.";
@@ -87,6 +94,12 @@ pub enum ParamSchema {
         properties: &'static [Property],
         description: &'static str,
     },
+    /// `{"type": "object"}` with no `properties`: any object, keys kept as
+    /// they come. Unlike `Any`, the model sees the type and a stringified
+    /// object still gets decoded.
+    OpenObject {
+        description: &'static str,
+    },
     Any {
         description: &'static str,
     },
@@ -141,6 +154,13 @@ pub fn to_json_schema(s: &ParamSchema) -> Value {
             if !required.is_empty() {
                 v["required"] = json!(required);
             }
+            if !description.is_empty() {
+                v["description"] = json!(description);
+            }
+            v
+        }
+        ParamSchema::OpenObject { description } => {
+            let mut v = json!({ "type": "object" });
             if !description.is_empty() {
                 v["description"] = json!(description);
             }
@@ -207,6 +227,7 @@ pub fn try_from_json(v: &Value) -> Result<&'static ParamSchema, String> {
             let items: &'static ParamSchema = try_from_json(items_val)?;
             ParamSchema::Array { items, description }
         }
+        Some("object") if v.get("properties").is_none() => ParamSchema::OpenObject { description },
         Some("object") => parse_object_schema(v, description)?,
         // A schema that spells out `properties` but forgets `type` is an object
         // and nothing else. Reading it as "any value" used to throw the whole
@@ -445,6 +466,7 @@ fn walk(schema: &ParamSchema, value: Value, path: &mut JsonPath) -> Result<Value
         ParamSchema::Enum { variants, .. } => validate_enum(variants, value, path),
         ParamSchema::Array { items, .. } => validate_array(items, value, path),
         ParamSchema::Object { properties, .. } => validate_object(properties, value, path),
+        ParamSchema::OpenObject { .. } => coerce_container(value, ParamKind::Object, path),
     }
 }
 
@@ -524,7 +546,7 @@ fn schema_type_name(schema: &ParamSchema) -> &'static str {
         ParamSchema::Primitive { kind, .. } => kind.as_str(),
         ParamSchema::Enum { .. } => "string (enum)",
         ParamSchema::Array { .. } => "array",
-        ParamSchema::Object { .. } => "object",
+        ParamSchema::Object { .. } | ParamSchema::OpenObject { .. } => "object",
         ParamSchema::Any { .. } => "any",
     }
 }
@@ -640,12 +662,20 @@ fn coerce_primitive(v: &Value, expected: ParamKind) -> Option<Value> {
             .or_else(|| f64_as_i64(s.parse::<f64>().ok()?))
             .map(Value::from),
         ParamKind::Number => s.parse::<f64>().ok().map(Value::from),
-        ParamKind::Bool => match s {
-            "true" => Some(Value::Bool(true)),
-            "false" => Some(Value::Bool(false)),
-            _ => None,
-        },
+        ParamKind::Bool => parse_bool_like(s).map(Value::Bool),
         _ => None,
+    }
+}
+
+/// Models stringify booleans, and some capitalize the word, so accept either
+/// spelling in any case instead of bouncing the call back.
+fn parse_bool_like(s: &str) -> Option<bool> {
+    if s.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if s.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -685,6 +715,80 @@ fn log_coercion(
         coerced = %preview(&coerced.to_string()),
         "coerced tool param type"
     );
+}
+
+/// Adds [`TOOLCALL_REASON_FIELD`] to an object schema that does not already
+/// declare it. `false` means the schema already has the property, so the
+/// caller must leave both the schema and any incoming value of that name
+/// alone: it belongs to the tool, not to us.
+///
+/// A schema that is not an object, or an object without `properties`, is
+/// shaped first. [`sanitize_tool_input_schema`] is what every schema passes
+/// through before it is shown to a model, so this sees the same shape.
+pub fn inject_toolcall_reason(schema: &mut Value) -> bool {
+    if !schema.is_object() {
+        *schema = json!({ "type": "object" });
+    }
+    let map = schema.as_object_mut().expect("just made an object");
+    if !map.contains_key("properties") {
+        sanitize_object_schema(map);
+    }
+    let properties = map
+        .get_mut("properties")
+        .and_then(|p| p.as_object_mut())
+        .expect("sanitize_object_schema inserts properties");
+    if properties.contains_key(TOOLCALL_REASON_FIELD) {
+        return false;
+    }
+    properties.insert(
+        TOOLCALL_REASON_FIELD.to_owned(),
+        json!({
+            "type": "string",
+            "description": TOOLCALL_REASON_DESCRIPTION,
+        }),
+    );
+    true
+}
+
+/// Pulls [`TOOLCALL_REASON_FIELD`] out of a call's arguments.
+///
+/// `injected` is what [`inject_toolcall_reason`] returned for this tool. When
+/// it is `false` the property is the tool's own and the value stays. A value
+/// that is not a string is dropped either way: the field we injected only
+/// accepts one, and anything else is the model ignoring the schema.
+pub fn strip_toolcall_reason(injected: bool, input: &mut Value) -> Option<String> {
+    if !injected {
+        return None;
+    }
+    let Value::Object(map) = input else {
+        return None;
+    };
+    match map.remove(TOOLCALL_REASON_FIELD)? {
+        Value::String(reason) => {
+            let reason = reason.trim().to_owned();
+            (!reason.is_empty()).then_some(reason)
+        }
+        _ => None,
+    }
+}
+
+/// Whether the published schema of `name` carries a [`TOOLCALL_REASON_FIELD`]
+/// we added.
+///
+/// The schema this sees is the one already sent to the model, so both an
+/// injected field and one the tool declared are present. They differ only in
+/// the description: ours is exactly [`TOOLCALL_REASON_DESCRIPTION`], and a tool
+/// that declares the field keeps its own. A tool we cannot find a schema for
+/// answers `false`: its value is not ours to take.
+pub fn toolcall_reason_injected(tools: &[Value], name: &str) -> bool {
+    let Some(schema) = tools
+        .iter()
+        .find_map(|tool| (tool["name"].as_str() == Some(name)).then(|| &tool["input_schema"]))
+    else {
+        return false;
+    };
+    schema["properties"][TOOLCALL_REASON_FIELD]["description"].as_str()
+        == Some(TOOLCALL_REASON_DESCRIPTION)
 }
 
 /// Sanitize a tool input schema to comply with OpenAI function-calling requirements.
@@ -980,7 +1084,11 @@ mod tests {
     #[test_case(json!("NaN"),                     ParamKind::Integer, None              ; "nan_string_rejected")]
     #[test_case(json!("inf"),                     ParamKind::Integer, None              ; "inf_string_rejected")]
     #[test_case(json!("1.25"),                   ParamKind::Number,  Some(json!(1.25)) ; "string_to_float")]
-    #[test_case(json!("true"),                   ParamKind::Bool,    Some(json!(true)) ; "string_to_bool")]
+    #[test_case(json!("true"),                   ParamKind::Bool,    Some(json!(true)) ; "string_to_true")]
+    #[test_case(json!("false"),                  ParamKind::Bool,    Some(json!(false)) ; "string_to_false")]
+    #[test_case(json!("True"),                   ParamKind::Bool,    Some(json!(true)) ; "capitalized_string_to_true")]
+    #[test_case(json!("FALSE"),                  ParamKind::Bool,    Some(json!(false)) ; "uppercase_string_to_false")]
+    #[test_case(json!("yes"),                    ParamKind::Bool,    None              ; "non_bool_word_rejected")]
     #[test_case(json!(30),                       ParamKind::Integer, None              ; "already_correct_type_no_coercion")]
     fn coerce_primitive_cases(value: Value, expected: ParamKind, wanted: Option<Value>) {
         assert_eq!(coerce_primitive(&value, expected), wanted);
@@ -1112,10 +1220,9 @@ mod tests {
         assert!(validate(schema, json!({})).is_err());
     }
 
-    #[test_case(json!({"type": "object"}) ; "nested_object_without_properties")]
-    #[test_case(json!({"type": "array"}) ; "nested_array_without_items")]
-    fn try_from_json_typeless_root_with_broken_property_degrades_to_any(broken: Value) {
-        let properties = json!({ ANY_PROP: broken });
+    #[test]
+    fn try_from_json_typeless_root_with_broken_property_degrades_to_any() {
+        let properties = json!({ ANY_PROP: {"type": "array"} });
         let typeless = try_from_json(&json!({ "properties": properties })).unwrap();
         assert!(
             matches!(typeless, ParamSchema::Any { .. }),
@@ -1124,6 +1231,15 @@ mod tests {
 
         let explicit = try_from_json(&json!({ "type": "object", "properties": properties }));
         assert!(explicit.is_err(), "{EXPLICIT_OBJECT_STILL_FAILS}");
+    }
+
+    #[test_case(json!({"a": 1}) ; "object_passes_through")]
+    #[test_case(json!("{\"a\": 1}") ; "stringified_object_is_decoded")]
+    fn open_object_keeps_keys_and_decodes_strings(value: Value) {
+        let schema = try_from_json(&json!({ "type": "object" })).unwrap();
+        assert_eq!(to_json_schema(schema), json!({ "type": "object" }));
+        assert_eq!(validate(schema, value).unwrap(), json!({"a": 1}));
+        assert!(validate(schema, json!([1])).is_err());
     }
 
     #[test_case(json!({}) ; "empty_schema")]
@@ -1333,6 +1449,89 @@ mod tests {
             result["properties"]["pair"],
             json!({"type": ["array", "null"], "items": {"type": "string"}})
         );
+    }
+
+    const REASON: &str = "why this call";
+
+    #[test]
+    fn inject_adds_the_reason_to_an_empty_schema() {
+        let mut schema = json!({});
+        assert!(inject_toolcall_reason(&mut schema));
+        assert_eq!(schema["type"], "object");
+        assert_eq!(
+            schema["properties"][TOOLCALL_REASON_FIELD],
+            json!({
+                "type": "string",
+                "description": TOOLCALL_REASON_DESCRIPTION,
+            })
+        );
+        assert!(schema.get("required").is_none());
+    }
+
+    #[test]
+    fn inject_keeps_existing_properties_and_required() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"]
+        });
+        assert!(inject_toolcall_reason(&mut schema));
+        assert_eq!(schema["properties"]["path"], json!({ "type": "string" }));
+        assert_eq!(schema["required"], json!(["path"]));
+        assert!(schema["properties"].get(TOOLCALL_REASON_FIELD).is_some());
+    }
+
+    #[test]
+    fn inject_leaves_a_schema_that_already_declares_the_field() {
+        let original = json!({
+            "type": "object",
+            "properties": { TOOLCALL_REASON_FIELD: { "type": "integer" } }
+        });
+        let mut schema = original.clone();
+        assert!(!inject_toolcall_reason(&mut schema));
+        assert_eq!(schema, original);
+    }
+
+    #[test]
+    fn strip_returns_the_reason_and_drops_it() {
+        let mut input = json!({ "path": "/a", TOOLCALL_REASON_FIELD: format!("  {REASON}  ") });
+        assert_eq!(strip_toolcall_reason(true, &mut input), Some(REASON.into()));
+        assert_eq!(input, json!({ "path": "/a" }));
+    }
+
+    #[test]
+    fn strip_keeps_a_reason_the_tool_declared() {
+        let mut input = json!({ TOOLCALL_REASON_FIELD: REASON });
+        let original = input.clone();
+        assert_eq!(strip_toolcall_reason(false, &mut input), None);
+        assert_eq!(input, original);
+    }
+
+    #[test_case(json!({ TOOLCALL_REASON_FIELD: "   " }) ; "blank")]
+    #[test_case(json!({ TOOLCALL_REASON_FIELD: 7 }) ; "not_a_string")]
+    fn strip_drops_a_reason_that_is_not_a_sentence(mut input: Value) {
+        assert_eq!(strip_toolcall_reason(true, &mut input), None);
+        assert_eq!(input, json!({}));
+    }
+
+    #[test]
+    fn injected_is_recognized_only_by_our_description() {
+        let ours = json!({
+            "name": "read",
+            "input_schema": {
+                "properties": {
+                    TOOLCALL_REASON_FIELD: { "description": TOOLCALL_REASON_DESCRIPTION }
+                }
+            }
+        });
+        let theirs = json!({
+            "name": "probe",
+            "input_schema": { "properties": { TOOLCALL_REASON_FIELD: { "description": "the tool's own" } } }
+        });
+        let tools = vec![ours, theirs];
+        assert!(toolcall_reason_injected(&tools, "read"));
+        assert!(!toolcall_reason_injected(&tools, "probe"));
+        assert!(!toolcall_reason_injected(&tools, "missing"));
     }
 
     #[test]

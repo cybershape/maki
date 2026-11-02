@@ -1,0 +1,1816 @@
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use flume::Sender;
+use reqwest::Client;
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tracing::{debug, warn};
+
+use std::sync::Arc;
+
+use crate::model::{Model, ModelInfo};
+use crate::provider::{BoxFuture, Provider};
+use crate::providers::{ResolvedAuth, Timeouts, sse_error_status};
+use crate::types::EffortDialect;
+use crate::{
+    AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
+    StreamResponse, ThinkingConfig, TokenUsage, dialect,
+};
+
+use maki_config::providers::ProvidersConfig;
+use maki_storage::id::SessionRef;
+
+const RESPONSES_PATH: &str = "/responses";
+const FAILED_RESPONSE_STATUS: u16 = 500;
+const NANO_AIU_PER_USD: f64 = 100_000_000_000.0;
+
+fn copilot_usd(copilot_usage: &Value) -> Option<f64> {
+    copilot_usage["total_nano_aiu"]
+        .as_f64()
+        .map(|nano_aiu| nano_aiu / NANO_AIU_PER_USD)
+}
+
+fn tool_parameters(tool: &Value) -> Value {
+    match tool.get("input_schema") {
+        Some(schema) if schema.is_object() => schema.clone(),
+        _ => json!({ "type": "object", "properties": {} }),
+    }
+}
+
+pub fn build_body(model: &Model, messages: &[Message], system: &str, tools: &Value) -> Value {
+    let input = convert_input(messages);
+    let wire_tools = convert_tools(tools);
+
+    let mut body = json!({
+        "model": model.id,
+        "instructions": system,
+        "input": input,
+        "stream": true,
+        "store": false,
+    });
+    if wire_tools.as_array().is_some_and(|a| !a.is_empty()) {
+        body["tools"] = wire_tools;
+    }
+    body
+}
+
+pub fn plan_dialect(model_id: &str) -> &'static EffortDialect<'static> {
+    if !model_id.contains("-codex") {
+        return if model_id.starts_with("gpt-6-") || model_id.starts_with("gpt-6.") {
+            &dialect::GPT_6
+        } else if model_id.starts_with("gpt-5.6-") {
+            &dialect::GPT_5_6
+        } else if model_id.starts_with("gpt-5.5") {
+            &dialect::CODING_PLAN
+        } else {
+            &dialect::GPT_5_6
+        };
+    }
+    if model_id.starts_with("gpt-5.1-codex") && !model_id.starts_with("gpt-5.1-codex-max") {
+        &dialect::CODEX_5_1
+    } else {
+        &dialect::CODEX
+    }
+}
+
+pub fn responses_dialect<'a>(
+    model_id: &str,
+    discovered: Option<&'a ModelInfo>,
+) -> EffortDialect<'a> {
+    let base = plan_dialect(model_id);
+    if let Some(effort) = discovered.and_then(|d| d.effort.as_ref()) {
+        effort.refine(base)
+    } else {
+        base.clone()
+    }
+}
+
+pub fn apply_responses_reasoning(
+    body: &mut Value,
+    thinking: ThinkingConfig,
+    model: &Model,
+    dialect: &EffortDialect,
+) {
+    if let Some(effort) = thinking.effort_str(dialect, model) {
+        let mut reasoning = json!({ "effort": effort });
+        if effort != dialect::OFF {
+            reasoning["summary"] = json!("auto");
+        }
+        body["reasoning"] = reasoning;
+    }
+}
+
+pub(crate) fn convert_input(messages: &[Message]) -> Value {
+    let mut input = Vec::new();
+
+    for msg in messages {
+        match msg.role {
+            Role::User => {
+                for block in &msg.content {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            input.push(json!({
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": text}]
+                            }));
+                        }
+                        ContentBlock::Image { source } => {
+                            input.push(json!({
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_image", "image_url": source.to_data_url()}]
+                            }));
+                        }
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } => {
+                            input.push(json!({
+                                "type": "function_call_output",
+                                "call_id": tool_use_id,
+                                "output": content,
+                            }));
+                        }
+                        ContentBlock::ToolUse { .. }
+                        | ContentBlock::Thinking { .. }
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::Unknown(_) => {}
+                    }
+                }
+            }
+            Role::Assistant => {
+                let mut text_parts = Vec::new();
+                let mut tool_calls = Vec::new();
+
+                for block in &msg.content {
+                    match block {
+                        ContentBlock::Text { text } => text_parts.push(text.as_str()),
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
+                            tool_calls.push((id, name, input));
+                        }
+                        ContentBlock::ToolResult { .. }
+                        | ContentBlock::Image { .. }
+                        | ContentBlock::Thinking { .. }
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::Unknown(_) => {}
+                    }
+                }
+
+                if !text_parts.is_empty() {
+                    let joined = text_parts.join("");
+                    input.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": joined}]
+                    }));
+                }
+
+                for (id, name, args) in tool_calls {
+                    input.push(json!({
+                        "type": "function_call",
+                        "call_id": id,
+                        "name": name,
+                        "arguments": args.to_string(),
+                    }));
+                }
+            }
+        }
+    }
+
+    Value::Array(input)
+}
+
+pub(crate) fn convert_tools(anthropic_tools: &Value) -> Value {
+    let Some(tools) = anthropic_tools.as_array() else {
+        return json!([]);
+    };
+
+    Value::Array(
+        tools
+            .iter()
+            .filter_map(|t| {
+                Some(json!({
+                    "type": "function",
+                    "name": t.get("name")?,
+                    "description": t.get("description")?,
+                    "parameters": tool_parameters(t),
+                    "strict": false,
+                }))
+            })
+            .collect(),
+    )
+}
+
+static SUMMARY_REJECTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn init_summary_rejected() -> &'static Mutex<HashSet<String>> {
+    SUMMARY_REJECTED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn summary_rejected(base: &str) -> bool {
+    init_summary_rejected().lock().unwrap().contains(base)
+}
+
+fn reject_summary(base: &str) {
+    init_summary_rejected()
+        .lock()
+        .unwrap()
+        .insert(base.to_owned());
+}
+
+fn has_summary(body: &Value) -> bool {
+    body.get("reasoning")
+        .and_then(|reasoning| reasoning.get("summary"))
+        .is_some()
+}
+
+fn strip_summary(body: &mut Value) {
+    if let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) {
+        reasoning.remove("summary");
+    }
+}
+
+pub(crate) async fn do_stream(
+    client: &Client,
+    model: &crate::model::Model,
+    body: &Value,
+    event_tx: &Sender<ProviderEvent>,
+    auth: &ResolvedAuth,
+    stream_timeout: Duration,
+) -> Result<StreamResponse, AgentError> {
+    let base = auth.base_url.as_deref().ok_or_else(|| AgentError::Config {
+        message: "Responses API requires a base_url in auth".into(),
+    })?;
+    let mut body = Cow::Borrowed(body);
+    if summary_rejected(base) && has_summary(&body) {
+        strip_summary(body.to_mut());
+    }
+    let result = post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await;
+    match result {
+        Err(err) if has_summary(&body) && err.is_unsupported_reasoning_summary() => {
+            reject_summary(base);
+            strip_summary(body.to_mut());
+            post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await
+        }
+        result => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn post_responses(
+    client: &Client,
+    model: &crate::model::Model,
+    body: &Value,
+    event_tx: &Sender<ProviderEvent>,
+    auth: &ResolvedAuth,
+    base: &str,
+    stream_timeout: Duration,
+) -> Result<StreamResponse, AgentError> {
+    let json_body = serde_json::to_vec(body)?;
+
+    let request = auth
+        .configure_request(
+            client
+                .post(format!("{base}{RESPONSES_PATH}"))
+                .header("content-type", "application/json")
+                .header("user-agent", super::user_agent()),
+        )
+        .body(json_body)
+        .build()?;
+
+    debug!(
+        model = %model.id,
+        provider = "OpenAI Coding Plan",
+        "sending Responses API request"
+    );
+
+    super::send_request(client, request, |response| async move {
+        if response.status().as_u16() == 200 {
+            parse_sse(super::body_reader(response), event_tx, stream_timeout).await
+        } else {
+            Err(AgentError::from_response(response).await)
+        }
+    })
+    .await
+}
+
+pub struct ResponsesProvider {
+    pub slug: String,
+    pub base_url: Option<String>,
+    pub system_prefix: Option<String>,
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    client: Client,
+    body_hook: Option<Arc<dyn super::codec::BodyHook>>,
+}
+
+fn parse_price_value(val: &Value) -> Option<f64> {
+    if let Some(n) = val.as_f64() {
+        Some(n)
+    } else if let Some(s) = val.as_str() {
+        s.parse::<f64>().ok()
+    } else {
+        None
+    }
+}
+
+fn normalize_price(val: Option<f64>) -> f64 {
+    let p = val.unwrap_or(0.0);
+    if p > 0.0 && p < 0.01 {
+        let scaled = p * 1_000_000.0;
+        (scaled * 1_000_000.0).round() / 1_000_000.0
+    } else {
+        p
+    }
+}
+
+fn parse_pricing(pricing_val: &Value) -> Option<crate::model::ModelPricing> {
+    if !pricing_val.is_object() {
+        return None;
+    }
+    let input = normalize_price(
+        pricing_val
+            .get("prompt")
+            .or_else(|| pricing_val.get("input"))
+            .and_then(parse_price_value),
+    );
+    let output = normalize_price(
+        pricing_val
+            .get("completion")
+            .or_else(|| pricing_val.get("output"))
+            .and_then(parse_price_value),
+    );
+    let cache_read = normalize_price(
+        pricing_val
+            .get("input_cache_read")
+            .or_else(|| pricing_val.get("cache_read"))
+            .and_then(parse_price_value),
+    );
+    let cache_write = normalize_price(
+        pricing_val
+            .get("input_cache_write")
+            .or_else(|| pricing_val.get("cache_write"))
+            .and_then(parse_price_value),
+    );
+    Some(crate::model::ModelPricing {
+        input,
+        output,
+        cache_write,
+        cache_read,
+        fast: None,
+    })
+}
+
+fn parse_model_info(m: &Value) -> Option<ModelInfo> {
+    let id = m["id"].as_str().or_else(|| m["slug"].as_str())?;
+    let context_window = m["context_window"]
+        .as_u64()
+        .or_else(|| m["context_length"].as_u64())
+        .or_else(|| m["max_model_len"].as_u64())
+        .or_else(|| m["max_input_tokens"].as_u64())
+        .and_then(|v| u32::try_from(v).ok());
+    let max_output_tokens = m["max_output_tokens"]
+        .as_u64()
+        .or_else(|| m["max_tokens"].as_u64())
+        .and_then(|v| u32::try_from(v).ok());
+
+    let supports_vision = m
+        .get("modalities")
+        .and_then(|mod_val| mod_val.get("input"))
+        .or_else(|| m.get("input_modalities"))
+        .and_then(Value::as_array)
+        .map(|modalities| modalities.iter().any(|modality| modality == "image"));
+
+    let pricing = m.get("pricing").and_then(parse_pricing);
+    let reasoning_flag = m.get("reasoning").and_then(Value::as_bool);
+
+    let mut efforts = Vec::new();
+    let mut has_none = false;
+    let levels_array = m
+        .get("supported_reasoning_levels")
+        .and_then(Value::as_array)
+        .or_else(|| m.get("reasoning_levels").and_then(Value::as_array));
+
+    if let Some(levels) = levels_array {
+        for lvl in levels {
+            let effort_str = lvl.as_str().or_else(|| lvl["effort"].as_str());
+            if let Some(s) = effort_str {
+                if s == dialect::OFF {
+                    has_none = true;
+                } else if let Ok(e) = s.parse::<crate::Effort>() {
+                    efforts.push(e);
+                }
+            }
+        }
+        efforts.sort_unstable();
+        efforts.dedup();
+    }
+
+    let (effort, supports_thinking) = if reasoning_flag == Some(false) {
+        (None, Some(false))
+    } else if !efforts.is_empty() || has_none {
+        (
+            Some(crate::model::ModelEffort {
+                supported: efforts.clone(),
+                send_off: Some(has_none),
+            }),
+            Some(!efforts.is_empty()),
+        )
+    } else if reasoning_flag == Some(true) {
+        (None, Some(true))
+    } else {
+        (None, None)
+    };
+
+    let name = m
+        .get("name")
+        .or_else(|| m.get("display_name"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    Some(ModelInfo {
+        id: id.to_string(),
+        name,
+        context_window,
+        max_output_tokens,
+        pricing,
+        supports_thinking,
+        supports_vision,
+        tier: None,
+        provider_info: None,
+        extra: Some(m.clone()),
+        effort,
+    })
+}
+
+impl ResponsesProvider {
+    pub fn new(
+        slug: String,
+        base_url: Option<String>,
+        auth: Arc<Mutex<ResolvedAuth>>,
+        timeouts: Timeouts,
+    ) -> Self {
+        Self {
+            slug,
+            base_url,
+            system_prefix: None,
+            auth,
+            timeouts,
+            client: super::http_client(timeouts),
+            body_hook: None,
+        }
+    }
+
+    pub fn with_body_hook(mut self, hook: Option<Arc<dyn super::codec::BodyHook>>) -> Self {
+        self.body_hook = hook;
+        self
+    }
+
+    pub fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
+        self.system_prefix = prefix;
+        self
+    }
+
+    fn resolve_url(&self, auth: &ResolvedAuth) -> Option<String> {
+        if let Some(b) = &auth.base_url {
+            return Some(b.clone());
+        }
+        if let Some(env) = maki_config::providers::base_url_override(&self.slug) {
+            return Some(env);
+        }
+        let config = ProvidersConfig::load();
+        if let Some(def) = config.get(&self.slug)
+            && let Some(b) = &def.base_url
+        {
+            return Some(b.clone());
+        }
+        self.base_url.clone()
+    }
+
+    async fn do_list_models(&self, auth: &ResolvedAuth) -> Result<Vec<ModelInfo>, AgentError> {
+        if let Some(base) = self.resolve_url(auth) {
+            let url = format!("{base}/models");
+            if let Ok(req) = auth
+                .configure_request(
+                    self.client
+                        .get(&url)
+                        .header("user-agent", super::user_agent()),
+                )
+                .build()
+                && let Ok(text) = super::ok_text(&self.client, req).await
+                && let Ok(val) = serde_json::from_str::<Value>(&text)
+            {
+                let raw_items = val["data"].as_array().or_else(|| val["models"].as_array());
+                if let Some(data) = raw_items {
+                    let mut models: Vec<ModelInfo> =
+                        data.iter().filter_map(parse_model_info).collect();
+                    models.sort_by(|a, b| a.id.cmp(&b.id));
+                    if !models.is_empty() {
+                        crate::model_registry::set_known_models(&self.slug, models.clone());
+                        return Ok(models);
+                    }
+                }
+            }
+        }
+        let config = ProvidersConfig::load();
+        if let Some(def) = config.get(&self.slug) {
+            let models: Vec<ModelInfo> = def
+                .models
+                .iter()
+                .map(|m| {
+                    let effort = m.thinking_fields.as_ref().map(|f| {
+                        let supported: Vec<_> = f.levels.keys().copied().collect();
+                        crate::model::ModelEffort {
+                            supported,
+                            send_off: Some(f.off.is_some()),
+                        }
+                    });
+                    ModelInfo {
+                        id: m.id.clone(),
+                        name: m.name.clone(),
+                        context_window: m.context_window,
+                        max_output_tokens: m.max_output_tokens,
+                        pricing: None,
+                        supports_thinking: m
+                            .supports_thinking
+                            .or_else(|| effort.as_ref().map(|e| !e.supported.is_empty())),
+                        supports_vision: m.supports_vision,
+                        tier: Some(m.tier),
+                        provider_info: None,
+                        extra: None,
+                        effort,
+                    }
+                })
+                .collect();
+            return Ok(models);
+        }
+        Ok(Vec::new())
+    }
+}
+
+impl Provider for ResponsesProvider {
+    fn stream_message<'a>(
+        &'a self,
+        model: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        tools: &'a Value,
+        event_tx: &'a Sender<ProviderEvent>,
+        opts: RequestOptions,
+        _session_id: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        let mut auth = self.auth.lock().unwrap().clone();
+        if auth.base_url.is_none() {
+            auth.base_url = self.resolve_url(&auth);
+        }
+        Box::pin(async move {
+            let effective_system = match &self.system_prefix {
+                Some(prefix) => format!("{prefix}\n\n{system}"),
+                None => system.to_string(),
+            };
+            let mut body = build_body(model, messages, &effective_system, tools);
+            if let Some((fields, fallback)) = model.effective_thinking_fields() {
+                opts.thinking
+                    .apply_fields(&mut body, model, fields, fallback);
+            } else {
+                let discovered = crate::model_registry::discovered(&self.slug, &model.id);
+                let dialect = responses_dialect(&model.id, discovered.as_ref());
+                apply_responses_reasoning(&mut body, opts.thinking, model, &dialect);
+            }
+            if let Some(hook) = &self.body_hook {
+                let ctx = super::codec::RequestCtx {
+                    model,
+                    opts: &opts,
+                    session: _session_id,
+                    discovered: None,
+                };
+                body = hook.call(body, &ctx).await?;
+            }
+            do_stream(
+                &self.client,
+                model,
+                &body,
+                event_tx,
+                &auth,
+                self.timeouts.stream,
+            )
+            .await
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        let auth = self.auth.lock().unwrap().clone();
+        Box::pin(async move { self.do_list_models(&auth).await })
+    }
+}
+
+struct ToolAccumulator {
+    output_index: u64,
+    call_id: String,
+    name: String,
+    arguments: String,
+}
+
+pub(crate) async fn parse_sse(
+    reader: impl AsyncBufRead + Unpin,
+    event_tx: &Sender<ProviderEvent>,
+    stream_timeout: Duration,
+) -> Result<StreamResponse, AgentError> {
+    let mut lines = reader.lines();
+
+    let mut text = String::new();
+    let mut reasoning_text = String::new();
+    let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
+    let mut usage = TokenUsage::default();
+    let mut stop_reason: Option<StopReason> = None;
+    let mut is_first_content = true;
+    let mut deadline = Instant::now() + stream_timeout;
+    let mut current_event = String::new();
+
+    while let Some(line) =
+        crate::providers::next_sse_line(&mut lines, &mut deadline, stream_timeout).await?
+    {
+        if let Some(event_type) = line.strip_prefix("event:") {
+            current_event = event_type.trim().to_string();
+            continue;
+        }
+
+        let data = match line.strip_prefix("data:") {
+            Some(d) => d.trim(),
+            None => continue,
+        };
+
+        if current_event == "error" {
+            if let Ok(ev) = serde_json::from_str::<crate::providers::SseErrorPayload>(data) {
+                warn!(error_type = %ev.error.r#type, message = %ev.error.message, "SSE error in stream");
+                return Err(ev.into_agent_error());
+            }
+            let parsed: Value = serde_json::from_str(data).unwrap_or_default();
+            let message = parsed["message"]
+                .as_str()
+                .unwrap_or("unknown error")
+                .to_string();
+            return Err(AgentError::api(500, message));
+        }
+
+        let parsed_event = if current_event.is_empty() {
+            serde_json::from_str::<Value>(data)
+                .ok()
+                .and_then(|value| value["type"].as_str().map(ToOwned::to_owned))
+                .unwrap_or_default()
+        } else {
+            current_event.clone()
+        };
+
+        match parsed_event.as_str() {
+            "response.output_text.delta" => {
+                let parsed: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(delta) = parsed["delta"].as_str()
+                    && !delta.is_empty()
+                {
+                    let delta = if is_first_content {
+                        is_first_content = false;
+                        delta.trim_start().to_string()
+                    } else {
+                        delta.to_string()
+                    };
+                    if !delta.is_empty() {
+                        text.push_str(&delta);
+                        event_tx
+                            .send_async(ProviderEvent::TextDelta { text: delta })
+                            .await?;
+                    }
+                }
+            }
+
+            "response.output_item.added" => {
+                let parsed: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let item = &parsed["item"];
+                let output_index = parsed["output_index"]
+                    .as_u64()
+                    .unwrap_or(tool_accumulators.len() as u64);
+                if item["type"].as_str() == Some("function_call") {
+                    let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
+                    let name = item["name"]
+                        .as_str()
+                        .or_else(|| item["function"]["name"].as_str())
+                        .or_else(|| item["function_call"]["name"].as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !name.is_empty() {
+                        event_tx
+                            .send_async(ProviderEvent::ToolUseStart {
+                                id: call_id.clone(),
+                                name: name.clone(),
+                            })
+                            .await?;
+                    }
+                    tool_accumulators.push(ToolAccumulator {
+                        output_index,
+                        call_id,
+                        name,
+                        arguments: String::new(),
+                    });
+                }
+            }
+
+            "response.function_call_arguments.delta" => {
+                let parsed: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let delta: Cow<'_, str> = if let Some(s) = parsed["delta"].as_str() {
+                    Cow::Borrowed(s)
+                } else if let Some(obj) = parsed["delta"].as_object() {
+                    Cow::Owned(serde_json::to_string(obj).unwrap_or_default())
+                } else {
+                    Cow::Borrowed("")
+                };
+                let acc = if let Some(idx) = parsed["output_index"].as_u64() {
+                    tool_accumulators.iter_mut().find(|a| a.output_index == idx)
+                } else {
+                    tool_accumulators.last_mut()
+                };
+                if let Some(acc) = acc {
+                    if acc.name.is_empty() {
+                        let name = parsed["name"]
+                            .as_str()
+                            .or_else(|| parsed["item"]["name"].as_str())
+                            .or_else(|| parsed["item"]["function"]["name"].as_str())
+                            .unwrap_or_default();
+                        if !name.is_empty() {
+                            acc.name = name.to_string();
+                            event_tx
+                                .send_async(ProviderEvent::ToolUseStart {
+                                    id: acc.call_id.clone(),
+                                    name: acc.name.clone(),
+                                })
+                                .await?;
+                        }
+                    }
+                    if !delta.is_empty() {
+                        acc.arguments.push_str(&delta);
+                    }
+                }
+            }
+
+            "response.in_progress" => {
+                let parsed: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(pp) = parsed.get("prompt_progress") {
+                    let processed = pp["processed"].as_u64().unwrap_or(0) as u32;
+                    let total = pp["total"].as_u64().unwrap_or(0) as u32;
+                    let cache = pp["cache"].as_u64().unwrap_or(0) as u32;
+                    event_tx
+                        .send_async(ProviderEvent::PromptProgress {
+                            processed,
+                            total,
+                            cache,
+                        })
+                        .await?;
+                }
+            }
+
+            "response.output_item.done" => {
+                let parsed: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let item = &parsed["item"];
+                if item["type"].as_str() == Some("function_call") {
+                    let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
+                    let name = item["name"]
+                        .as_str()
+                        .or_else(|| item["function"]["name"].as_str())
+                        .or_else(|| item["function_call"]["name"].as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let arguments = if let Some(s) = item["arguments"].as_str() {
+                        s.to_string()
+                    } else if let Some(obj) = item["arguments"].as_object() {
+                        serde_json::to_string(obj).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    let acc = if let Some(idx) = parsed["output_index"].as_u64() {
+                        tool_accumulators
+                            .iter_mut()
+                            .find(|acc| acc.output_index == idx)
+                    } else {
+                        tool_accumulators.last_mut()
+                    };
+                    if let Some(acc) = acc {
+                        let should_emit_start = acc.name.is_empty() && !name.is_empty();
+                        if acc.call_id.is_empty() {
+                            acc.call_id = call_id.clone();
+                        }
+                        if acc.name.is_empty() {
+                            acc.name = name.clone();
+                        }
+                        if !arguments.is_empty() {
+                            acc.arguments = arguments;
+                        }
+                        if should_emit_start {
+                            event_tx
+                                .send_async(ProviderEvent::ToolUseStart {
+                                    id: acc.call_id.clone(),
+                                    name: acc.name.clone(),
+                                })
+                                .await?;
+                        }
+                    } else {
+                        if !name.is_empty() {
+                            event_tx
+                                .send_async(ProviderEvent::ToolUseStart {
+                                    id: call_id.clone(),
+                                    name: name.clone(),
+                                })
+                                .await?;
+                        }
+                        tool_accumulators.push(ToolAccumulator {
+                            output_index: tool_accumulators.len() as u64,
+                            call_id,
+                            name,
+                            arguments,
+                        });
+                    }
+                }
+            }
+
+            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+                let parsed: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(delta) = parsed["delta"].as_str()
+                    && !delta.is_empty()
+                {
+                    reasoning_text.push_str(delta);
+                    event_tx
+                        .send_async(ProviderEvent::ThinkingDelta {
+                            text: delta.to_string(),
+                        })
+                        .await?;
+                }
+            }
+
+            "response.reasoning_summary_part.added" if !reasoning_text.is_empty() => {
+                reasoning_text.push_str("\n\n");
+            }
+
+            "response.completed" => {
+                let parsed: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let resp = &parsed["response"];
+
+                if let Some(u) = resp.get("usage") {
+                    usage = parse_usage(u);
+                    usage.cost = copilot_usd(&parsed["copilot_usage"]);
+                }
+
+                let status = resp["status"].as_str().unwrap_or("completed");
+                stop_reason = Some(match status {
+                    "completed" => {
+                        if tool_accumulators.is_empty() {
+                            StopReason::EndTurn
+                        } else {
+                            StopReason::ToolUse
+                        }
+                    }
+                    "incomplete" => StopReason::MaxTokens,
+                    _ => StopReason::EndTurn,
+                });
+            }
+
+            "response.incomplete" => {
+                let parsed: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let resp = &parsed["response"];
+                if let Some(u) = resp.get("usage") {
+                    usage = parse_usage(u);
+                    usage.cost = copilot_usd(&parsed["copilot_usage"]);
+                }
+                stop_reason = Some(StopReason::MaxTokens);
+            }
+
+            "response.failed" => {
+                let parsed: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let error = &parsed["response"]["error"];
+                let message = error["message"]
+                    .as_str()
+                    .unwrap_or("response generation failed")
+                    .to_string();
+                let status = error["code"]
+                    .as_str()
+                    .and_then(sse_error_status)
+                    .unwrap_or(FAILED_RESPONSE_STATUS);
+                return Err(AgentError::api(status, message));
+            }
+
+            _ => {}
+        }
+    }
+
+    let mut content_blocks: Vec<ContentBlock> = Vec::new();
+
+    if !reasoning_text.is_empty() {
+        content_blocks.push(ContentBlock::Thinking {
+            thinking: reasoning_text,
+            signature: None,
+            duration_ms: None,
+        });
+    }
+
+    if !text.is_empty() {
+        content_blocks.push(ContentBlock::Text { text });
+    }
+
+    for acc in tool_accumulators {
+        let input: Value = match serde_json::from_str(&acc.arguments) {
+            Ok(v) => {
+                debug!(tool = %acc.name, json = %acc.arguments, "tool input JSON");
+                v
+            }
+            Err(e) => {
+                warn!(error = %e, tool = %acc.name, json = %acc.arguments, "malformed tool JSON, falling back to {{}}");
+                Value::Object(Default::default())
+            }
+        };
+        content_blocks.push(ContentBlock::tool_use(acc.call_id, acc.name, input));
+    }
+
+    Ok(StreamResponse {
+        message: Message {
+            role: Role::Assistant,
+            content: content_blocks,
+            ..Default::default()
+        },
+        usage,
+        stop_reason,
+        ..Default::default()
+    })
+}
+
+fn parse_usage(u: &Value) -> TokenUsage {
+    let input_tokens = u["input_tokens"].as_u64().unwrap_or(0) as u32;
+    let output_tokens = u["output_tokens"].as_u64().unwrap_or(0) as u32;
+
+    let cached = u["input_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .unwrap_or(0) as u32;
+
+    TokenUsage {
+        input: input_tokens.saturating_sub(cached),
+        output: output_tokens,
+        cache_read: cached,
+        cache_creation: 0,
+        cost: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::Cursor;
+    use test_case::test_case;
+
+    use crate::test_support::sse_event;
+
+    const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+    const OVERLOAD_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
+    const BAD_REQUEST_MESSAGE: &str = "Invalid value for 'model'";
+    const RATE_LIMIT_MESSAGE: &str = "Rate limit hit";
+    const TOOL_NAME: &str = "word_count";
+    const TOOL_DESCRIPTION: &str = "Count words.";
+    const TOOL_MUST_SURVIVE: &str = "a tool without a schema still belongs in the request";
+
+    #[test]
+    fn strip_summary_keeps_effort() {
+        let mut body = json!({"reasoning": {"effort": "high", "summary": "auto"}});
+        assert!(has_summary(&body));
+        strip_summary(&mut body);
+        assert!(!has_summary(&body));
+        assert_eq!(body, json!({"reasoning": {"effort": "high"}}));
+    }
+
+    #[test]
+    fn summary_memo_records_rejection_once() {
+        let base = "https://summary-memo.test/v1";
+        assert!(!summary_rejected(base));
+        reject_summary(base);
+        assert!(summary_rejected(base));
+    }
+
+    #[test]
+    fn convert_tools_defaults_missing_parameters() {
+        let tools = json!([{ "name": TOOL_NAME, "description": TOOL_DESCRIPTION }]);
+        let converted = convert_tools(&tools);
+        assert_eq!(
+            converted[0]["name"],
+            json!(TOOL_NAME),
+            "{TOOL_MUST_SURVIVE}"
+        );
+        assert_eq!(
+            converted[0]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+    }
+
+    async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
+        let (tx, rx) = flume::unbounded();
+        let result = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT).await;
+        (result, rx.drain().collect())
+    }
+
+    const COPILOT_NANO_AIU: u64 = 375_000;
+    const COPILOT_USD: f64 = 0.00000375;
+
+    #[test_case("response.completed", "completed", StopReason::EndTurn, json!({"total_nano_aiu": COPILOT_NANO_AIU}), Some(COPILOT_USD) ; "completed")]
+    #[test_case("response.incomplete", "incomplete", StopReason::MaxTokens, json!({"total_nano_aiu": COPILOT_NANO_AIU}), Some(COPILOT_USD) ; "incomplete")]
+    #[test_case("response.completed", "completed", StopReason::EndTurn, json!({"token_details": []}), None ; "no_total")]
+    #[test_case("response.completed", "completed", StopReason::EndTurn, json!({"total_nano_aiu": COPILOT_NANO_AIU as f64}), Some(COPILOT_USD) ; "float_total")]
+    #[test_case("response.completed", "completed", StopReason::EndTurn, json!({"total_nano_aiu": "375000"}), None ; "string_total")]
+    #[test_case("response.completed", "completed", StopReason::EndTurn, json!("billed"), None ; "not_an_object")]
+    #[tokio::test]
+    async fn parse_sse_copilot_usage_prices_the_turn(
+        event: &str,
+        status: &str,
+        stop: StopReason,
+        copilot_usage: Value,
+        cost: Option<f64>,
+    ) {
+        let sse = sse_event(
+            event,
+            &json!({
+                "copilot_usage": copilot_usage,
+                "response": {"status": status, "usage": {"input_tokens": 100, "output_tokens": 10}},
+            }),
+        );
+
+        let (resp, _events) = run_sse(&sse).await;
+        let resp = resp.unwrap();
+
+        assert_eq!(
+            resp.usage,
+            TokenUsage {
+                input: 100,
+                output: 10,
+                cache_creation: 0,
+                cache_read: 0,
+                cost,
+            }
+        );
+        assert_eq!(resp.stop_reason, Some(stop));
+    }
+
+    #[tokio::test]
+    async fn parse_sse_text_and_usage() {
+        let sse = "\
+event: response.output_text.delta\n\
+data: {\"delta\":\"Hello\"}\n\
+\n\
+event: response.output_text.delta\n\
+data: {\"delta\":\" world\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":40}}}}\n\
+\n";
+
+        let (resp, events) = run_sse(sse).await;
+        let resp = resp.unwrap();
+
+        assert_eq!(resp.usage.input, 60);
+        assert_eq!(resp.usage.output, 10);
+        assert_eq!(resp.usage.cache_read, 40);
+        assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
+        assert!(
+            matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "Hello world")
+        );
+
+        let deltas: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["Hello", " world"]);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_tool_calls() {
+        let sse = "\
+event: response.output_item.added\n\
+data: {\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\
+\n\
+event: response.output_item.added\n\
+data: {\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"c2\",\"name\":\"read\"}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"output_index\":0,\"delta\":\"{\\\"command\\\": \\\"ls\\\"}\"}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"output_index\":1,\"delta\":\"{\\\"path\\\": \\\"/tmp\\\"}\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\
+\n";
+
+        let (resp, events) = run_sse(sse).await;
+        let resp = resp.unwrap();
+
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 2);
+        assert_eq!((tools[0].0, tools[0].1), ("c1", "bash"));
+        assert_eq!(tools[0].2["command"], "ls");
+        assert_eq!((tools[1].0, tools[1].1), ("c2", "read"));
+        assert_eq!(tools[1].2["path"], "/tmp");
+        assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
+
+        let starts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::ToolUseStart { id, name } => Some((id.as_str(), name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, vec![("c1", "bash"), ("c2", "read")]);
+    }
+
+    // Codex hides an overload in `code` on an otherwise healthy 200 stream, so these tags are what
+    // decide between backing off and giving up: https://github.com/tontinton/maki/issues/777
+    #[test_case("service_unavailable_error", "server_is_overloaded", OVERLOAD_MESSAGE, 529, true ; "codex_overload")]
+    #[test_case("overloaded_error", "", OVERLOAD_MESSAGE, 529, true                              ; "overload_without_code")]
+    #[test_case("invalid_request_error", "invalid_value", BAD_REQUEST_MESSAGE, 400, false        ; "bad_request")]
+    #[tokio::test]
+    async fn parse_sse_error_event(
+        error_type: &str,
+        code: &str,
+        message: &str,
+        status: u16,
+        retryable: bool,
+    ) {
+        let data = json!({
+            "type": "error",
+            "error": { "type": error_type, "code": code, "message": message },
+        });
+
+        let (result, _) = run_sse(&format!("event: error\ndata: {data}\n\n")).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), format!("API error ({status}): {message}"));
+        assert_eq!(err.is_retryable(), retryable);
+    }
+
+    #[test_case("rate_limit_exceeded", RATE_LIMIT_MESSAGE, 429 ; "rate_limit")]
+    #[test_case("server_is_overloaded", OVERLOAD_MESSAGE, 529  ; "overload")]
+    #[tokio::test]
+    async fn parse_sse_response_failed(code: &str, message: &str, status: u16) {
+        let data = json!({
+            "response": { "error": { "code": code, "message": message } },
+        });
+
+        let (result, _) = run_sse(&format!("event: response.failed\ndata: {data}\n\n")).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), format!("API error ({status}): {message}"));
+        assert!(err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn parse_sse_incomplete_response() {
+        let sse = "\
+event: response.output_text.delta\n\
+data: {\"delta\":\"partial\"}\n\
+\n\
+event: response.incomplete\n\
+data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
+\n";
+
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
+        assert_eq!(resp.stop_reason, Some(StopReason::MaxTokens));
+        assert!(
+            matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "partial")
+        );
+    }
+
+    #[test]
+    fn convert_input_structure() {
+        let messages = vec![
+            Message::user("hello".to_string()),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "thinking...".to_string(),
+                    },
+                    ContentBlock::tool_use("tc_1", "bash", json!({"command": "ls"})),
+                ],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result("tc_1", "file.txt", false)],
+                ..Default::default()
+            },
+        ];
+
+        let input = convert_input(&messages);
+        let items = input.as_array().unwrap();
+
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[0]["role"], "user");
+        assert_eq!(items[0]["content"][0]["type"], "input_text");
+        assert_eq!(items[0]["content"][0]["text"], "hello");
+
+        assert_eq!(items[1]["type"], "message");
+        assert_eq!(items[1]["role"], "assistant");
+        assert_eq!(items[1]["content"][0]["type"], "output_text");
+        assert_eq!(items[1]["content"][0]["text"], "thinking...");
+
+        assert_eq!(items[2]["type"], "function_call");
+        assert_eq!(items[2]["call_id"], "tc_1");
+        assert_eq!(items[2]["name"], "bash");
+
+        assert_eq!(items[3]["type"], "function_call_output");
+        assert_eq!(items[3]["call_id"], "tc_1");
+        assert_eq!(items[3]["output"], "file.txt");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_reasoning_text_delta() {
+        let sse = "\
+event: response.output_item.added\n\
+data: {\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"content\":[],\"encrypted_content\":\"\",\"status\":\"in_progress\"}}\n\
+\n\
+event: response.reasoning_text.delta\n\
+data: {\"delta\":\"Let me think\"}\n\
+\n\
+event: response.reasoning_text.delta\n\
+data: {\"delta\":\" about this\"}\n\
+\n\
+event: response.output_item.added\n\
+data: {\"output_index\":1,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"status\":\"in_progress\",\"content\":[],\"role\":\"assistant\"}}\n\
+\n\
+event: response.output_text.delta\n\
+data: {\"delta\":\"Hello world\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":20,\"input_tokens_details\":{\"cached_tokens\":10},\"output_tokens_details\":{\"reasoning_tokens\":5}}}}\n\
+\n";
+
+        let (resp, events) = run_sse(sse).await;
+        let resp = resp.unwrap();
+
+        assert_eq!(resp.usage.input, 90);
+        assert_eq!(resp.usage.output, 20);
+        assert_eq!(resp.usage.cache_read, 10);
+
+        assert_eq!(resp.message.content.len(), 2);
+        assert!(
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Let me think about this")
+        );
+        assert!(
+            matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hello world")
+        );
+
+        let thinking_deltas: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::ThinkingDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking_deltas, vec!["Let me think", " about this"]);
+
+        let text_deltas: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text_deltas, vec!["Hello world"]);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_reasoning_summary_text_delta() {
+        let sse = "\
+event: response.reasoning_summary_text.delta\n\
+data: {\"delta\":\"Summary part\"}\n\
+\n\
+event: response.output_text.delta\n\
+data: {\"delta\":\"Answer\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
+\n";
+
+        let (resp, events) = run_sse(sse).await;
+        let resp = resp.unwrap();
+
+        assert!(
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Summary part")
+        );
+
+        let thinking_deltas: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::ThinkingDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking_deltas, vec!["Summary part"]);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_reasoning_only_no_text() {
+        let sse = "\
+event: response.reasoning_text.delta\n\
+data: {\"delta\":\"Thinking only\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":5}}}}\n\
+\n";
+
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
+
+        assert_eq!(resp.message.content.len(), 1);
+        assert!(
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Thinking only")
+        );
+        assert_eq!(resp.usage.output, 5);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_malformed_tool_json_yields_empty_object() {
+        let sse = "\
+event: response.output_item.added\n\
+data: {\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"delta\":\"{broken\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\
+\n";
+
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].1, "bash");
+        assert_eq!(*tools[0].2, Value::Object(Default::default()));
+    }
+
+    // llama.cpp's /v1/responses endpoint omits output_index in SSE events
+    // (see https://github.com/ggml-org/llama.cpp/issues/20607)
+
+    #[tokio::test]
+    async fn parse_sse_tool_call_without_output_index() {
+        let sse = "\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"delta\":\"{\\\"command\\\": \\\"ls\\\"}\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\
+\n";
+
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
+
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].0, "c1");
+        assert_eq!(tools[0].1, "bash");
+        assert_eq!(tools[0].2["command"], "ls");
+        assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
+    }
+
+    #[tokio::test]
+    async fn parse_sse_sequential_tool_calls_without_output_index() {
+        // Simulates llama.cpp streaming two sequential tool calls without output_index
+        let sse = "\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"delta\":\"{\\\"command\\\": \\\"ls\\\"}\"}\n\
+\n\
+event: response.output_item.done\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"ls\\\"}\"}}\n\
+\n\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c2\",\"name\":\"read\"}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"delta\":\"{\\\"path\\\": \\\"/tmp\\\"}\"}\n\
+\n\
+event: response.output_item.done\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c2\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\": \\\"/tmp\\\"}\"}}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\
+\n";
+
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
+
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 2);
+        assert_eq!((tools[0].0, tools[0].1), ("c1", "bash"));
+        assert_eq!(tools[0].2["command"], "ls");
+        assert_eq!((tools[1].0, tools[1].1), ("c2", "read"));
+        assert_eq!(tools[1].2["path"], "/tmp");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_tool_done_without_output_index_updates_last_acc() {
+        // done event without output_index should update the last accumulator
+        let sse = "\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"glob\"}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"delta\":\"{\\\"pattern\\\": \\\"*.rs\\\"}\"}\n\
+\n\
+event: response.output_item.done\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"glob\",\"arguments\":\"{\\\"pattern\\\": \\\"*.rs\\\", \\\"path\\\": \\\"src\\\"}\"}}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\
+\n";
+
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
+
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].1, "glob");
+        assert_eq!(tools[0].2["pattern"], "*.rs");
+        assert_eq!(tools[0].2["path"], "src");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_prompt_progress_events() {
+        let sse = "\
+event: response.in_progress\n\
+data: {\"prompt_progress\":{\"processed\":100,\"total\":1000,\"cache\":50}}\n\
+\n\
+event: response.in_progress\n\
+data: {\"prompt_progress\":{\"processed\":500,\"total\":1000,\"cache\":50}}\n\
+\n\
+event: response.output_text.delta\n\
+data: {\"delta\":\"Hello\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10}}}\n\
+\n";
+
+        let (_resp, events) = run_sse(sse).await;
+
+        let progress: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::PromptProgress {
+                    processed,
+                    total,
+                    cache,
+                } => Some((*processed, *total, *cache)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(progress, vec![(100, 1000, 50), (500, 1000, 50)]);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_done_arguments_as_json_object() {
+        let sse = "\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\"}}\n\
+\n\
+event: response.output_item.done\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":{\"path\":\"/tmp/file.txt\"}}}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}
+\
+\n";
+
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
+
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].1, "read");
+        assert_eq!(tools[0].2["path"], "/tmp/file.txt");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_reasoning_summary_part_added() {
+        let sse = "\
+event: response.reasoning_summary_part.added\n\
+data: {\"id\":\"sp_1\"}\n\
+\n\
+event: response.reasoning_summary_text.delta\n\
+data: {\"delta\":\"First part\"}\n\
+\n\
+event: response.reasoning_summary_part.added\n\
+data: {\"id\":\"sp_2\"}\n\
+\n\
+event: response.reasoning_summary_text.delta\n\
+data: {\"delta\":\"Second part\"}\n\
+\n\
+event: response.output_text.delta\n\
+data: {\"delta\":\"Answer\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
+\n";
+
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
+
+        assert!(
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "First part\n\nSecond part")
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_delta_arguments_as_json_object() {
+        let sse = "\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"grep\"}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"delta\":{\"pattern\":\"TODO\",\"path\":\"src\"}}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}
+\
+\n";
+
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
+
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].1, "grep");
+        assert_eq!(tools[0].2["pattern"], "TODO");
+        assert_eq!(tools[0].2["path"], "src");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_done_object_args_overrides_empty_delta() {
+        let sse = "\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"edit\"}}\n\
+\n\
+event: response.output_item.done\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"edit\",\"arguments\":{\"path\":\"foo.rs\",\"old_string\":\"a\",\"new_string\":\"b\"}}}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}
+\
+\n";
+
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
+
+        let tools: Vec<_> = resp.message.tool_uses().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].1, "edit");
+        assert_eq!(tools[0].2["path"], "foo.rs");
+        assert_eq!(tools[0].2["old_string"], "a");
+        assert_eq!(tools[0].2["new_string"], "b");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_no_reasoning_tokens_in_usage() {
+        let sse = "\
+event: response.output_text.delta\n\
+data: {\"delta\":\"Hello\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":40}}}}\n\
+\n";
+
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
+
+        assert_eq!(resp.usage.input, 60);
+        assert_eq!(resp.usage.output, 10);
+        assert_eq!(resp.usage.cache_read, 40);
+    }
+
+    #[test_case(ThinkingConfig::Adaptive, "gpt-5.3-codex", "medium" ; "adaptive_codex")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Minimal), "gpt-5.3-codex", "low" ; "minimal_snaps_to_low_on_codex")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Low), "gpt-5.3-codex", "low" ; "low_codex")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Medium), "gpt-5.3-codex", "medium" ; "medium_codex")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::High), "gpt-5.3-codex", "high" ; "high_codex")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::XHigh), "gpt-5.3-codex", "xhigh" ; "xhigh_codex")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Max), "gpt-5.3-codex", "xhigh" ; "max_snaps_to_xhigh_on_codex")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::XHigh), "gpt-5.1-codex", "high" ; "xhigh_snaps_to_high_on_5_1")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::XHigh), "gpt-5.1-codex-max", "xhigh" ; "xhigh_passes_through_on_5_1_max")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Minimal), "gpt-5.5", "minimal" ; "minimal_passes_through_on_5_5")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Max), "gpt-5.5", "xhigh" ; "max_snaps_to_xhigh_on_5_5")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Minimal), "gpt-5.6-sol", "minimal" ; "minimal_passes_through_on_5_6_sol")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Max), "gpt-5.6-sol", "max" ; "max_passes_through_on_5_6_sol")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Max), "gpt-5.6-terra", "max" ; "max_passes_through_on_5_6_terra")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Max), "gpt-5.6-luna", "max" ; "max_passes_through_on_5_6_luna")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Max), "gpt-6-sol", "max" ; "max_passes_through_on_6_sol")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Minimal), "gpt-6-sol", "low" ; "minimal_snaps_to_low_on_6_sol")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Max), "gpt-6-luna", "max" ; "max_passes_through_on_6_luna")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Minimal), "gpt-6-luna", "low" ; "minimal_snaps_to_low_on_6_luna")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Max), "gpt-6-astra", "max" ; "max_passes_through_on_6_astra")]
+    #[test_case(ThinkingConfig::Effort(crate::Effort::Minimal), "gpt-6-astra", "low" ; "minimal_snaps_to_low_on_6_astra")]
+    #[test_case(ThinkingConfig::Adaptive, "gpt-6-astra", "medium" ; "adaptive_on_6_astra")]
+    fn responses_reasoning_uses_responses_effort_object(
+        thinking: ThinkingConfig,
+        model_id: &str,
+        expected: &str,
+    ) {
+        let model = Model::from_spec(&format!("responses/{model_id}")).unwrap();
+        let mut body = json!({});
+        let dialect = responses_dialect(&model.id, None);
+        apply_responses_reasoning(&mut body, thinking, &model, &dialect);
+        assert_eq!(body["reasoning"]["effort"], expected);
+    }
+
+    #[test_case("gpt-5.3-codex")]
+    #[test_case("gpt-6-sol")]
+    #[test_case("gpt-6-luna")]
+    #[test_case("gpt-6-astra")]
+    fn responses_reasoning_omits_effort_when_disabled(model_id: &str) {
+        let model = Model::from_spec(&format!("responses/{model_id}")).unwrap();
+        let mut body = json!({});
+        let dialect = responses_dialect(&model.id, None);
+        apply_responses_reasoning(&mut body, ThinkingConfig::Off, &model, &dialect);
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test_case("gpt-5.5")]
+    #[test_case("gpt-5.6-luna")]
+    #[test_case("gpt-5.6-terra")]
+    #[test_case("gpt-5.6-sol")]
+    fn responses_reasoning_sends_none_when_disabled(model_id: &str) {
+        let model = Model::from_spec(&format!("responses/{model_id}")).unwrap();
+        let mut body = json!({});
+        let dialect = responses_dialect(&model.id, None);
+        apply_responses_reasoning(&mut body, ThinkingConfig::Off, &model, &dialect);
+        assert_eq!(body["reasoning"]["effort"], "none");
+        assert!(body["reasoning"].get("summary").is_none());
+    }
+
+    #[test]
+    fn parse_model_info_extracts_reasoning_levels() {
+        let raw = json!({
+            "id": "custom-thinking-model",
+            "context_length": 128000,
+            "max_tokens": 16000,
+            "supported_reasoning_levels": [
+                {"effort": "low"},
+                {"effort": "high"},
+                {"effort": "none"}
+            ]
+        });
+        let info = parse_model_info(&raw).expect("parses model info");
+        assert_eq!(info.id, "custom-thinking-model");
+        assert_eq!(info.supports_thinking, Some(true));
+        let effort = info.effort.expect("has effort");
+        assert_eq!(
+            effort.supported,
+            vec![crate::Effort::Low, crate::Effort::High]
+        );
+        assert_eq!(effort.send_off, Some(true));
+    }
+
+    #[test]
+    fn parse_model_info_curl_magpie_sample() {
+        let grok = json!({
+            "context_length": 500000,
+            "context_window": 500000,
+            "id": "group/grok-4.7",
+            "max_input_tokens": 500000,
+            "max_output_tokens": 500000,
+            "modalities": {"input": ["text", "image"]},
+            "pricing": {
+                "completion": "0.000006",
+                "input_cache_read": "0.0000005",
+                "prompt": "0.000002"
+            },
+            "reasoning": true,
+            "reasoning_levels": ["low", "medium", "high", "xhigh"],
+            "supported_reasoning_levels": [
+                {"effort": "low"},
+                {"effort": "medium"},
+                {"effort": "high"},
+                {"effort": "xhigh"}
+            ]
+        });
+        let info = parse_model_info(&grok).expect("parses grok-4.7");
+        assert_eq!(info.id, "group/grok-4.7");
+        assert_eq!(info.context_window, Some(500000));
+        assert_eq!(info.max_output_tokens, Some(500000));
+        assert_eq!(info.supports_vision, Some(true));
+        assert_eq!(info.supports_thinking, Some(true));
+        let pricing = info.pricing.expect("has pricing");
+        assert_eq!(pricing.input, 2.0);
+        assert_eq!(pricing.output, 6.0);
+        assert_eq!(pricing.cache_read, 0.5);
+        let effort = info.effort.expect("has effort");
+        assert_eq!(
+            effort.supported,
+            vec![
+                crate::Effort::Low,
+                crate::Effort::Medium,
+                crate::Effort::High,
+                crate::Effort::XHigh
+            ]
+        );
+
+        let composer = json!({
+            "id": "cursor/composer-2.5-fast",
+            "reasoning": false,
+            "reasoning_levels": [],
+            "supported_reasoning_levels": []
+        });
+        let info = parse_model_info(&composer).expect("parses composer");
+        assert_eq!(info.supports_thinking, Some(false));
+        assert!(info.effort.is_none());
+
+        let codex = json!({
+            "id": "codex/gpt-6.1-sol",
+            "context_length": 400000,
+            "max_output_tokens": 128000,
+            "pricing": {
+                "completion": "0.00001",
+                "input_cache_read": "0.0000001",
+                "input_cache_write": "0.0000025",
+                "prompt": "0.000002"
+            },
+            "service_tiers": [
+                {"id": "priority", "name": "Fast"}
+            ]
+        });
+        let info = parse_model_info(&codex).expect("parses codex");
+        let pricing = info.pricing.expect("has pricing");
+        assert_eq!(pricing.input, 2.0);
+        assert_eq!(pricing.output, 10.0);
+        assert_eq!(pricing.cache_read, 0.1);
+        assert_eq!(pricing.cache_write, 2.5);
+        assert!(info.extra.is_some());
+    }
+
+    #[test]
+    fn parse_model_info_extracts_name_and_display_name() {
+        let with_name = json!({
+            "id": "gpt-6.1-sol",
+            "name": "GPT-6.1 Sol"
+        });
+        let info = parse_model_info(&with_name).expect("parses model info");
+        assert_eq!(info.id, "gpt-6.1-sol");
+        assert_eq!(info.name.as_deref(), Some("GPT-6.1 Sol"));
+
+        let with_display_name = json!({
+            "id": "claude-opus-4-7",
+            "display_name": "Claude Opus 4.7"
+        });
+        let info = parse_model_info(&with_display_name).expect("parses model info");
+        assert_eq!(info.id, "claude-opus-4-7");
+        assert_eq!(info.name.as_deref(), Some("Claude Opus 4.7"));
+
+        let without_name = json!({
+            "id": "raw-model"
+        });
+        let info = parse_model_info(&without_name).expect("parses model info");
+        assert_eq!(info.id, "raw-model");
+        assert_eq!(info.name, None);
+    }
+}

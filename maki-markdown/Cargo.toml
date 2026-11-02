@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 maki-highlight = { workspace = true }
+txm = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 
@@ -17,3 +18,6 @@ unicode-width = { workspace = true }
 syntect = { workspace = true }
 test-case = { workspace = true }
 fastrand = { workspace = true }
+
+[lints]
+workspace = true

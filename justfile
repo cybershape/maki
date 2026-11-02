@@ -4,18 +4,34 @@ default:
 build *ARGS:
     cargo build {{ARGS}}
 
+# Fat LTO: UI hot paths about 8% faster, binary about 8% smaller.
+# About 2.5 minutes on an M3 Pro, so a plain release build leaves it off.
+build-lto *ARGS:
+    CARGO_PROFILE_RELEASE_LTO=true cargo build --release {{ARGS}}
+
 # Types only, no codegen, no lints. Add `-p <crate>` to make it cheaper still.
 check *ARGS:
-    cargo check --workspace --tests {{ARGS}}
+    cargo check --workspace --all-targets --features maki-ui/bench {{ARGS}}
 
 run *ARGS:
     cargo run {{ARGS}}
+
+install *ARGS:
+    cargo install --locked --path . {{ARGS}}
 
 test *ARGS:
     cargo nextest run --workspace {{ARGS}}
 
 lint:
-    cargo clippy --all --tests -- -D warnings
+    cargo clippy --all --all-targets --features maki-ui/bench -- -D warnings
+
+# Narrow it down, e.g. `just bench -p maki-ui --bench input`.
+bench *ARGS:
+    cargo bench --features maki-ui/bench {{ARGS}}
+
+# Dev profile: builds fast, to see a bench run. Its numbers mean little.
+bench-quick *ARGS:
+    cargo bench --profile dev --features maki-ui/bench {{ARGS}}
 
 lint-fix:
     cargo clippy --all --tests --fix
@@ -27,6 +43,11 @@ fmt-check:
 fmt:
     cargo fmt --all
     stylua plugins/
+
+# Same command as CI. lute reads `plugins/.config.luau` from the working directory.
+# Not part of `ci` yet: it needs the lute nightly pinned in `.github/workflows/rust.yml`.
+check-lua:
+    cd plugins && lute check $(find . -name '*.lua')
 
 pylint:
     ruff check scripts/

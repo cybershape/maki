@@ -3,6 +3,7 @@
 //! `atomic_write_permissions` sets file mode before persist (for auth keys at 0600).
 
 pub mod auth;
+pub mod frame;
 pub mod id;
 pub mod input_history;
 pub mod intern;
@@ -164,6 +165,13 @@ pub fn now_epoch() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+pub fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]

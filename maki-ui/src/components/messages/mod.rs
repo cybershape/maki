@@ -8,17 +8,20 @@ mod tests;
 pub use self::scroll::ScrollPos;
 
 use self::render::RenderCursor;
-use self::scroll::{Layout, TailPart};
+use self::scroll::Layout;
 use self::segment::{Segment, SegmentCache};
 
+use super::compact_detail::CompactTarget;
 use super::tool_display::{
-    RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info, assistant_style,
-    build_instructions_lines, build_tool_lines, done_style, error_style, format_timestamp_now,
-    instructions_search_text, search_text_for, thinking_indicator, thinking_style,
-    truncate_to_header, user_style,
+    MOVABLE_HINT, RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info,
+    assistant_style, build_instructions_lines, build_tool_lines, done_style, error_style,
+    format_timestamp_now, hint_columns, instructions_search_text, notice_style, outcome_glyph,
+    search_text_for, thinking_style, truncate_to_header, user_style,
 };
 use super::{
-    DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER, ToolRole, ToolStatus, code_view::SectionFlags,
+    BackgroundBadge, BackgroundOutcome, CompactDetail, DisplayMessage, DisplayRole, GroupEntry,
+    GroupThinkingEntry, GroupToolEntry, IMAGE_PLACEHOLDER, ToolGroupRole, ToolRole, ToolStatus,
+    code_view::SectionFlags, tool_group,
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
@@ -29,21 +32,22 @@ use crate::splash::{ColorTransition, Splash};
 use crate::terminal_image;
 use crate::theme;
 use crate::update;
-use crate::wrap;
-use maki_config::{ClockFormat, ToolOutputLines, UiConfig};
+use maki_config::{ClockFormat, ThinkingLines, ToolOutputLines, UiConfig};
 use ratatui_image::picker::Picker;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::mem;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::scrollbar::{self, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
+use super::thinking;
 use maki_agent::{
-    BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND, SharedBuf,
-    ToolDoneEvent, ToolOutput, ToolStartEvent,
+    BufWatch, BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND,
+    SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
-use maki_lua::{EventHandle, WARM_TOOL_CAP, WinView};
+use maki_lua::{EventHandle, LuaCommandInfo, WARM_TOOL_CAP, WinView};
 use maki_storage::id::{MakiId, SessionRef};
 
 use ratatui::Frame;
@@ -57,6 +61,24 @@ use tracing::warn;
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
 /// How far outside the drawn range an image keeps its encoded protocol.
 const IMAGE_KEEP_MARGIN_SEGMENTS: usize = 8;
+/// A click on transcript thinking expands or collapses it.
+const CLICKABLE: bool = true;
+const NOTICE_COLLAPSED_MARK: &str = " ▸";
+const NOTICE_EXPANDED_MARK: &str = " ▾";
+const NOTICE_DETAIL_INDENT: &str = "  ";
+
+/// What a click in the transcript asks of the app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClickOutcome {
+    None,
+    Handled,
+    /// A moved row: open its task tab.
+    OpenTask(String),
+    /// A running row's hint: move only this call.
+    MoveCall(String),
+    /// A compact row: open what the call actually did.
+    OpenCompact(CompactTarget),
+}
 
 #[derive(Clone, Copy)]
 pub struct PromptProgress {
@@ -75,9 +97,6 @@ pub struct MessagesPanel {
     viewport_height: u16,
     viewport_width: u16,
     cache: SegmentCache,
-    /// The streaming tail the last `view` drew, in the order it drew it. Lets
-    /// the row walk and clicks address the tail between frames.
-    tail: Vec<(TailPart, u16)>,
     hl_worker: RenderWorker,
     image_picker: Option<Picker>,
     inline_images: bool,
@@ -89,17 +108,19 @@ pub struct MessagesPanel {
     expanded_tools: HashMap<String, SectionFlags>,
     /// Per-tool log of post-completion click rows, replayed on restore.
     lua_clicks: HashMap<String, Vec<usize>>,
-    live_bufs: HashMap<String, Arc<SharedBuf>>,
+    live_bufs: HashMap<String, BufWatch>,
     /// Bufs of finished tools we keep polling so runtime-side warm
     /// clicks stay visible. Purely local: every finished-tool click
     /// carries a restore fallback, so we never track the runtime's
     /// warm cache.
-    watched_bufs: VecDeque<(String, Arc<SharedBuf>)>,
+    watched_bufs: VecDeque<(String, BufWatch)>,
     tool_output_lines: ToolOutputLines,
     lua_event_handle: EventHandle,
     restore_event_tx: Option<EventSender>,
-    show_thinking: bool,
-    thinking_collapsed: bool,
+    thinking_lines: ThinkingLines,
+    /// The reader's click on the live thinking, handed to its message by
+    /// [`Self::flush_thinking`].
+    live_thinking_expanded: bool,
     clock_format: ClockFormat,
     /// One re-bake per tool per generation; `snapshot_theme_gen`
     /// only bumps when colors actually land.
@@ -109,6 +130,11 @@ pub struct MessagesPanel {
     /// plugin files the call where the live one went.
     session_id: Option<SessionRef>,
     task_id: Option<Arc<str>>,
+    /// Where the streaming segments start. `view` drops and rebuilds them
+    /// every frame, so they always sit at the end of the cache.
+    live_start: usize,
+    pub compact_tools: bool,
+    pub compact_lines: usize,
 }
 
 impl MessagesPanel {
@@ -134,9 +160,8 @@ impl MessagesPanel {
             scroll: ScrollPos::default(),
             auto_scroll: true,
             viewport_height: 24,
-            viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(1)),
+            viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(2)),
             cache: SegmentCache::new(),
-            tail: Vec::new(),
             hl_worker: RenderWorker::new(),
             image_picker: terminal_image::picker(ui_config.inline_images),
             inline_images: ui_config.inline_images,
@@ -152,13 +177,16 @@ impl MessagesPanel {
             tool_output_lines: ui_config.tool_output_lines,
             lua_event_handle,
             restore_event_tx: None,
-            show_thinking: ui_config.show_thinking,
-            thinking_collapsed: !ui_config.show_thinking,
+            thinking_lines: ui_config.thinking_lines,
+            live_thinking_expanded: false,
             clock_format: ui_config.clock_format,
             rebake_requested: HashMap::new(),
             prompt_progress: None,
             session_id: None,
             task_id: None,
+            live_start: 0,
+            compact_tools: ui_config.compact_tools,
+            compact_lines: ui_config.compact_lines,
         }
     }
 
@@ -169,6 +197,10 @@ impl MessagesPanel {
     pub(crate) fn set_chat(&mut self, session_id: MakiId, task_id: Option<Arc<str>>) {
         self.session_id = Some(SessionRef::from(session_id));
         self.task_id = task_id;
+    }
+
+    pub(crate) fn session_id(&self) -> Option<MakiId> {
+        self.session_id.as_ref().map(SessionRef::id)
     }
 
     fn stamp_chat(&self, item: &mut maki_lua::RestoreItem) {
@@ -211,14 +243,7 @@ impl MessagesPanel {
         self.cache.clear();
     }
 
-    pub fn load_messages(&mut self, mut msgs: Vec<DisplayMessage>) {
-        if !self.show_thinking {
-            for msg in &mut msgs {
-                if matches!(msg.role, DisplayRole::Thinking) {
-                    msg.thinking_collapsed = true;
-                }
-            }
-        }
+    pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
         self.messages = msgs;
         self.cache.clear();
         self.expanded_tools.clear();
@@ -227,19 +252,235 @@ impl MessagesPanel {
         self.watched_bufs.clear();
         self.rebake_requested.clear();
         self.highlight_segment = None;
-        self.thinking_collapsed = !self.show_thinking;
+        self.live_thinking_expanded = false;
+    }
+
+    pub fn seal_open_group(&mut self) {
+        if !self.compact_tools {
+            return;
+        }
+        if let Some(DisplayMessage {
+            role: DisplayRole::ToolGroup(g),
+            ..
+        }) = self.messages.last()
+            && !g.sealed
+            && g.entries.is_empty()
+        {
+            self.messages.pop();
+            self.cache.clear();
+            return;
+        }
+        if let Some(DisplayMessage {
+            role: DisplayRole::ToolGroup(g),
+            ..
+        }) = self.messages.last_mut()
+            && !g.sealed
+        {
+            g.sealed = true;
+            g.waiting_since = None;
+            if g.duration.is_none() {
+                g.duration = g.started_at.map(|st| st.elapsed());
+            }
+            for entry in &mut g.entries {
+                if let GroupEntry::Thinking(th) = entry {
+                    th.active = false;
+                    if th.duration.is_none() {
+                        th.duration = th.started_at.map(|st| st.elapsed());
+                    }
+                }
+            }
+            let group_id = g.id.clone();
+            self.rebuild_tool_group_segment(&group_id);
+        }
+    }
+
+    pub fn ensure_active_group(&mut self) {
+        if !self.compact_tools {
+            return;
+        }
+        if let Some(DisplayMessage {
+            role: DisplayRole::ToolGroup(g),
+            ..
+        }) = self.messages.last()
+            && !g.sealed
+        {
+            return;
+        }
+        let gid = format!("compact-group-{}", self.messages.len());
+        let group = ToolGroupRole {
+            id: gid,
+            sealed: false,
+            entries: Vec::new(),
+            started_at: Some(Instant::now()),
+            duration: None,
+            waiting_since: Some(Instant::now()),
+            expanded: false,
+        };
+        self.messages.push(DisplayMessage::new(
+            DisplayRole::ToolGroup(Box::new(group)),
+            String::new(),
+        ));
     }
 
     pub fn thinking_delta(&mut self, text: &str) {
+        if self.compact_tools {
+            self.flush_streaming_text();
+            let mut group_id = None;
+            if let Some(DisplayMessage {
+                role: DisplayRole::ToolGroup(g),
+                ..
+            }) = self.messages.last_mut()
+                && !g.sealed
+            {
+                group_id = Some(g.id.clone());
+                let wait_start = g.waiting_since.take();
+                if let Some(GroupEntry::Thinking(th)) = g.entries.last_mut() {
+                    if th.active {
+                        th.text.push_str(text);
+                        th.tokens = th.text.len().div_ceil(4);
+                    } else {
+                        let start_time = wait_start
+                            .or_else(|| (g.entries.len() <= 1).then_some(g.started_at).flatten())
+                            .unwrap_or_else(Instant::now);
+                        g.entries.push(GroupEntry::Thinking(GroupThinkingEntry {
+                            id: g.entries.len(),
+                            text: text.to_string(),
+                            tokens: text.len().div_ceil(4),
+                            active: true,
+                            started_at: Some(start_time),
+                            duration: None,
+                        }));
+                    }
+                } else {
+                    let start_time = wait_start.or(g.started_at).unwrap_or_else(Instant::now);
+                    g.entries.push(GroupEntry::Thinking(GroupThinkingEntry {
+                        id: g.entries.len(),
+                        text: text.to_string(),
+                        tokens: text.len().div_ceil(4),
+                        active: true,
+                        started_at: Some(start_time),
+                        duration: None,
+                    }));
+                }
+            }
+
+            if let Some(gid) = group_id {
+                self.rebuild_tool_group_segment(&gid);
+            } else {
+                let gid = format!("compact-group-{}", self.messages.len());
+                let group = ToolGroupRole {
+                    id: gid,
+                    sealed: false,
+                    entries: vec![GroupEntry::Thinking(GroupThinkingEntry {
+                        id: 0,
+                        text: text.to_string(),
+                        tokens: text.len().div_ceil(4),
+                        active: true,
+                        started_at: Some(Instant::now()),
+                        duration: None,
+                    })],
+                    started_at: Some(Instant::now()),
+                    duration: None,
+                    waiting_since: None,
+                    expanded: false,
+                };
+                self.messages.push(DisplayMessage::new(
+                    DisplayRole::ToolGroup(Box::new(group)),
+                    String::new(),
+                ));
+            }
+            return;
+        }
         self.streaming_thinking.push(text);
     }
 
     pub fn text_delta(&mut self, text: &str) {
+        if self.compact_tools && !text.trim().is_empty() {
+            self.seal_open_group();
+        }
         self.flush_thinking();
         self.streaming_text.push(text);
     }
 
     pub fn tool_pending(&mut self, id: String, name: &str) {
+        if self.compact_tools {
+            self.flush_streaming_text();
+            if let Some(DisplayMessage {
+                role: DisplayRole::ToolGroup(g),
+                ..
+            }) = self.messages.last_mut()
+                && !g.sealed
+            {
+                let wait_start = g.waiting_since.take();
+                if let Some(GroupEntry::Thinking(th)) = g.entries.last_mut() {
+                    th.active = false;
+                    if th.duration.is_none() {
+                        th.duration = th.started_at.map(|st| st.elapsed());
+                    }
+                }
+                let entries_count = g.entries.len();
+                let g_started = g.started_at;
+                if let Some(entry) = g.entries.iter_mut().find_map(|e| match e {
+                    GroupEntry::Tool(t) if t.id == id => Some(t),
+                    _ => None,
+                }) {
+                    entry.name = Arc::from(name);
+                    entry.receiving_args = true;
+                    if entry.started_at.is_none() {
+                        let start_time = wait_start
+                            .or_else(|| (entries_count <= 1).then_some(g_started).flatten())
+                            .unwrap_or_else(Instant::now);
+                        entry.started_at = Some(start_time);
+                    }
+                } else {
+                    let start_time = wait_start
+                        .or_else(|| g.entries.is_empty().then_some(g.started_at).flatten())
+                        .unwrap_or_else(Instant::now);
+                    g.entries.push(GroupEntry::Tool(Box::new(GroupToolEntry {
+                        id: id.clone(),
+                        name: Arc::from(name),
+                        summary: String::new(),
+                        raw_input: None,
+                        children: Vec::new(),
+                        status: ToolStatus::InProgress,
+                        receiving_args: true,
+                        started_at: Some(start_time),
+                        duration: None,
+                        detail: None,
+                    })));
+                }
+                let gid = g.id.clone();
+                self.rebuild_tool_group_segment(&gid);
+                return;
+            }
+
+            let gid = format!("compact-group-{}", self.messages.len());
+            let group = ToolGroupRole {
+                id: gid,
+                sealed: false,
+                entries: vec![GroupEntry::Tool(Box::new(GroupToolEntry {
+                    id,
+                    name: Arc::from(name),
+                    summary: String::new(),
+                    raw_input: None,
+                    children: Vec::new(),
+                    status: ToolStatus::InProgress,
+                    receiving_args: true,
+                    started_at: Some(Instant::now()),
+                    duration: None,
+                    detail: None,
+                }))],
+                started_at: Some(Instant::now()),
+                duration: None,
+                waiting_since: None,
+                expanded: false,
+            };
+            self.messages.push(DisplayMessage::new(
+                DisplayRole::ToolGroup(Box::new(group)),
+                String::new(),
+            ));
+            return;
+        }
         self.flush();
         let role = DisplayRole::Tool(Box::new(ToolRole {
             id,
@@ -252,6 +493,117 @@ impl MessagesPanel {
     }
 
     pub fn tool_start(&mut self, event: ToolStartEvent) {
+        if self.compact_tools {
+            let summary = tool_group::format_compact_summary(
+                &event.tool,
+                event.raw_input.as_ref(),
+                &event.summary,
+            );
+            let mut found_group = None;
+            for msg in self.messages.iter_mut().rev() {
+                if let DisplayRole::ToolGroup(g) = &mut msg.role {
+                    let entries_count = g.entries.len();
+                    let g_started = g.started_at;
+                    if let Some(entry) = g.entries.iter_mut().find_map(|e| match e {
+                        GroupEntry::Tool(t) if t.id == event.id => Some(t),
+                        _ => None,
+                    }) {
+                        entry.name = Arc::clone(&event.tool);
+                        entry.summary = summary.clone();
+                        entry.raw_input = event.raw_input.clone();
+                        entry.receiving_args = false;
+                        let detail = entry
+                            .detail
+                            .get_or_insert_with(|| CompactDetail::from_start(&event));
+                        detail.input = event.input.clone();
+                        detail.raw_input = event.raw_input.clone();
+                        detail.annotation = event.annotation.clone();
+                        detail.render_header = event.render_header.clone();
+                        if let Some(output) = &event.output {
+                            detail.output = Some(Arc::new(output.clone()));
+                        }
+                        if entry.started_at.is_none() {
+                            let wait_start = g.waiting_since.take();
+                            let start_time = wait_start
+                                .or_else(|| (entries_count <= 1).then_some(g_started).flatten())
+                                .unwrap_or_else(Instant::now);
+                            entry.started_at = Some(start_time);
+                        }
+                        found_group = Some(g.id.clone());
+                    }
+                    if found_group.is_some() {
+                        g.waiting_since = None;
+                        break;
+                    }
+                }
+            }
+            if let Some(gid) = found_group {
+                self.rebuild_tool_group_segment(&gid);
+                return;
+            }
+
+            self.flush_streaming_text();
+
+            if let Some(DisplayMessage {
+                role: DisplayRole::ToolGroup(g),
+                ..
+            }) = self.messages.last_mut()
+                && !g.sealed
+            {
+                let wait_start = g.waiting_since.take();
+                if let Some(GroupEntry::Thinking(th)) = g.entries.last_mut() {
+                    th.active = false;
+                    if th.duration.is_none() {
+                        th.duration = th.started_at.map(|st| st.elapsed());
+                    }
+                }
+                let start_time = wait_start
+                    .or_else(|| g.entries.is_empty().then_some(g.started_at).flatten())
+                    .unwrap_or_else(Instant::now);
+                g.entries.push(GroupEntry::Tool(Box::new(GroupToolEntry {
+                    id: event.id.clone(),
+                    name: Arc::clone(&event.tool),
+                    summary: summary.clone(),
+                    raw_input: event.raw_input.clone(),
+                    children: Vec::new(),
+                    status: ToolStatus::InProgress,
+                    receiving_args: false,
+                    started_at: Some(start_time),
+                    duration: None,
+                    detail: Some(CompactDetail::from_start(&event)),
+                })));
+                let gid = g.id.clone();
+                self.rebuild_tool_group_segment(&gid);
+                return;
+            }
+
+            let gid = format!("compact-group-{}", self.messages.len());
+            let group = ToolGroupRole {
+                id: gid,
+                sealed: false,
+                entries: vec![GroupEntry::Tool(Box::new(GroupToolEntry {
+                    id: event.id.clone(),
+                    name: Arc::clone(&event.tool),
+                    summary,
+                    raw_input: event.raw_input.clone(),
+                    children: Vec::new(),
+                    status: ToolStatus::InProgress,
+                    receiving_args: false,
+                    started_at: Some(Instant::now()),
+                    duration: None,
+                    detail: Some(CompactDetail::from_start(&event)),
+                }))],
+                started_at: Some(Instant::now()),
+                duration: None,
+                waiting_since: None,
+                expanded: false,
+            };
+            self.messages.push(DisplayMessage::new(
+                DisplayRole::ToolGroup(Box::new(group)),
+                String::new(),
+            ));
+            return;
+        }
         if let Some(msg) = self.find_tool_msg_mut(&event.id) {
             if let DisplayRole::Tool(t) = &mut msg.role {
                 t.name = Arc::clone(&event.tool);
@@ -284,6 +636,26 @@ impl MessagesPanel {
     }
 
     pub fn tool_output(&mut self, tool_id: &str, content: &str) {
+        if self.compact_tools
+            && self.messages.iter_mut().rev().any(|msg| {
+                let DisplayRole::ToolGroup(group) = &mut msg.role else {
+                    return false;
+                };
+                let Some(entry) = group.entries.iter_mut().find_map(|entry| match entry {
+                    GroupEntry::Tool(tool) if tool.id == tool_id => Some(tool),
+                    _ => None,
+                }) else {
+                    return false;
+                };
+                entry
+                    .detail
+                    .get_or_insert_with(CompactDetail::default)
+                    .live_output = Some(content.to_owned());
+                true
+            })
+        {
+            return;
+        }
         let Some(msg) = self
             .messages
             .iter_mut()
@@ -302,6 +674,59 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
+        if self.compact_tools {
+            let mut found_group = None;
+            for msg in self.messages.iter_mut().rev() {
+                if let DisplayRole::ToolGroup(g) = &mut msg.role
+                    && let Some(entry) = g.entries.iter_mut().find_map(|e| match e {
+                        GroupEntry::Tool(t) if t.id == event.id => Some(t),
+                        _ => None,
+                    })
+                {
+                    entry.status = if event.is_error {
+                        ToolStatus::Error
+                    } else {
+                        ToolStatus::Success
+                    };
+                    entry.receiving_args = false;
+                    if let Some(detail) = &mut entry.detail {
+                        detail.output = Some(Arc::clone(&event.output));
+                        detail.live_output = None;
+                        if let Some(note) = event
+                            .annotation
+                            .as_deref()
+                            .map(str::to_owned)
+                            .or_else(|| event.output.annotation())
+                        {
+                            append_annotation(&mut detail.annotation, &note);
+                        }
+                    }
+                    let dur = event
+                        .call
+                        .as_ref()
+                        .map(|c| {
+                            c.duration
+                                .max(entry.started_at.map_or(Duration::ZERO, |st| st.elapsed()))
+                        })
+                        .or_else(|| entry.started_at.map(|st| st.elapsed()));
+                    entry.duration = dur;
+                    let all_done = g.entries.iter().all(|e| match e {
+                        GroupEntry::Tool(t) => t.status != ToolStatus::InProgress,
+                        GroupEntry::Thinking(th) => !th.active,
+                    });
+                    if all_done {
+                        g.waiting_since = Some(Instant::now());
+                    }
+                    found_group = Some(g.id.clone());
+                    break;
+                }
+            }
+            if let Some(gid) = found_group {
+                self.retire_live_buf(&event.id);
+                self.rebuild_tool_group_segment(&gid);
+                return;
+            }
+        }
         let had_live_buf = self.retire_live_buf(&event.id);
         let Some(msg) = self
             .messages
@@ -317,6 +742,10 @@ impl MessagesPanel {
                 ToolStatus::Success
             };
         }
+        msg.movable = false;
+        if event.backgrounded && msg.background.is_none() {
+            msg.background = Some(BackgroundBadge::moved(&event));
+        }
         truncate_to_header(&mut msg.text);
         let done_annotation = event
             .annotation
@@ -331,7 +760,7 @@ impl MessagesPanel {
             ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text)
                 if msg.render_snapshot.is_none() =>
             {
-                if had_live_buf {
+                if had_live_buf && !event.backgrounded {
                     // The plugin streamed a body buf but no snapshot ever
                     // landed: this is the raw llm_output glitch users report.
                     warn!(
@@ -357,12 +786,74 @@ impl MessagesPanel {
         self.rebuild_tool_segment(&event.id);
     }
 
+    /// Ends a row that no `ToolDone` will reach.
+    pub fn settle_tool(&mut self, tool_id: &str, status: ToolStatus) {
+        self.retire_live_buf(tool_id);
+        self.update_tool(tool_id, |msg| {
+            if let DisplayRole::Tool(tool) = &mut msg.role {
+                tool.status = status;
+            }
+        });
+    }
+
+    pub fn set_tool_movable(&mut self, tool_id: &str, movable: bool) {
+        self.update_tool(tool_id, |msg| msg.movable = movable);
+    }
+
+    pub fn set_tool_background(&mut self, tool_id: &str, badge: BackgroundBadge) {
+        self.update_tool(tool_id, |msg| msg.background = Some(badge));
+    }
+
+    pub fn set_background_outcome(&mut self, tool_id: &str, outcome: BackgroundOutcome) {
+        self.update_tool(tool_id, |msg| {
+            if let Some(badge) = &mut msg.background {
+                badge.outcome = Some(outcome);
+            }
+        });
+    }
+
+    pub fn has_background_badge(&self, tool_id: &str) -> bool {
+        self.find_tool_msg(tool_id)
+            .is_some_and(|m| m.background.is_some())
+    }
+
+    pub fn background_badges(&self) -> Vec<BackgroundBadge> {
+        self.messages
+            .iter()
+            .filter_map(|m| m.background.clone())
+            .collect()
+    }
+
+    /// A copy of the tool's row, for a task tab that shows the same call.
+    pub fn tool_message(&self, tool_id: &str) -> Option<DisplayMessage> {
+        self.find_tool_msg(tool_id).cloned()
+    }
+
+    pub fn tool_name(&self, tool_id: &str) -> Option<Arc<str>> {
+        match &self.find_tool_msg(tool_id)?.role {
+            DisplayRole::Tool(tool) => Some(Arc::clone(&tool.name)),
+            _ => None,
+        }
+    }
+
+    /// The buf a running tool streams into, live or still watched.
+    pub fn live_buf(&self, tool_id: &str) -> Option<Arc<SharedBuf>> {
+        self.live_bufs
+            .get(tool_id)
+            .or_else(|| {
+                self.watched_bufs
+                    .iter()
+                    .find_map(|(id, watch)| (id == tool_id).then_some(watch))
+            })
+            .map(|watch| Arc::clone(watch.buf()))
+    }
+
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
         self.update_tool(tool_id, |msg| msg.text = summary.to_owned());
     }
 
-    pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
-        self.update_tool(tool_id, |msg| append_annotation(&mut msg.annotation, model));
+    pub fn annotate_tool(&mut self, tool_id: &str, note: &str) {
+        self.update_tool(tool_id, |msg| append_annotation(&mut msg.annotation, note));
     }
 
     pub fn tool_snapshot(
@@ -438,7 +929,7 @@ impl MessagesPanel {
     pub fn stream_reset(&mut self) {
         self.streaming_thinking.clear();
         self.streaming_text.clear();
-        self.thinking_collapsed = !self.show_thinking;
+        self.live_thinking_expanded = false;
         self.cancel_in_progress();
     }
 
@@ -463,12 +954,14 @@ impl MessagesPanel {
             .collect();
         for (id, tool) in ids {
             self.tool_done(ToolDoneEvent {
+                call: None,
                 id,
                 tool,
                 output: Arc::new(ToolOutput::Plain(message.clone().into())),
                 is_error: true,
                 annotation: None,
                 written_path: None,
+                backgrounded: false,
             });
         }
     }
@@ -496,15 +989,109 @@ impl MessagesPanel {
             self.retire_live_buf(id);
             self.rebuild_tool_segment(id);
         }
+
+        if self.compact_tools {
+            if let Some(DisplayMessage {
+                role: DisplayRole::ToolGroup(g),
+                ..
+            }) = self.messages.last()
+                && !g.sealed
+                && g.entries.is_empty()
+            {
+                self.messages.pop();
+                self.cache.clear();
+            }
+            let mut affected_groups = Vec::new();
+            let mut cancelled_tools = Vec::new();
+            for msg in &mut self.messages {
+                if let DisplayRole::ToolGroup(g) = &mut msg.role {
+                    let mut changed = false;
+                    for entry in &mut g.entries {
+                        match entry {
+                            GroupEntry::Tool(t) if t.status == ToolStatus::InProgress => {
+                                t.status = ToolStatus::Error;
+                                for child in &mut t.children {
+                                    if child.status == ToolStatus::InProgress {
+                                        child.status = ToolStatus::Error;
+                                        child.duration = child.duration.or_else(|| {
+                                            child.started_at.map(|start| start.elapsed())
+                                        });
+                                    }
+                                }
+                                cancelled_tools.push(t.id.clone());
+                                changed = true;
+                            }
+                            GroupEntry::Thinking(th) if th.active => {
+                                th.active = false;
+                                if th.duration.is_none() {
+                                    th.duration = th.started_at.map(|st| st.elapsed());
+                                }
+                                changed = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !g.sealed {
+                        g.sealed = true;
+                        g.waiting_since = None;
+                        if g.duration.is_none() {
+                            g.duration = g.started_at.map(|st| st.elapsed());
+                        }
+                        changed = true;
+                    }
+                    if changed {
+                        affected_groups.push(g.id.clone());
+                    }
+                }
+            }
+            for id in cancelled_tools {
+                self.retire_live_buf(&id);
+            }
+            for gid in affected_groups {
+                self.rebuild_tool_group_segment(&gid);
+            }
+        }
     }
 
     pub fn in_progress_count(&self) -> usize {
         self.messages
             .iter()
-            .filter(
-                |m| matches!(&m.role, DisplayRole::Tool(t) if t.status == ToolStatus::InProgress),
-            )
-            .count()
+            .map(|m| match &m.role {
+                DisplayRole::Tool(t) if t.status == ToolStatus::InProgress => 1,
+                DisplayRole::ToolGroup(g) => g
+                    .entries
+                    .iter()
+                    .filter(|e| match e {
+                        GroupEntry::Tool(t) => t.status == ToolStatus::InProgress,
+                        GroupEntry::Thinking(th) => th.active,
+                    })
+                    .count(),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    pub fn current_turn_thinking_ms(&self) -> Option<u64> {
+        let mut sum_ms = 0u64;
+        let mut has_thinking = false;
+        for msg in self.messages.iter().rev() {
+            if matches!(msg.role, DisplayRole::Notice) {
+                break;
+            }
+            if let DisplayRole::ToolGroup(g) = &msg.role {
+                for entry in &g.entries {
+                    if let GroupEntry::Thinking(th) = entry {
+                        has_thinking = true;
+                        let dur = th
+                            .duration
+                            .or_else(|| th.started_at.map(|st| st.elapsed()))
+                            .map_or(0, |d| d.as_millis() as u64);
+                        sum_ms += dur;
+                    }
+                }
+            }
+        }
+        if has_thinking { Some(sum_ms) } else { None }
     }
 
     #[cfg(test)]
@@ -538,9 +1125,17 @@ impl MessagesPanel {
         self.messages.len()
     }
 
+    pub fn messages(&self) -> &[DisplayMessage] {
+        &self.messages
+    }
+
     #[cfg(test)]
     pub fn message_at(&self, index: usize) -> Option<&DisplayMessage> {
         self.messages.get(index)
+    }
+
+    pub fn has_user_message(&self) -> bool {
+        self.messages.iter().any(|m| m.role == DisplayRole::User)
     }
 
     pub fn last_message_text(&self) -> &str {
@@ -593,19 +1188,25 @@ impl MessagesPanel {
         self.prompt_progress = None;
     }
 
-    pub fn flush(&mut self) {
-        self.flush_thinking();
-        self.prompt_progress = None;
+    fn flush_streaming_text(&mut self) {
         if !self.streaming_text.is_empty() {
-            self.messages.push(DisplayMessage::new(
-                DisplayRole::Assistant,
-                self.streaming_text.take_all(),
-            ));
+            let text = self.streaming_text.take_all();
+            if !text.trim().is_empty() {
+                self.messages
+                    .push(DisplayMessage::new(DisplayRole::Assistant, text));
+            }
         }
     }
 
+    pub fn flush(&mut self) {
+        self.seal_open_group();
+        self.flush_thinking();
+        self.prompt_progress = None;
+        self.flush_streaming_text();
+    }
+
     fn layout(&self) -> Layout<'_> {
-        Layout::new(&self.cache, &self.tail, self.viewport_width)
+        Layout::new(&self.cache, self.viewport_width)
     }
 
     /// Positive scrolls up. Clamping is immediate rather than deferred to the
@@ -676,7 +1277,145 @@ impl MessagesPanel {
         self.accent.set(color);
     }
 
-    pub fn handle_click(&mut self, row: u16, area: Rect) -> bool {
+    /// {col} is the screen column, for the right-aligned move hint.
+    pub fn handle_click(&mut self, row: u16, col: u16, area: Rect) -> ClickOutcome {
+        if self.try_expand_compact_group(row, area) {
+            return ClickOutcome::Handled;
+        }
+        if let Some(target) = self.compact_target_at(row, area) {
+            return ClickOutcome::OpenCompact(target);
+        }
+        self.tool_target_at(row, col, area)
+            .unwrap_or_else(|| self.toggle_click(row, area))
+    }
+
+    /// Expands hidden rows in a compact tool group if the clicked line is the hidden count notice.
+    pub fn try_expand_compact_group(&mut self, row: u16, area: Rect) -> bool {
+        if !self.compact_tools || area.height == 0 {
+            return false;
+        }
+        let pos = self
+            .layout()
+            .advance(self.scroll, u32::from(row.saturating_sub(area.y)));
+        if pos.seg >= self.live_start {
+            return false;
+        }
+        let Some(seg) = self.cache.get(pos.seg) else {
+            return false;
+        };
+        let Some(group_id) = seg.tool_id.as_deref() else {
+            return false;
+        };
+        let Some(line) = seg.source_line_at(pos.row, self.viewport_width) else {
+            return false;
+        };
+        if line != 1 {
+            return false;
+        }
+        let Some(msg) = self
+            .messages
+            .iter_mut()
+            .rfind(|m| matches!(&m.role, DisplayRole::ToolGroup(g) if g.id == group_id))
+        else {
+            return false;
+        };
+        let DisplayRole::ToolGroup(group) = &mut msg.role else {
+            return false;
+        };
+        if group.expanded || group.entries.len() <= self.compact_lines {
+            return false;
+        }
+        group.expanded = true;
+        let group_id = group_id.to_owned();
+        self.rebuild_tool_group_segment(&group_id);
+        true
+    }
+
+    /// The compact row under a click. The title row is the group itself and
+    /// opens nothing; every row under it is one call, a batch child included.
+    pub fn compact_target_at(&self, row: u16, area: Rect) -> Option<CompactTarget> {
+        if !self.compact_tools || area.height == 0 {
+            return None;
+        }
+        let pos = self
+            .layout()
+            .advance(self.scroll, u32::from(row.saturating_sub(area.y)));
+        if pos.seg >= self.live_start {
+            return None;
+        }
+        let seg = self.cache.get(pos.seg)?;
+        let group_id = seg.tool_id.as_deref()?;
+        let msg = self
+            .messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::ToolGroup(g) if g.id == group_id))?;
+        let DisplayRole::ToolGroup(group) = &msg.role else {
+            return None;
+        };
+        let line = seg.source_line_at(pos.row, self.viewport_width)?;
+        if line == 0 {
+            return None;
+        }
+        let hidden = if group.expanded {
+            0
+        } else {
+            group.entries.len().saturating_sub(self.compact_lines)
+        };
+        let mut cursor = 1 + usize::from(hidden > 0);
+        for (entry_idx, entry) in group.entries.iter().enumerate().skip(hidden) {
+            let rows = match entry {
+                GroupEntry::Tool(tool) => 1 + tool.children.len(),
+                GroupEntry::Thinking(_) => 1,
+            };
+            if (cursor..cursor + rows).contains(&line) {
+                return Some(CompactTarget {
+                    group_id: group_id.to_owned(),
+                    entry: entry_idx,
+                    child: line.checked_sub(cursor + 1),
+                });
+            }
+            cursor += rows;
+        }
+        None
+    }
+
+    /// The click a row takes when it targets no task, for a moved row whose
+    /// task is gone.
+    pub fn toggle_click(&mut self, row: u16, area: Rect) -> ClickOutcome {
+        if self.toggle_at(row, area) {
+            ClickOutcome::Handled
+        } else {
+            ClickOutcome::None
+        }
+    }
+
+    /// A moved row opens its task from anywhere on it. On a running row only
+    /// the hint moves that one call, so the rest of the row keeps its clicks.
+    fn tool_target_at(&self, row: u16, col: u16, area: Rect) -> Option<ClickOutcome> {
+        if area.height == 0 {
+            return None;
+        }
+        let pos = self
+            .layout()
+            .advance(self.scroll, u32::from(row.saturating_sub(area.y)));
+        if pos.seg >= self.live_start {
+            return None;
+        }
+        let seg = self.cache.get(pos.seg)?;
+        let tool_id = seg.tool_id.as_deref()?;
+        let msg = self.find_tool_msg(tool_id)?;
+        if let Some(badge) = &msg.background {
+            return Some(ClickOutcome::OpenTask(badge.id.clone()));
+        }
+        let col = col.checked_sub(area.x)?;
+        (pos.row == 0 && hint_columns(seg.lines().first()?)?.contains(&col))
+            .then(|| ClickOutcome::MoveCall(tool_id.to_owned()))
+    }
+
+    fn toggle_at(&mut self, row: u16, area: Rect) -> bool {
+        if self.try_expand_compact_group(row, area) {
+            return true;
+        }
         if area.height == 0 {
             return false;
         }
@@ -684,19 +1423,26 @@ impl MessagesPanel {
             .layout()
             .advance(self.scroll, u32::from(row.saturating_sub(area.y)));
         let width = self.viewport_width;
-        // Both fallbacks toggle thinking: a position past the cached segments
-        // belongs to the still-streaming indicator, and a segment without a
-        // tool_id is a finished message's text.
+        if pos.seg >= self.live_start {
+            return self.try_toggle_live_thinking(pos);
+        }
         let Some(seg) = self.cache.get(pos.seg) else {
-            return self.try_toggle_collapsed_thinking(pos);
+            return false;
         };
         if !seg.images.is_empty() && pos.row >= seg.text_height(width) {
             return false;
         }
         let Some(tool_id) = seg.tool_id.as_deref() else {
-            let msg_idx = seg.msg_index;
-            return self.try_toggle_cached_thinking(msg_idx, width);
+            return self.try_toggle_cached_thinking(pos.seg, width)
+                || self.try_toggle_cached_notice(pos.seg, width);
         };
+        // A moved row draws only its header, so there is nothing to unfold.
+        if self
+            .find_tool_msg(tool_id)
+            .is_some_and(|msg| msg.background.is_some())
+        {
+            return false;
+        }
 
         if self.has_snapshot(tool_id) {
             let buf_row = seg
@@ -757,11 +1503,6 @@ impl MessagesPanel {
         true
     }
 
-    #[cfg(test)]
-    pub fn toggle_expansion_at(&mut self, row: u16, area: Rect) -> bool {
-        self.handle_click(row, area)
-    }
-
     fn rebuild_expanded_tool(&mut self, tool_id: &str) {
         if segment::is_instruction_segment(tool_id) {
             if let Some(parent_id) = segment::instruction_parent(tool_id)
@@ -795,24 +1536,28 @@ impl MessagesPanel {
     }
 
     pub fn cadence(&self) -> Cadence {
-        // Collapsed thinking draws a line count, not the text, so its
-        // typewriter reveals nothing and never advances either, since only
-        // `view` ticks it. Believing it would pin the loop at full frame rate
-        // for the whole reasoning phase.
         let smooth = self.streaming_text.is_animating()
             || self.accent.is_animating()
-            || (self.streaming_thinking.is_animating() && !self.streaming_thinking_collapsed());
+            || (self.streaming_thinking.is_animating()
+                && thinking::reveals_text(self.thinking_lines, self.live_thinking_expanded));
+        let compact_animating = self.compact_tools
+            && self
+                .messages
+                .last()
+                .is_some_and(|m| matches!(&m.role, DisplayRole::ToolGroup(g) if !g.sealed));
         Cadence::any([
             // A running tool draws a spinner. Its output arriving is data, and
             // `tick` reports that separately.
-            Cadence::when(self.in_progress_count() > 0, Cadence::SPINNER),
+            Cadence::when(
+                self.in_progress_count() > 0 || compact_animating,
+                Cadence::SPINNER,
+            ),
+            // A moved row's elapsed time only changes once a second, and it
+            // may tick for hours.
+            self.elapsed_due().map_or(Cadence::IDLE, Cadence::clock),
             Cadence::when(smooth, Cadence::SMOOTH),
             Cadence::when(self.show_idle_splash(), self.idle_splash.cadence()),
         ])
-    }
-
-    fn streaming_thinking_collapsed(&self) -> bool {
-        self.thinking_collapsed && !self.streaming_thinking.is_empty()
     }
 
     fn show_idle_splash(&self) -> bool {
@@ -861,9 +1606,11 @@ impl MessagesPanel {
         area: Rect,
         has_selection: bool,
         images_visible: bool,
+        lua_commands: &[LuaCommandInfo],
     ) {
         self.viewport_height = area.height;
-        let width = area.width.saturating_sub(1);
+        let pad_left = u16::from(area.width >= 2);
+        let width = area.width.saturating_sub(1 + pad_left);
         let theme_gen = theme::generation();
         let theme_changed = self.theme_generation != theme_gen;
         let needs_reflow = self.viewport_width != width || theme_changed;
@@ -875,12 +1622,13 @@ impl MessagesPanel {
             self.rebake_stale_snapshots(theme_gen);
         }
 
+        // Last frame's streaming segments go first. Otherwise a message that
+        // `flush` just committed would be built after them and show up twice.
+        self.cache.truncate(self.live_start);
         if self.show_idle_splash() {
-            // Every other exit rebuilds the tail; this one has to drop it, or
-            // `Layout` keeps answering with rows nothing draws any more.
-            self.tail.clear();
             let accent = self.accent.resolve();
-            self.idle_splash.render(area, frame.buffer_mut(), accent);
+            self.idle_splash
+                .render(area, frame.buffer_mut(), accent, lua_commands);
             return;
         }
 
@@ -900,16 +1648,24 @@ impl MessagesPanel {
             );
         }
         self.rebuild_line_cache();
-        if self.in_progress_count() > 0 {
+        let compact_animating = self.compact_tools
+            && self
+                .messages
+                .last()
+                .is_some_and(|m| matches!(&m.role, DisplayRole::ToolGroup(g) if !g.sealed));
+        if self.in_progress_count() > 0 || compact_animating || self.elapsed_due().is_some() {
+            if self.compact_tools
+                && let Some(gid) = self.messages.iter().rev().find_map(|m| match &m.role {
+                    DisplayRole::ToolGroup(g) if !g.sealed => Some(g.id.clone()),
+                    _ => None,
+                })
+            {
+                self.rebuild_tool_group_segment(&gid);
+            }
             self.update_spinners();
         }
 
-        let collapsed_thinking_lines = if self.streaming_thinking_collapsed() {
-            self.build_streaming_collapsed_lines()
-        } else {
-            Vec::new()
-        };
-        self.tail = self.build_tail(width, &collapsed_thinking_lines);
+        self.rebuild_live_segments(width);
 
         // The reflow window is picked from `scroll` and the bottom pin, and
         // the reflow changes the heights both are derived from: resolve
@@ -918,7 +1674,7 @@ impl MessagesPanel {
         self.reflow_viewport(width);
         self.resolve_scroll(has_selection);
 
-        let viewport = Rect::new(area.x, area.y, width, area.height);
+        let viewport = Rect::new(area.x + pad_left, area.y, width, area.height);
         let mut cursor = RenderCursor::new(self.scroll.row, viewport);
 
         let mut last_drawn = self.scroll.seg;
@@ -932,36 +1688,19 @@ impl MessagesPanel {
             if cursor.past_bottom() {
                 break;
             }
-            let h = seg.text_height(width);
             let highlight = self.highlight_segment == Some(i);
-            let style = seg.tool_id.as_ref().map(|_| theme::current().tool_bg);
-            cursor.render(seg.lines(), h, style, highlight, frame);
+            let style = if seg.is_user {
+                Some(theme::current().user_bg)
+            } else {
+                None
+            };
+            cursor.render_segment(seg, style, highlight, frame);
             for image in &mut seg.images {
                 cursor.render_image(image, self.image_picker.as_ref(), images_visible, frame);
             }
             last_drawn = i;
         }
         self.release_images_outside(last_drawn);
-
-        let spacer_lines: [Line<'static>; 1] = [Line::default()];
-        for &(part, h) in self
-            .tail
-            .iter()
-            .skip(self.scroll.seg.saturating_sub(self.cache.len()))
-        {
-            if cursor.past_bottom() {
-                break;
-            }
-            let lines = match part {
-                TailPart::Spacer => &spacer_lines[..],
-                TailPart::Thinking if !collapsed_thinking_lines.is_empty() => {
-                    &collapsed_thinking_lines
-                }
-                TailPart::Thinking => self.streaming_thinking.cached_lines(),
-                TailPart::Text => self.streaming_text.cached_lines(),
-            };
-            cursor.render(lines, h, None, false, frame);
-        }
 
         if let Some(pp) = self.prompt_progress
             && pp.total > 0
@@ -971,7 +1710,7 @@ impl MessagesPanel {
             let label = " Processing ";
             let label_width = label.len() as u16;
             let total_width = label_width + bar_width;
-            let bar_x = area.x + width.saturating_sub(total_width);
+            let bar_x = viewport.x + width.saturating_sub(total_width);
             let bar_y = area.y + area.height.saturating_sub(1);
             let bar_area = Rect::new(bar_x, bar_y, total_width, 1);
             crate::components::progress_bar::render(
@@ -1001,37 +1740,37 @@ impl MessagesPanel {
         }
     }
 
-    /// The streaming tail, in the same order and under the same spacer rule
-    /// `rebuild_line_cache` uses when the turn flushes. A [`ScrollPos`] in the
-    /// tail keeps pointing at the same content across that flush only while
-    /// the two agree, so anything added here needs its segment there.
-    fn build_tail(
-        &mut self,
-        width: u16,
-        collapsed_thinking: &[Line<'static>],
-    ) -> Vec<(TailPart, u16)> {
-        let has_cached = self.cache.len() > 0;
-        let mut tail: Vec<(TailPart, u16)> = Vec::new();
-        // Mirrors `SegmentCache::push_spacer_if_needed`: a part is separated
-        // from whatever precedes it in the document.
-        let mut push = |part, height| {
-            if has_cached || !tail.is_empty() {
-                tail.push((TailPart::Spacer, 1));
-            }
-            tail.push((part, height));
-        };
-
-        if self.streaming_thinking_collapsed() {
-            push(TailPart::Thinking, collapsed_thinking.len() as u16);
-        } else if !self.streaming_thinking.is_empty() {
-            let h = wrap::total_rows(self.streaming_thinking.render_lines(width), width);
-            push(TailPart::Thinking, h);
+    /// Same order and spacers as `rebuild_line_cache` builds once they flush,
+    /// so a [`ScrollPos`] still points at the same text after the flush.
+    fn rebuild_live_segments(&mut self, width: u16) {
+        self.live_start = self.cache.len();
+        if !self.streaming_thinking.is_empty() {
+            let collapsed = thinking::collapsed_view(
+                thinking::tail_rows(self.thinking_lines, self.live_thinking_expanded),
+                self.streaming_thinking.line_count(),
+                CLICKABLE,
+                |rows| {
+                    self.streaming_thinking
+                        .render_tail(rows, width)
+                        .map(<[_]>::to_vec)
+                },
+            );
+            let drawn_collapsed = collapsed.is_some();
+            let lines =
+                collapsed.unwrap_or_else(|| self.streaming_thinking.render_lines(width).to_vec());
+            self.push_live_segment(lines, drawn_collapsed);
         }
         if !self.streaming_text.is_empty() {
-            let h = wrap::total_rows(self.streaming_text.render_lines(width), width);
-            push(TailPart::Text, h);
+            let lines = self.streaming_text.render_lines(width).to_vec();
+            self.push_live_segment(lines, false);
         }
-        tail
+    }
+
+    fn push_live_segment(&mut self, lines: Vec<Line<'static>>, collapsed: bool) {
+        self.cache.push_spacer_if_needed();
+        let mut seg = Segment::with_lines(lines, None);
+        seg.truncation.output = collapsed;
+        self.cache.push(seg);
     }
 
     pub fn scroll_pos(&self) -> ScrollPos {
@@ -1148,13 +1887,15 @@ impl MessagesPanel {
     /// watched set keeps what `tick` polls bounded.
     /// Returns whether a live buf existed for this id.
     fn retire_live_buf(&mut self, id: &str) -> bool {
-        let Some(buf) = self.live_bufs.remove(id) else {
+        let Some(mut watch) = self.live_bufs.remove(id) else {
             return false;
         };
-        if let Some(lines) = buf.read_if_dirty() {
-            self.store_snapshot(id, BufferSnapshot::from_arc(lines), false, None);
+        if let Some(snapshot) = watch.changed() {
+            self.store_snapshot(id, snapshot, false, None);
         }
-        self.watched_bufs.push_back((id.to_owned(), buf));
+        // A part's tab registers the same buf again on every report.
+        self.watched_bufs.retain(|(watched, _)| watched != id);
+        self.watched_bufs.push_back((id.to_owned(), watch));
         if self.watched_bufs.len() > WARM_TOOL_CAP {
             self.watched_bufs.pop_front();
         }
@@ -1251,10 +1992,73 @@ impl MessagesPanel {
         theme_gen: Option<u64>,
     ) {
         if theme_gen.is_some() {
-            // A generation only comes with restore replies. The restore
-            // superseded the old live view (and evicted the runtime's
-            // warm handle), so its buf must not overwrite this snapshot.
             self.stop_watching(tool_id);
+        }
+        if self.compact_tools {
+            let group_id = self.messages.iter_mut().rev().find_map(|msg| {
+                let DisplayRole::ToolGroup(group) = &mut msg.role else {
+                    return None;
+                };
+                let entry = group.entries.iter_mut().find_map(|entry| match entry {
+                    GroupEntry::Tool(tool) if tool.id == tool_id => Some(tool),
+                    _ => None,
+                })?;
+                if is_header {
+                    let header = snapshot.first_line_text();
+                    if !header.is_empty() {
+                        entry.summary = header;
+                    }
+                    entry
+                        .detail
+                        .get_or_insert_with(CompactDetail::default)
+                        .render_header = Some(snapshot.clone());
+                    return Some(group.id.clone());
+                }
+                entry
+                    .detail
+                    .get_or_insert_with(CompactDetail::default)
+                    .render_snapshot = Some(snapshot.clone());
+                if entry.name.as_ref() != tool_group::BATCH_TOOL {
+                    return Some(group.id.clone());
+                }
+                let mut children = tool_group::batch_children(&snapshot, entry.raw_input.as_ref());
+                for (index, child) in children.iter_mut().enumerate() {
+                    let previous = entry
+                        .children
+                        .get(index)
+                        .filter(|old| old.name == child.name);
+                    child.started_at = previous.and_then(|old| old.started_at);
+                    if child.status == ToolStatus::InProgress {
+                        child.started_at.get_or_insert_with(Instant::now);
+                    } else if child.duration.is_none() {
+                        child.duration = previous
+                            .and_then(|old| old.duration)
+                            .or_else(|| child.started_at.map(|start| start.elapsed()));
+                    }
+                }
+                if entry.status == ToolStatus::Error {
+                    for child in &mut children {
+                        if child.status == ToolStatus::InProgress {
+                            child.status = ToolStatus::Error;
+                        }
+                    }
+                }
+                if !children.is_empty() {
+                    if entry.duration.is_none() && entry.status != ToolStatus::InProgress {
+                        entry.duration = children.iter().filter_map(|child| child.duration).max();
+                    }
+                    entry.children = children;
+                    entry.summary = tool_group::update_batch_compact_summary(
+                        &entry.summary,
+                        entry.children.len(),
+                    );
+                }
+                Some(group.id.clone())
+            });
+            if let Some(group_id) = group_id {
+                self.rebuild_tool_group_segment(&group_id);
+                return;
+            }
         }
         let Some(applied_gen) = self.resolve_snapshot_gen(tool_id, theme_gen) else {
             return;
@@ -1276,6 +2080,12 @@ impl MessagesPanel {
         }
     }
 
+    fn find_tool_msg(&self, tool_id: &str) -> Option<&DisplayMessage> {
+        self.messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+    }
+
     fn find_tool_msg_mut(&mut self, tool_id: &str) -> Option<&mut DisplayMessage> {
         self.messages
             .iter_mut()
@@ -1291,7 +2101,13 @@ impl MessagesPanel {
     }
 
     pub fn register_live_buf(&mut self, id: String, body: Arc<SharedBuf>) {
-        self.live_bufs.insert(id, body);
+        let mut watch = BufWatch::new(body);
+        if self.find_tool_msg(&id).is_some()
+            && let Some(snapshot) = watch.changed()
+        {
+            self.store_snapshot(&id, snapshot, false, None);
+        }
+        self.live_bufs.insert(id, watch);
     }
 
     /// Snapshots are baked at the last width `view` saw, and a resize
@@ -1300,13 +2116,17 @@ impl MessagesPanel {
     fn poll_live_bufs(&mut self) -> Dirty {
         let updated: Vec<_> = self
             .live_bufs
-            .iter()
-            .chain(self.watched_bufs.iter().map(|(id, buf)| (id, buf)))
-            .filter_map(|(id, buf)| buf.read_if_dirty().map(|lines| (id.clone(), lines)))
+            .iter_mut()
+            .chain(
+                self.watched_bufs
+                    .iter_mut()
+                    .map(|(id, watch)| (&*id, watch)),
+            )
+            .filter_map(|(id, watch)| watch.changed().map(|snapshot| (id.clone(), snapshot)))
             .collect();
         let dirty = Dirty::from(!updated.is_empty());
-        for (tool_id, lines) in updated {
-            self.store_snapshot(&tool_id, BufferSnapshot::from_arc(lines), false, None);
+        for (tool_id, snapshot) in updated {
+            self.store_snapshot(&tool_id, snapshot, false, None);
         }
         dirty
     }
@@ -1318,15 +2138,14 @@ impl MessagesPanel {
         exp: SectionFlags,
     ) -> ToolLines {
         let mut tl = build_tool_lines(msg, status, rctx, exp);
-        if let Some(ts) = &msg.timestamp
-            && !tl.lines.is_empty()
-        {
-            append_right_info(
-                &mut tl.lines[0],
-                msg.turn_usage.as_deref(),
-                Some(ts),
-                rctx.width,
-            );
+        if let Some(header) = tl.lines.first_mut() {
+            let running = status == ToolStatus::InProgress;
+            let hint = (msg.movable && running).then_some(MOVABLE_HINT);
+            let usage = msg
+                .turn_usage
+                .as_deref()
+                .filter(|_| msg.timestamp.is_some());
+            append_right_info(header, hint, usage, msg.timestamp.as_deref(), rctx.width);
         }
         tl
     }
@@ -1337,89 +2156,82 @@ impl MessagesPanel {
         }
         let mut msg =
             DisplayMessage::new(DisplayRole::Thinking, self.streaming_thinking.take_all());
-        msg.thinking_collapsed = self.thinking_collapsed;
-        self.thinking_collapsed = !self.show_thinking;
+        msg.thinking_expanded = mem::take(&mut self.live_thinking_expanded);
         self.messages.push(msg);
     }
 
-    fn build_streaming_collapsed_lines(&self) -> Vec<Line<'static>> {
-        thinking_indicator(self.streaming_thinking.line_count(), true)
-    }
-
-    fn build_cached_thinking_indicator(&self, text: &str) -> Vec<Line<'static>> {
-        thinking_indicator(logical_line_count(text), true)
-    }
-
-    /// `pos` is past the cached segments, so it names a tail part: the click
-    /// toggles only when that part is the collapsed thinking indicator.
-    fn try_toggle_collapsed_thinking(&mut self, pos: ScrollPos) -> bool {
-        let part = pos
-            .seg
-            .checked_sub(self.cache.len())
-            .and_then(|i| self.tail.get(i))
-            .map(|&(p, _)| p);
-        if part != Some(TailPart::Thinking) || !self.streaming_thinking_collapsed() {
+    fn try_toggle_live_thinking(&mut self, pos: ScrollPos) -> bool {
+        // Thinking is always the first live segment, so it sits right after
+        // the spacer that separates it from whatever came before.
+        let thinking_seg = self.live_start + usize::from(self.live_start > 0);
+        if pos.seg != thinking_seg || self.streaming_thinking.is_empty() {
             return false;
         }
-        self.thinking_collapsed = false;
+        let drawn_collapsed = self.cache.get(pos.seg).is_some_and(|s| s.truncation.output);
+        if !thinking::click_toggles(self.live_thinking_expanded, drawn_collapsed) {
+            return false;
+        }
+        self.live_thinking_expanded = !self.live_thinking_expanded;
         true
     }
 
-    fn try_toggle_cached_thinking(&mut self, msg_idx: Option<usize>, width: u16) -> bool {
-        if self.show_thinking {
-            return false;
-        }
-        let Some(idx) = msg_idx else { return false };
-        let Some(msg) = self.messages.get_mut(idx) else {
+    fn try_toggle_cached_thinking(&mut self, seg_idx: usize, width: u16) -> bool {
+        let Some(seg) = self.cache.get(seg_idx) else {
             return false;
         };
-        if !matches!(msg.role, DisplayRole::Thinking) {
-            return false;
-        }
-        msg.thinking_collapsed = !msg.thinking_collapsed;
-        self.rebuild_thinking_segment(idx, width);
-        true
-    }
-
-    fn rebuild_thinking_segment(&mut self, msg_idx: usize, width: u16) {
-        let Some((text, collapsed)) = self
-            .messages
-            .get(msg_idx)
-            .map(|m| (m.text.clone(), m.thinking_collapsed))
+        let drawn_collapsed = seg.truncation.output;
+        let Some(msg) = seg
+            .msg_index
+            .and_then(|idx| self.messages.get_mut(idx))
+            .filter(|m| matches!(m.role, DisplayRole::Thinking))
         else {
-            return;
+            return false;
         };
-        let lines = if collapsed {
-            self.build_cached_thinking_indicator(&text)
-        } else {
-            let style = thinking_style();
-            text_to_lines(
-                &text,
-                style.prefix,
-                style.text_style,
-                style.prefix_style,
-                width,
-                None,
-            )
+        if !thinking::click_toggles(msg.thinking_expanded, drawn_collapsed) {
+            return false;
+        }
+        msg.thinking_expanded = !msg.thinking_expanded;
+        self.reflow_text_segment(seg_idx, width);
+        true
+    }
+
+    fn try_toggle_cached_notice(&mut self, seg_idx: usize, width: u16) -> bool {
+        let msg_index = self.cache.get(seg_idx).and_then(|seg| seg.msg_index);
+        let Some(msg) = msg_index
+            .and_then(|idx| self.messages.get_mut(idx))
+            .filter(|m| matches!(m.role, DisplayRole::Notice) && m.detail.is_some())
+        else {
+            return false;
         };
-        let seg_idx = self
-            .cache
+        msg.detail_expanded = !msg.detail_expanded;
+        self.reflow_text_segment(seg_idx, width);
+        true
+    }
+
+    fn elapsed_due(&self) -> Option<Duration> {
+        self.cache
             .segments()
             .iter()
-            .position(|s| s.msg_index == Some(msg_idx) && s.tool_id.is_none());
-        let Some(seg_idx) = seg_idx else { return };
-        if let Some(seg) = self.cache.get_mut(seg_idx) {
-            seg.set_lines(lines);
-        }
+            .filter_map(Segment::elapsed_due)
+            .min()
     }
 
     fn update_spinners(&mut self) {
-        let spinner_span = Span::styled(
-            spinner_str(self.started_at.elapsed().as_millis()),
-            theme::current().spinner,
-        );
+        let elapsed = self.started_at.elapsed().as_millis();
+        let spinner_span = Span::styled(spinner_str(elapsed), theme::current().spinner);
+        let (frame, style) = tool_group::busy_spinner_frame(elapsed);
+        let group_spinner_span = Span::styled(format!("{frame} "), style);
         for seg in self.cache.segments_mut() {
-            seg.update_spinners(&spinner_span);
+            let is_group = seg
+                .msg_index
+                .and_then(|index| self.messages.get(index))
+                .is_some_and(|msg| matches!(&msg.role, DisplayRole::ToolGroup(_)));
+            seg.update_spinners(if is_group {
+                &group_spinner_span
+            } else {
+                &spinner_span
+            });
+            seg.update_elapsed();
         }
     }
 
@@ -1440,17 +2252,21 @@ impl MessagesPanel {
     }
 
     fn rebuild_tool_segment(&mut self, tool_id: &str) {
-        let Some(msg) = self
-            .messages
-            .iter()
-            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
-        else {
+        let Some(msg) = self.messages.iter().rfind(|m| match &m.role {
+            DisplayRole::Tool(t) => t.id == tool_id,
+            DisplayRole::ToolGroup(g) => g.id == tool_id,
+            _ => false,
+        }) else {
             return;
         };
-        let DisplayRole::Tool(t) = &msg.role else {
-            unreachable!()
+        let status = match &msg.role {
+            DisplayRole::Tool(t) => t.status,
+            DisplayRole::ToolGroup(_) => {
+                self.rebuild_tool_group_segment(tool_id);
+                return;
+            }
+            _ => unreachable!(),
         };
-        let status = t.status;
         let Some(seg_idx) = self.cache.find_by_tool_id(tool_id) else {
             return;
         };
@@ -1475,6 +2291,30 @@ impl MessagesPanel {
         if let Some(blocks) = instructions {
             self.upsert_instruction_segment(tool_id, &blocks);
         }
+    }
+
+    fn rebuild_tool_group_segment(&mut self, group_id: &str) {
+        let Some(msg) = self
+            .messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::ToolGroup(g) if g.id == group_id))
+        else {
+            return;
+        };
+        let DisplayRole::ToolGroup(g) = &msg.role else {
+            return;
+        };
+        let Some(seg_idx) = self.cache.find_by_tool_id(group_id) else {
+            return;
+        };
+        let tl = tool_group::build_tool_group_lines(
+            g,
+            self.viewport_width,
+            self.started_at.elapsed().as_millis(),
+            self.compact_lines,
+        );
+        let seg = self.cache.get_mut(seg_idx).unwrap();
+        seg.update_with_reuse(tl, &self.hl_worker);
     }
 
     fn rebuild_line_cache(&mut self) {
@@ -1503,17 +2343,26 @@ impl MessagesPanel {
                 if let Some(blocks) = blocks {
                     self.upsert_instruction_segment(&id, &blocks);
                 }
+            } else if let DisplayRole::ToolGroup(g) = &msg.role {
+                let tl = tool_group::build_tool_group_lines(
+                    g,
+                    self.viewport_width,
+                    self.started_at.elapsed().as_millis(),
+                    self.compact_lines,
+                );
+                let id = g.id.clone();
+                self.cache.push_spacer_if_needed();
+                let mut seg = Segment::with_tool(id);
+                seg.msg_index = Some(i);
+                seg.apply_highlight(tl, &self.hl_worker);
+                self.cache.push(seg);
             } else {
-                if matches!(&msg.role, DisplayRole::Thinking) && msg.thinking_collapsed {
-                    let text = msg.text.clone();
-                    let lines = self.build_cached_thinking_indicator(&text);
-                    self.cache.push_spacer_if_needed();
-                    self.cache.push(Segment::with_lines(lines, Some(i)));
-                    continue;
-                }
-                let lines = build_message_lines(msg, self.viewport_width);
+                let (lines, truncated) =
+                    message_view(msg, self.thinking_lines, self.viewport_width);
                 self.cache.push_spacer_if_needed();
                 let mut seg = Segment::with_lines(lines, Some(i));
+                seg.is_user = matches!(msg.role, DisplayRole::User);
+                seg.truncation.output = truncated;
                 seg.set_images(message_images(msg));
                 self.cache.push(seg);
             }
@@ -1553,8 +2402,6 @@ impl MessagesPanel {
         let below = viewport
             .saturating_add(margin)
             .saturating_add(u32::from(self.scroll.row));
-        // A scroll position in the streaming tail has no segment to start
-        // from; the last cached one is the closest thing above it.
         let start = self.scroll.seg.min(self.cache.len().saturating_sub(1));
 
         self.reflow_run(start..self.cache.len(), below, width);
@@ -1592,31 +2439,14 @@ impl MessagesPanel {
             return;
         };
         seg.stale = false;
-        let (tool_id, msg_idx) = (seg.tool_id.clone(), seg.msg_index);
-
-        if let Some(tid) = tool_id {
-            let parent = segment::instruction_parent(&tid)
-                .map(str::to_string)
-                .unwrap_or(tid);
-            self.rebuild_tool_segment(&parent);
-            return;
-        }
-
-        let Some(msg_idx) = msg_idx else {
+        let Some(tid) = seg.tool_id.clone() else {
+            self.reflow_text_segment(seg_idx, width);
             return;
         };
-
-        let collapsed = self
-            .messages
-            .get(msg_idx)
-            .is_some_and(|m| matches!(m.role, DisplayRole::Thinking) && m.thinking_collapsed);
-        if collapsed {
-            // Geometry is width-independent, but a theme change marks segments
-            // stale too; rebuild so spans pick up the new palette.
-            self.rebuild_thinking_segment(msg_idx, width);
-        } else {
-            self.reflow_text_segment(seg_idx, width);
-        }
+        let parent = segment::instruction_parent(&tid)
+            .map(str::to_string)
+            .unwrap_or(tid);
+        self.rebuild_tool_segment(&parent);
     }
 
     fn reflow_text_segment(&mut self, seg_idx: usize, width: u16) {
@@ -1626,11 +2456,12 @@ impl MessagesPanel {
         let Some(msg) = self.messages.get(msg_idx) else {
             return;
         };
-        let lines = build_message_lines(msg, width);
+        let (lines, truncated) = message_view(msg, self.thinking_lines, width);
         let Some(seg) = self.cache.get_mut(seg_idx) else {
             return;
         };
         seg.set_lines(lines);
+        seg.truncation.output = truncated;
     }
 }
 
@@ -1656,7 +2487,8 @@ fn message_style(role: &DisplayRole) -> RoleStyle {
         DisplayRole::Thinking => thinking_style(),
         DisplayRole::Error => error_style(),
         DisplayRole::Done => done_style(),
-        DisplayRole::Tool(_) => unreachable!(),
+        DisplayRole::Notice => notice_style(),
+        DisplayRole::Tool(_) | DisplayRole::ToolGroup(_) => unreachable!(),
     }
 }
 
@@ -1669,24 +2501,66 @@ fn message_prefix(msg: &DisplayMessage, style: &RoleStyle) -> &'static str {
     }
 }
 
-/// Carries the role prefix so a query can hit either the prose or the "you>"
-/// and "thinking>" markers the reader sees. Collapsed thinking needs no case of
+/// Carries the role prefix so a query can hit either the prose or the role
+/// prefix markers the reader sees. Collapsed thinking needs no case of
 /// its own: its indicator is drawn from the same prefix.
 fn message_search_text(msg: &DisplayMessage) -> String {
     let style = message_style(&msg.role);
     format!("{}{}", message_prefix(msg, &style), msg.text)
 }
 
-fn logical_line_count(text: &str) -> usize {
-    if text.is_empty() {
-        0
+/// A non-Tool message's lines at `width`, and whether they are thinking drawn
+/// collapsed, which is what makes a click on them expand it.
+fn message_view(
+    msg: &DisplayMessage,
+    mode: ThinkingLines,
+    width: u16,
+) -> (Vec<Line<'static>>, bool) {
+    if matches!(msg.role, DisplayRole::Thinking)
+        && let Some(lines) = thinking::collapsed_view(
+            thinking::tail_rows(mode, msg.thinking_expanded),
+            thinking::line_count(&msg.text),
+            CLICKABLE,
+            |rows| thinking::render_tail(&msg.text, rows, width, thinking_style().text_style, None),
+        )
+    {
+        return (lines, true);
+    }
+    let mut lines = build_message_lines(msg, width);
+    if let Some(end) = msg.task_end
+        && let Some(first) = lines.first_mut()
+    {
+        first.spans.insert(0, outcome_glyph(end));
+    }
+    if matches!(msg.role, DisplayRole::Notice)
+        && let Some(detail) = &msg.detail
+    {
+        push_notice_detail(&mut lines, detail, msg.detail_expanded);
+    }
+    (lines, false)
+}
+
+fn push_notice_detail(lines: &mut Vec<Line<'static>>, detail: &str, expanded: bool) {
+    let style = notice_style().text_style;
+    let mark = if expanded {
+        NOTICE_EXPANDED_MARK
     } else {
-        text.bytes().filter(|&b| b == b'\n').count() + 1
+        NOTICE_COLLAPSED_MARK
+    };
+    if let Some(last) = lines.last_mut() {
+        last.spans.push(Span::styled(mark, style));
+    }
+    if expanded {
+        lines.extend(
+            detail.lines().map(|line| {
+                Line::from(Span::styled(format!("{NOTICE_DETAIL_INDENT}{line}"), style))
+            }),
+        );
     }
 }
 
-/// Builds ratatui lines for a non-Tool, non-collapsed-Thinking message at the
-/// given width. Shared by `rebuild_line_cache` (new messages) and
+/// Builds ratatui lines for a non-Tool message shown in full at the given
+/// width. Shared by `rebuild_line_cache` (new messages) and
 /// `reflow_text_segment` (stale-on-resize messages) so both paths produce
 /// identical segments.
 fn build_message_lines(msg: &DisplayMessage, width: u16) -> Vec<Line<'static>> {

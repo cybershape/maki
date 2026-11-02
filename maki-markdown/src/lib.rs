@@ -4,6 +4,7 @@
 //! `Emphasis` (bold, italic, strike). They compose freely, so `***x***` is
 //! bold+italic, and code inside bold keeps both.
 
+pub mod math;
 pub mod render;
 
 const BULLET: &str = "• ";
@@ -69,6 +70,7 @@ impl Emphasis {
 pub enum SpanKind {
     Text,
     Code,
+    Math,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,6 +93,14 @@ impl InlineSpan {
         Self {
             text: text.into(),
             kind: SpanKind::Code,
+            emphasis,
+        }
+    }
+
+    pub fn math(text: impl Into<String>, emphasis: Emphasis) -> Self {
+        Self {
+            text: text.into(),
+            kind: SpanKind::Math,
             emphasis,
         }
     }
@@ -124,28 +134,72 @@ pub enum Block {
         rows: Vec<Vec<String>>,
         header_end: usize,
     },
+    Math {
+        source: String,
+    },
 }
 
 pub fn parse(text: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
-    let mut rest = text;
-    while let Some(fence) = find_code_fence(rest) {
-        let before = rest[..fence.before_end].trim_end_matches('\n');
+    let mut fences = CodeFences { text, pos: 0 };
+    for (base, fence) in &mut fences {
+        let before = text[base..base + fence.before_end].trim_end_matches('\n');
         if !before.is_empty() {
             blocks.extend(split_normal_blocks(before));
         }
-        blocks.push(Block::Code {
-            lang: fence.lang.to_owned(),
-            code: fence.code.to_owned(),
-        });
-        let skip = fence.block_end + rest[fence.block_end..].len()
-            - rest[fence.block_end..].trim_start_matches('\n').len();
-        rest = &rest[skip..];
+        if fence.lang.eq_ignore_ascii_case("math") || fence.lang.eq_ignore_ascii_case("latex") {
+            blocks.push(Block::Math {
+                source: fence.code.to_owned(),
+            });
+        } else {
+            blocks.push(Block::Code {
+                lang: fence.lang.to_owned(),
+                code: fence.code.to_owned(),
+            });
+        }
     }
+    let rest = &text[fences.pos..];
     if !rest.is_empty() {
         blocks.extend(split_normal_blocks(rest));
     }
     blocks
+}
+
+/// Moves `offset` back to the opening fence when it lands inside a code block.
+/// Rendering from the middle of a block would turn its code into prose. It
+/// walks the same fences as [`parse`], so the two always agree on where
+/// blocks are.
+pub fn code_block_start(text: &str, offset: usize) -> usize {
+    for (base, fence) in (CodeFences { text, pos: 0 }) {
+        let open = base + fence.before_end;
+        if offset <= open {
+            break;
+        }
+        if offset < base + fence.block_end {
+            return open;
+        }
+    }
+    offset
+}
+
+/// Yields each fence with its base offset, because [`CodeFence`] positions
+/// count from where the search started, not from the start of the text.
+struct CodeFences<'a> {
+    text: &'a str,
+    pos: usize,
+}
+
+impl<'a> Iterator for CodeFences<'a> {
+    type Item = (usize, CodeFence<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let rest = &self.text[self.pos..];
+        let fence = find_code_fence(rest)?;
+        let base = self.pos;
+        let after = &rest[fence.block_end..];
+        self.pos += fence.block_end + after.len() - after.trim_start_matches('\n').len();
+        Some((base, fence))
+    }
 }
 
 fn split_normal_blocks(text: &str) -> Vec<Block> {
@@ -162,6 +216,101 @@ fn split_normal_blocks(text: &str) -> Vec<Block> {
 
     while i < lines_with_offsets.len() {
         let (_, line) = lines_with_offsets[i];
+        let trimmed = line.trim();
+
+        let is_single_line_math =
+            (trimmed.starts_with("$$") && trimmed.ends_with("$$") && trimmed.len() > 4)
+                || (trimmed.starts_with("\\[") && trimmed.ends_with("\\]") && trimmed.len() > 4);
+        if is_single_line_math {
+            if let Some(ns) = normal_start.take() {
+                let start = lines_with_offsets[ns].0;
+                let end = lines_with_offsets[i].0;
+                let slice = text[start..end].trim_matches('\n');
+                if !slice.is_empty() {
+                    blocks.push(Block::Lines(lines_to_blocks(slice)));
+                }
+            }
+            blocks.push(Block::Math {
+                source: trimmed.to_owned(),
+            });
+            i += 1;
+            continue;
+        }
+
+        if trimmed == "$$" || (trimmed.starts_with("$$") && !trimmed[2..].contains("$$")) {
+            if let Some(ns) = normal_start.take() {
+                let start = lines_with_offsets[ns].0;
+                let end = lines_with_offsets[i].0;
+                let slice = text[start..end].trim_matches('\n');
+                if !slice.is_empty() {
+                    blocks.push(Block::Lines(lines_to_blocks(slice)));
+                }
+            }
+            let mut j = i + 1;
+            let mut closed = false;
+            while j < lines_with_offsets.len() {
+                let t = lines_with_offsets[j].1.trim();
+                if t == "$$" || t.ends_with("$$") {
+                    closed = true;
+                    break;
+                }
+                j += 1;
+            }
+            let end_idx = if closed {
+                j
+            } else {
+                lines_with_offsets.len() - 1
+            };
+            let start = lines_with_offsets[i].0;
+            let end = lines_with_offsets[end_idx].0 + lines_with_offsets[end_idx].1.len();
+            blocks.push(Block::Math {
+                source: text[start..end].to_owned(),
+            });
+            i = if closed {
+                j + 1
+            } else {
+                lines_with_offsets.len()
+            };
+            continue;
+        }
+
+        if trimmed == "\\[" || (trimmed.starts_with("\\[") && !trimmed[2..].contains("\\]")) {
+            if let Some(ns) = normal_start.take() {
+                let start = lines_with_offsets[ns].0;
+                let end = lines_with_offsets[i].0;
+                let slice = text[start..end].trim_matches('\n');
+                if !slice.is_empty() {
+                    blocks.push(Block::Lines(lines_to_blocks(slice)));
+                }
+            }
+            let mut j = i + 1;
+            let mut closed = false;
+            while j < lines_with_offsets.len() {
+                let t = lines_with_offsets[j].1.trim();
+                if t == "\\]" || t.ends_with("\\]") {
+                    closed = true;
+                    break;
+                }
+                j += 1;
+            }
+            let end_idx = if closed {
+                j
+            } else {
+                lines_with_offsets.len() - 1
+            };
+            let start = lines_with_offsets[i].0;
+            let end = lines_with_offsets[end_idx].0 + lines_with_offsets[end_idx].1.len();
+            blocks.push(Block::Math {
+                source: text[start..end].to_owned(),
+            });
+            i = if closed {
+                j + 1
+            } else {
+                lines_with_offsets.len()
+            };
+            continue;
+        }
+
         if is_table_row(line) {
             let table_start = i;
             let header_cols = parse_table_cells(line).len();
@@ -517,6 +666,30 @@ fn parse_inline_impl(text: &str, base: Emphasis, mode: ParseMode) -> Vec<InlineS
             continue;
         }
 
+        if mode == ParseMode::WithCode
+            && bytes[pos] == b'$'
+            && pos + 1 < bytes.len()
+            && bytes[pos + 1] != b'$'
+            && bytes[pos + 1] != b' '
+            && !bytes[pos + 1].is_ascii_digit()
+            && let Some(close_rel) = bytes[pos + 1..].iter().position(|&b| b == b'$')
+        {
+            let close = pos + 1 + close_rel;
+            if close > pos + 1 && bytes[close - 1] != b' ' {
+                let content = &text[pos + 1..close];
+                if !content.is_empty() {
+                    flush_plain(&mut spans, &text[plain_start..pos], base, mode);
+                    spans.push(InlineSpan::math(
+                        crate::math::linearize_latex(content),
+                        base,
+                    ));
+                    pos = close + 1;
+                    plain_start = pos;
+                    continue;
+                }
+            }
+        }
+
         let outcome = match bytes[pos] {
             b'*' => try_star_emphasis(bytes, pos),
             b'~' => try_strike_emphasis(bytes, pos),
@@ -658,10 +831,7 @@ fn is_valid_italic_open(bytes: &[u8], pos: usize) -> bool {
             return false;
         }
     }
-    if ch == b'_' && pos > 0 && is_word_char(bytes[pos - 1]) {
-        return false;
-    }
-    true
+    !(ch == b'_' && pos > 0 && is_word_char(bytes[pos - 1]))
 }
 
 fn is_valid_strike_open(bytes: &[u8], pos: usize) -> bool {
@@ -1111,6 +1281,20 @@ mod tests {
         assert_eq!(code, "```\ninner\n```");
     }
 
+    const FENCED: &str = "intro\n```rust\nlet a = 1;\n```\nafter";
+
+    #[test_case(FENCED, 0 => 0 ; "before_any_fence")]
+    #[test_case(FENCED, 14 => 6 ; "inside_a_fence")]
+    #[test_case(FENCED, 29 => 29 ; "after_a_closed_fence")]
+    #[test_case("```\nfoo\nbar", 8 => 0 ; "inside_an_unclosed_fence")]
+    #[test_case(FOUR_BACKTICK_FENCE, 9 => 0 ; "inner_fence_does_not_close_the_outer")]
+    #[test_case("```\na\n  ```\nb\n```\n", 12 => 0 ; "indented_backticks_do_not_close_a_fence")]
+    #[test_case("  ```\nnot code\n", 6 => 6 ; "indented_backticks_are_not_a_fence")]
+    #[test_case("~~~\nnot code\n", 4 => 4 ; "tildes_are_not_a_fence")]
+    fn code_block_start_backs_up_to_the_opening_fence(text: &str, offset: usize) -> usize {
+        code_block_start(text, offset)
+    }
+
     #[test]
     fn unclosed_code_fence_runs_to_eof() {
         let blocks = parse("```\nfoo\nbar");
@@ -1215,5 +1399,53 @@ mod tests {
         let strip =
             |s: &str| -> String { s.chars().filter(|c| !STRIP_DELIMS.contains(c)).collect() };
         assert_eq!(strip(&visible), strip(input));
+    }
+
+    #[test]
+    fn parse_single_line_display_math() {
+        let input = "$$\\text{Cache Hit Rate} = \\frac{a}{b}$$";
+        let blocks = parse(input);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0],
+            Block::Math {
+                source: input.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_multi_line_display_math() {
+        let input = "$$\n\\text{Cache Hit Rate} = \\frac{a}{b}\n$$";
+        let blocks = parse(input);
+        assert_eq!(blocks.len(), 1);
+        let Block::Math { source } = &blocks[0] else {
+            panic!("expected Math block");
+        };
+        assert!(source.contains("\\frac{a}{b}"));
+    }
+
+    #[test]
+    fn parse_code_fence_math() {
+        let input = "```math\n\\text{Cache Hit Rate} = \\frac{a}{b}\n```";
+        let blocks = parse(input);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0],
+            Block::Math {
+                source: "\\text{Cache Hit Rate} = \\frac{a}{b}".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_inline_math() {
+        let input = "formula $E = mc^2$ in text";
+        let spans = parse_inline(input);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].text, "formula ");
+        assert_eq!(spans[1].kind, SpanKind::Math);
+        assert_eq!(spans[1].text, "E = mc^2");
+        assert_eq!(spans[2].text, " in text");
     }
 }

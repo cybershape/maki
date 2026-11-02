@@ -53,6 +53,7 @@ pub struct UsageModalContext<'a> {
     pub model: &'a Model,
     pub fast: bool,
     pub clock_format: ClockFormat,
+    pub show_cost: bool,
 }
 
 pub struct UsageModal {
@@ -119,6 +120,7 @@ impl UsageModal {
         let modal = Modal {
             title: TITLE,
             width_percent: 60,
+            min_width: 0,
             max_height_percent: 70,
         };
         let (popup, inner) = modal.render(frame, area, total);
@@ -168,6 +170,7 @@ fn build_lines(
         ctx.total_cost,
         ctx.total_list_cost,
         ctx.model.subsidy_source(),
+        ctx.show_cost,
         theme,
     )));
 
@@ -177,7 +180,7 @@ fn build_lines(
             format!("{PREFIX}{} quota", ctx.model.provider_display_name()),
             theme.keybind_section,
         )));
-        lines.extend(quota_lines(state, theme, ctx.clock_format));
+        lines.extend(quota_lines(state, theme, ctx.clock_format, ctx.show_cost));
         if let Some(ready) = provider_usage(state)
             && !ready.by_model_today.is_empty()
         {
@@ -187,9 +190,18 @@ fn build_lines(
                 format!("{PREFIX}By model (provider, today)"),
                 theme.keybind_section,
             )));
-            lines.push(Line::from(provider_by_model_header(model_w, theme)));
+            lines.push(Line::from(provider_by_model_header(
+                model_w,
+                ctx.show_cost,
+                theme,
+            )));
             for row in &ready.by_model_today {
-                lines.push(Line::from(provider_by_model_row(row, model_w, fg)));
+                lines.push(Line::from(provider_by_model_row(
+                    row,
+                    model_w,
+                    ctx.show_cost,
+                    fg,
+                )));
             }
         }
     }
@@ -208,15 +220,19 @@ fn build_lines(
         format!("{PREFIX}Per model"),
         theme.keybind_section,
     )));
-    lines.push(Line::from(header_row(model_w, theme)));
+    lines.push(Line::from(header_row(model_w, ctx.show_cost, theme)));
 
     for (id, usage) in entries {
-        let cost = model_cost(id, usage, ctx.model, ctx.fast);
+        let cost = ctx
+            .show_cost
+            .then(|| model_cost(id, usage, ctx.model, ctx.fast))
+            .flatten();
         lines.push(Line::from(model_row(
             id,
             usage,
             cost,
             model_w,
+            ctx.show_cost,
             fg,
             theme.status_dim,
         )));
@@ -230,6 +246,7 @@ fn totals_row(
     cost: Option<f64>,
     list_cost: Option<f64>,
     subsidy_source: Option<&str>,
+    show_cost: bool,
     theme: &crate::theme::Theme,
 ) -> Vec<Span<'static>> {
     let mut spans = vec![
@@ -246,15 +263,17 @@ fn totals_row(
             Style::new().fg(theme.foreground),
         ),
     ];
-    match (cost, list_cost, subsidy_source) {
-        (Some(c), Some(list), Some(source)) if list > 0.0 => {
-            spans.push(Span::styled(
-                format!("  ${c:.3} (~${list:.3} {source})"),
-                theme.accent,
-            ));
+    if show_cost {
+        match (cost, list_cost, subsidy_source) {
+            (Some(c), Some(list), Some(source)) if list > 0.0 => {
+                spans.push(Span::styled(
+                    format!("  ${c:.3} (~${list:.3} {source})"),
+                    theme.accent,
+                ));
+            }
+            (Some(c), _, _) => spans.push(Span::styled(format!("  ${c:.3}"), theme.accent)),
+            (None, _, _) => {}
         }
-        (Some(c), _, _) => spans.push(Span::styled(format!("  ${c:.3}"), theme.accent)),
-        (None, _, _) => {}
     }
     spans
 }
@@ -268,10 +287,10 @@ fn model_col_width(names: impl IntoIterator<Item = impl AsRef<str>>) -> usize {
         .max(MODEL_COL_MIN)
 }
 
-fn header_row(model_w: usize, theme: &crate::theme::Theme) -> Vec<Span<'static>> {
+fn header_row(model_w: usize, show_cost: bool, theme: &crate::theme::Theme) -> Vec<Span<'static>> {
     let h = |label: &str| Span::styled(format!("{label:>NUM_COL$}"), theme.status_dim);
     let gap = || Span::raw(" ".repeat(COL_GAP));
-    vec![
+    let mut spans = vec![
         Span::raw(PREFIX),
         Span::styled(
             format!("{:width$}", "model", width = model_w),
@@ -285,9 +304,12 @@ fn header_row(model_w: usize, theme: &crate::theme::Theme) -> Vec<Span<'static>>
         h("cache"),
         gap(),
         h("total"),
-        gap(),
-        Span::styled(format!("{:>6}", "cost"), theme.status_dim),
-    ]
+    ];
+    if show_cost {
+        spans.push(gap());
+        spans.push(Span::styled(format!("{:>6}", "cost"), theme.status_dim));
+    }
+    spans
 }
 
 fn provider_usage(state: &UsageFetchState) -> Option<&ProviderUsage> {
@@ -298,10 +320,14 @@ fn provider_usage(state: &UsageFetchState) -> Option<&ProviderUsage> {
     }
 }
 
-fn provider_by_model_header(model_w: usize, theme: &crate::theme::Theme) -> Vec<Span<'static>> {
+fn provider_by_model_header(
+    model_w: usize,
+    show_cost: bool,
+    theme: &crate::theme::Theme,
+) -> Vec<Span<'static>> {
     let h = |label: &str| Span::styled(format!("{label:>NUM_COL$}"), theme.status_dim);
     let gap = || Span::raw(" ".repeat(COL_GAP));
-    vec![
+    let mut spans = vec![
         Span::raw(PREFIX),
         Span::styled(
             format!("{:width$}", "model", width = model_w),
@@ -313,16 +339,23 @@ fn provider_by_model_header(model_w: usize, theme: &crate::theme::Theme) -> Vec<
         h("out"),
         gap(),
         h("total"),
-        gap(),
-        Span::styled(format!("{:>7}", "spend"), theme.status_dim),
-    ]
+    ];
+    if show_cost {
+        spans.push(gap());
+        spans.push(Span::styled(format!("{:>7}", "spend"), theme.status_dim));
+    }
+    spans
 }
 
-fn provider_by_model_row(row: &ModelUsageRow, model_w: usize, fg: Style) -> Vec<Span<'static>> {
+fn provider_by_model_row(
+    row: &ModelUsageRow,
+    model_w: usize,
+    show_cost: bool,
+    fg: Style,
+) -> Vec<Span<'static>> {
     let num = |v: u64| Span::styled(format!("{:>NUM_COL$}", format_tokens(v)), fg);
     let gap = || Span::raw(" ".repeat(COL_GAP));
-    let dollars = row.spend_microdollars as f64 / 1_000_000.0;
-    vec![
+    let mut spans = vec![
         Span::raw(PREFIX),
         Span::styled(format!("{:<width$}", row.model, width = model_w), fg),
         gap(),
@@ -331,9 +364,13 @@ fn provider_by_model_row(row: &ModelUsageRow, model_w: usize, fg: Style) -> Vec<
         num(row.output_tokens),
         gap(),
         num(row.total_tokens),
-        gap(),
-        Span::styled(format!("{dollars:>7.4}"), fg),
-    ]
+    ];
+    if show_cost {
+        let dollars = row.spend_microdollars as f64 / 1_000_000.0;
+        spans.push(gap());
+        spans.push(Span::styled(format!("{dollars:>7.4}"), fg));
+    }
+    spans
 }
 
 fn model_row(
@@ -341,12 +378,13 @@ fn model_row(
     usage: &StoredTokenUsage,
     cost: Option<f64>,
     model_w: usize,
+    show_cost: bool,
     fg: Style,
     dim: Style,
 ) -> Vec<Span<'static>> {
     let num = |v: u32| Span::styled(format!("{:>NUM_COL$}", format_tokens(v)), fg);
     let gap = || Span::raw(" ".repeat(COL_GAP));
-    vec![
+    let mut spans = vec![
         Span::raw(PREFIX),
         Span::styled(format!("{id:<model_w$}"), fg),
         gap(),
@@ -357,15 +395,22 @@ fn model_row(
         num(usage.cache_read),
         gap(),
         num(usage.total()),
-        gap(),
-        match cost {
+    ];
+    if show_cost {
+        spans.push(gap());
+        spans.push(match cost {
             Some(c) => Span::styled(format!("{c:>6.3}"), fg),
-            None => Span::styled(format!("{:>6}", "—"), dim),
-        },
-    ]
+            None => Span::styled(format!("{:>6}", "-"), dim),
+        });
+    }
+    spans
 }
 
 impl crate::components::Overlay for UsageModal {
+    fn is_prompting(&self) -> bool {
+        self.is_open()
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }
@@ -379,6 +424,7 @@ fn quota_lines(
     state: &UsageFetchState,
     theme: &crate::theme::Theme,
     clock: ClockFormat,
+    show_cost: bool,
 ) -> Vec<Line<'static>> {
     let fg = Style::new().fg(theme.foreground);
     let dim = theme.status_dim;
@@ -417,7 +463,9 @@ fn quota_lines(
                     spans.push(Span::styled(format!("{pct:>3}%"), theme.accent));
                     spans.push(Span::styled(" used", dim));
                 }
-                if let Some(detail) = &limit.detail {
+                if let Some(detail) = &limit.detail
+                    && (show_cost || !detail.contains('$'))
+                {
                     spans.push(Span::styled(format!("  {detail}"), dim));
                 }
                 if let Some(ms) = limit.reset_at {
@@ -480,7 +528,7 @@ mod tests {
     const ONE_MILLION: u32 = 1_000_000;
     const ONE_MILLION_TEXT: &str = "1.0m";
     const UNKNOWN_MODEL: &str = "a-model-no-table-has-ever-heard-of";
-    const NO_COST_TEXT: &str = "—";
+    const NO_COST_TEXT: &str = "-";
 
     fn line_texts(lines: &[Line<'static>]) -> Vec<String> {
         lines
@@ -542,7 +590,12 @@ mod tests {
             ],
             by_model_today: vec![],
         };
-        let lines = quota_lines(&UsageFetchState::Ready(usage), &theme, ClockFormat::Hour24);
+        let lines = quota_lines(
+            &UsageFetchState::Ready(usage),
+            &theme,
+            ClockFormat::Hour24,
+            true,
+        );
         assert_eq!(lines.len(), 3);
         assert!(
             lines[0]
@@ -574,14 +627,43 @@ mod tests {
     }
 
     #[test]
+    fn quota_ready_lines_hide_cost_detail_when_show_cost_is_false() {
+        let theme = crate::theme::current();
+        let usage = ProviderUsage {
+            plan: Some("lite".into()),
+            limits: vec![UsageLimit {
+                label: "Usage credits".into(),
+                percentage: Some(4),
+                reset_at: None,
+                detail: Some("$2.33 spent".into()),
+            }],
+            by_model_today: vec![],
+        };
+        let lines = quota_lines(
+            &UsageFetchState::Ready(usage),
+            &theme,
+            ClockFormat::Hour24,
+            false,
+        );
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].spans.iter().any(|s| s.content.contains("4%")));
+        assert!(
+            !lines[1]
+                .spans
+                .iter()
+                .any(|s| s.content.contains("$2.33 spent"))
+        );
+    }
+
+    #[test]
     fn quota_non_terminal_states_render_single_line() {
         let theme = crate::theme::current();
         let clock = ClockFormat::Hour24;
         assert_eq!(
-            quota_lines(&UsageFetchState::Loading, &theme, clock).len(),
+            quota_lines(&UsageFetchState::Loading, &theme, clock, true).len(),
             1
         );
-        let unsupported = quota_lines(&UsageFetchState::Unsupported, &theme, clock);
+        let unsupported = quota_lines(&UsageFetchState::Unsupported, &theme, clock, true);
         assert_eq!(unsupported.len(), 1);
         assert!(
             unsupported[0]
@@ -589,7 +671,7 @@ mod tests {
                 .iter()
                 .any(|s| s.content.contains(NO_USAGE_ENDPOINT))
         );
-        let err = quota_lines(&UsageFetchState::Error("nope".into()), &theme, clock);
+        let err = quota_lines(&UsageFetchState::Error("nope".into()), &theme, clock, true);
         assert_eq!(err.len(), 1);
         assert!(err[0].spans.iter().any(|s| s.content.contains("nope")));
     }
@@ -616,6 +698,7 @@ mod tests {
             model,
             fast: false,
             clock_format: ClockFormat::Hour24,
+            show_cost: true,
         };
         line_texts(&build_lines(&ctx, None, &crate::theme::current()))
     }
@@ -678,6 +761,53 @@ mod tests {
             .map(|(_, cost)| cost.trim().to_string())
     }
 
+    #[test]
+    fn show_cost_false_hides_all_cost_and_spend_data() {
+        let model = test_model();
+        let total = TokenUsage {
+            input: ONE_MILLION,
+            ..Default::default()
+        };
+        let by_model = HashMap::from([(model.id.clone(), stored(Some(RECORDED_COST)))]);
+        let ctx = UsageModalContext {
+            total: &total,
+            total_cost: Some(RECORDED_COST),
+            total_list_cost: None,
+            by_model: &by_model,
+            model: &model,
+            fast: false,
+            clock_format: ClockFormat::Hour24,
+            show_cost: false,
+        };
+        let provider_usage = UsageFetchState::Ready(ProviderUsage {
+            plan: None,
+            limits: vec![],
+            by_model_today: vec![ModelUsageRow {
+                model: "test-model".into(),
+                input_tokens: 100,
+                output_tokens: 200,
+                total_tokens: 300,
+                spend_microdollars: 50000,
+            }],
+        });
+        let rows = line_texts(&build_lines(
+            &ctx,
+            Some(&provider_usage),
+            &crate::theme::current(),
+        ));
+        for row in &rows {
+            assert!(!row.contains('$'), "row should not contain '$': {row}");
+            assert!(
+                !row.contains("cost"),
+                "header should not contain 'cost': {row}"
+            );
+            assert!(
+                !row.contains("spend"),
+                "header should not contain 'spend': {row}"
+            );
+        }
+    }
+
     fn slot(state: UsageFetchState) -> ArcSwapOption<UsageFetchState> {
         ArcSwapOption::from_pointee(state)
     }
@@ -694,6 +824,7 @@ mod tests {
             model: &model,
             fast: false,
             clock_format: ClockFormat::Hour24,
+            show_cost: true,
         };
         terminal
             .draw(|f| {

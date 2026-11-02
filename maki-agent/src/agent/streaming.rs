@@ -8,9 +8,11 @@ use maki_providers::{
 };
 use maki_storage::id::SessionRef;
 use serde_json::Value;
+use tokio::time::sleep;
 use tracing::warn;
 
 use crate::cancel::CancelToken;
+use crate::types::TurnTiming;
 use crate::{AgentError, AgentEvent, EventSender};
 
 const FUNCTIONS_PREFIX: &str = "functions.";
@@ -42,22 +44,80 @@ fn canonicalize_tool_names(message: &mut Message) {
     }
 }
 
+/// What the forwarder saw: the text the cancel path replays, plus the timing
+/// a per-turn stats line reads. `ttft` starts at the request, so it includes
+/// prompt processing; `thinking` sums every thinking span, which is what an
+/// interleaved-thinking dialect needs.
+struct ForwardedEvents {
+    streamed: String,
+    ttft: Option<Duration>,
+    thinking: Duration,
+    /// One entry per thinking span, in the order the blocks were streamed.
+    /// The response carries the text but not how long it took, so this is
+    /// what gets written onto each block before it is stored.
+    spans: Vec<Duration>,
+}
+
+/// Writes each measured span onto the thinking block it belongs to.
+///
+/// Spans and blocks are counted in the same order: a span ends when text or
+/// a tool call starts, which is also where the provider closes the block.
+/// A block past the spans keeps `None`, the same as one loaded from a
+/// session written before the field existed.
+fn stamp_thinking(message: &mut Message, spans: &[Duration]) {
+    let mut spans = spans.iter();
+    for block in &mut message.content {
+        if let ContentBlock::Thinking { duration_ms, .. } = block {
+            *duration_ms = spans.next().map(|span| span.as_millis() as u64);
+        }
+    }
+}
+
+fn end_thinking_span(
+    span: &mut Option<Instant>,
+    thinking: &mut Duration,
+    spans: &mut Vec<Duration>,
+) {
+    if let Some(start) = span.take() {
+        let took = start.elapsed();
+        *thinking += took;
+        spans.push(took);
+    }
+}
+
 async fn forward_provider_events(
     prx: flume::Receiver<ProviderEvent>,
     event_tx: &EventSender,
-) -> String {
+    started: Instant,
+) -> ForwardedEvents {
     let mut streamed = String::new();
+    let mut ttft = None;
+    let mut thinking = Duration::ZERO;
+    let mut thinking_span = None;
+    let mut spans = Vec::new();
     while let Ok(pe) = prx.recv_async().await {
         let ae = match pe {
             ProviderEvent::TextDelta { text } => {
+                end_thinking_span(&mut thinking_span, &mut thinking, &mut spans);
+                ttft.get_or_insert_with(|| started.elapsed());
                 streamed.push_str(&text);
                 AgentEvent::TextDelta { text }
             }
-            ProviderEvent::ThinkingDelta { text } => AgentEvent::ThinkingDelta { text },
-            ProviderEvent::ToolUseStart { id, name } => AgentEvent::ToolPending {
-                id,
-                name: canonical_tool_name(&name).to_owned(),
-            },
+            ProviderEvent::ThinkingDelta { text } => {
+                thinking_span.get_or_insert_with(Instant::now);
+                ttft.get_or_insert_with(|| started.elapsed());
+                AgentEvent::ThinkingDelta { text }
+            }
+            ProviderEvent::ToolUseStart { id, name } => {
+                end_thinking_span(&mut thinking_span, &mut thinking, &mut spans);
+                ttft.get_or_insert_with(|| started.elapsed());
+                AgentEvent::ToolPending {
+                    id,
+                    name: canonical_tool_name(&name).to_owned(),
+                }
+            }
+            // Progress is the prompt still being read, so it is neither a token
+            // for `ttft` nor the end of a thinking span.
             ProviderEvent::PromptProgress {
                 processed,
                 total,
@@ -72,7 +132,13 @@ async fn forward_provider_events(
             break;
         }
     }
-    streamed
+    end_thinking_span(&mut thinking_span, &mut thinking, &mut spans);
+    ForwardedEvents {
+        streamed,
+        ttft,
+        thinking,
+        spans,
+    }
 }
 
 /// Cancelling mid-stream carries the text the user still sees on screen,
@@ -183,12 +249,21 @@ pub(crate) struct StreamRequest<'a> {
 /// `gauge` is `None` for a request whose messages are not the session's, as
 /// compaction's stripped and collapsed rewrite is: neither its size nor the
 /// count it comes back with says anything about the session.
+/// A response plus the wall-clock metrics of the request that produced it.
+/// `timing` covers the whole call — retries included — while `ttft` and
+/// `thinking` describe only the attempt that answered, the one whose stream
+/// the user saw.
+pub(crate) struct StreamedResponse {
+    pub response: StreamResponse,
+    pub timing: TurnTiming,
+}
+
 pub(crate) async fn stream_with_retry(
     req: StreamRequest<'_>,
     mut gauge: Option<&mut ContextGauge>,
     event_tx: &EventSender,
     cancel: &CancelToken,
-) -> Result<StreamResponse, StreamError> {
+) -> Result<StreamedResponse, StreamError> {
     let StreamRequest {
         provider,
         model,
@@ -201,6 +276,9 @@ pub(crate) async fn stream_with_retry(
         retry,
     } = req;
     let opts = opts.clamped(model);
+    // Covers image adaptation and every attempt, so it reads as the turn's
+    // wall-clock wait rather than the winning request's alone.
+    let call_started = Instant::now();
     // The session's own size wins where it is larger, being a count a provider
     // made rather than a byte estimate.
     let measured = gauge.as_deref().map_or(0, ContextGauge::size);
@@ -223,7 +301,11 @@ pub(crate) async fn stream_with_retry(
         })?;
     let messages = &*adapted;
     let mut retry = RetryState::new(retry, provider.keys().map_or(1, |keys| keys.key_count()));
+    let mut sleep_detector = crate::sleep::SleepDetector::new();
     loop {
+        if let Some(_slept) = sleep_detector.check() {
+            retry.note_wake(crate::sleep::WAKE_GRACE_DURATION);
+        }
         // The turn budget is all that moves. What the model declares stays put:
         // the thinking a request may spend is read off the `max_tokens` this
         // produces, so the two can never disagree, whatever a provider
@@ -232,19 +314,29 @@ pub(crate) async fn stream_with_retry(
         let model = &fitted;
         let started = Instant::now();
         let (ptx, prx) = flume::unbounded();
-        let forwarder = smol::spawn({
+        let forwarder = tokio::spawn({
             let event_tx = event_tx.clone();
-            async move { forward_provider_events(prx, &event_tx).await }
+            async move { forward_provider_events(prx, &event_tx, started).await }
         });
         // `race` checks the token before it polls, so a run cancelled while a
         // retry slept on a server `Retry-After` never pays for the attempt it
         // woke up to make.
+        let stream_call = async {
+            tokio::select! {
+                biased;
+                res = provider.stream_message(model, messages, system, tools, &ptx, opts, session_id) => res,
+                slept = crate::sleep::watch_for_sleep(
+                    Duration::from_millis(500),
+                    crate::sleep::DEFAULT_SLEEP_THRESHOLD,
+                ) => Err(AgentError::SystemSleep(slept)),
+            }
+        };
         let result = cancel
-            .race(provider.stream_message(model, messages, system, tools, &ptx, opts, session_id))
+            .race(stream_call)
             .await
             .unwrap_or(Err(AgentError::Cancelled));
         drop(ptx);
-        let streamed = forwarder.await;
+        let forwarded = forwarder.await.expect("provider event forwarder panicked");
         match result {
             Ok(mut r) => {
                 canonicalize_tool_names(&mut r.message);
@@ -252,12 +344,27 @@ pub(crate) async fn stream_with_retry(
                 if let Some(gauge) = gauge.as_deref_mut() {
                     gauge.record(r.usage.total_input());
                 }
-                return Ok(r);
+                stamp_thinking(&mut r.message, &forwarded.spans);
+                return Ok(StreamedResponse {
+                    response: r,
+                    timing: TurnTiming {
+                        elapsed_ms: call_started.elapsed().as_millis() as u64,
+                        ttft_ms: forwarded.ttft.map(|d| d.as_millis() as u64),
+                        thinking_ms: forwarded.thinking.as_millis() as u64,
+                    },
+                });
             }
-            Err(AgentError::Cancelled) => return Err(StreamError::Cancelled { streamed }),
+            Err(AgentError::Cancelled) => {
+                return Err(StreamError::Cancelled {
+                    streamed: forwarded.streamed,
+                });
+            }
             Err(e) => {
                 attempt += 1;
                 emit_api_error(model, &e, attempt, started.elapsed());
+                if let AgentError::SystemSleep(_) = &e {
+                    retry.note_wake(crate::sleep::WAKE_GRACE_DURATION);
+                }
                 // Rotation is decided above anything `retry_kind()` says: a
                 // fresh key and a delay cure different problems. A 401 or a 403
                 // is dead for the key that produced it, fine for the next one,
@@ -272,10 +379,17 @@ pub(crate) async fn stream_with_retry(
                 let (message, delay) = if rotated {
                     (e.retry_message(), Duration::ZERO)
                 } else if let Some(kind) = e.retry_kind() {
+                    let in_grace = kind == maki_providers::retry::RetryKind::Connect
+                        && retry.is_in_wake_grace();
                     let Some(delay) = retry.next_delay(kind, e.retry_after()) else {
                         return Err(e.into());
                     };
-                    (e.retry_message(), delay)
+                    let message = if in_grace {
+                        "waiting for network connection...".to_owned()
+                    } else {
+                        e.retry_message()
+                    };
+                    (message, delay)
                 } else {
                     // A budget overflow is the one rejection maki caused itself,
                     // by asking for more output than the prompt left room for.
@@ -324,7 +438,7 @@ pub(crate) async fn stream_with_retry(
                     delay_ms,
                 })?;
                 if !delay.is_zero() {
-                    let _ = cancel.race(smol::Timer::after(delay)).await;
+                    let _ = cancel.race(sleep(delay)).await;
                 }
             }
         }
@@ -389,6 +503,62 @@ mod tests {
     use super::*;
 
     const SECRET_BODY: &str = "messages.0.content: \"my private prompt\", key sk-abc";
+    const FIRST_SPAN_MS: u64 = 1500;
+    const SECOND_SPAN_MS: u64 = 250;
+
+    fn thinking(text: &str) -> ContentBlock {
+        ContentBlock::Thinking {
+            thinking: text.into(),
+            signature: None,
+            duration_ms: None,
+        }
+    }
+
+    #[test]
+    fn stamp_thinking_writes_each_span_onto_its_block() {
+        let mut message = Message {
+            role: Role::Assistant,
+            content: vec![
+                thinking("first"),
+                ContentBlock::Text { text: "mid".into() },
+                thinking("second"),
+            ],
+            ..Default::default()
+        };
+        stamp_thinking(
+            &mut message,
+            &[
+                Duration::from_millis(FIRST_SPAN_MS),
+                Duration::from_millis(SECOND_SPAN_MS),
+            ],
+        );
+        let stamped: Vec<_> = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Thinking { duration_ms, .. } => Some(*duration_ms),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stamped, vec![Some(FIRST_SPAN_MS), Some(SECOND_SPAN_MS)]);
+    }
+
+    #[test]
+    fn stamp_thinking_leaves_a_block_without_a_measured_span() {
+        let mut message = Message {
+            role: Role::Assistant,
+            content: vec![thinking("only")],
+            ..Default::default()
+        };
+        stamp_thinking(&mut message, &[]);
+        assert!(matches!(
+            &message.content[0],
+            ContentBlock::Thinking {
+                duration_ms: None,
+                ..
+            }
+        ));
+    }
     const WINDOW: u32 = 262_144;
     /// The shape that started all this: the declared output cap is the whole
     /// window, so "ask for what fits" asks for everything.
@@ -406,7 +576,7 @@ mod tests {
     const CROWDING_PROMPT: u32 = WINDOW - CROWDED_ROOM;
 
     fn model_with(max_output_tokens: Option<u32>) -> Model {
-        let mut model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let mut model = Model::from_spec("responses/default").unwrap();
         model.context_window = WINDOW;
         model.max_output_tokens = max_output_tokens;
         model
@@ -618,6 +788,7 @@ mod tests {
                         ..Default::default()
                     },
                     stop_reason: Some(maki_providers::StopReason::EndTurn),
+                    ..Default::default()
                 })
             })
         }
@@ -654,7 +825,7 @@ mod tests {
         model: &Model,
         gauge: Option<&mut ContextGauge>,
         retry: RetryPolicy,
-    ) -> (Result<StreamResponse, StreamError>, Vec<AgentEvent>) {
+    ) -> (Result<StreamedResponse, StreamError>, Vec<AgentEvent>) {
         let (tx, rx) = flume::unbounded();
         let result = stream_with_retry(
             StreamRequest {
@@ -699,41 +870,39 @@ mod tests {
     /// A race wakes from whichever side gets there first, so racing the token
     /// against the request still sent it about half the time. `race` checks the
     /// token before it polls at all.
-    #[test]
-    fn a_cancelled_run_is_never_billed_for_a_request() {
-        smol::block_on(async {
-            let server = StrictServer {
-                window: STRICT_WINDOW,
-                requests: Mutex::default(),
-            };
-            let (trigger, cancel) = CancelToken::new();
-            trigger.cancel();
-            let (tx, _rx) = flume::unbounded();
+    #[tokio::test]
+    async fn a_cancelled_run_is_never_billed_for_a_request() {
+        let server = StrictServer {
+            window: STRICT_WINDOW,
+            requests: Mutex::default(),
+        };
+        let (trigger, cancel) = CancelToken::new();
+        trigger.cancel();
+        let (tx, _rx) = flume::unbounded();
 
-            let result = stream_with_retry(
-                StreamRequest {
-                    provider: &server,
-                    model: &strict_model(STRICT_WINDOW),
-                    messages: &transcript(),
-                    system: "",
-                    tools: &json!([]),
-                    opts: RequestOptions::default(),
-                    output_budget: TURN_BUDGET,
-                    session_id: None,
-                    retry: RetryPolicy::default(),
-                },
-                None,
-                &EventSender::new(tx, 0),
-                &cancel,
-            )
-            .await;
+        let result = stream_with_retry(
+            StreamRequest {
+                provider: &server,
+                model: &strict_model(STRICT_WINDOW),
+                messages: &transcript(),
+                system: "",
+                tools: &json!([]),
+                opts: RequestOptions::default(),
+                output_budget: TURN_BUDGET,
+                session_id: None,
+                retry: RetryPolicy::default(),
+            },
+            None,
+            &EventSender::new(tx, 0),
+            &cancel,
+        )
+        .await;
 
-            assert!(matches!(result, Err(StreamError::Cancelled { .. })));
-            assert!(
-                server.requests.lock().unwrap().is_empty(),
-                "a cancelled run reached the provider"
-            );
-        });
+        assert!(matches!(result, Err(StreamError::Cancelled { .. })));
+        assert!(
+            server.requests.lock().unwrap().is_empty(),
+            "a cancelled run reached the provider"
+        );
     }
 
     /// `AgentEvent::Retry` is the only thing that makes the view drop what the
@@ -742,68 +911,66 @@ mod tests {
     /// replaces it to be appended to.
     #[test_case(STRICT_WINDOW, &[] ; "a_request_that_fits_reports_nothing")]
     #[test_case(CROWDED_WINDOW, &[(FIRST_ATTEMPT, BUDGET_RETRY_MESSAGE, NO_WAIT)] ; "a_shrunk_budget_is_reported_like_any_other_retry")]
-    fn every_way_round_the_loop_tells_the_view_to_start_over(
+    #[tokio::test]
+    async fn every_way_round_the_loop_tells_the_view_to_start_over(
         window: u32,
         expected: &[(u32, &str, u64)],
     ) {
-        smol::block_on(async {
-            let server = StrictServer {
-                window,
-                requests: Mutex::default(),
-            };
-            let mut gauge = ContextGauge::default();
+        let server = StrictServer {
+            window,
+            requests: Mutex::default(),
+        };
+        let mut gauge = ContextGauge::default();
 
-            let (result, events) = send(
-                &server,
-                &strict_model(window),
-                Some(&mut gauge),
-                RetryPolicy::default(),
-            )
-            .await;
+        let (result, events) = send(
+            &server,
+            &strict_model(window),
+            Some(&mut gauge),
+            RetryPolicy::default(),
+        )
+        .await;
 
-            result.expect("a shrunk budget is answered");
-            assert_eq!(retries_of(&events), expected);
-        });
+        result.expect("a shrunk budget is answered");
+        assert_eq!(retries_of(&events), expected);
     }
 
     #[test_case(STRICT_WINDOW, 1 ; "a_window_sized_cap_still_leaves_room_for_the_prompt")]
     // A retry is cheap and compaction is not, so a budget that genuinely does
     // not fit comes back smaller, with nothing summarized away to get there.
     #[test_case(CROWDED_WINDOW, 2 ; "a_budget_that_does_not_fit_is_retried_smaller")]
-    fn a_strict_server_is_answered_without_dropping_context(window: u32, attempts: usize) {
-        smol::block_on(async {
-            let server = StrictServer {
-                window,
-                requests: Mutex::default(),
-            };
-            let mut gauge = ContextGauge::default();
+    #[tokio::test]
+    async fn a_strict_server_is_answered_without_dropping_context(window: u32, attempts: usize) {
+        let server = StrictServer {
+            window,
+            requests: Mutex::default(),
+        };
+        let mut gauge = ContextGauge::default();
 
-            let response = send(
-                &server,
-                &strict_model(window),
-                Some(&mut gauge),
-                RetryPolicy::default(),
-            )
-            .await
-            .0
-            .expect("a flat budget leaves the window room for the prompt");
+        let response = send(
+            &server,
+            &strict_model(window),
+            Some(&mut gauge),
+            RetryPolicy::default(),
+        )
+        .await
+        .0
+        .expect("a flat budget leaves the window room for the prompt");
 
-            let asks = server.requests.lock().unwrap().clone();
-            assert_eq!(asks.len(), attempts, "asked for {asks:?}");
-            assert!(
-                asks[0] <= TURN_BUDGET,
-                "the first ask is a turn budget, not the window"
-            );
-            assert!(
-                asks.windows(2).all(|pair| pair[1] < pair[0]),
-                "every retry asks for less than the ask that was refused"
-            );
-            assert_eq!(
-                gauge.size(),
-                response.usage.input,
-                "the session keeps the server's count, not the estimate under it"
-            );
-        });
+        let asks = server.requests.lock().unwrap().clone();
+        assert_eq!(asks.len(), attempts, "asked for {asks:?}");
+        assert!(
+            asks[0] <= TURN_BUDGET,
+            "the first ask is a turn budget, not the window"
+        );
+        assert!(
+            asks.windows(2).all(|pair| pair[1] < pair[0]),
+            "every retry asks for less than the ask that was refused"
+        );
+        assert_eq!(
+            gauge.size(),
+            response.response.usage.input,
+            "the session keeps the server's count, not the estimate under it"
+        );
     }
 
     const POOL_KEYS: [&str; 3] = ["sk-first", "sk-second", "sk-third"];
@@ -878,6 +1045,7 @@ mod tests {
                     message: Message::user("ok".into()),
                     usage: TokenUsage::default(),
                     stop_reason: Some(maki_providers::StopReason::EndTurn),
+                    ..Default::default()
                 })
             })
         }
@@ -900,7 +1068,7 @@ mod tests {
     /// view for every rotation it took: a `Retry` event at all, so the failed
     /// attempt's half printed text is dropped instead of appended to, and a
     /// zero delay, because a fresh key waits for nothing.
-    async fn send_pooled(server: &PooledServer) -> Result<StreamResponse, StreamError> {
+    async fn send_pooled(server: &PooledServer) -> Result<StreamedResponse, StreamError> {
         let (result, events) = send(server, &strict_model(STRICT_WINDOW), None, no_budget()).await;
 
         let retries = retries_of(&events);
@@ -919,21 +1087,19 @@ mod tests {
     /// The reported regression: a 429 on the first key used to spend the rate
     /// limit budget before anything rotated, so a pool whose budget was zero
     /// never reached its other keys at all.
-    #[test]
-    fn a_fresh_key_is_tried_without_spending_the_retry_budget() {
-        smol::block_on(async {
-            let server = PooledServer::new(FULL_POOL, RATE_LIMITED, Some(POOL_KEYS[FULL_POOL - 1]));
+    #[tokio::test]
+    async fn a_fresh_key_is_tried_without_spending_the_retry_budget() {
+        let server = PooledServer::new(FULL_POOL, RATE_LIMITED, Some(POOL_KEYS[FULL_POOL - 1]));
 
-            send_pooled(&server)
-                .await
-                .expect("the last key in the pool answers");
+        send_pooled(&server)
+            .await
+            .expect("the last key in the pool answers");
 
-            assert_eq!(
-                server.keys_seen(),
-                POOL_KEYS,
-                "the walk tries each key once, in the pool's order"
-            );
-        });
+        assert_eq!(
+            server.keys_seen(),
+            POOL_KEYS,
+            "the walk tries each key once, in the pool's order"
+        );
     }
 
     /// A 401 and a 403 carry no retry kind at all, which is why rotation is
@@ -944,14 +1110,70 @@ mod tests {
     #[test_case(UNAUTHORIZED, FULL_POOL  ; "unauthorized_walks_the_whole_pool")]
     #[test_case(FORBIDDEN, FULL_POOL     ; "forbidden_walks_the_whole_pool")]
     #[test_case(UNAUTHORIZED, SINGLE_KEY ; "a_lone_key_is_tried_once")]
-    fn a_spent_pool_is_walked_once_and_then_gives_up(status: u16, keys: usize) {
-        smol::block_on(async {
-            let server = PooledServer::new(keys, status, None);
+    #[tokio::test]
+    async fn a_spent_pool_is_walked_once_and_then_gives_up(status: u16, keys: usize) {
+        let server = PooledServer::new(keys, status, None);
 
-            let result = send_pooled(&server).await;
+        let result = send_pooled(&server).await;
 
-            assert!(result.is_err(), "no key in the pool is accepted");
-            assert_eq!(server.keys_seen().len(), keys, "and no key is tried twice");
-        });
+        assert!(result.is_err(), "no key in the pool is accepted");
+        assert_eq!(server.keys_seen().len(), keys, "and no key is tried twice");
+    }
+
+    struct SleepThenOkServer {
+        slept: Mutex<bool>,
+    }
+
+    impl Provider for SleepThenOkServer {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                let mut slept = self.slept.lock().unwrap();
+                if !*slept {
+                    *slept = true;
+                    return Err(AgentError::SystemSleep(Duration::from_secs(60)));
+                }
+                Ok(StreamResponse {
+                    message: Message::user("ok".into()),
+                    usage: TokenUsage::default(),
+                    stop_reason: Some(maki_providers::StopReason::EndTurn),
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, AgentError>,
+        > {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    #[tokio::test]
+    async fn system_sleep_triggers_retry_and_announces() {
+        let server = SleepThenOkServer {
+            slept: Mutex::new(false),
+        };
+        let policy = RetryPolicy {
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            ..RetryPolicy::default()
+        };
+        let (result, events) = send(&server, &strict_model(STRICT_WINDOW), None, policy).await;
+        result.expect("retries after system sleep and succeeds");
+        let retries = retries_of(&events);
+        assert_eq!(retries.len(), 1);
+        assert!(retries[0].1.contains("System resumed from sleep"));
     }
 }

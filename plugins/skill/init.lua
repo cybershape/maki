@@ -7,17 +7,19 @@ local ToolView = require("maki.tool_view")
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
+local format_output = helpers.format_output
+local parse_output = helpers.parse_output
 
 local PROJECT_SKILL_DIRS = {
-  ".maki/skills",
-  ".claude/skills",
-  ".opencode/skills",
-  ".agents/skills",
+  { ".maki/skills" },
+  { ".claude/skills", "claude" },
+  { ".opencode/skills", "opencode" },
+  { ".agents/skills" },
 }
 local GLOBAL_SKILL_DIRS = {
-  ".claude/skills",
-  ".config/opencode/skills",
-  ".agents/skills",
+  { ".claude/skills", "claude" },
+  { ".config/opencode/skills", "opencode" },
+  { ".agents/skills" },
 }
 
 local function scan_skill_dir(dir, skills)
@@ -115,18 +117,48 @@ local function discover_skills()
 
   local home = maki.uv.os_homedir()
   if home then
-    for _, rel in ipairs(GLOBAL_SKILL_DIRS) do
-      scan_skill_dir(maki.fs.joinpath(home, rel), skills)
+    for _, source in ipairs(GLOBAL_SKILL_DIRS) do
+      if not source[2] or maki.api.agent_enabled(source[2]) then
+        scan_skill_dir(maki.fs.joinpath(home, source[1]), skills)
+      end
     end
   end
 
   for _, ancestor in ipairs(find_project_ancestors()) do
-    for _, rel in ipairs(PROJECT_SKILL_DIRS) do
-      scan_skill_dir(maki.fs.joinpath(ancestor, rel), skills)
+    for _, source in ipairs(PROJECT_SKILL_DIRS) do
+      if not source[2] or maki.api.agent_enabled(source[2]) then
+        scan_skill_dir(maki.fs.joinpath(ancestor, source[1]), skills)
+      end
     end
   end
 
   return skills
+end
+
+local function view_opts(ctx)
+  local tol = ctx:tool_output_lines()
+  return { max_lines = (tol and tol.other) or 20, keep = "head" }
+end
+
+-- Live call and restore both draw from the llm text, so the two views
+-- cannot drift. Nil when the text is not a skill listing.
+local function skill_view(output, ctx)
+  local location, content = parse_output(output)
+  if not location then
+    return nil
+  end
+
+  local buf = maki.ui.buf()
+  local view = ToolView.new(buf, view_opts(ctx))
+  buf:on("click", function()
+    view:toggle()
+  end)
+  view:set_highlight(content, location:match("%.([^%.]+)$") or "md")
+  view:finish()
+
+  local header = maki.ui.buf()
+  header:line({ { shorten_path(location), "path" } })
+  return { body = buf, header = header }
 end
 
 local boot_skills = discover_skills()
@@ -150,11 +182,7 @@ maki.api.register_tool({
   end,
 
   restore = function(_input, output, _is_error, ctx)
-    local tol = ctx:tool_output_lines()
-    return ToolView.restore(output, {
-      max_lines = (tol and tol.other) or 20,
-      keep = "head",
-    })
+    return skill_view(output, ctx) or ToolView.restore(output, view_opts(ctx))
   end,
 
   handler = function(input, ctx)
@@ -172,38 +200,9 @@ maki.api.register_tool({
       skill.content = skill.resolve()
     end
 
-    local lines = {}
-    for i, line in ipairs(maki.split(skill.content, "\n")) do
-      lines[#lines + 1] = string.format("%4d | %s", i, line)
-    end
-    local formatted = skill.location .. "\n" .. table.concat(lines, "\n")
-
-    local buf = maki.ui.buf()
-    local tol = ctx:tool_output_lines()
-    local view = ToolView.new(buf, {
-      max_lines = (tol and tol.other) or 20,
-      keep = "head",
-    })
-    buf:on("click", function()
-      view:toggle()
-    end)
-
-    local ext = skill.location:match("%.([^%.]+)$") or "md"
-    if not view:set_highlight(skill.content, ext) then
-      for line in formatted:gmatch("([^\n]*)\n?") do
-        view:append(line)
-      end
-    end
-    view:finish()
-
-    local short = shorten_path(skill.location)
-    local header_buf = maki.ui.buf()
-    header_buf:line({ { short, "path" } })
-
-    return {
-      llm_output = formatted,
-      body = buf,
-      header = header_buf,
-    }
+    local llm_output = format_output(skill.location, skill.content)
+    local result = skill_view(llm_output, ctx)
+    result.llm_output = llm_output
+    return result
   end,
 })

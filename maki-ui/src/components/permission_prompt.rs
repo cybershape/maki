@@ -127,6 +127,9 @@ struct Request {
     subagent_id: Option<String>,
     allow_scopes: Vec<String>,
     project_trusted: bool,
+    /// Set when a plugin escalated the call, so the user sees why they are
+    /// asked about a call their rules might have let through.
+    reason: Option<String>,
 }
 
 /// An answer carries the ask it settles: the agent only accepts one naming the
@@ -149,6 +152,10 @@ pub struct PermissionPrompt {
 }
 
 impl Overlay for PermissionPrompt {
+    fn is_prompting(&self) -> bool {
+        self.is_open()
+    }
+
     fn is_open(&self) -> bool {
         !self.queue.is_empty()
     }
@@ -157,8 +164,9 @@ impl Overlay for PermissionPrompt {
         false
     }
 
-    /// Only reached when the run those asks belonged to is gone (cancel,
-    /// session switch), which is what unparks their tool calls anyway.
+    /// Only reached by a cancel or a session reset, and the prompt takes every
+    /// key while it holds an ask, so neither runs over one: an ask from a task
+    /// that outlives them would wait on an answer that never comes.
     fn close(&mut self) {
         self.queue.clear();
         self.reset_entry();
@@ -181,6 +189,7 @@ impl PermissionPrompt {
         scopes: Vec<String>,
         subagent_id: Option<String>,
         project_trusted: bool,
+        reason: Option<String>,
     ) {
         let allow_scopes = generalized_scopes(&tool, &scopes);
         let allow_scopes = if allow_scopes == scopes {
@@ -195,6 +204,7 @@ impl PermissionPrompt {
             subagent_id,
             allow_scopes,
             project_trusted,
+            reason,
         });
     }
 
@@ -211,6 +221,10 @@ impl PermissionPrompt {
             self.reset_entry();
         }
         self.queue.retain(|request| !owns(request));
+    }
+
+    pub(crate) fn is_asking(&self, id: &str) -> bool {
+        self.queue.iter().any(|request| request.id == id)
     }
 
     pub(crate) fn tool(&self) -> Option<&ToolKey> {
@@ -310,12 +324,14 @@ impl PermissionPrompt {
         }
     }
 
+    /// True while the prompt is up, since it owns the keyboard then. Only the
+    /// deny editor has a place for {text}, anywhere else it is dropped.
     pub fn handle_paste(&mut self, text: &str) -> bool {
-        if !self.is_open() || self.state != PromptState::DenyEditing {
-            return false;
+        let open = self.is_open();
+        if open && self.state == PromptState::DenyEditing {
+            self.buffer.insert_text(text);
         }
-        self.buffer.insert_text(text);
-        true
+        open
     }
 
     fn build_lines(&self) -> Vec<Line<'static>> {
@@ -325,6 +341,7 @@ impl PermissionPrompt {
             subagent_id,
             allow_scopes,
             project_trusted,
+            reason,
             ..
         }) = self.queue.front()
         else {
@@ -342,6 +359,13 @@ impl PermissionPrompt {
         tool_spans.push(Span::styled(tool.to_string(), value_style));
 
         let mut lines = vec![Line::raw(""), Line::from(tool_spans)];
+        if let Some(reason) = reason {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("why   ", label_style),
+                Span::styled(reason.clone(), value_style),
+            ]));
+        }
         let waiting = self.queue.len() - 1;
         if waiting > 0 {
             lines.push(Line::from(vec![
@@ -375,7 +399,7 @@ impl PermissionPrompt {
             let (display_text, cursor_pos) = if text.is_empty() {
                 (DEFAULT_DENY_GUIDANCE, 0)
             } else {
-                (text.as_str(), TextBuffer::char_to_byte(&text, buffer.x()))
+                (text, TextBuffer::char_to_byte(text, buffer.x()))
             };
             let (before, after) = display_text.split_at(cursor_pos);
             let mut chars = after.chars();
@@ -487,6 +511,7 @@ mod tests {
             vec!["execute".into()],
             None,
             project_trusted,
+            None,
         );
     }
 
@@ -497,6 +522,7 @@ mod tests {
             vec!["/tmp/x".into()],
             Some(SUB_AGENT.into()),
             true,
+            None,
         );
     }
 
@@ -578,9 +604,11 @@ mod tests {
     }
 
     #[test]
-    fn handle_paste_requires_editing_mode() {
+    fn handle_paste_lands_only_in_the_deny_editor() {
+        assert!(!PermissionPrompt::new().handle_paste("closed"));
         let mut prompt = open_prompt();
-        assert!(!prompt.handle_paste("ignored"));
+        assert!(prompt.handle_paste("dropped"));
+        assert_eq!(prompt.buffer.value(), "");
         prompt.handle_key(key(KeyCode::Char('n')));
         assert!(prompt.handle_paste("accepted"));
         assert_eq!(prompt.buffer.value(), "accepted");
@@ -589,7 +617,7 @@ mod tests {
     #[test]
     fn wildcard_tool_key_opens() {
         let mut prompt = PermissionPrompt::new();
-        prompt.push(MAIN_ID.into(), ToolKey::Wildcard, vec![], None, true);
+        prompt.push(MAIN_ID.into(), ToolKey::Wildcard, vec![], None, true, None);
         assert!(prompt.is_open());
     }
 
@@ -687,5 +715,34 @@ mod tests {
             None,
             "the project answer stays available either way"
         );
+    }
+
+    const ASK_REASON: &str = "plugin wants a human to look";
+    const WHY_LABEL: &str = "why";
+
+    #[test_case(Some(ASK_REASON) ; "with_reason")]
+    #[test_case(None ; "without_reason")]
+    fn why_row_follows_reason(reason: Option<&str>) {
+        let mut prompt = PermissionPrompt::new();
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("bash"),
+            vec!["execute".into()],
+            None,
+            true,
+            reason.map(str::to_owned),
+        );
+
+        let why_row = prompt.build_lines().iter().find_map(|line| {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            text.trim_start()
+                .starts_with(WHY_LABEL)
+                .then(|| text.trim_start()[WHY_LABEL.len()..].trim().to_owned())
+        });
+        assert_eq!(why_row.as_deref(), reason);
     }
 }

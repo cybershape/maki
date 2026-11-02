@@ -6,7 +6,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Wrap;
 
 use maki_config::providers::{self, Protocol, ProviderDef, ProvidersConfig, slugify};
-use maki_providers::catalog_providers_if_available;
 use maki_storage::StateDir;
 use maki_storage::auth::{
     ProviderCredentials, load_provider_credentials, load_tokens, save_provider_credentials,
@@ -22,11 +21,7 @@ use crate::theme;
 const TITLE: &str = " Login ";
 const CATALOG_UNAVAILABLE_SLUG: &str = "catalog-unavailable";
 
-const PROTOCOLS: &[(&str, &str)] = &[
-    ("openai", "OpenAI-compatible"),
-    ("anthropic", "Anthropic"),
-    ("google", "Google Gemini"),
-];
+const PROTOCOLS: &[(&str, &str)] = &[("openai-responses", "Responses API")];
 
 #[derive(Clone)]
 struct ProviderItem {
@@ -164,7 +159,7 @@ enum StepAction {
 pub struct LoginPicker {
     step: Step,
     provider_items: Vec<ProviderItem>,
-    storage: Option<maki_storage::StateDir>,
+    storage: Option<StateDir>,
 }
 
 impl LoginPicker {
@@ -176,7 +171,7 @@ impl LoginPicker {
         }
     }
 
-    pub fn open(&mut self, storage: maki_storage::StateDir) {
+    pub fn open(&mut self, storage: StateDir) {
         let builtins = providers::all_builtins();
         let config = providers::ProvidersConfig::load();
         let mut items: Vec<ProviderItem> = builtins
@@ -215,34 +210,6 @@ impl LoginPicker {
                 has_env,
                 configured: false,
                 section: None,
-            });
-        }
-
-        if let Some(catalog) = catalog_providers_if_available() {
-            let state_dir = StateDir::resolve().ok();
-            for cat in catalog {
-                let has_key = state_dir
-                    .as_ref()
-                    .and_then(|s| cat.load_key_from_storage(s))
-                    .is_some();
-                let has_env = cat.env_key_set().is_some();
-                items.push(ProviderItem {
-                    slug: cat.slug.clone(),
-                    display_name: cat.display_name.clone(),
-                    has_key,
-                    has_env,
-                    configured: false,
-                    section: Some("Providers from Models.dev"),
-                });
-            }
-        } else {
-            items.push(ProviderItem {
-                slug: CATALOG_UNAVAILABLE_SLUG.to_string(),
-                display_name: "Models.dev providers (not yet downloaded)".to_string(),
-                has_key: false,
-                has_env: false,
-                configured: false,
-                section: Some("Providers from Models.dev"),
             });
         }
 
@@ -442,7 +409,7 @@ impl LoginPicker {
                             protocol: Some(
                                 info.protocol
                                     .parse::<Protocol>()
-                                    .unwrap_or(Protocol::Openai),
+                                    .unwrap_or(Protocol::OpenaiResponses),
                             ),
                             base_url: Some(info.base_url.clone()),
                             api_key_env: Some(api_key_env),
@@ -665,11 +632,7 @@ impl LoginPicker {
             Step::PickProvider(picker) => picker.view(frame, area),
             Step::PickPlan { picker, .. } => picker.view(frame, area),
             Step::CustomName { input } => {
-                let modal = Modal {
-                    title: " Provider name ",
-                    width_percent: 65,
-                    max_height_percent: 40,
-                };
+                let modal = step_modal(" Provider name ");
                 let (popup, inner) = modal.render(frame, area, 2);
                 let t = theme::current();
                 let hint = Span::styled("Enter provider name, then Enter", t.input_placeholder);
@@ -684,11 +647,7 @@ impl LoginPicker {
             }
             Step::CustomProtocol { picker, .. } => picker.view(frame, area),
             Step::CustomUrl { input, .. } => {
-                let modal = Modal {
-                    title: " Base URL ",
-                    width_percent: 65,
-                    max_height_percent: 40,
-                };
+                let modal = step_modal(" Base URL ");
                 let (popup, inner) = modal.render(frame, area, 2);
                 let t = theme::current();
                 let hint = Span::styled("Enter base URL, then Enter", t.input_placeholder);
@@ -706,11 +665,8 @@ impl LoginPicker {
                 display_name,
                 ..
             } => {
-                let modal = Modal {
-                    title: &format!(" {display_name} "),
-                    width_percent: 65,
-                    max_height_percent: 40,
-                };
+                let title = format!(" {display_name} ");
+                let modal = step_modal(&title);
                 let (popup, inner) = modal.render(frame, area, 2);
                 let t = theme::current();
                 let hint = Span::styled("Edit host URL, or Enter to confirm", t.input_placeholder);
@@ -729,11 +685,8 @@ impl LoginPicker {
                 api_key_optional,
                 ..
             } => {
-                let modal = Modal {
-                    title: &format!(" {display_name} "),
-                    width_percent: 65,
-                    max_height_percent: 40,
-                };
+                let title = format!(" {display_name} ");
+                let modal = step_modal(&title);
                 let (popup, inner) = modal.render(frame, area, 2);
                 let t = theme::current();
                 let hint_text = if *api_key_optional {
@@ -755,6 +708,7 @@ impl LoginPicker {
                 let modal = Modal {
                     title: " Login ",
                     width_percent: 50,
+                    min_width: 0,
                     max_height_percent: 30,
                 };
                 let (popup, inner) = modal.render(frame, area, 1);
@@ -770,6 +724,10 @@ impl LoginPicker {
 }
 
 impl Overlay for LoginPicker {
+    fn is_prompting(&self) -> bool {
+        false
+    }
+
     fn is_open(&self) -> bool {
         !matches!(self.step, Step::Closed)
     }
@@ -779,10 +737,19 @@ impl Overlay for LoginPicker {
     }
 }
 
+fn step_modal(title: &str) -> Modal<'_> {
+    Modal {
+        title,
+        width_percent: 65,
+        min_width: 0,
+        max_height_percent: 40,
+    }
+}
+
 fn input_line_with_cursor(input: &TextBuffer) -> Line<'static> {
     let t = theme::current();
     let value = input.value();
-    let cursor_byte = TextBuffer::char_to_byte(&value, input.x());
+    let cursor_byte = TextBuffer::char_to_byte(value, input.x());
     let (before, rest) = value.split_at(cursor_byte);
     let mut chars = rest.chars();
     let cursor_char = chars.next().unwrap_or(' ');

@@ -11,11 +11,14 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 const ELLIPSIS: &str = "...";
 const QUEUE_LABEL: &str = " Queue ";
+const STEER_LABEL: &str = " Steer ";
+const MIXED_LABEL: &str = " Queue / Steer ";
 const FOCUSED_HINT: &str = " - Enter to delete";
 
 pub struct QueueEntry<'a> {
     pub text: Cow<'a, str>,
     pub color: ratatui::style::Color,
+    pub is_steer: bool,
 }
 
 pub fn height(queue_len: usize) -> u16 {
@@ -38,17 +41,32 @@ pub fn view(frame: &mut Frame, area: Rect, entries: &[QueueEntry], focus: Option
             let flat = entry.text.replace('\n', " ");
             let (style, hint_parts) = if focus == Some(i) {
                 (theme::current().queue_delete, ("", FOCUSED_HINT, ""))
-            } else if i == 0 {
-                (
-                    Style::new().fg(entry.color),
-                    (" - ", key::POP_QUEUE.label, " to delete"),
-                )
             } else {
                 (Style::new().fg(entry.color), ("", "", ""))
             };
             truncate_line(&flat, content_width, style, hint_parts)
         })
         .collect();
+
+    let title = if entries.iter().all(|e| e.is_steer) {
+        STEER_LABEL
+    } else if entries.iter().any(|e| e.is_steer) {
+        MIXED_LABEL
+    } else {
+        QUEUE_LABEL
+    };
+
+    let right_hint = if entries.first().is_some_and(|e| e.is_steer) {
+        crate::components::hint_footer(&[
+            (key::POP_QUEUE.label, "edit"),
+            (key::QUEUE.label, "queue"),
+        ])
+    } else {
+        crate::components::hint_footer(&[
+            (key::POP_QUEUE.label, "edit"),
+            (key::STEER.label, "steer"),
+        ])
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -58,7 +76,8 @@ pub fn view(frame: &mut Frame, area: Rect, entries: &[QueueEntry], focus: Option
         } else {
             theme::current().panel_border
         })
-        .title_top(Line::from(QUEUE_LABEL).left_aligned())
+        .title_top(Line::from(title).left_aligned())
+        .title_top(right_hint)
         .title_style(theme::current().panel_title);
 
     let paragraph = Paragraph::new(lines)
@@ -144,5 +163,35 @@ mod tests {
             span_texts(&truncate_line(input, width, style(), hint)),
             expected
         );
+    }
+
+    #[test]
+    fn view_renders_steer_and_queue_titles() {
+        let backend = ratatui::backend::TestBackend::new(40, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        let queue_entry = [QueueEntry {
+            text: Cow::Borrowed("queue msg"),
+            color: ratatui::style::Color::White,
+            is_steer: false,
+        }];
+        terminal
+            .draw(|f| view(f, Rect::new(0, 0, 40, 3), &queue_entry, None))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("Queue"));
+
+        let steer_entry = [QueueEntry {
+            text: Cow::Borrowed("steer msg"),
+            color: ratatui::style::Color::White,
+            is_steer: true,
+        }];
+        terminal
+            .draw(|f| view(f, Rect::new(0, 0, 40, 3), &steer_entry, None))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("Steer"));
     }
 }

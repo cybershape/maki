@@ -1,7 +1,5 @@
-use std::sync::atomic::Ordering;
-
 use crate::components::Overlay;
-use crate::components::input::{BORDER_ROWS, Placeholder};
+use crate::components::input::BORDER_ROWS;
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
@@ -10,6 +8,7 @@ use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
+use maki_config::MaxWidth;
 use maki_lua::Split;
 use maki_providers::RequestOptions;
 use ratatui::Frame;
@@ -17,9 +16,37 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
-use super::{App, Mode, Status};
+#[cfg(test)]
+use super::Status;
+use super::{App, Mode};
+
+/// A tab without an input box, a finished task's or a moved call's, has
+/// only this hint to say how to get out and where to stop it.
+pub(super) const NO_INPUT_TAB_HINT: &str = " esc back · ctrl+x tasks ";
+
+pub fn center_rect(area: Rect, max_width: Option<MaxWidth>) -> Rect {
+    match max_width {
+        Some(max_w) => {
+            let target_w = max_w.resolve(area.width);
+            if target_w > 0 && area.width > target_w {
+                let x_offset = (area.width - target_w) / 2;
+                Rect {
+                    x: area.x + x_offset,
+                    y: area.y,
+                    width: target_w,
+                    height: area.height,
+                }
+            } else {
+                area
+            }
+        }
+        None => area,
+    }
+}
 
 struct ViewLayout {
+    /// `max_width` applied once, before splits carve the chat column out of it.
+    ui: Rect,
     msg_area: Rect,
     bottom_area: Rect,
     status_area: Rect,
@@ -47,20 +74,24 @@ impl App {
     }
 
     /// Whether a plugin writing to the chat input would land in a box the
-    /// user can see: nothing covering it, the main chat in front, no form in
-    /// the bottom panel, and a {area} tall enough to leave the box a text
-    /// row. An overlay counts even when it only takes the keyboard, because
-    /// the user is reading it and not the draft.
+    /// user can see: nothing covering it, no form in the bottom panel, and a
+    /// {area} tall enough to leave the box a text row. An overlay counts
+    /// even when it only takes the keyboard, because the user is reading it
+    /// and not the draft.
     ///
     /// Worked out from state on every ask rather than recorded while
     /// painting: a whole batch of wakes is handled between two frames, so a
     /// permission prompt and a plugin's edit can arrive in the same one and
     /// the edit has to meet the prompt that is already open.
     pub(crate) fn input_live(&self, area: Rect) -> bool {
-        self.is_main_chat()
+        self.chat_accepts_input()
             && !self.any_overlay_open()
             && !self.plan_form_active()
             && self.compute_layout(area).input_area.height > BORDER_ROWS
+    }
+
+    pub(crate) fn ui_area(&self, area: Rect) -> Rect {
+        center_rect(area, self.ui_config.max_width)
     }
 
     /// Returns the cell the terminal cursor belongs on, the cell the input box
@@ -79,15 +110,17 @@ impl App {
         self.render_messages(frame, &layout, render_chat);
         let caret = self.render_bottom_panel(frame, &layout);
         self.render_splits(frame, &layout);
-        let mut overlay_rect = self.render_picker_overlays(frame, &layout);
+        let mut overlay_rect = self.render_picker_overlays(frame, &layout, layout.ui);
         self.render_status_bar(frame, layout.status_area, render_chat);
-        overlay_rect = self.render_top_modals(frame, overlay_rect, caret);
+        overlay_rect = self.render_top_modals(frame, overlay_rect, caret, layout.ui);
         self.register_zones(&layout, overlay_rect);
         self.apply_selection(frame, render_chat);
         caret.filter(|_| self.input_has_keyboard())
     }
 
     fn compute_layout(&self, area: Rect) -> ViewLayout {
+        let area = self.ui_area(area);
+        let ui = area;
         let prompt_open = self.prompt_open();
 
         // Carve the full-width status bar first so the split carving below only
@@ -117,9 +150,9 @@ impl App {
             0
         } else if self.form_visible() {
             self.plan_form.height(max_bottom).min(max_bottom)
-        } else if self.is_main_chat() {
+        } else if self.chat_accepts_input() {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
-            queue_panel::height(self.queue.panel_len())
+            queue_panel::height(self.active_queue_len())
                 + panel_h
                 + self.input_box.height(inner.width).min(max_bottom)
         } else {
@@ -141,7 +174,7 @@ impl App {
         let queue_height = if bottom_takeover {
             0
         } else {
-            queue_panel::height(self.queue.panel_len())
+            queue_panel::height(self.active_queue_len())
         };
 
         let mut constraints = vec![Constraint::Length(queue_height)];
@@ -160,6 +193,7 @@ impl App {
         let input_area = areas[areas.len() - 1];
 
         ViewLayout {
+            ui,
             msg_area,
             bottom_area,
             status_area,
@@ -186,62 +220,54 @@ impl App {
             layout.msg_area,
             self.selection_state.is_some(),
             images_visible,
+            self.command_palette.lua_commands(),
         );
     }
 
     /// Returns the cell the input box drew its caret in, when it drew one at
-    /// all: a prompt, a form, a `below` split or a focused subagent chat all
-    /// take the box off screen, and a box scrolled off its own viewport draws
-    /// without a caret.
+    /// all: a prompt, a form, a `below` split or a chat that takes no
+    /// messages all take the box off screen, and a box scrolled off its own
+    /// viewport draws without a caret. A running subagent's chat keeps the
+    /// box, so a message can be queued for that subagent while watching it.
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) -> Option<Position> {
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, layout.bottom_area);
         } else if self.pack_review.is_open() {
             self.pack_review.view(frame, layout.bottom_area);
-        } else if !self.is_main_chat() {
+        } else if !self.chat_accepts_input() {
             let panel_reqs = self.float_mgr.panel_reqs();
             let panel_h: u16 = panel_reqs.iter().map(|(_, h)| *h).sum();
-            let (panel_areas, sep_area) = if panel_h > 0 {
-                let [panels, s] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
+            let sep_area = if panel_h > 0 {
+                let [panels, sep] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
                     .areas(layout.bottom_area);
                 let constraints: Vec<_> = panel_reqs
                     .iter()
                     .map(|&(_, h)| Constraint::Length(h))
                     .collect();
-                let sub = Layout::vertical(constraints).split(panels);
-                let areas: Vec<(usize, Rect)> = panel_reqs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &(idx, _))| (idx, sub[i]))
-                    .collect();
-                (Some(areas), s)
-            } else {
-                (None, layout.bottom_area)
-            };
-            if let Some(areas) = panel_areas {
-                for (idx, rect) in areas {
-                    self.float_mgr.view_panel(frame, idx, rect);
+                let areas = Layout::vertical(constraints).split(panels);
+                for (i, &(idx, _)) in panel_reqs.iter().enumerate() {
+                    self.float_mgr.view_panel(frame, idx, areas[i]);
                 }
-            }
+                sep
+            } else {
+                layout.bottom_area
+            };
+            let hint = Line::from(Span::styled(NO_INPUT_TAB_HINT, theme::current().tool_dim));
             let sep = Block::default()
                 .borders(Borders::TOP)
-                .border_style(self.separator_style());
+                .border_style(self.separator_style())
+                .title_top(hint.right_aligned());
             frame.render_widget(sep, sep_area);
         } else if self.plan_form_active() {
             self.plan_form.view(frame, layout.bottom_area);
         } else if layout.bottom_area.height > 0 {
-            let queue_entries = self.queue.panel_entries();
-            queue_panel::view(frame, layout.queue_area, &queue_entries, self.queue.focus());
+            let queue_entries = self.active_queue_entries();
+            let focus = self.queue.focus().filter(|_| self.is_main_chat());
+            queue_panel::view(frame, layout.queue_area, &queue_entries, focus);
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
-            let placeholder = if self.status == Status::Streaming {
-                Placeholder::Queue
-            } else if self.state.session.messages().is_empty() {
-                Placeholder::Suggestion
-            } else {
-                Placeholder::Blank
-            };
+            let placeholder = self.input_placeholder();
             let panel_hint = (self.state.mode == Mode::Plan)
                 .then(|| self.plan_form.hint_line())
                 .flatten()
@@ -254,7 +280,8 @@ impl App {
                 self.input_has_keyboard(),
                 panel_hint,
             );
-            self.command_palette.view(frame, layout.input_area);
+            self.command_palette
+                .view(frame, layout.input_area, &self.input_box.buffer);
             return caret;
         }
         None
@@ -268,9 +295,13 @@ impl App {
         }
     }
 
-    fn render_picker_overlays(&mut self, frame: &mut Frame, layout: &ViewLayout) -> Rect {
+    fn render_picker_overlays(
+        &mut self,
+        frame: &mut Frame,
+        layout: &ViewLayout,
+        full: Rect,
+    ) -> Rect {
         let mut overlay_rect = Rect::default();
-        let full = frame.area();
 
         if self.search_modal.is_open() {
             overlay_rect = self.search_modal.view(frame, layout.msg_area);
@@ -304,25 +335,38 @@ impl App {
         frame: &mut Frame,
         mut overlay_rect: Rect,
         caret: Option<Position>,
+        full: Rect,
     ) -> Rect {
-        let full = frame.area();
         let r = self.btw_modal.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;
         }
-        let r = self.help_modal.view(frame, full);
+        let r = self.compact_detail.view(frame, full);
+        if r.width > 0 {
+            overlay_rect = r;
+        }
+        let r = self.help_modal.view(frame, full, &self.keymap_reader);
         if r.width > 0 {
             overlay_rect = r;
         }
         if self.usage_modal.is_open() {
             let ctx = UsageModalContext {
                 total: &self.state.token_usage,
-                total_cost: self.state.cost,
-                total_list_cost: self.state.subsidised_list_cost,
+                total_cost: self
+                    .ui_config
+                    .show_cost
+                    .then_some(self.state.cost)
+                    .flatten(),
+                total_list_cost: self
+                    .ui_config
+                    .show_cost
+                    .then_some(self.state.subsidised_list_cost)
+                    .flatten(),
                 by_model: self.state.session.usage_by_model(),
                 model: &self.state.model,
                 fast: self.state.fast,
                 clock_format: self.ui_config.clock_format,
+                show_cost: self.ui_config.show_cost,
             };
             let r = self.usage_modal.view(frame, full, &ctx);
             if r.width > 0 {
@@ -333,43 +377,61 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
+        let r = self.alert_modal.view(frame, full);
+        if r.width > 0 {
+            overlay_rect = r;
+        }
         overlay_rect
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {
         let chat = &self.chats[render_chat];
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
+        // Only the session's model is at hand here, and a subagent may run on
+        // another, so a subagent's options are shown as stored.
         let opts = chat.opts.unwrap_or(RequestOptions {
-            thinking: self.state.thinking,
+            thinking: self.state.thinking.shown(&self.state.model),
             fast: self.state.fast,
         });
         let (mode_label, mode_style) = self.mode_label();
+        let model_str = if self.ui_config.prefer_model_name {
+            if let Some(ref chat_model_id) = chat.model_id {
+                maki_providers::model_registry::resolve_model_name_or(chat_model_id, chat_model_id)
+            } else {
+                self.state.model.display_name().to_string()
+            }
+        } else {
+            chat.model_id
+                .as_deref()
+                .unwrap_or(&self.state.session.model)
+                .to_string()
+        };
         let ctx = StatusBarContext {
             status: &self.status,
+            motion: self.status_motion(),
             mode_label,
             mode_style,
-            model_id: chat
-                .model_id
-                .as_deref()
-                .unwrap_or(&self.state.session.model),
+            model_id: &model_str,
             stats: UsageStats {
-                global_cost: self.state.cost,
+                global_cost: self
+                    .ui_config
+                    .show_cost
+                    .then_some(self.state.cost)
+                    .flatten(),
                 context_size: chat.context_size,
-                cost: chat.cost,
-                list_cost: chat.list_cost,
+                cost: self.ui_config.show_cost.then_some(chat.cost).flatten(),
+                list_cost: self.ui_config.show_cost.then_some(chat.list_cost).flatten(),
                 subsidy_source: self.state.model.subsidised_by.clone(),
                 context_window: self.state.model.context_window,
                 show_global: self.chats.len() > 1,
             },
             auto_scroll: chat.auto_scroll(),
             chat_name,
-            retry_info: self.retry_info.as_ref(),
             thinking_label: opts.thinking.status_label(),
             fast: opts.fast,
             workflow: self.state.workflow,
             restricted: self.trust_question.is_some(),
             yolo: self.permissions.is_yolo(),
-            restoring: self.restoring.load(Ordering::Relaxed),
         };
         self.status_bar.view(frame, status_area, &ctx);
     }
@@ -383,7 +445,7 @@ impl App {
             zone: SelectionZone::Messages,
         });
 
-        if layout.input_area.height > 0 && !layout.bottom_takeover && self.is_main_chat() {
+        if layout.input_area.height > 0 && !layout.bottom_takeover && self.chat_accepts_input() {
             let input_inner = Rect::new(
                 layout.input_area.x,
                 layout.input_area.y + 1,
@@ -398,16 +460,12 @@ impl App {
 
         self.zones.push_overlay(layout.status_area);
 
-        if self.form_visible() {
+        if self.form_visible() || !self.chat_accepts_input() {
             self.zones.push_overlay(layout.bottom_area);
         }
 
         for &(_, rect) in &layout.panel_windows {
             self.zones.push_overlay(selection::inset_border(rect));
-        }
-
-        if !self.is_main_chat() && layout.bottom_area.height > 0 {
-            self.zones.push_overlay(layout.bottom_area);
         }
 
         if layout.queue_area.height > 0 && !layout.bottom_takeover {
@@ -464,22 +522,18 @@ impl App {
     }
 
     fn lua_hint_line(&self) -> Option<Line<'static>> {
-        let snap = self.hints.get()?;
-        if snap.entries.is_empty() {
-            return None;
-        }
-        let mut spans = Vec::new();
-        for (_, pairs) in &snap.entries {
-            for (text, style_name) in pairs {
-                let style = theme::style_by_name(style_name);
-                spans.push(Span::styled(text.clone(), style));
-            }
-        }
-        Some(Line::from(spans))
+        let spans: Vec<_> = self
+            .hints
+            .get()?
+            .visible_in(self.state.session.id)
+            .flat_map(|entry| &entry.spans)
+            .map(|(text, style_name)| Span::styled(text.clone(), theme::style_by_name(style_name)))
+            .collect();
+        (!spans.is_empty()).then(|| Line::from(spans))
     }
 
     #[cfg(test)]
-    pub(super) fn active_keybind_contexts(&self) -> Vec<KeybindContext> {
+    pub(super) fn active_keybind_contexts(&mut self) -> Vec<KeybindContext> {
         let mut contexts = vec![KeybindContext::General];
         if self.pack_review.is_open() || self.plan_form_active() {
             contexts.push(KeybindContext::FormInput);
@@ -491,7 +545,7 @@ impl App {
             contexts.push(KeybindContext::ThemePicker);
         } else if self.model_picker.is_open() {
             contexts.push(KeybindContext::ModelPicker);
-        } else if self.command_palette.is_active() {
+        } else if self.command_palette.is_active(&self.input_box.buffer) {
             contexts.push(KeybindContext::CommandPalette);
         } else if self.search_modal.is_open() {
             contexts.push(KeybindContext::Search);

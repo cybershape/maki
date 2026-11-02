@@ -45,6 +45,10 @@ headers = { Authorization = "Bearer ${ANALYTICS_TOKEN}" }
 referenced variable that is unset or empty fails that server with the variable
 named in its status, instead of sending a dangling `Bearer ` and getting a 401.
 
+Maki does not pass provider API keys such as `ANTHROPIC_API_KEY` to the
+processes it starts, so a stdio server that needs one gets it through
+`environment = { ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}" }`.
+
 Some HTTP servers need OAuth but have no dynamic client registration. For those, give Maki a static client:
 
 ```toml
@@ -52,6 +56,16 @@ Some HTTP servers need OAuth but have no dynamic client registration. For those,
 url = "https://mcp.acme.example.com/mcp"
 oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3118, callback_path = "/callback", callback_hostname = "localhost" }
 ```
+
+For a server whose certificate comes from a private CA, point `ca_file` at a PEM bundle:
+
+```toml
+[mcp.internal]
+url = "https://mcp.corp.example.com/mcp"
+ca_file = "~/certs/corp-ca.pem"
+```
+
+Maki checks certificates against the operating system's trust store, so a CA that is already trusted in the macOS keychain or the Windows certificate store works without `ca_file`. Set `ca_file` for a CA that is not in that store. The bundle replaces the default CAs for this server and its OAuth endpoints. If OAuth goes through a public provider, add the public CAs to the bundle too, for example `cat /etc/ssl/cert.pem corp-ca.pem > bundle.pem`. The path expands `${VAR}` and `~`, and a relative path starts from the folder of the `mcp.toml` that sets it. On Linux, you can instead trust a CA for every HTTPS request Maki makes by pointing `SSL_CERT_FILE` at a bundle that holds the public CAs as well. On macOS and Windows, MCP servers ignore `SSL_CERT_FILE`, so use `ca_file` there.
 
 ### All options
 
@@ -61,68 +75,66 @@ oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3
 | `url` | string | | HTTP: server URL |
 | `environment` | map | | Stdio only. Values expand `${VAR}` from the environment |
 | `headers` | map | | HTTP only. Values expand `${VAR}` from the environment |
-| `oauth` | table | | HTTP only: static client (`client_id`, optional `client_secret`, optional `callback_port`, optional `callback_path`, optional `callback_hostname`) |
+| `oauth` | table | | HTTP only: OAuth client (optional `client_id`, optional `client_secret`, optional `callback_port`, optional `callback_path`, optional `callback_hostname`, optional `callback_scheme`) |
+| `ca_file` | path | | HTTP only. PEM bundle that replaces the default CAs for this server and its OAuth |
+| `description` | string | | Summary of the server capabilities shown to the model |
 | `timeout` | u64 | 30000 | Milliseconds (1-300000) |
 | `enabled` | bool | true | |
-| `always_load` | bool | false | Skip tool search, load all tools upfront |
 
 Set `command` for stdio, `url` for HTTP. Pick one.
 
-One option lives at the top level of `mcp.toml`, outside any server:
+## External libraries and code execution
 
-| Field | Type | Default | Notes |
-|-------|------|---------|-------|
-| `defer_tools` | usize | 10 | Defer tools only when more than this many exist |
+Every tool definition a server exposes costs context window space on every request. A server with dozens of tools can consume thousands of tokens before a conversation even starts. Adding or loading tool definitions mid-session also alters the request prefix, invalidating the prompt cache and triggering costly cache writes.
 
-## Tool search
+To keep the prompt cache completely stable across all models, Maki treats MCP servers as **external Python libraries** called exclusively inside `code_execution`.
 
-Every tool definition a server exposes costs context window space, on every request. Take Datadog's MCP server: with all toolsets on it ships over 100 tools, when a task often needs three.
+MCP functions never enter the top-level API `tools` array. The model sees available modules and their functions listed in the `code_execution` environment description, and can call them via module attributes:
 
-So Maki, like Claude Code, defers MCP tools by default. The model sees one small `tool_search` tool that lists the deferred names, searches when it actually needs something, and the matches stay loaded for the rest of the session. Resume a session and the tools it was using come back. Subagents keep their own loads, so their searches don't bloat your main conversation.
+```python
+await github.create_issue(title="Bug fix", body="Details")
+```
+
+Flat namespaced names (`await github__create_issue(...)`) remain supported as aliases.
 
 ```
-server ships 117 tool definitions
+MCP servers (e.g. github, datadog)
         │
-  more than defer_tools (10)?
-   │ no          │ yes
-   ▼             ▼
-   all load      context gets one small tool: tool_search
-   upfront       │
-                 │  model: tool_search("logs")
-                 ▼
-                 3 matches load, stay for the session
-                 114 definitions never enter context
+        ▼
+context keeps tools array static: [read, write, edit, bash, code_execution, library_help]
+        │
+        ▼  model calls library_help(library_name="github", function_name="create_issue")
+gets Python signature + docstring
+        │
+        ▼  model writes Python script in code_execution
+await github.create_issue(title="Bug fix")
 ```
 
-You don't configure anything for this. Add the server as usual:
+### Inspecting function documentation
 
-```toml
-[mcp.datadog]
-url = "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp?toolsets=all"
+When at least one MCP server is configured, Maki exposes the `library_help` tool to the model. The tool takes both `library_name` and `function_name` and returns the exact Python async function signature, parameter types, and docstring:
+
+```python
+async def create_issue(
+    owner: str,
+    repo: str,
+    title: str,
+    body: str = None,
+    labels: list[str] = None
+) -> str:
+    """
+    Create an issue in a repository.
+
+    Parameters:
+    - owner (str, required): The account owner of the repository.
+    - repo (str, required): The name of the repository.
+    - title (str, required): The issue title.
+    - body (str, optional): The issue contents.
+    - labels (list[str], optional): Labels to associate with this issue.
+    """
 ```
 
-Ask about an incident, and the model searches for something like `datadog logs`, gets back the few matching tools, and the other hundred definitions never enter the conversation.
-
-With 10 or fewer tools across all your servers there is no search step: at that size, searching costs more than it saves, so everything loads upfront. The top-level `defer_tools` key moves that line:
-
-```toml
-defer_tools = 30
-
-[mcp.github]
-url = "https://api.githubcopilot.com/mcp/"
-```
-
-Set it to 0 to always defer, or above your tool count to never defer.
-
-If one server should skip the search step entirely, opt it out:
-
-```toml
-[mcp.linear]
-command = ["linear-mcp-server"]
-always_load = true
-```
-
-Good for small servers you rely on every turn. On a big server it defeats the point: every definition is back in your context on every request.
+When no MCP servers are configured, `library_help` is automatically hidden from the model.
 
 ## Naming and namespacing
 
@@ -155,17 +167,20 @@ maki mcp auth <server-name>     # manually trigger auth
 maki mcp logout <server-name>   # remove stored tokens
 ```
 
-Servers without dynamic client registration need a client you registered yourself (e.g. your own app on their platform). Add it to the server config so the auth flow uses it instead of trying to register:
+Servers without dynamic client registration need a client you registered yourself (e.g. your own app on their platform). Add it to the server config so the auth flow uses it instead of trying to register. Without `client_id`, the `callback_*` fields still apply and Maki registers a client dynamically with that redirect URI:
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `client_id` | string | Client id of your registered app |
-| `client_secret` | string | Optional, for confidential clients |
+| `client_id` | string | Optional, client id of your registered app |
+| `client_secret` | string | Optional, for confidential clients (needs `client_id`) |
 | `callback_port` | u16 | Optional, pins the loopback port so the redirect URI can be pre-registered |
 | `callback_path` | string | Optional, loopback path of the redirect URI (default `/mcp/oauth/callback`) |
 | `callback_hostname` | string | Optional, loopback hostname of the redirect URI (default `127.0.0.1`) |
+| `callback_scheme` | string | Optional, `http` (default) or `https` |
 
 Set `callback_port` when the server only accepts exact redirect URIs. Otherwise Maki falls back to its default port, then to any free port, so the redirect URI changes between runs. Set `callback_path` when the server registered a different path (e.g. `/callback`). Set `callback_hostname` to `localhost` when the server registered the name form instead of the IP (the listener still binds to 127.0.0.1).
+
+Set `callback_scheme = "https"` (needs `callback_port`) when the server only accepts https redirect URIs, such as `https://localhost:3119/callback`. Maki serves the callback with a self-signed certificate it makes for each login, so the browser warns once before the redirect lands. Proceed past the warning and the login finishes, in the TUI or in `maki mcp auth <server-name>`.
 
 ### Headless machines
 

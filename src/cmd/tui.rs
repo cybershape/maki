@@ -15,15 +15,14 @@ use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::{InitFiles, Interaction, PackPlan, PackReport, PluginHost};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
-use maki_ui::{AppSession, RunOutcome};
+use maki_ui::{OpenSession, RunOutcome};
 
 use crate::cli::{Cli, normalize_tool_name};
+use crate::provider_scripts;
 use crate::resume::{self, Resolved};
 use crate::setup;
 
-const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
-const STALE_PROJECT_CONFIG: &str = ".maki/config.toml";
-const STALE_GLOBAL_CONFIG: &str = "config.toml";
+const FALLBACK_MODEL_SPEC: &str = "responses/default";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
 const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
@@ -73,11 +72,11 @@ impl Drop for Teardown {
     }
 }
 
-fn discover_commands(disable: bool, cwd: &Path) -> Vec<CustomCommand> {
+fn discover_commands(disable: bool, cwd: &Path, config: &Config) -> Vec<CustomCommand> {
     if disable {
         return Vec::new();
     }
-    command::discover_commands(cwd)
+    command::discover_commands(cwd, &config.compatibility)
 }
 
 fn load_config(
@@ -115,6 +114,9 @@ fn load_config(
                 .filter_map(|t| normalize_tool_name(t).ok()),
         );
     }
+    if let Some(max_width) = cli.max_width {
+        config.ui.max_width = Some(max_width);
+    }
     config.validate()?;
     Ok(config)
 }
@@ -144,17 +146,21 @@ struct Launch<'a> {
 /// The one construction path for a generation: first startup passes
 /// `fallback: None` (fail-fast); `/reload` passes the last-good config and
 /// model so a broken config reopens the UI with a warning instead of exiting.
-fn build_stack(
+async fn build_stack(
     launch: &Launch<'_>,
     trust: &ProjectDecision,
     fallback: Option<(Config, Model)>,
 ) -> Result<(Stack, Vec<String>)> {
     let cli = launch.cli;
-    let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
-        .context("initialize lua plugin host")?;
+    let mut plugin_host = PluginHost::start(
+        Arc::clone(ToolRegistry::global_arc()),
+        launch.interaction,
+        !cli.no_jit,
+    )
+    .context("initialize lua plugin host")?;
 
     let (fallback_config, fallback_model) = fallback.unzip();
-    let (config, mut warnings) = super::load_plugins(
+    let (mut config, mut warnings) = super::load_plugins(
         &mut plugin_host,
         cli.no_plugins,
         if fallback_model.is_some() {
@@ -175,13 +181,19 @@ fn build_stack(
             );
             config_or_fallback(loaded, fallback_config, warnings)
         },
-    )?;
+    )
+    .await?;
 
-    let commands = discover_commands(cli.no_commands, launch.cwd);
+    let commands = discover_commands(cli.no_commands, launch.cwd, &config);
 
-    let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage);
+    setup::remember_thinking(&mut config.session_defaults, launch.storage);
+    let model_result =
+        setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage).await;
     let (model, needs_login) = match (model_result, fallback_model) {
-        (Ok(m), _) => (m, false),
+        (Ok((m, warning)), _) => {
+            warnings.extend(warning);
+            (m, false)
+        }
         (Err(e), Some(last_model)) => {
             warnings.push(format!("{MODEL_FALLBACK_WARNING}: {e:#}"));
             (last_model, false)
@@ -209,12 +221,12 @@ fn build_stack(
 /// and the only step left here is the TUI-only one: an explicit `--model` is a
 /// choice about the session being opened, and a session's own spec is what
 /// every later switch reads.
-fn open_tab(resolved: Resolved, model: &str, explicit_model: bool, cwd: &str) -> AppSession {
-    let mut session = resolved.into_session(model, cwd);
+fn open_tab(resolved: Resolved, model: &str, explicit_model: bool, cwd: &str) -> OpenSession {
+    let mut tab = resolved.into_session(model, cwd);
     if explicit_model {
-        session.set_model(model.to_owned());
+        tab.session.set_model(model.to_owned());
     }
-    session
+    tab
 }
 
 fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
@@ -239,7 +251,7 @@ fn should_load_project_env(was_trusted: bool, now_trusted: bool) -> bool {
 /// project environment, because the ordering is the whole safety argument: the
 /// old plugin host's thread must be joined before `load_env_files` touches the
 /// process env, and the env must be in place before the new host reads config.
-fn rebuild(
+async fn rebuild(
     launch: &Launch<'_>,
     mut stack: Stack,
     teardown: &mut Teardown,
@@ -264,22 +276,25 @@ fn rebuild(
     } else {
         teardown.defer(move || drop(stack));
     }
-    let pack_report = pack.map(maki_lua::apply_pack_plan);
+    let pack_report = match pack {
+        Some(plan) => Some(maki_lua::apply_pack_plan(plan).await),
+        None => None,
+    };
 
     if load_env {
         // This calls `std::env::set_var`. On the startup grant path nothing
         // long-lived exists yet, so the join above is the whole story. The only
         // site that reaches it with threads alive is `/trust`, a rare explicit
-        // action, and only after the join: smol's worker pool and any telemetry
-        // exporter may still be parked.
+        // action, and only after the join: tokio's worker threads and any
+        // telemetry exporter may still be parked.
         load_env_files(&trust.project_config);
     }
 
-    let (stack, warnings) = build_stack(launch, trust, fallback)?;
+    let (stack, warnings) = build_stack(launch, trust, fallback).await?;
     Ok((stack, warnings, pack_report))
 }
 
-pub fn run(mut cli: Cli) -> Result<()> {
+pub async fn run(mut cli: Cli) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
@@ -303,7 +318,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
     };
     let mut trust = project::resolve(&storage, &cwd, mode);
     load_env_files(&trust.project_config);
-    warn_stale_config_toml(&trust.project_config);
     let mut teardown = Teardown::default();
     let launch = Launch {
         cli: &cli,
@@ -311,7 +325,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         storage: &storage,
         interaction,
     };
-    let (mut stack, mut startup_warnings) = build_stack(&launch, &trust, None)?;
+    let (mut stack, mut startup_warnings) = build_stack(&launch, &trust, None).await?;
 
     // The card owns the terminal, so it is drawn before logging, telemetry and
     // the panic hook claim it, and while the process is still single-threaded.
@@ -351,7 +365,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     was_trusted,
                     None,
                     None,
-                )?;
+                )
+                .await?;
             } else {
                 startup_warnings.extend(trust.warning.clone());
             }
@@ -360,7 +375,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         None => startup_warnings.extend(trust.state.restricted_warning()),
     }
 
-    setup::init_logging(&stack.config.storage);
+    setup::init_logging(&stack.config.storage, trust.project_config.config_root());
     setup::init_telemetry(&stack.config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
@@ -370,7 +385,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
     // mode that never opens the UI has to report them here or a broken
     // package fails in complete silence.
     if cli.is_sdk_mode() || cli.print {
-        for warning in &startup_warnings {
+        for warning in startup_warnings
+            .iter()
+            .chain(&provider_scripts::startup_warning())
+        {
             eprintln!("warning: {warning}");
         }
     }
@@ -383,11 +401,13 @@ pub fn run(mut cli: Cli) -> Result<()> {
     setup::report_session_start(resolved.start_type, Some(&resolved.id));
 
     if cli.is_sdk_mode() {
+        let (resumed, claim) = resolved.into_resumed();
         let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
         let timeouts = stack.timeouts();
-        crate::sdk_mode::run(crate::sdk_mode::SdkParams {
+        let interrupt = crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
-            resumed: resolved.into_resumed(),
+            resumed,
+            claim,
             storage: storage.clone(),
             model: stack.model,
             config: stack.config.agent,
@@ -400,13 +420,19 @@ pub fn run(mut cli: Cli) -> Result<()> {
             lua_handle: stack.plugin_host.event_handle(),
             project_config: trust.project_config.clone(),
         })
+        .await
         .context("run sdk mode")?;
+        drop(stack.plugin_host);
+        teardown.join();
+        interrupt.exit_if_caught();
         return Ok(());
     }
 
     if cli.print {
+        let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
-        crate::print::run(crate::print::PrintParams {
+        let background_wait = cli.background_wait();
+        let interrupt = crate::print::run(crate::print::PrintParams {
             model: stack.model,
             prompt: cli.initial_prompt,
             image_paths: cli.images,
@@ -420,10 +446,17 @@ pub fn run(mut cli: Cli) -> Result<()> {
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
             project_config: trust.project_config.clone(),
-            resumed: resolved.into_resumed(),
+            resumed,
+            claim,
             storage: storage.clone(),
+            program_status: stack.config.ui.program_status,
+            background_wait,
         })
+        .await
         .context("run print mode")?;
+        drop(stack.plugin_host);
+        teardown.join();
+        interrupt.exit_if_caught();
         return Ok(());
     }
 
@@ -434,6 +467,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         &cwd_str,
     )];
     let mut focused = 0;
+    let mut handed_over = Vec::new();
     let mut warnings = startup_warnings;
     let mut initial_prompt = read_initial_prompt(cli.initial_prompt.take())?;
     let launch = Launch {
@@ -444,7 +478,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     };
 
     loop {
-        for session in &mut tabs {
+        for OpenSession { session, .. } in &mut tabs {
             if session.messages().is_empty() {
                 stack.config.session_defaults.seed(&mut session.meta);
             }
@@ -463,6 +497,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 focused,
                 startup_warnings: std::mem::take(&mut warnings),
                 startup_notice: notice.take(),
+                // Read per run: plugins have just (re)loaded, and a script one
+                // of them now replaces is no longer worth a word.
+                startup_alert: provider_scripts::startup_warning(),
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
@@ -475,24 +512,33 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 )),
                 timeouts: stack.timeouts(),
                 exit_on_done: cli.exit_on_done,
+                background_wait: cli.background_wait(),
                 lua_command_reader: stack.plugin_host.command_reader(),
                 keymap_reader: stack.plugin_host.keymap_reader(),
                 hint_reader: stack.plugin_host.hint_reader(),
+                input_rules_reader: stack.plugin_host.input_rules_reader(),
                 ui_action_rx: stack.plugin_host.ui_action_rx(),
+                ui_wake_rx: stack.plugin_host.ui_wake_rx(),
                 ui_attachment: stack.plugin_host.ui_attachment(),
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
                 project_config: trust.project_config.clone(),
                 trust_question: trust.state.question().cloned(),
+                handed_over: std::mem::take(&mut handed_over),
             },
             initial_prompt.take(),
         )
+        .await
         .context("run UI")?;
 
         match outcome {
             RunOutcome::Exit { session_id, code } => {
                 if let Some(session_id) = session_id {
-                    eprintln!("Resume session:\n\n  maki -s {session_id}");
+                    let argv0 = env::args_os().next().unwrap_or_default();
+                    eprintln!(
+                        "Resume session:\n\n  {} -r {session_id}",
+                        argv0.to_string_lossy()
+                    );
                 }
                 let started = Instant::now();
                 drop(stack);
@@ -513,7 +559,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 tabs: reloaded,
                 focused: f,
                 pack,
+                mailboxes,
             } => {
+                // Held across the rebuild: a result no run drained yet lives
+                // only there.
+                handed_over = mailboxes;
                 let started = Instant::now();
                 let last_good = (stack.config.clone(), stack.model.clone());
                 let was_trusted = trust.project_config.is_trusted();
@@ -528,10 +578,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     was_trusted,
                     pack,
                     Some(last_good),
-                )?;
+                )
+                .await?;
                 tabs = reloaded;
                 if tabs.is_empty() {
-                    let replacement = Resolved::fresh();
+                    let replacement = Resolved::fresh(&storage);
                     setup::report_session_start(replacement.start_type, Some(&replacement.id));
                     tabs.push(replacement.into_session(&new_stack.model.spec(), &cwd_str));
                 }
@@ -552,39 +603,23 @@ pub fn run(mut cli: Cli) -> Result<()> {
     }
 }
 
-/// Trust has nothing to say about this file, because Maki no longer reads it.
-/// Someone who declined trust deserves to hear that the file is inert just as
-/// much as someone who accepted.
-fn warn_stale_config_toml(project_config: &ProjectConfig) {
-    let stale_paths = [
-        maki_config::global_config_dir().map(|dir| dir.join(STALE_GLOBAL_CONFIG)),
-        Some(project_config.config_root().join(STALE_PROJECT_CONFIG)),
-    ];
-    for path in stale_paths.into_iter().flatten() {
-        if path.is_file() {
-            tracing::warn!(
-                path = %path.display(),
-                "config.toml found but no longer used. Migrate to init.lua. See https://maki.sh/docs/configuration/"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
     use color_eyre::eyre::eyre;
     use maki_agent::tools::ToolRegistry;
-    use maki_config::RawConfig;
+    use maki_config::{MaxWidth, RawConfig};
     use maki_providers::Message;
+    use maki_storage::sessions::SessionClaim;
+    use maki_ui::AppSession;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::tempdir;
     use test_case::test_case;
 
-    const STARTUP_SPEC: &str = "anthropic/claude-sonnet-4-5";
+    const STARTUP_SPEC: &str = "responses/claude-sonnet-4-5";
     const STORED_SPEC: &str = "zai/glm-4.6";
     const CWD: &str = "/project";
     const STORED_MESSAGE: &str = "the turn the stored session already had";
@@ -689,7 +724,7 @@ mod tests {
         let cli = Cli::parse_from(["maki", "--no-plugins"]);
         assert!(cli.no_plugins);
 
-        let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true)
+        let mut plugin_host = PluginHost::new(Arc::new(ToolRegistry::new()))
             .expect("live host boots under --no-plugins");
 
         let config = load_config(
@@ -731,7 +766,7 @@ mod tests {
         assert!(!cli.no_plugins);
 
         let mut plugin_host =
-            PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
+            PluginHost::new(Arc::new(ToolRegistry::new())).expect("live host boots");
 
         match load_config(
             &plugin_host,
@@ -761,12 +796,17 @@ mod tests {
         let cwd = dir.path().to_string_lossy().into_owned();
         let mut stored = AppSession::new(STORED_SPEC, &cwd);
         stored.push_message(Message::user(STORED_MESSAGE.to_owned()));
-        stored.save(&storage).expect("write session to disk");
         let stored_id = stored.id;
+        stored
+            .save(
+                &SessionClaim::acquire(stored_id, &storage).expect("claim"),
+                &storage,
+            )
+            .expect("write session to disk");
         let resolved = resume::resolve(&Cli::parse_from(["maki", "-c"]), &cwd, &storage)
             .expect("continue resolves");
 
-        let session = open_tab(resolved, STARTUP_SPEC, explicit_model, &cwd);
+        let session = open_tab(resolved, STARTUP_SPEC, explicit_model, &cwd).session;
 
         assert_eq!(session.id, stored_id);
         assert_eq!(
@@ -785,12 +825,41 @@ mod tests {
     /// reports is what it writes.
     #[test]
     fn a_fresh_tab_opens_on_the_resolved_id_and_the_startup_spec() {
-        let resolved = Resolved::fresh();
+        let dir = tempdir().expect("tempdir");
+        let storage = StateDir::from_path(dir.path().join("state"));
+        let resolved = Resolved::fresh(&storage);
         let id = resolved.id.id();
-        let session = open_tab(resolved, STARTUP_SPEC, false, CWD);
+        let session = open_tab(resolved, STARTUP_SPEC, false, CWD).session;
 
         assert_eq!(session.id, id);
         assert!(session.messages().is_empty());
         assert_eq!(session.model, STARTUP_SPEC);
+    }
+
+    #[test]
+    fn cli_max_width_overrides_ui_config() {
+        let dir = tempdir().expect("tempdir");
+        let cli = Cli::parse_from(["maki", "--max-width", "100"]);
+        assert_eq!(cli.max_width, Some(MaxWidth::Fixed(100)));
+
+        let plugin_host = PluginHost::new(Arc::new(ToolRegistry::new())).expect("live host boots");
+
+        let config = load_config(
+            &plugin_host,
+            &cli,
+            InitFiles::Disabled,
+            &ProjectConfig::for_project(dir.path()),
+            &no_names,
+            &mut Vec::new(),
+        )
+        .expect("load config");
+
+        assert_eq!(config.ui.max_width, Some(MaxWidth::Fixed(100)));
+
+        let cli_ratio = Cli::parse_from(["maki", "--max-width", "0.8"]);
+        assert_eq!(cli_ratio.max_width, Some(MaxWidth::Ratio(0.8)));
+
+        let cli_offset = Cli::parse_from(["maki", "--max-width", "-10"]);
+        assert_eq!(cli_offset.max_width, Some(MaxWidth::Offset(-10)));
     }
 }

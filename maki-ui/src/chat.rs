@@ -5,18 +5,29 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::app::tasks::{TaskOutcome, TaskStatus};
-use crate::components::messages::{MessagesPanel, PromptProgress, ScrollPos};
+use crate::app::tasks::{TaskClock, TaskOutcome, TaskParent, TaskStatus};
+use crate::components::input::Draft;
+use crate::components::messages::{ClickOutcome, MessagesPanel, PromptProgress, ScrollPos};
 use crate::components::tool_display::append_annotation;
-use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
+use crate::components::{
+    BackgroundBadge, BackgroundOutcome, CompactDetail, DisplayMessage, DisplayRole, GroupEntry,
+    GroupThinkingEntry, GroupToolEntry, ToolGroupRole, ToolRole, ToolStatus,
+};
 use crate::markdown::truncate_output;
 
 use crate::selection::{DocPos, RowPos, Selection};
+use maki_agent::tools::schema::TOOLCALL_REASON_FIELD;
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
-use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use maki_agent::types::ALLOWED_BY;
+use maki_agent::{
+    AgentEvent, BufferSnapshot, DisplayItem, SharedBuf, SteerKind, SubagentInbox, ToolDoneEvent,
+    ToolOutput, ToolStartEvent, TurnCompleteEvent, TurnTiming, display_order, observation_detail,
+};
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
-use maki_lua::WinView;
-use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
+use maki_lua::{LuaCommandInfo, WinView};
+use maki_providers::{
+    ContentBlock, ImageSource, Message, RequestOptions, Role, TokenUsage, format_tokens,
+};
 use maki_storage::id::MakiId;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -27,9 +38,15 @@ use crate::repaint::{Cadence, Dirty};
 pub(crate) const DONE_TEXT: &str = "Done!";
 pub(crate) const ERROR_TEXT: &str = "Error";
 pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
+pub(crate) const LOST_TEXT: &str = "Lost";
 /// One notice per streak: a wedged model can spend twenty nudges, and twenty
 /// identical bubbles bury the conversation they are about.
 const NUDGE_TEXT: &str = "Model stalled after tool calls, nudging...";
+const REWRITTEN_PREFIX: &str = "A plugin rewrote this message. The model got:";
+const DROPPED_PREFIX: &str = "A plugin kept this message from the model:";
+const CONTINUED_PREFIX: &str = "A plugin kept the agent going:";
+pub(crate) const INBOX_DROPPED_SUFFIX: &str =
+    " queued message(s) dropped: the subagent finished first";
 
 pub enum ChatEventResult {
     Continue,
@@ -43,12 +60,35 @@ pub enum ChatEventResult {
         id: String,
         tool: ToolKey,
         scopes: Vec<String>,
+        reason: Option<String>,
     },
     AuthRequired,
 }
 
+/// A call this chat's agent started that has not reported done.
+pub(crate) struct RunningCall {
+    pub(crate) id: String,
+    pub(crate) tool: Arc<str>,
+}
+
 pub struct Chat {
     pub name: String,
+    /// The plugin that opened this task with `maki.agent.session`. A tool task
+    /// has none: it lives for one turn of the main chat and is swept with it,
+    /// while a plugin task answers only to its plugin and to Esc in its tab.
+    pub(crate) plugin: Option<Arc<str>>,
+    /// A plugin task between runs: its run ended, its session did not. Kept
+    /// by [`Self::track_run`] from the runs' own events.
+    pub(crate) idle: bool,
+    /// Its run waits on expired credentials for the user's Enter. Any later
+    /// event of the run, or the chat's end, lifts it, so it never goes stale.
+    pub(crate) auth_parked: bool,
+    /// Shows a call moved off its turn. The call is out until its final
+    /// result, whatever its runs do in between, so it never reads idle.
+    pub(crate) backs_moved_call: bool,
+    /// The moved call `/tasks` lists this task under.
+    pub(crate) parent: Option<TaskParent>,
+    pub(crate) clock: Option<TaskClock>,
     pub cost: Option<f64>,
     /// This chat's slice of the session's list-price reference cost; mirrors
     /// `cost`, but only ever set for subsidised models.
@@ -58,11 +98,26 @@ pub struct Chat {
     /// A subagent's own settings; `None` on the main chat, which reads the
     /// session's.
     pub opts: Option<RequestOptions>,
+    /// A running subagent's inbox for messages typed in its chat. Taken when
+    /// the chat finishes, since nothing would drain it after that.
+    pub(crate) inbox: Option<Arc<SubagentInbox>>,
+    /// Where a subagent's permission answers go. It lives until the chat
+    /// finishes, not the turn, so a subagent moved off its turn can still be
+    /// answered.
+    pub(crate) answer_tx: Option<flume::Sender<String>>,
+    /// Parked while another chat is in front, see `App::set_active_chat`.
+    pub(crate) draft: Draft,
     pending_turn_usage: Option<String>,
+    /// Wall-clock and token counters for the current user turn, filled from
+    /// each live `TurnComplete` and rendered once on `Done`/`Error`.
+    pending_turn_stats: PendingTurnStats,
     messages_panel: MessagesPanel,
     /// The ending and the index of the bubble announcing it, so a later, better
     /// informed outcome can fix that bubble instead of appending a second one.
     finish: Option<(TaskOutcome, usize)>,
+    /// Candidates only: a row can stop running without a `ToolDone` (a cancel,
+    /// a retry), so [`Self::running_calls`] checks each against its row.
+    running_calls: Vec<RunningCall>,
 }
 
 impl Chat {
@@ -80,15 +135,30 @@ impl Chat {
         messages_panel.set_chat(session_id, task_id.map(Arc::from));
         Self {
             name,
+            plugin: None,
+            idle: false,
+            auth_parked: false,
+            backs_moved_call: false,
+            parent: None,
+            clock: None,
             cost: None,
             list_cost: None,
             context_size: 0,
             model_id: None,
             opts: None,
+            inbox: None,
+            answer_tx: None,
+            draft: Draft::default(),
             pending_turn_usage: None,
+            pending_turn_stats: PendingTurnStats::default(),
             messages_panel,
             finish: None,
+            running_calls: Vec::new(),
         }
+    }
+
+    pub(crate) fn reset_turn_stats(&mut self) {
+        self.pending_turn_stats = PendingTurnStats::default();
     }
 
     /// The handle `maki.task` addresses a task by, see `app::tasks`.
@@ -106,7 +176,40 @@ impl Chat {
     }
 
     pub(crate) fn task_status(&self) -> TaskStatus {
-        self.finish.map(|(outcome, _)| outcome).into()
+        match self.finish {
+            Some((outcome, _)) => outcome.into(),
+            None if self.idle && !self.backs_moved_call => TaskStatus::Idle,
+            None => TaskStatus::Working,
+        }
+    }
+
+    /// A plugin task that still answers to its plugin. Its session lives in
+    /// the Lua host, so neither a rewind nor a reload of the chrome ends it.
+    pub(crate) fn is_live_plugin_task_of(&self, session: MakiId) -> bool {
+        self.plugin.is_some()
+            && !self.is_finished()
+            && self.messages_panel.session_id() == Some(session)
+    }
+
+    /// A run is working from any event of its own to its `Done` or `Error`.
+    /// A run woken by a moved call's result opens without a prompt, so no
+    /// single event marks the start. What trails a run, its transcript, its
+    /// close and frozen renders, says nothing either way. Only a plugin task
+    /// goes idle, but any run's own event means it no longer waits on auth.
+    pub(crate) fn track_run(&mut self, event: &AgentEvent) {
+        let idle = match event {
+            AgentEvent::Done { .. } | AgentEvent::Error { .. } => true,
+            AgentEvent::SubagentHistory { .. }
+            | AgentEvent::StreamClosed
+            | AgentEvent::ToolSnapshot { .. }
+            | AgentEvent::ToolHeaderSnapshot { .. }
+            | AgentEvent::LiveToolBuf { .. } => return,
+            _ => false,
+        };
+        self.auth_parked = false;
+        if self.plugin.is_some() {
+            self.idle = idle;
+        }
     }
 
     pub fn set_pending_turn_usage(&mut self, usage: String) {
@@ -128,13 +231,22 @@ impl Chat {
                 self.messages_panel.text_delta(&text);
             }
             AgentEvent::ToolPending { id, name } => self.messages_panel.tool_pending(id, &name),
-            AgentEvent::ToolStart(e) => self.messages_panel.tool_start(*e),
+            AgentEvent::ToolStart(e) => {
+                if !self.running_calls.iter().any(|call| call.id == e.id) {
+                    self.running_calls.push(RunningCall {
+                        id: e.id.clone(),
+                        tool: Arc::clone(&e.tool),
+                    });
+                }
+                self.messages_panel.tool_start(*e);
+            }
             AgentEvent::ToolOutput { id, content } => {
                 self.messages_panel.tool_output(&id, &content)
             }
             AgentEvent::ToolDone(e) => {
                 let plan_write = plan_path.filter(|pp| e.wrote_to(pp));
                 let is_full_write = &*e.tool == WRITE_TOOL_NAME;
+                self.running_calls.retain(|call| call.id != e.id);
                 self.messages_panel.tool_done(*e);
                 if let Some(pp) = plan_write {
                     let content = if is_full_write {
@@ -147,6 +259,7 @@ impl Chat {
                 }
             }
             AgentEvent::TurnComplete(turn) => {
+                self.pending_turn_stats.observe(&turn);
                 for block in turn.message.content {
                     if let ContentBlock::Image { source } = block {
                         self.messages_panel.flush();
@@ -177,18 +290,52 @@ impl Chat {
                 return ChatEventResult::QueueItemConsumed { text, images };
             }
             AgentEvent::QueueDrained => {}
+            AgentEvent::ToolMovable { id, movable } => {
+                self.messages_panel.set_tool_movable(&id, movable);
+            }
+            // Parts belong to `/tasks`, which the App keeps, never to a transcript.
+            AgentEvent::ToolParts { .. } => {}
             AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
             AgentEvent::Done { .. } => {
                 self.messages_panel.flush();
+                let usage = self.pending_turn_stats.usage;
+                self.push_turn_stats_line(&usage);
                 return ChatEventResult::Done;
             }
-            AgentEvent::Error { message } => {
+            AgentEvent::Error { message, .. } => {
                 self.messages_panel.flush();
+                let usage = self.pending_turn_stats.usage;
+                self.push_turn_stats_line(&usage);
                 return ChatEventResult::Error(message);
             }
-            AgentEvent::PermissionRequest { id, tool, scopes } => {
-                return ChatEventResult::PermissionRequest { id, tool, scopes };
+            AgentEvent::PermissionRequest {
+                id,
+                tool,
+                scopes,
+                reason,
+            } => {
+                return ChatEventResult::PermissionRequest {
+                    id,
+                    tool,
+                    scopes,
+                    reason,
+                };
             }
+            AgentEvent::Steered { kind, text } => {
+                let prefix = match kind {
+                    SteerKind::MessageRewritten => REWRITTEN_PREFIX,
+                    SteerKind::MessageDropped => DROPPED_PREFIX,
+                    SteerKind::Continued => CONTINUED_PREFIX,
+                };
+                self.messages_panel.flush();
+                self.messages_panel.push(DisplayMessage::new(
+                    DisplayRole::Assistant,
+                    format!("{prefix}\n\n{text}"),
+                ));
+            }
+            AgentEvent::AllowedByPlugin { id, plugin } => self
+                .messages_panel
+                .annotate_tool(&id, &format!("{ALLOWED_BY} {plugin}")),
             AgentEvent::AuthRequired => {
                 return ChatEventResult::AuthRequired;
             }
@@ -215,6 +362,18 @@ impl Chat {
                         NUDGE_TEXT.into(),
                     ));
                 }
+            }
+            AgentEvent::Notice { text } => {
+                self.messages_panel.flush();
+                self.messages_panel.push(notice(text, None));
+            }
+            AgentEvent::ObservationLine { text, detail, end } => {
+                self.messages_panel.flush();
+                self.messages_panel.push(task_notice(
+                    text,
+                    detail,
+                    end.map(BackgroundOutcome::from),
+                ));
             }
             AgentEvent::SubagentHistory { .. } | AgentEvent::StreamClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
@@ -298,9 +457,10 @@ impl Chat {
         area: Rect,
         has_selection: bool,
         images_visible: bool,
+        lua_commands: &[LuaCommandInfo],
     ) {
         self.messages_panel
-            .view(frame, area, has_selection, images_visible);
+            .view(frame, area, has_selection, images_visible, lua_commands);
     }
 
     pub fn scroll_pos(&self) -> ScrollPos {
@@ -323,8 +483,16 @@ impl Chat {
         self.messages_panel.extract_selection_text(sel, msg_area)
     }
 
-    pub fn handle_click(&mut self, row: u16, area: Rect) {
-        self.messages_panel.handle_click(row, area);
+    pub fn messages(&self) -> &[DisplayMessage] {
+        self.messages_panel.messages()
+    }
+
+    pub fn handle_click(&mut self, row: u16, col: u16, area: Rect) -> ClickOutcome {
+        self.messages_panel.handle_click(row, col, area)
+    }
+
+    pub fn toggle_click(&mut self, row: u16, area: Rect) -> ClickOutcome {
+        self.messages_panel.toggle_click(row, area)
     }
 
     pub fn tool_snapshot(
@@ -351,6 +519,18 @@ impl Chat {
         self.messages_panel.stream_reset();
     }
 
+    fn push_turn_stats_line(&mut self, usage: &TokenUsage) {
+        let mut timing = self.pending_turn_stats.timing();
+        if let Some(compact_ms) = self.messages_panel.current_turn_thinking_ms() {
+            timing.thinking_ms = compact_ms.max(timing.thinking_ms);
+        }
+        if let Some(line) = turn_stats_line(usage, timing) {
+            self.messages_panel
+                .push(DisplayMessage::new(DisplayRole::Notice, line));
+        }
+        self.reset_turn_stats();
+    }
+
     pub fn flush(&mut self) {
         self.messages_panel.flush();
     }
@@ -372,6 +552,41 @@ impl Chat {
         self.messages_panel.push(msg);
     }
 
+    /// Ends the task before its work says so, after a stop or a loss. Rows
+    /// still in progress would never hear back, so they are cancelled here.
+    pub(crate) fn end_early(&mut self, outcome: TaskOutcome, text: &str) {
+        self.flush();
+        self.cancel_in_progress();
+        self.mark_finished(outcome, text);
+    }
+
+    /// Like [`Self::mark_finished`], but the latest word wins. A part's tab
+    /// only mirrors reports, and a report that lands after its call ended
+    /// knows better than the call did.
+    pub(crate) fn end_as(&mut self, outcome: TaskOutcome, text: &str) {
+        match self.finish {
+            Some((previous, _)) if previous == outcome => {}
+            Some((_, bubble)) => {
+                self.finish = Some((outcome, bubble));
+                self.messages_panel
+                    .replace(bubble, DisplayMessage::new(outcome.role(), text.into()));
+            }
+            None => self.mark_finished(outcome, text),
+        }
+    }
+
+    pub(crate) fn finish_outcome(&self) -> Option<TaskOutcome> {
+        self.finish.map(|(outcome, _)| outcome)
+    }
+
+    /// The call this tab is a part of, see [`TaskParent::Part`].
+    pub(crate) fn part_of(&self) -> Option<&Arc<str>> {
+        match &self.parent {
+            Some(TaskParent::Part(call)) => Some(call),
+            _ => None,
+        }
+    }
+
     /// Ends the transcript with the bubble [`TaskOutcome::role`] picks. A chat
     /// only ever grows one ending, but a caller who knows more than the one who
     /// got here first rewrites it in place. See [`TaskOutcome::refines`].
@@ -385,14 +600,41 @@ impl Chat {
             return;
         }
         self.messages_panel.flush();
+        self.answer_tx = None;
+        self.auth_parked = false;
+        if let Some(clock) = &mut self.clock {
+            clock.stop();
+        }
+        let undelivered = self.inbox.take().map_or(0, |inbox| inbox.len());
+        if undelivered > 0 {
+            self.messages_panel.push(DisplayMessage::new(
+                DisplayRole::Error,
+                format!("{undelivered}{INBOX_DROPPED_SUFFIX}"),
+            ));
+        }
         let bubble = self
             .messages_panel
             .push(DisplayMessage::new(outcome.role(), text.into()));
         self.finish = Some((outcome, bubble));
     }
 
+    /// Takes back an ending the turn wrote for a task that outlived it. Its
+    /// bubble stays as the record of that Esc. The next event naming the task
+    /// brings back the senders the ending dropped.
+    pub(crate) fn reopen(&mut self) {
+        self.finish = None;
+        if let Some(clock) = &mut self.clock {
+            clock.resume();
+        }
+    }
+
     pub fn is_finished(&self) -> bool {
         self.finish.is_some()
+    }
+
+    /// A moved call's task has no inbox, a finished one nothing to read it.
+    pub(crate) fn takes_messages(&self) -> bool {
+        self.inbox.is_some() && !self.is_finished()
     }
 
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
@@ -400,15 +642,68 @@ impl Chat {
     }
 
     pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
-        self.messages_panel.update_tool_model(tool_id, model);
+        self.messages_panel.annotate_tool(tool_id, model);
     }
 
     pub fn set_tool_turn_usage(&mut self, tool_id: &str, usage: String) {
         self.messages_panel.set_tool_turn_usage(tool_id, usage);
     }
 
+    /// The calls still running now, oldest first.
+    pub(crate) fn running_calls(&mut self) -> &[RunningCall] {
+        let panel = &self.messages_panel;
+        self.running_calls.retain(|call| {
+            panel.tool_message(&call.id).is_some_and(|msg| {
+                matches!(&msg.role, DisplayRole::Tool(t) if t.status == ToolStatus::InProgress)
+            })
+        });
+        &self.running_calls
+    }
+
+    pub(crate) fn tool_message(&self, tool_id: &str) -> Option<DisplayMessage> {
+        self.messages_panel.tool_message(tool_id)
+    }
+
+    pub(crate) fn live_buf(&self, tool_id: &str) -> Option<Arc<SharedBuf>> {
+        self.messages_panel.live_buf(tool_id)
+    }
+
+    pub(crate) fn tool_name(&self, tool_id: &str) -> Option<Arc<str>> {
+        self.messages_panel.tool_name(tool_id)
+    }
+
+    pub(crate) fn register_live_buf(&mut self, tool_id: String, buf: Arc<SharedBuf>) {
+        self.messages_panel.register_live_buf(tool_id, buf);
+    }
+
+    pub(crate) fn settle_tool(&mut self, tool_id: &str, status: ToolStatus) {
+        self.messages_panel.settle_tool(tool_id, status);
+    }
+
+    pub(crate) fn set_tool_background(&mut self, tool_id: &str, badge: BackgroundBadge) {
+        self.messages_panel.set_tool_background(tool_id, badge);
+    }
+
+    pub(crate) fn set_background_outcome(&mut self, tool_id: &str, outcome: BackgroundOutcome) {
+        self.messages_panel.set_background_outcome(tool_id, outcome);
+    }
+
+    pub(crate) fn has_background_badge(&self, tool_id: &str) -> bool {
+        self.messages_panel.has_background_badge(tool_id)
+    }
+
+    pub(crate) fn background_badges(&self) -> Vec<BackgroundBadge> {
+        self.messages_panel.background_badges()
+    }
+
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
+        self.running_calls.clear();
         self.messages_panel.load_messages(msgs);
+    }
+
+    /// Whether the transcript already shows what the subagent was asked.
+    pub(crate) fn has_user_message(&self) -> bool {
+        self.messages_panel.has_user_message()
     }
 
     pub fn push_user_message(&mut self, text: impl Into<String>) {
@@ -425,7 +720,12 @@ impl Chat {
             text.into(),
             images,
         ));
+        self.messages_panel.ensure_active_group();
         self.enable_auto_scroll();
+    }
+
+    pub fn ensure_active_group(&mut self) {
+        self.messages_panel.ensure_active_group();
     }
 
     pub fn shell_tool_start(&mut self, event: ToolStartEvent) {
@@ -486,16 +786,47 @@ impl Chat {
     }
 }
 
+/// The reason stored on a call that has no header of its own.
+fn toolcall_reason(input: &serde_json::Value) -> Option<String> {
+    let reason = input.get(TOOLCALL_REASON_FIELD)?.as_str()?.trim();
+    (!reason.is_empty()).then(|| reason.to_owned())
+}
+
 pub fn history_to_display(
     messages: &[Message],
     tool_outputs: &HashMap<String, Arc<ToolOutput>>,
     tool_output_lines: &ToolOutputLines,
+    compact_tools: bool,
 ) -> (Vec<DisplayMessage>, Vec<maki_lua::RestoreItem>) {
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
     let mut restore_items: Vec<maki_lua::RestoreItem> = Vec::new();
-    for msg in messages {
-        if msg.is_observation() {
+
+    let seal_last_group = |display: &mut Vec<DisplayMessage>| {
+        if let Some(DisplayMessage {
+            role: DisplayRole::ToolGroup(g),
+            ..
+        }) = display.last_mut()
+        {
+            g.sealed = true;
+        }
+    };
+
+    for item in display_order(messages) {
+        let msg = match item {
+            DisplayItem::Message(msg) => msg,
+            DisplayItem::ObservationLine { index, text } => {
+                seal_last_group(&mut display);
+                let message = &messages[index];
+                display.push(task_notice(
+                    text.to_owned(),
+                    observation_detail(message).map(str::to_owned),
+                    message.settles.as_ref().map(|settled| settled.end.into()),
+                ));
+                continue;
+            }
+        };
+        if msg.is_context_update() || msg.is_observation() {
             continue;
         }
         match msg.role {
@@ -508,6 +839,7 @@ pub fn history_to_display(
                 let images = user_images(msg);
                 let text = msg.user_text();
                 if text.is_some() || !images.is_empty() {
+                    seal_last_group(&mut display);
                     display.push(DisplayMessage::with_images(
                         DisplayRole::User,
                         text.unwrap_or_default().to_owned(),
@@ -519,16 +851,61 @@ pub fn history_to_display(
                 for block in &msg.content {
                     match block {
                         ContentBlock::Text { text } if !text.is_empty() => {
+                            seal_last_group(&mut display);
                             display.push(DisplayMessage::new(DisplayRole::Assistant, text.clone()));
                         }
                         ContentBlock::Image { source } => {
+                            seal_last_group(&mut display);
                             display.push(DisplayMessage::with_images(
                                 DisplayRole::Assistant,
                                 String::new(),
                                 vec![source.clone()],
                             ));
                         }
-                        ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                        ContentBlock::Thinking {
+                            thinking,
+                            duration_ms,
+                            ..
+                        } if !thinking.is_empty() => {
+                            if compact_tools {
+                                let entry = GroupThinkingEntry {
+                                    id: display
+                                        .last()
+                                        .and_then(|m| match &m.role {
+                                            DisplayRole::ToolGroup(g) => Some(g.entries.len()),
+                                            _ => None,
+                                        })
+                                        .unwrap_or(0),
+                                    text: thinking.clone(),
+                                    tokens: thinking.len().div_ceil(4),
+                                    active: false,
+                                    started_at: None,
+                                    duration: duration_ms.map(std::time::Duration::from_millis),
+                                };
+                                if let Some(DisplayMessage {
+                                    role: DisplayRole::ToolGroup(g),
+                                    ..
+                                }) = display.last_mut()
+                                    && !g.sealed
+                                {
+                                    g.entries.push(GroupEntry::Thinking(entry));
+                                    continue;
+                                }
+                                let group = ToolGroupRole {
+                                    id: format!("compact-group-{}", display.len()),
+                                    sealed: false,
+                                    entries: vec![GroupEntry::Thinking(entry)],
+                                    started_at: None,
+                                    duration: None,
+                                    waiting_since: None,
+                                    expanded: false,
+                                };
+                                display.push(DisplayMessage::new(
+                                    DisplayRole::ToolGroup(Box::new(group)),
+                                    String::new(),
+                                ));
+                                continue;
+                            }
                             display
                                 .push(DisplayMessage::new(DisplayRole::Thinking, thinking.clone()));
                         }
@@ -539,7 +916,16 @@ pub fn history_to_display(
                             let reg = ToolRegistry::global();
                             let tool_call: Option<Box<dyn ToolInvocation>> =
                                 reg.get(name).and_then(|entry| entry.try_parse(input));
-                            let summary = reg.resolve_header(name, input);
+                            // A registry tool's header already leads with the
+                            // reason. MCP and `tool_search` have none, and no
+                            // schema of their own declares the field, so the
+                            // stored value is the one we asked the model for.
+                            let summary = if tool_call.is_none() {
+                                toolcall_reason(input)
+                            } else {
+                                None
+                            }
+                            .unwrap_or_else(|| reg.resolve_header(name, input));
                             let (status, result_text) = results
                                 .get(id.as_str())
                                 .map(|(err, text)| {
@@ -592,6 +978,55 @@ pub fn history_to_display(
                                     reason: maki_lua::RestoreReason::Load,
                                 });
                             }
+                            if compact_tools {
+                                let summary = crate::components::tool_group::format_compact_summary(
+                                    static_name,
+                                    Some(input),
+                                    &summary,
+                                );
+                                let entry = GroupToolEntry {
+                                    id: id.clone(),
+                                    name: Arc::from(static_name),
+                                    summary,
+                                    raw_input: Some(input.clone()),
+                                    children: Vec::new(),
+                                    status,
+                                    receiving_args: false,
+                                    started_at: None,
+                                    duration: stored.and_then(|o| o.duration()),
+                                    detail: Some(CompactDetail {
+                                        raw_input: Some(input.clone()),
+                                        output: stored.cloned(),
+                                        annotation,
+                                        live_output: result_text.map(str::to_owned),
+                                        truncated_lines,
+                                        ..CompactDetail::default()
+                                    }),
+                                };
+                                if let Some(DisplayMessage {
+                                    role: DisplayRole::ToolGroup(g),
+                                    ..
+                                }) = display.last_mut()
+                                    && !g.sealed
+                                {
+                                    g.entries.push(GroupEntry::Tool(Box::new(entry)));
+                                    continue;
+                                }
+                                let group = ToolGroupRole {
+                                    id: format!("compact-group-{}", display.len()),
+                                    sealed: false,
+                                    entries: vec![GroupEntry::Tool(Box::new(entry))],
+                                    started_at: None,
+                                    duration: None,
+                                    waiting_since: None,
+                                    expanded: false,
+                                };
+                                display.push(DisplayMessage::new(
+                                    DisplayRole::ToolGroup(Box::new(group)),
+                                    String::new(),
+                                ));
+                                continue;
+                            }
                             display.push(DisplayMessage {
                                 role: DisplayRole::Tool(Box::new(ToolRole {
                                     id: id.clone(),
@@ -612,7 +1047,12 @@ pub fn history_to_display(
                                 render_snapshot: None,
                                 render_header: None,
                                 snapshot_theme_gen: 0,
-                                thinking_collapsed: false,
+                                thinking_expanded: false,
+                                movable: false,
+                                background: None,
+                                detail: None,
+                                detail_expanded: false,
+                                task_end: None,
                             });
                         }
                         _ => {}
@@ -621,7 +1061,24 @@ pub fn history_to_display(
             }
         }
     }
+    seal_last_group(&mut display);
     (display, restore_items)
+}
+
+fn notice(text: String, detail: Option<String>) -> DisplayMessage {
+    task_notice(text, detail, None)
+}
+
+fn task_notice(
+    text: String,
+    detail: Option<String>,
+    task_end: Option<BackgroundOutcome>,
+) -> DisplayMessage {
+    DisplayMessage {
+        detail,
+        task_end,
+        ..DisplayMessage::new(DisplayRole::Notice, text)
+    }
 }
 
 /// `ToolResult` is gone after session load, so we rebuild from
@@ -716,7 +1173,7 @@ fn user_images(msg: &Message) -> Vec<ImageSource> {
 fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
     let mut map = HashMap::new();
     for msg in messages {
-        if !matches!(msg.role, Role::User) || msg.is_observation() {
+        if !matches!(msg.role, Role::User) || msg.is_from_host() {
             continue;
         }
         for block in &msg.content {
@@ -724,6 +1181,7 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } = block
             {
                 map.insert(tool_use_id.as_str(), (*is_error, content.as_str()));
@@ -733,13 +1191,92 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
     map
 }
 
+/// Timing summed across every model round in one user turn.
+#[derive(Default)]
+struct PendingTurnStats {
+    elapsed_ms: u64,
+    thinking_ms: u64,
+    ttft_sum_ms: u64,
+    ttft_samples: u32,
+    usage: TokenUsage,
+}
+
+impl PendingTurnStats {
+    fn observe(&mut self, turn: &TurnCompleteEvent) {
+        if turn.timing.elapsed_ms == 0 {
+            return;
+        }
+        self.elapsed_ms += turn.timing.elapsed_ms;
+        self.thinking_ms += turn.timing.thinking_ms;
+        if let Some(ms) = turn.timing.ttft_ms {
+            self.ttft_sum_ms += ms;
+            self.ttft_samples += 1;
+        }
+        self.usage += turn.usage;
+    }
+
+    fn timing(&self) -> TurnTiming {
+        TurnTiming {
+            elapsed_ms: self.elapsed_ms,
+            thinking_ms: self.thinking_ms,
+            ttft_ms: (self.ttft_samples > 0)
+                .then(|| self.ttft_sum_ms / u64::from(self.ttft_samples)),
+        }
+    }
+}
+
+/// The one-line timing and token readout a turn ends with. `None` when the
+/// event carries no timing, which is how a replayed turn's reconstructed
+/// `TurnComplete` arrives.
+fn turn_stats_line(usage: &TokenUsage, timing: TurnTiming) -> Option<String> {
+    if timing.elapsed_ms == 0 {
+        return None;
+    }
+    let elapsed_secs = (timing.elapsed_ms as f64 / 1000.0).max(0.001);
+    let tps = (usage.output as f64 / elapsed_secs).round() as u64;
+    let total_input = usage.total_input();
+    let cache = (usage.cache_read as u64 * 100)
+        .checked_div(total_input.max(1) as u64)
+        .unwrap_or(0);
+    let ttft = timing
+        .ttft_ms
+        .map_or_else(String::new, |ms| format!(" · t₁ {}", fmt_secs(ms)));
+    Some(format!(
+        "◷ {} / {} · ↑{} ↓{} · » {} t/s{} · ⛁ {}%",
+        fmt_secs(timing.elapsed_ms),
+        fmt_secs(timing.thinking_ms),
+        format_tokens(total_input),
+        format_tokens(usage.output),
+        tps,
+        ttft,
+        cache,
+    ))
+}
+
+/// `0s`, `4.5s`, `10s`, `1m30s`.
+fn fmt_secs(ms: u64) -> String {
+    if ms == 0 {
+        return "0s".into();
+    }
+    if ms >= 60_000 {
+        format!("{}m{}s", ms / 60_000, ms % 60_000 / 1_000)
+    } else if ms >= 10_000 {
+        format!("{}s", (ms + 500) / 1_000)
+    } else {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::components::IMAGE_PLACEHOLDER;
-    use maki_agent::{AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
+    use maki_agent::{
+        AgentEvent, RunTotals, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+        TurnTiming,
+    };
     use maki_config::UiConfig;
-    use maki_providers::ImageMediaType;
+    use maki_providers::{ImageMediaType, TaskEnd, TaskSettled, TokenUsage};
     use test_case::test_case;
 
     const IMAGE_DATA: &str = "dGVzdA==";
@@ -747,6 +1284,188 @@ mod tests {
 
     fn image() -> ImageSource {
         ImageSource::new(ImageMediaType::Png, Arc::from(IMAGE_DATA))
+    }
+
+    #[test]
+    fn turn_stats_line_reads_timing_and_usage() {
+        let usage = TokenUsage {
+            input: 200,
+            output: 725,
+            cache_creation: 0,
+            cache_read: 6_200,
+            ..Default::default()
+        };
+        let timing = TurnTiming {
+            elapsed_ms: 10_800,
+            ttft_ms: Some(4_500),
+            thinking_ms: 0,
+        };
+        assert_eq!(
+            turn_stats_line(&usage, timing).unwrap(),
+            "◷ 11s / 0s · ↑6.4k ↓725 · » 67 t/s · t₁ 4.5s · ⛁ 96%"
+        );
+    }
+
+    #[test]
+    fn turn_stats_line_skips_timingless_events() {
+        assert!(turn_stats_line(&TokenUsage::default(), TurnTiming::default()).is_none());
+    }
+
+    #[test]
+    fn user_turn_stats_line_shown_once_when_run_finishes() {
+        use maki_agent::DoneReason;
+
+        let mut chat = chat();
+        let round = |elapsed_ms, input, output| {
+            AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+                message: Message::default(),
+                usage: TokenUsage {
+                    input,
+                    output,
+                    ..Default::default()
+                },
+                model: String::new(),
+                cost: None,
+                subsidised_list_cost: None,
+                context_size: None,
+                context_window: 0,
+                timing: TurnTiming {
+                    elapsed_ms,
+                    ttft_ms: Some(1_000),
+                    thinking_ms: 100,
+                },
+            }))
+        };
+        chat.handle_event(round(5_000, 100, 50), None);
+        chat.handle_event(round(4_000, 200, 75), None);
+        assert!(notice_lines(&chat).is_empty());
+        chat.handle_event(
+            AgentEvent::Done {
+                usage: TokenUsage {
+                    input: 300,
+                    output: 125,
+                    ..Default::default()
+                },
+                cost: None,
+                list_cost: None,
+                context_size: 0,
+                context_window: 0,
+                num_turns: 2,
+                reason: DoneReason::EndTurn,
+            },
+            None,
+        );
+        let notices = notice_lines(&chat);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(
+            notices[0],
+            "◷ 9.0s / 0.2s · ↑300 ↓125 · » 14 t/s · t₁ 1.0s · ⛁ 0%"
+        );
+    }
+
+    #[test]
+    fn user_turn_stats_line_sums_multiple_compact_thinking_blocks() {
+        use crate::components::{GroupEntry, GroupThinkingEntry, ToolGroupRole};
+        use maki_agent::DoneReason;
+
+        let mut chat = Chat::new(
+            MakiId::generate(),
+            None,
+            MAIN_NAME.into(),
+            UiConfig {
+                compact_tools: true,
+                ..UiConfig::default()
+            },
+            maki_lua::EventHandle::disconnected_for_test(),
+        );
+
+        let group = ToolGroupRole {
+            id: "group-1".into(),
+            sealed: false,
+            entries: vec![
+                GroupEntry::Thinking(GroupThinkingEntry {
+                    id: 0,
+                    text: "thinking block 1".into(),
+                    tokens: 10,
+                    active: false,
+                    started_at: None,
+                    duration: Some(std::time::Duration::from_millis(3_000)),
+                }),
+                GroupEntry::Thinking(GroupThinkingEntry {
+                    id: 1,
+                    text: "thinking block 2".into(),
+                    tokens: 10,
+                    active: false,
+                    started_at: None,
+                    duration: Some(std::time::Duration::from_millis(4_500)),
+                }),
+            ],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
+            expanded: false,
+        };
+        chat.push(DisplayMessage::new(
+            DisplayRole::ToolGroup(Box::new(group)),
+            String::new(),
+        ));
+
+        chat.pending_turn_stats.observe(&TurnCompleteEvent {
+            message: Message::default(),
+            usage: TokenUsage {
+                input: 200,
+                output: 100,
+                ..Default::default()
+            },
+            model: String::new(),
+            cost: None,
+            subsidised_list_cost: None,
+            context_size: None,
+            context_window: 0,
+            timing: TurnTiming {
+                elapsed_ms: 10_000,
+                ttft_ms: Some(1_000),
+                thinking_ms: 0,
+            },
+        });
+
+        chat.handle_event(
+            AgentEvent::Done {
+                usage: TokenUsage {
+                    input: 200,
+                    output: 100,
+                    ..Default::default()
+                },
+                cost: None,
+                list_cost: None,
+                context_size: 0,
+                context_window: 0,
+                num_turns: 1,
+                reason: DoneReason::EndTurn,
+            },
+            None,
+        );
+
+        let notices = notice_lines(&chat);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("◷ 10s / 7.5s"), "got: {}", notices[0]);
+    }
+
+    fn notice_lines(chat: &Chat) -> Vec<&str> {
+        (0..chat.message_count())
+            .filter_map(|i| chat.message_at(i))
+            .filter(|m| matches!(m.role, DisplayRole::Notice))
+            .map(|m| m.text.as_str())
+            .collect()
+    }
+
+    #[test_case(0, "0s" ; "zero")]
+    #[test_case(500, "0.5s" ; "sub_second")]
+    #[test_case(4_500, "4.5s" ; "fractional")]
+    #[test_case(10_800, "11s" ; "whole_seconds")]
+    #[test_case(65_000, "1m5s" ; "minutes")]
+    fn fmt_secs_display(ms: u64, expected: &str) {
+        assert_eq!(fmt_secs(ms), expected);
     }
 
     #[test_case(USER_TEXT, USER_TEXT ; "captioned")]
@@ -761,11 +1480,7 @@ mod tests {
         let tool_result = Message {
             role: Role::User,
             content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: TASK_ID.into(),
-                    content: USER_TEXT.into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result(TASK_ID, USER_TEXT, false),
                 ContentBlock::Image { source: image() },
             ],
             ..Default::default()
@@ -785,6 +1500,7 @@ mod tests {
             ],
             &empty_outputs(),
             &ToolOutputLines::default(),
+            false,
         );
         assert_eq!(display.len(), 2);
         assert_eq!(display[0].role, DisplayRole::User);
@@ -839,6 +1555,7 @@ mod tests {
                 subsidised_list_cost: None,
                 context_size: None,
                 context_window: 0,
+                timing: Default::default(),
             })),
             None,
         );
@@ -879,12 +1596,14 @@ mod tests {
         written_path: Option<String>,
     ) -> AgentEvent {
         AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            call: None,
             id: id.into(),
             tool: tool.into(),
             output: Arc::new(output),
             is_error: false,
             annotation: None,
             written_path,
+            backgrounded: false,
         }))
     }
 
@@ -913,6 +1632,9 @@ mod tests {
     const TASK_ID: &str = "toolu_01";
     const USER_TEXT: &str = "one more thing";
     const REPLY_TEXT: &str = "on it";
+    const NOTICE_BODY: &str = "Background task find auth finished:\n\nok";
+    const NOTICE_LINE: &str = "Background agent finished: find auth";
+    const TASK_PLUGIN: &str = "monitor";
 
     fn chat() -> Chat {
         Chat::new(
@@ -935,11 +1657,7 @@ mod tests {
     }
 
     fn end(chat: &mut Chat, outcome: TaskOutcome) {
-        let text = match outcome {
-            TaskOutcome::Error => ERROR_TEXT,
-            TaskOutcome::Unknown | TaskOutcome::Done => DONE_TEXT,
-        };
-        chat.mark_finished(outcome, text);
+        chat.mark_finished(outcome, outcome.text());
     }
 
     fn text_delta(chat: &mut Chat, text: &str) {
@@ -957,6 +1675,30 @@ mod tests {
             None,
         );
         assert_eq!(chat.in_progress_count(), 0);
+    }
+
+    /// The call never opened a prompt, so the row is the only place the user
+    /// learns something let it through. A code_execution run marks its row
+    /// once per inner call, and the row needs to say it only once.
+    #[test]
+    fn a_call_a_plugin_allowed_is_marked_on_its_row_once() {
+        const PLUGIN: &str = "automode";
+        let mut chat = chat();
+        chat.handle_event(tool_start("t1", "code_execution"), None);
+        for _ in 0..2 {
+            chat.handle_event(
+                AgentEvent::AllowedByPlugin {
+                    id: "t1".into(),
+                    plugin: PLUGIN.into(),
+                },
+                None,
+            );
+        }
+        let row = chat.message_at(0).expect("the tool row");
+        assert_eq!(
+            row.annotation.as_deref(),
+            Some(format!("{ALLOWED_BY} {PLUGIN}").as_str())
+        );
     }
 
     #[test]
@@ -1020,28 +1762,83 @@ mod tests {
             ..Default::default()
         }];
         assert!(
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default())
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false)
                 .0
                 .is_empty()
         );
     }
 
-    #[test]
-    fn history_hides_observations_but_keeps_the_reply() {
-        let msgs = vec![
-            Message::observation("build failed".into()),
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "I will fix it".into(),
-                }],
-                ..Default::default()
-            },
-        ];
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
-        assert_eq!(display.len(), 1);
-        assert_eq!(display[0].role, DisplayRole::Assistant);
-        assert_eq!(display[0].text, "I will fix it");
+    #[test_case(Message::observation("build failed".into()) ; "observation")]
+    #[test_case(Message::context_update("<context-update>Date is now tomorrow.</context-update>".into(), Default::default()) ; "context_update")]
+    fn history_hides_host_messages_but_keeps_the_prompt(host: Message) {
+        let msgs = vec![host, Message::user(USER_TEXT.into())];
+        let display =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false).0;
+        let shown: Vec<(DisplayRole, &str)> = display
+            .iter()
+            .map(|d| (d.role.clone(), d.text.as_str()))
+            .collect();
+        assert_eq!(shown, [(DisplayRole::User, USER_TEXT)]);
+    }
+
+    /// The line is saved with the observation, so a restored session shows
+    /// it as a notice row, and the body stays the model's alone. Where the
+    /// row goes is `display_order`'s call.
+    #[test_case(Some(NOTICE_LINE), &[(DisplayRole::User, USER_TEXT), (DisplayRole::Notice, NOTICE_LINE)] ; "labelled")]
+    #[test_case(None, &[(DisplayRole::User, USER_TEXT)] ; "unlabelled")]
+    fn a_restored_observation_shows_only_its_line(
+        line: Option<&str>,
+        expected: &[(DisplayRole, &str)],
+    ) {
+        let mut observation = Message::observation(NOTICE_BODY.into());
+        observation.display_text = line.map(str::to_owned);
+        let next = Message::user(USER_TEXT.into());
+        let saved = serde_json::to_string(&[observation, next]).unwrap();
+        let restored: Vec<Message> = serde_json::from_str(&saved).unwrap();
+
+        let display = history_to_display(
+            &restored,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            false,
+        )
+        .0;
+
+        let shown: Vec<(DisplayRole, &str)> = display
+            .iter()
+            .map(|d| (d.role.clone(), d.text.as_str()))
+            .collect();
+        assert_eq!(shown, expected);
+    }
+
+    const NOTICE_OUTPUT: &str = "ok";
+
+    /// The line already names the task, so a background result unfolds to
+    /// its output alone, and its dot says how the task ended.
+    #[test_case(Some(TaskEnd::Failed), NOTICE_OUTPUT, Some(BackgroundOutcome::Error) ; "a_result")]
+    #[test_case(None, NOTICE_BODY, None ; "a_plain_observation")]
+    fn a_restored_notice_unfolds_to_what_it_reports(
+        end: Option<TaskEnd>,
+        detail: &str,
+        task_end: Option<BackgroundOutcome>,
+    ) {
+        let mut observation = Message::observation(NOTICE_BODY.into());
+        observation.display_text = Some(NOTICE_LINE.into());
+        observation.settles = end.map(|end| TaskSettled {
+            task: TASK_ID.into(),
+            end,
+        });
+
+        let display = history_to_display(
+            &[observation],
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            false,
+        )
+        .0;
+
+        assert_eq!(display[0].detail.as_deref(), Some(detail));
+        assert_eq!(display[0].task_end, task_end);
     }
 
     fn tool_use_pair(
@@ -1058,11 +1855,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: result.into(),
-                    is_error,
-                }],
+                content: vec![ContentBlock::tool_result("t1", result, is_error)],
                 ..Default::default()
             },
         ]
@@ -1077,7 +1870,8 @@ mod tests {
             "output",
             is_error,
         );
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false).0;
         assert_eq!(display.len(), 1);
         assert!(matches!(&display[0].role, DisplayRole::Tool(t) if t.status == expected));
     }
@@ -1098,11 +1892,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "hi".into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("t1", "hi", false)],
                 ..Default::default()
             },
             Message {
@@ -1113,7 +1903,8 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false).0;
         assert_eq!(display.len(), 4);
         assert_eq!(display[0].role, DisplayRole::User);
         assert_eq!(display[1].role, DisplayRole::Assistant);
@@ -1161,7 +1952,7 @@ mod tests {
             let discriminant = std::mem::discriminant(&output);
             let msgs = tool_use_pair(tool_name, input_json, "ok", false);
             let outputs = HashMap::from([("t1".into(), Arc::new(output))]);
-            let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
+            let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), false).0;
             assert_eq!(
                 std::mem::discriminant(display[0].tool_output.as_deref().unwrap()),
                 discriminant,
@@ -1184,7 +1975,7 @@ mod tests {
             false,
         );
         let outputs = HashMap::from([("t1".into(), Arc::new(write_output))]);
-        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), false).0;
         assert!(display[0].annotation.is_some());
     }
 
@@ -1198,7 +1989,8 @@ mod tests {
             &joined,
             false,
         );
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false).0;
         let line_count = display[0].text.lines().count();
         assert!(
             line_count < long_output.len(),
@@ -1214,7 +2006,8 @@ mod tests {
             "1: fn main() {}",
             false,
         );
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false).0;
         assert!(display[0].tool_output.is_none());
         assert!(display[0].text.contains("fn main"));
     }
@@ -1227,6 +2020,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "reasoning".into(),
                     signature: None,
+                    duration_ms: None,
                 },
                 ContentBlock::Text {
                     text: "answer".into(),
@@ -1235,7 +2029,8 @@ mod tests {
             ],
             ..Default::default()
         }];
-        let display = history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default(), false).0;
         assert_eq!(display.len(), 2);
         assert_eq!(display[0].role, DisplayRole::Thinking);
         assert_eq!(display[0].text, "reasoning");
@@ -1287,11 +2082,167 @@ mod tests {
             false,
         );
         let outputs = HashMap::from([("t1".to_owned(), Arc::new(edit_output("a")))]);
-        let (_, items) = history_to_display(&msgs, &outputs, &ToolOutputLines::default());
+        let (_, items) = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), false);
         assert!(items.is_empty(), "Rust owns Diff rendering on restore");
 
-        let (_, items) = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default());
+        let (_, items) =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false);
         assert_eq!(items.len(), 1, "text-only history still restores via Lua");
+    }
+
+    #[test]
+    fn history_compact_tools_groups_consecutive_tools() {
+        let msgs = vec![
+            Message::user("run tasks".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "thinking step".into(),
+                        signature: None,
+                        duration_ms: None,
+                    },
+                    ContentBlock::tool_use(
+                        "t1",
+                        "bash",
+                        serde_json::json!({"command": "cargo test"}),
+                    ),
+                ],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result("t1", "ok", false)],
+                ..Default::default()
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    "t2",
+                    "read",
+                    serde_json::json!({"path": "src/lib.rs"}),
+                )],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result("t2", "code", false)],
+                ..Default::default()
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "all passed".into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let mut out1 = ToolOutput::Plain("ok".into());
+        out1.set_duration(std::time::Duration::from_millis(120));
+        let mut out2 = ToolOutput::Plain("code".into());
+        out2.set_duration(std::time::Duration::from_millis(30));
+        let outputs = HashMap::from([
+            ("t1".to_owned(), Arc::new(out1)),
+            ("t2".to_owned(), Arc::new(out2)),
+        ]);
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true).0;
+        assert_eq!(display.len(), 3);
+        assert_eq!(display[0].role, DisplayRole::User);
+        let DisplayRole::ToolGroup(g) = &display[1].role else {
+            panic!("expected ToolGroup in display[1]");
+        };
+        assert!(g.sealed);
+        assert_eq!(g.entries.len(), 3);
+        assert!(matches!(
+            &g.entries[0],
+            GroupEntry::Thinking(th) if th.text == "thinking step" && th.duration.is_none()
+        ));
+        assert!(
+            matches!(&g.entries[1], GroupEntry::Tool(t) if t.name.as_ref() == "bash" && t.duration == Some(std::time::Duration::from_millis(120)))
+        );
+        assert!(
+            matches!(&g.entries[2], GroupEntry::Tool(t) if t.name.as_ref() == "read" && t.duration == Some(std::time::Duration::from_millis(30)))
+        );
+        assert_eq!(g.total_duration(), std::time::Duration::from_millis(150));
+        assert_eq!(display[2].role, DisplayRole::Assistant);
+        assert_eq!(display[2].text, "all passed");
+    }
+
+    #[test]
+    fn history_compact_tools_formats_calling_reason() {
+        let msgs = vec![
+            Message::user("inspect code".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    "t1",
+                    "read",
+                    serde_json::json!({
+                        "path": "src/main.rs",
+                        "offset": 1,
+                        "limit": 50,
+                        "toolcall_reason": "checking entry point"
+                    }),
+                )],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result("t1", "fn main() {}", false)],
+                ..Default::default()
+            },
+        ];
+        let outputs = HashMap::new();
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true).0;
+        assert_eq!(display.len(), 2);
+        let DisplayRole::ToolGroup(g) = &display[1].role else {
+            panic!("expected ToolGroup in display[1]");
+        };
+        let GroupEntry::Tool(t) = &g.entries[0] else {
+            panic!("expected GroupEntry::Tool");
+        };
+        assert_eq!(t.summary, "checking entry point · src/main.rs:1-50");
+    }
+
+    #[test]
+    fn history_compact_tools_stores_batch_raw_input() {
+        let batch_input = serde_json::json!({
+            "tool_calls": [
+                {
+                    "tool": "read",
+                    "parameters": {
+                        "path": "src/main.rs",
+                        "offset": 1,
+                        "limit": 50,
+                        "toolcall_reason": "checking entry point"
+                    }
+                }
+            ],
+            "toolcall_reason": "batching tools"
+        });
+        let msgs = vec![
+            Message::user("inspect code".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use("t1", "batch", batch_input.clone())],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result("t1", "done", false)],
+                ..Default::default()
+            },
+        ];
+        let outputs = HashMap::new();
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true).0;
+        let DisplayRole::ToolGroup(g) = &display[1].role else {
+            panic!("expected ToolGroup in display[1]");
+        };
+        let GroupEntry::Tool(t) = &g.entries[0] else {
+            panic!("expected GroupEntry::Tool");
+        };
+        assert_eq!(t.summary, "batching tools · 1 tools");
+        assert_eq!(t.raw_input.as_ref(), Some(&batch_input));
     }
 
     #[test]
@@ -1343,6 +2294,7 @@ mod tests {
                 context_size_before: 0,
                 context_size_after: 0,
                 context_window: 0,
+                summary: String::new(),
             },
             None,
         );
@@ -1471,5 +2423,70 @@ mod tests {
         assert!(sub.is_finished());
         assert_eq!(sub.task_status(), TaskStatus::Error);
         assert_eq!(sub.task_id().map(|id| &**id), Some(TASK_ID));
+    }
+
+    /// Once its run ends, only another run brings a task back. A woken run
+    /// opens with no prompt, and what trails a run says nothing of the next.
+    #[test_case(AgentEvent::TextDelta { text: USER_TEXT.into() }, TaskStatus::Working ; "a_run_streams")]
+    #[test_case(AgentEvent::ObservationLine { text: USER_TEXT.into(), detail: None, end: None }, TaskStatus::Working ; "a_woken_run_lands_its_notice")]
+    #[test_case(AgentEvent::SubagentHistory { tool_use_id: TASK_ID.into(), messages: Vec::new() }, TaskStatus::Idle ; "transcript_trails_the_run")]
+    #[test_case(AgentEvent::StreamClosed, TaskStatus::Idle ; "close_trails_the_run")]
+    fn only_a_run_event_brings_an_idle_task_back(event: AgentEvent, status: TaskStatus) {
+        let mut sub = subagent_chat();
+        sub.plugin = Some(TASK_PLUGIN.into());
+        sub.track_run(&AgentEvent::Error {
+            message: ERROR_TEXT.into(),
+            auth: false,
+            totals: RunTotals::default(),
+        });
+        assert_eq!(sub.task_status(), TaskStatus::Idle);
+
+        sub.track_run(&event);
+
+        assert_eq!(sub.task_status(), status);
+    }
+
+    const STEER_TEXT: &str = "keep going";
+    const ASK_REASON: &str = "plugin wants a human to look";
+    const EXPECTED_PERMISSION_REQUEST: &str = "a permission request must reach the caller";
+
+    #[test_case(SteerKind::MessageRewritten, REWRITTEN_PREFIX ; "message_rewritten")]
+    #[test_case(SteerKind::MessageDropped, DROPPED_PREFIX ; "message_dropped")]
+    #[test_case(SteerKind::Continued, CONTINUED_PREFIX ; "continued")]
+    fn steered_shows_one_prefixed_assistant_message(kind: SteerKind, prefix: &str) {
+        let mut chat = chat();
+        chat.handle_event(
+            AgentEvent::Steered {
+                kind,
+                text: STEER_TEXT.into(),
+            },
+            None,
+        );
+        assert_eq!(chat.message_count(), 1);
+        let text = chat.last_message_text();
+        assert!(
+            text.starts_with(prefix) && text.ends_with(STEER_TEXT),
+            "{text}"
+        );
+        assert_eq!(chat.last_message_role(), Some(&DisplayRole::Assistant));
+    }
+
+    #[test]
+    fn permission_request_carries_reason() {
+        let mut chat = chat();
+        let result = chat.handle_event(
+            AgentEvent::PermissionRequest {
+                id: TASK_ID.into(),
+                tool: ToolKey::native("bash"),
+                scopes: Vec::new(),
+                reason: Some(ASK_REASON.into()),
+            },
+            None,
+        );
+        let ChatEventResult::PermissionRequest { id, reason, .. } = result else {
+            panic!("{EXPECTED_PERMISSION_REQUEST}");
+        };
+        assert_eq!(id, TASK_ID);
+        assert_eq!(reason.as_deref(), Some(ASK_REASON));
     }
 }

@@ -10,6 +10,7 @@ use maki_config::{
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
 use crate::gen_folder_trust::POLICY_EXAMPLE;
+use crate::lua_util::in_registration_window;
 
 type ExtraColumn = (&'static str, fn(&ConfigField) -> String);
 
@@ -91,8 +92,9 @@ fn write_plugin_options(out: &mut String, specs: &PluginOptionSpecs) {
 }
 
 fn collect_plugin_options() -> PluginOptionSpecs {
-    let host =
-        PluginHost::with_all_builtins(Arc::new(ToolRegistry::new())).expect("loading builtins");
+    let host = in_registration_window(|| {
+        PluginHost::with_all_builtins(Arc::new(ToolRegistry::new())).expect("loading builtins")
+    });
     let specs = host.plugin_options().expect("collecting plugin options");
     assert!(
         !specs.is_empty(),
@@ -131,6 +133,14 @@ fn write_theme_section(out: &mut String) {
          so their properties take precedence. Diff gutters use \
          `diff_old_line_nr` and `diff_new_line_nr`, which default to \
          `diff_line_nr`.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "The input caret uses `cursor` when the terminal has focus and \
+         `cursor_unfocused` when focus is lost. `cursor_unfocused` defaults \
+         to `cursor`, so themes only need it when the two should differ. \
+         Terminals that do not report focus events keep the focused caret.\n"
     )
     .unwrap();
     writeln!(
@@ -225,13 +235,101 @@ fn write_trust_section(out: &mut String) {
     .unwrap();
 }
 
+/// `files` is a list of file names and `overrides` a list of tables, which
+/// the `ConfigValue` table cannot describe, so these sections are prose like
+/// `trust`.
+fn write_instructions_section(out: &mut String) {
+    writeln!(out, "### `instructions`\n").unwrap();
+    writeln!(
+        out,
+        "Which instruction files Maki loads from each project directory. Read \
+         from the global `~/.config/maki/init.lua` only, since a project file \
+         that could pick its own instructions would be trusting itself.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "`files` replaces the built-in list (`AGENTS.md`, `CLAUDE.md`, \
+         `.github/copilot-instructions.md`, and friends) with your own, in \
+         priority order. An empty list loads no project instruction files at \
+         all, and `AGENTS.local.md` still loads:\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "```lua\nmaki.setup({{\n    instructions = {{ files = {{ \"CLAUDE.md\" }} }},\n}})\n```\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "`overrides` narrows it per checkout, for when one repository wants a \
+         different answer. Each entry matches a checkout by `path` (a glob \
+          against the project root, `~` included, like `trust.paths`) or by \
+          `remote` (a glob against every git remote URL of the project, \
+          normalized to `host/path`: `https://host/a/b.git` and \
+          `git@host:a/b.git` both become `host/a/b`). When both are set, both \
+          must match; an entry with neither matches every project. The first \
+          matching entry wins, and one that sets no `files` still ends the \
+          search, keeping the global `files`:\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "```lua\nmaki.setup({{\n    instructions = {{\n        overrides = {{\n            {{ remote = \"github.com/example/*\", files = {{}} }},\n            {{ path = \"~/src/secret\", files = {{ \"CLAUDE.md\" }} }},\n        }},\n    }},\n}})\n```\n"
+    )
+    .unwrap();
+}
+
+fn write_compatibility_section(out: &mut String) {
+    out.push_str(r#"### `compatibility`
+
+Control automatic loading from other agents. This table is read only from the global `~/.config/maki/init.lua`. Project settings are ignored with a warning.
+
+```lua
+maki.setup({
+    compatibility = { all = false },
+})
+```
+
+Every setting defaults to `true`. Set `all = false` to disable every agent compatibility source, including sources added in future versions. It overrides individual `true` settings. To disable selected agents, omit `all` and set their fields to `false`:
+
+```lua
+maki.setup({
+    compatibility = {
+        claude = false,
+        opencode = false,
+    },
+})
+```
+
+| Field | Sources |
+|---|---|
+| `all` | All agent compatibility sources below and future additions |
+| `claude` | `CLAUDE.md`, user and project `.claude/skills/` and `.claude/commands/` |
+| `opencode` | User `~/.config/opencode/skills/` and project `.opencode/skills/` |
+| `copilot` | `.github/copilot-instructions.md`, `COPILOT.md` |
+| `cursor` | `.cursorrules` |
+| `windsurf` | `.windsurfrules` |
+| `cline` | `.clinerules` |
+| `gemini` | `GEMINI.md` |
+
+Disabled sources are skipped before reading their content, at startup and during later discovery. The policy also applies to known agent instruction files explicitly listed in `instructions.files` or `instructions.overrides`.
+
+Maki skills and commands, the builtin skill, `AGENTS.md`, `AGENTS.local.md`, and `.agents/skills/` remain available. `CONVENTIONS.md`, `CODING_AGENT.md`, and custom instruction filenames keep their existing behavior. This controls automatic discovery, not explicit file reads by tools. Restart Maki or use `/reload` after changing the policy. Existing conversation content is retained.
+
+"#);
+}
+
 fn write_telemetry_section(out: &mut String) {
     write_section(out, "[telemetry]", TelemetryConfig::FIELDS);
     writeln!(
         out,
-        "Every field also has an environment variable, shown in the Env \
-         column, and the variable wins. See [Telemetry](/docs/telemetry/) \
-         for the full picture.\n"
+        "The Env column names the matching environment variable. For \
+         `enabled`, the exporters, `metrics_include_*`, \
+         `log_user_prompts`, `log_tool_details` and `content_max_length`, \
+         the variable wins. Every other field is passed to the OpenTelemetry SDK and wins \
+         over its variable. See [Telemetry](/docs/telemetry/) for the full \
+         picture.\n"
     )
     .unwrap();
 }
@@ -339,6 +437,8 @@ All fields are optional. Typos in field names cause an error right away.
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
     write_net_section(&mut out);
     write_trust_section(&mut out);
+    write_instructions_section(&mut out);
+    write_compatibility_section(&mut out);
     write_telemetry_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
@@ -423,6 +523,7 @@ On top of the project instruction files Maki loads from the git root down to the
 
 - `AGENTS.local.md` in any of those project directories for per-directory preferences (gitignored)
 - `~/.config/maki/AGENTS.md` for preferences that apply to all projects
+- `instructions.files` in the global `init.lua` to replace the project file list, scoped per checkout with `instructions.overrides` (see [`instructions`](#instructions))
 
 All of these are added to the system prompt at the start of every session.
 

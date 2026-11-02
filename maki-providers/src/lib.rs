@@ -1,39 +1,51 @@
+mod child_env;
 pub(crate) mod error;
+pub mod http;
 pub(crate) mod image;
 pub(crate) mod manifest;
 pub mod model;
 pub mod model_registry;
+pub mod models_cache;
 pub mod pricing;
 pub mod provider;
 pub(crate) mod providers;
 pub mod retry;
 pub mod spec;
+/// One recorded server for two audiences: other crates get it behind the
+/// feature, this crate's own tests get it without.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod tokens;
 pub(crate) mod types;
 
+pub use child_env::{shell_command, strip_provider_keys};
 pub use error::{AgentError, Overflow};
 pub use maki_storage::sessions::add_cost;
 pub use model::{
-    FastPricing, Model, ModelEntry, ModelError, ModelFamily, ModelInfo, ModelPricing, ModelTier,
-    ThinkingOption, ThinkingSupport, TokenUsage, format_tokens,
+    FastPricing, FastSupport, Model, ModelEntry, ModelError, ModelFamily, ModelInfo, ModelPricing,
+    ModelTier, ThinkingOption, ThinkingSupport, TokenUsage, format_tokens,
 };
 pub use pricing::{model_cost, settle_session};
-pub use providers::Timeouts;
-pub use providers::catalog::ProviderData;
-pub use providers::catalog::{
-    catalog_provider, catalog_provider_if_available, catalog_providers,
-    catalog_providers_if_available, refresh_catalog, warm_catalog,
+pub use providers::client_builder;
+pub use providers::custom;
+pub use providers::plugin;
+pub use providers::responses::{
+    ResponsesProvider, apply_responses_reasoning, build_body, responses_dialect,
 };
-pub use providers::copilot::auth as copilot_auth;
-pub use providers::dynamic;
-pub use providers::openai::auth as openai_auth;
-pub use providers::xai::auth as xai_auth;
 pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
+pub use providers::{Timeouts, user_agent};
+
+pub fn warm_catalog() {}
+pub fn refresh_catalog() -> Result<(), AgentError> {
+    Ok(())
+}
 pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
 pub use types::{
-    ContentBlock, EMPTY_RESPONSE_MARKER, Effort, EffortDialect, IMAGE_EVICTED_NOTE,
-    IMAGE_OMITTED_NOTE, IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource,
+    CONTEXT_UPDATE_WITHOUT_FACTS, ContentBlock, DEFER_LOADING_KEY, EMPTY_RESPONSE_MARKER, Effort,
+    EffortDialect, FACTS_WITHOUT_CONTEXT_UPDATE, IMAGE_EVICTED_NOTE, IMAGE_OMITTED_NOTE,
+    IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource, InputTransformation,
     Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions, Role,
-    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, ThinkingFallback, UsageLimit,
-    adapt_images_for_model, dialect,
+    StopReason, StreamResponse, THINKING_USAGE, TaskEnd, TaskSettled, ThinkingConfig,
+    ThinkingFallback, UNKNOWN_IMAGE_MEDIA_TYPE, UNTYPED_BLOCK, UsageLimit, adapt_images_for_model,
+    dialect, is_deferred_tool,
 };

@@ -23,6 +23,9 @@ pub enum Language {
     Lua,
     Elixir,
     Markdown,
+    /// The inline half of markdown: emphasis, code spans, links. Markdown
+    /// parses blocks only and leaves each paragraph's text to this grammar.
+    MarkdownInline,
     Starlark,
     V,
     Zig,
@@ -36,6 +39,8 @@ pub enum Language {
     Hcl,
     Json,
     Make,
+    Clojure,
+    Vue,
 }
 
 impl Language {
@@ -62,6 +67,7 @@ impl Language {
             "lua" => Some(Self::Lua),
             "elixir" => Some(Self::Elixir),
             "markdown" => Some(Self::Markdown),
+            "markdown_inline" => Some(Self::MarkdownInline),
             "starlark" => Some(Self::Starlark),
             "v" => Some(Self::V),
             "zig" => Some(Self::Zig),
@@ -75,6 +81,8 @@ impl Language {
             "hcl" => Some(Self::Hcl),
             "json" => Some(Self::Json),
             "make" => Some(Self::Make),
+            "clojure" => Some(Self::Clojure),
+            "vue" => Some(Self::Vue),
             _ => None,
         }
     }
@@ -115,6 +123,8 @@ impl Language {
             "hcl" | "tf" | "tfvars" => Some(Self::Hcl),
             "json" => Some(Self::Json),
             "mk" => Some(Self::Make),
+            "clj" | "cljs" | "cljc" | "bb" => Some(Self::Clojure),
+            "vue" => Some(Self::Vue),
             _ => None,
         }
     }
@@ -142,6 +152,7 @@ impl Language {
             Self::Lua => tree_sitter_lua::LANGUAGE.into(),
             Self::Elixir => tree_sitter_elixir::LANGUAGE.into(),
             Self::Markdown => tree_sitter_md::LANGUAGE.into(),
+            Self::MarkdownInline => tree_sitter_md::INLINE_LANGUAGE.into(),
             Self::Starlark => tree_sitter_starlark::LANGUAGE.into(),
             Self::V => tree_sitter_vlang::LANGUAGE.into(),
             Self::Zig => tree_sitter_zig::LANGUAGE.into(),
@@ -155,6 +166,8 @@ impl Language {
             Self::Hcl => tree_sitter_hcl::LANGUAGE.into(),
             Self::Json => tree_sitter_json::LANGUAGE.into(),
             Self::Make => tree_sitter_make::LANGUAGE.into(),
+            Self::Clojure => tree_sitter_clojure_orchard::LANGUAGE.into(),
+            Self::Vue => tree_sitter_vue_next::LANGUAGE.into(),
         }
     }
 }
@@ -199,5 +212,24 @@ mod tests {
     fn ts_extension_keeps_type_assertions() {
         let ts = Language::from_extension("ts").unwrap();
         assert!(parses_cleanly(ts, TYPE_ASSERTION_SOURCE));
+    }
+
+    #[test_case("clj")]
+    #[test_case("cljs")]
+    #[test_case("cljc")]
+    #[test_case("bb")]
+    fn clojure_extension_parses_cleanly(ext: &str) {
+        assert!(parses_cleanly(
+            Language::from_extension(ext).unwrap(),
+            "(ns a.b (:require [c.d :as e]))\n(defn f [x] (inc x))"
+        ));
+    }
+
+    #[test]
+    fn vue_extension_parses_cleanly() {
+        assert!(parses_cleanly(
+            Language::from_extension("vue").unwrap(),
+            "<template><div>{{ msg }}</div></template>\n<script setup lang=\"ts\">\nconst msg = 'hello';\n</script>"
+        ));
     }
 }

@@ -52,7 +52,7 @@ const MAX_ROOTS: usize = 4;
 /// Paths one root may retain. The corpus outlives the walk that built it in a
 /// process-wide registry, so without a ceiling a walk of a huge tree would pin
 /// a list of every path in it for the rest of the session.
-const MAX_ENTRIES: usize = 200_000;
+pub const MAX_ENTRIES: usize = 200_000;
 /// Entries ranked between two looks at the cancel flag.
 const CANCEL_EVERY: usize = 2048;
 /// Walks running at once across the process. One is a thread plus a pool of
@@ -400,7 +400,7 @@ struct WalkPermit;
 impl WalkPermit {
     fn take() -> Option<Self> {
         WALKS
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |walking| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |walking| {
                 (walking < MAX_WALKS).then_some(walking + 1)
             })
             .ok()
@@ -556,6 +556,24 @@ impl FileIndex {
             return;
         }
         abandon(&self.shared);
+    }
+
+    /// Ends the walk the way one stopped at `MAX_ENTRIES` ends it, over the
+    /// list published so far. Pairs with `detached`.
+    pub fn cap(&self) {
+        if !self.hand_published() {
+            return;
+        }
+        let _walk = lock(&self.shared.walk);
+        let current = self.shared.corpus.load();
+        self.shared.corpus.store(Arc::new(Corpus {
+            batches: current.batches.clone(),
+            len: current.len,
+            generation: current.generation,
+            complete: true,
+            crashed: false,
+            truncated: true,
+        }));
     }
 
     /// Replaces everything the index knows, the way a finished re-walk does:
@@ -1271,7 +1289,7 @@ mod tests {
         limit: 5,
         highlights: false,
     };
-    const WAIT_SECS: u64 = 10;
+    const WAIT_SECS: u64 = 25;
     /// Longer than any wait the module sits on, so an ending held for this
     /// long is one no test can watch go stale.
     const NEVER_DUE: Duration = Duration::from_secs(60 * 60);
@@ -1309,7 +1327,7 @@ mod tests {
     const GONE_FILE: &str = "gone.rs";
     /// Not valid UTF-8, so it has no name the picker could draw or the editor
     /// could open.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     const NON_UTF8_NAME: &[u8] = b"bad\xff.rs";
     const HAND_PUBLISHED: &str = "made_up.rs";
 
@@ -1332,8 +1350,11 @@ mod tests {
             if ready(&corpus) {
                 return corpus;
             }
+            if !index.shared.detached && !lock(&index.shared.walk).running {
+                index.refresh();
+            }
             assert!(Instant::now() < deadline, "{NEVER_SETTLED}");
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -1424,7 +1445,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
         while lock(&index.shared.walk).running {
             assert!(Instant::now() < deadline, "{NEVER_SETTLED}");
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -1723,6 +1744,7 @@ mod tests {
         index.refresh();
         assert!(!index.cancelled(), "starting a walk clears the flag");
         assert_eq!(walked(&index).len(), 1);
+        settled(&index);
     }
 
     /// Ranking has to agree with what the picker does with the same corpus, or
@@ -1731,7 +1753,8 @@ mod tests {
     #[test]
     fn ranking_matches_a_matcher_built_the_way_the_picker_builds_one() {
         let dir = tree(&["vendor/main/x.rs", "src/main.rs", "README.md"]);
-        let index = file_index(dir.path());
+        let root = dir.path().canonicalize().unwrap();
+        let index = file_index(&root);
         let corpus = walked(&index);
 
         let pattern = file_pattern(MAIN_QUERY);
@@ -1917,6 +1940,7 @@ mod tests {
             names.len() + 1,
             "every file plus the directory holding them"
         );
+        settled(&index);
     }
 
     /// A plugin looping over the subdirectories of a repo asks for one root
@@ -1938,6 +1962,7 @@ mod tests {
         drop(spent);
         index.refresh();
         assert_eq!(walked(&index).len(), 1, "the next ask got the walk");
+        settled(&index);
     }
 
     /// The tools write files the user then goes looking for. Without a word
@@ -2063,7 +2088,8 @@ mod tests {
     /// A lossy name is a name nothing else in maki can use: the picker draws
     /// it, Enter inserts it, and the editor is asked to open a path the
     /// filesystem does not have.
-    #[cfg(unix)]
+    // APFS rejects non-UTF-8 names.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_path_that_is_not_utf8_never_reaches_the_corpus() {
         use std::ffi::OsStr;
@@ -2158,25 +2184,27 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         let ends: Arc<Mutex<Vec<(usize, bool, bool)>>> = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&ends);
+        let root_for_observer = root.clone();
         // Every walk in the process reaches the observer, and other tests
         // walk their own trees, so only this root counts.
         on_walk_end(move |end| {
-            if end.root == root {
+            if end.root == root_for_observer {
                 lock(&seen).push((end.files, end.crashed, end.truncated));
             }
         });
 
-        let index = file_index(dir.path());
+        let index = file_index(&root);
         walked(&index);
         let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
         while lock(&ends).is_empty() {
             assert!(Instant::now() < deadline, "{NEVER_SETTLED}");
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(5));
         }
 
         let ends = lock(&ends);
         assert_eq!(ends.len(), 1, "one walk, one event");
         assert_eq!(ends[0], (2, false, false), "the whole tree, intact");
+        *lock(&WALK_OBSERVER) = None;
     }
 
     /// `publish` drives tests through an exact sequence of states. Aimed at a

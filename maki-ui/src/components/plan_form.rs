@@ -97,6 +97,7 @@ pub enum PlanFormAction {
     Implement,
     OpenEditor,
     Hide,
+    Refine,
     /// Plugin row picked, named by its position in the menu the
     /// `ui.plan_form.actions` chain built and the generation that menu was
     /// published with. App dispatches it to Lua. `then` is the built-in
@@ -286,8 +287,8 @@ impl PlanForm {
         match entry.action {
             Some(PlanRowAction::ClearAndImplement) => PlanFormAction::ClearAndImplement,
             Some(PlanRowAction::Implement) => PlanFormAction::Implement,
-            // Refine dismisses, and so does a row nobody can run.
-            Some(PlanRowAction::Refine) | None => PlanFormAction::Hide,
+            Some(PlanRowAction::Refine) => PlanFormAction::Refine,
+            None => PlanFormAction::Hide,
         }
     }
 
@@ -510,7 +511,7 @@ mod tests {
         assert_eq!(form.selected, target);
     }
 
-    #[test_case(0, PlanFormAction::Hide              ; "enter_at_0_refine")]
+    #[test_case(0, PlanFormAction::Refine            ; "enter_at_0_refine")]
     #[test_case(1, PlanFormAction::ClearAndImplement ; "enter_at_1")]
     #[test_case(2, PlanFormAction::Implement          ; "enter_at_2")]
     fn enter_dispatches(selected: usize, expected: PlanFormAction) {
@@ -638,7 +639,7 @@ mod tests {
         form.open_with(menu(rows));
         assert_eq!(form.menu.rows.len(), 1);
         form.selected = 0;
-        assert_eq!(form.handle_key(key(KeyCode::Enter)), PlanFormAction::Hide);
+        assert_eq!(form.handle_key(key(KeyCode::Enter)), PlanFormAction::Refine);
     }
 
     /// A plugin that wants no form keeps `ui.plan_form` closed instead of

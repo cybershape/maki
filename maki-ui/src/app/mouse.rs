@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
-use crate::clipboard::CopyResult;
+use crate::clipboard::{self, CopyResult};
+use crate::components::messages::ClickOutcome;
 use crate::selection::{
     self, ContentRegion, DocPos, EdgeScroll, RowPos, ScreenSelection, Selection, SelectionState,
     SelectionZone,
@@ -8,16 +9,27 @@ use crate::selection::{
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
+use crate::components::input::InputAction;
+use crate::image;
 use crate::repaint::Dirty;
 
-use super::App;
+use super::image_paste::{spawn_read, take_ready};
+use super::{App, InputWriter, MAIN_CHAT, Msg};
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(super) const FLASH_COPIED: &str = "Copied selection";
 
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) {
         match event.kind {
+            // Mouse capture turns the terminal's middle-click paste into a
+            // plain button event, so the selection is read back and routed
+            // like a bracketed paste.
+            MouseEventKind::Down(MouseButton::Middle) => {
+                self.primary_paste_rx
+                    .push(spawn_read(clipboard::read_primary_selection));
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(zone) = self.zone_at(event.row, event.column) {
                     if self.has_modal_overlay() && zone.zone != SelectionZone::Overlay {
@@ -47,14 +59,149 @@ impl App {
                         let zone = sel.zone;
                         self.selection_state = None;
                         if zone == SelectionZone::Messages {
-                            let area = self.msg_area();
-                            self.chats[self.active_chat].handle_click(event.row, area);
+                            self.click_messages(event.row, event.column);
                         }
                     }
                 }
             }
             _ => {}
         }
+    }
+
+    /// A moved row whose task tab was deleted, or never restored, has no task
+    /// to open, so it takes the click any row would.
+    fn click_messages(&mut self, row: u16, col: u16) {
+        let area = self.msg_area();
+        let chat = self.active_chat;
+        let outcome = self.chats[chat].handle_click(row, col, area);
+        let outcome = match outcome {
+            ClickOutcome::OpenTask(id) if self.chat_of_task(&id).is_err() => {
+                self.chats[chat].toggle_click(row, area)
+            }
+            outcome => outcome,
+        };
+        self.handle_click_outcome(outcome);
+    }
+
+    pub(super) fn handle_click_outcome(&mut self, outcome: ClickOutcome) {
+        match outcome {
+            ClickOutcome::OpenTask(id) => {
+                if let Err(e) = self.focus_task(&id) {
+                    self.flash(e);
+                }
+            }
+            ClickOutcome::MoveCall(id) => {
+                self.move_to_background(Some(&id));
+            }
+            ClickOutcome::OpenCompact(target) => self.open_compact_detail(target),
+            ClickOutcome::Handled | ClickOutcome::None => {}
+        }
+    }
+
+    /// Copies the clicked row out of the transcript, so output landing later
+    /// cannot move the text the reader is looking at.
+    fn open_compact_detail(&mut self, target: crate::components::compact_detail::CompactTarget) {
+        use crate::components::compact_detail::Shown;
+        use crate::components::tool_group::extract_batch_child_output;
+        use crate::components::{CompactDetail, DisplayRole, GroupEntry};
+        use maki_agent::ToolOutput;
+        use std::sync::Arc;
+
+        let Some(msg) = self.chats[self.active_chat]
+            .messages()
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::ToolGroup(g) if g.id == target.group_id))
+        else {
+            return;
+        };
+        let DisplayRole::ToolGroup(group) = &msg.role else {
+            return;
+        };
+
+        let mut items = Vec::new();
+        let mut selected_idx = 0;
+
+        for (e_idx, entry) in group.entries.iter().enumerate() {
+            match entry {
+                GroupEntry::Tool(tool) => {
+                    let tool_idx = items.len();
+                    if e_idx == target.entry && target.child.is_none() {
+                        selected_idx = tool_idx;
+                    }
+                    items.push(Shown::Tool(tool.clone()));
+
+                    for (c_idx, child) in tool.children.iter().enumerate() {
+                        let child_target_idx = items.len();
+                        if e_idx == target.entry && target.child == Some(c_idx) {
+                            selected_idx = child_target_idx;
+                        }
+                        let mut child_entry = child.clone();
+                        if child_entry.detail.is_none()
+                            && let Some(parent_detail) = &tool.detail
+                        {
+                            let child_output = parent_detail.output.as_ref().and_then(|out| {
+                                extract_batch_child_output(&out.as_display_text(), c_idx)
+                            });
+                            if let Some(out_str) = child_output {
+                                child_entry.detail = Some(CompactDetail {
+                                    raw_input: child_entry.raw_input.clone(),
+                                    output: Some(Arc::new(ToolOutput::Plain(out_str.into()))),
+                                    ..CompactDetail::default()
+                                });
+                            }
+                        }
+                        items.push(Shown::Tool(Box::new(child_entry)));
+                    }
+                }
+                GroupEntry::Thinking(thinking) => {
+                    let thinking_idx = items.len();
+                    if e_idx == target.entry && target.child.is_none() {
+                        selected_idx = thinking_idx;
+                    }
+                    items.push(Shown::Thinking(thinking.clone()));
+                }
+            }
+        }
+
+        if !items.is_empty() {
+            self.compact_detail.open_group(items, selected_idx);
+        }
+    }
+
+    /// What the chat input does with a paste no one else took: a line that is
+    /// an image path attaches the image, otherwise the text goes in.
+    pub(super) fn builtin_paste(&mut self, text: &str) {
+        // A finished tab has no input box, so the paste goes to the main
+        // chat, the way typed keys do.
+        if !self.chat_accepts_input() {
+            self.last_esc = None;
+            self.set_active_chat(MAIN_CHAT);
+        }
+        let mut any_image = false;
+        for line in text.lines() {
+            if let Some((path, media_type)) = image::try_parse_image_path(line) {
+                self.start_file_image_paste(path, media_type);
+                any_image = true;
+            }
+        }
+        if !any_image && let InputAction::Changed = self.input_box.handle_paste(text) {
+            self.input_changed(InputWriter::Anyone);
+        }
+    }
+
+    /// The selection is read in the background, so it comes back as a paste
+    /// typed now and waits behind any keys still held, like one from the
+    /// terminal.
+    pub fn poll_primary_paste(&mut self) -> Dirty {
+        let mut dirty = Dirty::NO;
+        while let Some(selection) = take_ready(&mut self.primary_paste_rx) {
+            dirty = Dirty::YES;
+            if let Some(text) = selection.filter(|text| !text.is_empty()) {
+                let actions = self.update(Msg::Paste(text));
+                self.pending_actions.extend(actions);
+            }
+        }
+        dirty
     }
 
     pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {
@@ -190,15 +337,7 @@ impl App {
                     self.selection_state = None;
                     return;
                 };
-                let copy_text = self.input_box.copy_text();
-                let input_area = sel.area;
-                let line_breaks = self.input_box.line_breaks(input_area.width);
-                let regions = [ContentRegion {
-                    area: input_area,
-                    raw_text: &copy_text,
-                    line_breaks,
-                }];
-                selection::extract_selected_text(buf, &screen_sel, &regions)
+                self.input_box.selected_text(sel.area, &screen_sel)
             }
             SelectionZone::Overlay => {
                 let Some(screen_sel) = self.screen_selection(sel, render_chat) else {
@@ -213,12 +352,16 @@ impl App {
             }
         };
 
-        match self.clipboard.copy_text(&text) {
+        self.copy(&text);
+        self.selection_state = None;
+    }
+
+    pub(super) fn copy(&mut self, text: &str) {
+        match self.clipboard.copy_text(text) {
             Ok(CopyResult::Noop) => {}
-            Ok(CopyResult::Copied) => self.status_bar.flash("Copied selection".into()),
+            Ok(CopyResult::Copied) => self.status_bar.flash(FLASH_COPIED.into()),
             Err(e) => self.status_bar.flash(format!("Copy failed: {e}")),
         }
-        self.selection_state = None;
     }
 
     pub(super) fn zone_at(&self, row: u16, col: u16) -> Option<selection::SelectableZone> {
@@ -263,7 +406,13 @@ impl App {
             .find(SelectionZone::Messages)
             .map(|z| {
                 let a = z.area;
-                Rect::new(a.x, a.y, a.width.saturating_sub(1), a.height)
+                let pad_left = u16::from(a.width >= 2);
+                Rect::new(
+                    a.x + pad_left,
+                    a.y,
+                    a.width.saturating_sub(1 + pad_left),
+                    a.height,
+                )
             })
             .unwrap_or_default()
     }

@@ -91,7 +91,7 @@ fn protocol_from_env(
         return None;
     }
     match get("TERM_PROGRAM").as_deref() {
-        Some("ghostty" | "kitty") => return Some(ProtocolType::Kitty),
+        Some("ghostty" | "kitty" | "rex") => return Some(ProtocolType::Kitty),
         Some("iTerm.app" | "WezTerm") => return Some(ProtocolType::Iterm2),
         _ => {}
     }
@@ -297,6 +297,7 @@ mod tests {
     }
 
     #[test_case(&[(TERM_PROGRAM, "iTerm.app")], Some(ProtocolType::Iterm2); "known_terminal")]
+    #[test_case(&[(TERM_PROGRAM, "rex")], Some(ProtocolType::Kitty); "rex_terminal")]
     #[test_case(&[(TERM, KITTY_TERM)], Some(ProtocolType::Kitty); "known_term")]
     #[test_case(&[(TERM_PROGRAM, UNKNOWN_PROGRAM), (TERM, KITTY_TERM)], Some(ProtocolType::Kitty); "unsupported_program_falls_back_to_term")]
     #[test_case(&[(TERM_PROGRAM, UNKNOWN_PROGRAM), (TERM, "xterm-256color")], None; "unsupported_program_and_term")]

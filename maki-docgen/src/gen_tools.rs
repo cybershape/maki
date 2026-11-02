@@ -1,4 +1,5 @@
 use maki_agent::template::Vars;
+use maki_agent::tools::schema::{TOOLCALL_REASON_DESCRIPTION, TOOLCALL_REASON_FIELD};
 use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolSource};
 use maki_config::{PluginFileConfig, PluginsConfig};
 use regex::Regex;
@@ -9,14 +10,19 @@ use std::sync::Arc;
 
 use maki_lua::{OptionType, PluginHost};
 
+use crate::lua_util::in_registration_window;
+
 const DATE_PLACEHOLDER: &str = "YYYY-MM-DD";
+/// Tools a plugin registers only when one of its boolean options is on, as
+/// (plugin, option, tool).
+const OPTION_GATED_TOOLS: &[(&str, &str, &str)] = &[("task", "allow_background", "task_message")];
 
 const SECTIONS: &[(&str, &[&str])] = &[
     (
         "File Operations",
         &[
             "bash",
-            "list",
+            "list_dir",
             "read",
             "write",
             "edit",
@@ -31,11 +37,18 @@ const SECTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "Execution & Control",
-        &["batch", "code_execution", "question"],
+        &["batch", "code_execution", "library_help", "question"],
     ),
     (
         "Agent & Knowledge",
-        &["task", "todo_write", "memory", "skill"],
+        &[
+            "task",
+            "task_stop",
+            "task_message",
+            "todo_write",
+            "memory",
+            "skill",
+        ],
     ),
     ("Web", &["webfetch", "websearch"]),
 ];
@@ -77,6 +90,19 @@ fn first_paragraph(desc: &str) -> &str {
     desc.split("\n\n").next().unwrap_or(desc)
 }
 
+/// Drops a `toolcall_reason` this process injected. A tool that declared the
+/// field itself keeps its own description, which is not ours, so it stays.
+fn documented_schema(schema: &Value) -> Value {
+    let mut schema = schema.clone();
+    if schema["properties"][TOOLCALL_REASON_FIELD]["description"].as_str()
+        == Some(TOOLCALL_REASON_DESCRIPTION)
+        && let Some(properties) = schema.get_mut("properties").and_then(|p| p.as_object_mut())
+    {
+        properties.remove(TOOLCALL_REASON_FIELD);
+    }
+    schema
+}
+
 fn extract_params(schema: &Value) -> Vec<Param> {
     let properties = match schema.get("properties").and_then(|p| p.as_object()) {
         Some(p) => p,
@@ -90,10 +116,7 @@ fn extract_params(schema: &Value) -> Vec<Param> {
 
     let mut params = Vec::new();
     for (name, prop) in properties {
-        let raw_type = prop
-            .get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("string");
+        let raw_type = prop.get("type").and_then(|t| t.as_str()).unwrap_or("any");
         let raw_desc = prop
             .get("description")
             .and_then(|d| d.as_str())
@@ -142,7 +165,7 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
         .and_then(|d| d.as_str())
         .unwrap_or("");
     let schema = info.def.get("input_schema").cloned().unwrap_or(Value::Null);
-    let params = extract_params(&schema);
+    let params = extract_params(&documented_schema(&schema));
     let summary = first_paragraph(description);
 
     writeln!(out).unwrap();
@@ -169,10 +192,9 @@ fn redact_path(input: &str, target: &str, placeholder: &str) -> String {
     }
 }
 
-/// Plugins bake env-specific values into their `description` at registration:
-/// `bash` interpolates `maki.uv.cwd()` and `websearch` interpolates
-/// `os.date("%Y-%m-%d")`. Scrub both so `gen-docs-check` is stable across
-/// machines and days. CWD is replaced before HOME so a cwd nested under ~
+/// A plugin may bake env-specific values (the cwd, today's date) into its
+/// `description` at registration. Scrub both so `gen-docs-check` is stable
+/// across machines and days. CWD is replaced before HOME so a cwd nested under ~
 /// doesn't get partially mangled.
 fn redact_env_and_dates(input: &str) -> String {
     let cwd = std::env::current_dir()
@@ -223,23 +245,34 @@ fn collect_tool_info(
     })
 }
 
-/// Loads every builtin with all sub-tools on, so the reference documents
-/// opt-in tools too. "Opt-in" means the plugin declares the tool as a boolean
-/// option defaulting to false, so the badge cannot drift from the defaults.
+/// Loads every builtin with all sub-tools and option-gated tools on, so the
+/// reference documents opt-in tools too. "Opt-in" means the plugin declares
+/// the tool, or the option gating it, as a boolean option defaulting to false,
+/// so the badge cannot drift from the defaults.
 fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
-    let registry = Arc::new(ToolRegistry::new());
-    let mut host = PluginHost::new(Arc::clone(&registry)).expect("plugin host");
-
-    let mut plugins = HashMap::new();
     let mut edit = PluginFileConfig::default();
     for &sub in maki_config::EDIT_SUB_TOOLS {
         edit.opts.insert(sub.to_owned(), Value::Bool(true));
     }
-    plugins.insert("edit".to_owned(), edit);
-    host.load_builtins(&PluginsConfig::from_plugins(plugins))
-        .expect("loading builtin plugins");
+    let mut plugins = HashMap::from([("edit".to_owned(), edit)]);
+    for &(plugin, option, _) in OPTION_GATED_TOOLS {
+        plugins
+            .entry(plugin.to_owned())
+            .or_default()
+            .opts
+            .insert(option.to_owned(), Value::Bool(true));
+    }
+    let config = PluginsConfig::from_plugins(plugins);
 
-    let opt_in = host
+    let registry = Arc::new(ToolRegistry::new());
+    let host = in_registration_window(|| {
+        let mut host = PluginHost::new(Arc::clone(&registry)).expect("plugin host");
+        host.load_builtins(&config)
+            .expect("loading builtin plugins");
+        host
+    });
+
+    let mut opt_in: HashSet<String> = host
         .plugin_options()
         .expect("collecting plugin options")
         .into_values()
@@ -247,6 +280,12 @@ fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
         .filter(|o| o.ty == OptionType::Boolean && o.default == Some(Value::Bool(false)))
         .map(|o| o.name)
         .collect();
+    let gated: Vec<String> = OPTION_GATED_TOOLS
+        .iter()
+        .filter(|(_, option, _)| opt_in.contains(*option))
+        .map(|(_, _, tool)| (*tool).to_owned())
+        .collect();
+    opt_in.extend(gated);
     (registry, opt_in)
 }
 
@@ -264,6 +303,7 @@ pub fn generate() -> String {
             audience: ToolAudience::MAIN,
             workflow: false,
             mcp: false,
+            mcp_libraries: None,
         },
         false,
     );
@@ -386,8 +426,8 @@ mod tests {
         assert!(cleaned.starts_with(remaining_prefix), "cleaned: {cleaned}");
     }
 
-    #[test]
-    fn sections_partition_registered_tools() {
+    #[tokio::test]
+    async fn sections_partition_registered_tools() {
         let (registry, _) = load_registry_with_builtins();
         let snapshot = registry.iter();
         let registered: HashSet<&str> = snapshot.iter().map(|e| e.name()).collect();

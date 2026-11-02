@@ -1,12 +1,18 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum, value_parser};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
+use maki_config::MaxWidth;
 
 use crate::print::OutputFormat;
+
+const DEFAULT_BACKGROUND_TIMEOUT_SECS: u64 = 600;
+/// A week. The deadline is an `Instant`, which panics on overflow.
+const MAX_BACKGROUND_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone, ValueEnum, Default)]
 pub enum PromptVariant {
@@ -25,6 +31,10 @@ pub enum InputFormat {
 
 #[derive(Parser)]
 #[command(name = "maki", version, about = "AI coding agent for the terminal")]
+// Only one way to name the session to load, or the resolver would quietly pick
+// one. `--fork-session` requires it, since forking nothing used to start a
+// blank session.
+#[command(group = ArgGroup::new("loaded").args(["continue_session", "resume"]))]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -37,7 +47,7 @@ pub struct Cli {
     #[arg(long = "image", value_name = "PATH")]
     pub images: Vec<PathBuf>,
 
-    /// Model spec (provider/model-id). Defaults to last used model, or claude-opus-4-6
+    /// Model spec (provider/model-id). Defaults to last used model, then configured default_model, then auto-detected
     #[arg(short, long)]
     pub model: Option<String>,
 
@@ -50,8 +60,13 @@ pub struct Cli {
     pub continue_session: bool,
 
     /// Resume a specific session by its ID
-    #[arg(short = 's', long, alias = "resume")]
-    pub session: Option<String>,
+    #[arg(
+        short = 'r',
+        long,
+        visible_short_alias = 's',
+        visible_alias = "session"
+    )]
+    pub resume: Option<String>,
 
     /// Output format for --print mode
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -104,12 +119,16 @@ pub struct Cli {
     pub session_id: Option<String>,
 
     /// Fork the loaded session under a new ID
-    #[arg(long)]
+    #[arg(long, requires = "loaded")]
     pub fork_session: bool,
 
     /// Maximum number of agent turns
     #[arg(long)]
     pub max_turns: Option<u32>,
+
+    /// Maximum width of the UI in terminal columns, fraction (e.g. 0.8), or negative offset (e.g. -10)
+    #[arg(long, allow_hyphen_values = true, value_name = "WIDTH")]
+    pub max_width: Option<MaxWidth>,
 
     /// System prompt override
     #[arg(long)]
@@ -126,6 +145,20 @@ pub struct Cli {
     /// Include partial streaming messages in SDK output
     #[arg(long)]
     pub include_partial_messages: bool,
+
+    /// How long --print, SDK mode and --exit-on-done stay up for background
+    /// tasks once their input ends. Each result that comes back in time wakes
+    /// the model for another turn. Tasks still running after this are stopped.
+    /// Unset: 600 for SDK mode and --exit-on-done, while --print runs with
+    /// background tasks off so it exits right after its answer. 0 turns them
+    /// off for --print, SDK and ACP, so every tool call blocks until it
+    /// finishes. At most a week
+    #[arg(
+        long,
+        value_name = "SECS",
+        value_parser = value_parser!(u64).range(..=MAX_BACKGROUND_TIMEOUT_SECS),
+    )]
+    pub background_timeout: Option<u64>,
 
     /// Permission prompt tool (accepted for compat, used in SDK mode)
     #[arg(long, hide = true)]
@@ -196,6 +229,19 @@ impl Cli {
 
     pub fn is_sdk_mode(&self) -> bool {
         self.print && matches!(self.input_format, InputFormat::StreamJson)
+    }
+
+    /// `None` when background tasks are off. `-p` has no one to use the wait
+    /// and promises one answer, so it only waits when asked to.
+    pub fn background_wait(&self) -> Option<Duration> {
+        let secs = self
+            .background_timeout
+            .unwrap_or(if self.print && !self.is_sdk_mode() {
+                0
+            } else {
+                DEFAULT_BACKGROUND_TIMEOUT_SECS
+            });
+        (secs > 0).then(|| Duration::from_secs(secs))
     }
 }
 
@@ -297,6 +343,9 @@ pub enum SessionAction {
         /// Show sessions from all projects
         #[arg(short, long)]
         global: bool,
+        /// Print machine-readable session summaries, one JSON array
+        #[arg(long)]
+        json: bool,
     },
     /// Delete a session
     Delete {
@@ -307,12 +356,26 @@ pub enum SessionAction {
         #[arg(short, long)]
         force: bool,
     },
+    /// Write a session as a portable JSON transcript to stdout
+    Export {
+        /// Session ID (see `maki session list`)
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+    },
+    /// Store a JSON transcript as a new session in this directory and print its ID
+    Import {
+        /// Transcript file, or stdin when omitted or `-`
+        #[arg(value_name = "FILE")]
+        file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
 pub enum MigrateAction {
     /// Migrate files from ~/.maki/ to XDG directories
     Xdg,
+    /// Print a prompt that ports your old provider scripts to Lua plugins
+    Providers,
 }
 
 #[derive(Subcommand)]
@@ -372,6 +435,8 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
+
     #[test_case("Read", "read")]
     #[test_case("Bash", "bash")]
     #[test_case("CodeExecution", "code_execution")]
@@ -390,5 +455,44 @@ mod tests {
     #[test]
     fn normalize_tool_name_multi_edit_rejects_snake_variant() {
         assert!(normalize_tool_name("MultiEdit").is_err());
+    }
+
+    /// `--session-id` with `-c` stays legal: continue the latest, but write
+    /// under this id.
+    #[test_case(&["-c", "-r", SESSION_ID], false ; "two sessions to load")]
+    #[test_case(&["-c", "-s", SESSION_ID], false ; "two sessions to load through the short alias")]
+    #[test_case(&["-c", "--session", SESSION_ID], false ; "two sessions to load through the long alias")]
+    #[test_case(&["--fork-session"], false ; "a fork with nothing to fork")]
+    #[test_case(&["--fork-session", "-c"], true ; "a fork of the latest")]
+    #[test_case(&["--fork-session", "-r", SESSION_ID], true ; "a fork of a named session")]
+    #[test_case(&["-c", "--session-id", SESSION_ID], true ; "a redirected continue")]
+    fn session_flag_combinations(args: &[&str], accepted: bool) {
+        let argv = std::iter::once("maki").chain(args.iter().copied());
+
+        assert_eq!(Cli::try_parse_from(argv).is_ok(), accepted);
+    }
+
+    #[test_case(&["-p"], None ; "print_default_is_off")]
+    #[test_case(&["-p", "--input-format", "stream-json"], Some(DEFAULT_BACKGROUND_TIMEOUT_SECS) ; "sdk_default")]
+    #[test_case(&["--exit-on-done"], Some(DEFAULT_BACKGROUND_TIMEOUT_SECS) ; "tui_default")]
+    #[test_case(&["acp"], Some(DEFAULT_BACKGROUND_TIMEOUT_SECS) ; "acp_default_is_on")]
+    #[test_case(&["-p", "--background-timeout", "30"], Some(30) ; "print_set")]
+    #[test_case(&["--background-timeout", "0", "acp"], None ; "zero_turns_acp_off")]
+    fn background_timeout_flag(args: &[&str], expected_secs: Option<u64>) {
+        let argv = std::iter::once("maki").chain(args.iter().copied());
+
+        let cli = Cli::try_parse_from(argv).unwrap();
+
+        assert_eq!(
+            cli.background_wait(),
+            expected_secs.map(Duration::from_secs)
+        );
+    }
+
+    #[test]
+    fn background_timeout_past_the_cap_is_refused() {
+        let too_long = (MAX_BACKGROUND_TIMEOUT_SECS + 1).to_string();
+
+        assert!(Cli::try_parse_from(["maki", "-p", "--background-timeout", &too_long]).is_err());
     }
 }

@@ -3,7 +3,6 @@
 -- dispatch live in Rust, which exposes primitives only (`maki.api.get_tools`,
 -- `maki.agent.call_tool`); orchestration policy is here.
 
-local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 local partial = require("maki.partial")
@@ -11,8 +10,14 @@ local partial = require("maki.partial")
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
 local MAX_SCRIPT_LINES = 2000
+local OPEN_READ_CHECK_LINES = 1
+local READ_INPUT_SLOTS = { "tool.read.input", "tool.*.input" }
+local LIST_INPUT_SLOTS = { "tool.list_dir.input", "tool.*.input" }
+local OPEN_READ_HOOKED_ERR = "open() cannot read while a plugin hooks the read tool, call read() instead"
+local INSPECT_HOOKED_ERR = "os and pathlib cannot look at files while a plugin hooks the list_dir tool, call list_dir() instead"
+local MKDIR_BASH_HINT = ", create the directory with the bash tool instead"
+local OPEN_APPEND_UNSUPPORTED_ERR = "open() cannot append because the write tool has no append option"
 local NO_OUTPUT = "(no output)"
-local SEPARATOR = "──────"
 local CANCELLED_ERR = "cancelled"
 local TIME_LIMIT_SUBSTR = "time limit exceeded"
 -- Same marker the batch tool uses for a failed child, so a failure reads the
@@ -51,15 +56,20 @@ async def gather(*calls):
 local TOOLS_HEADER = "\n\nAvailable tools (async Python functions, keyword args only):\n"
 local WORKFLOW_TOOLS_NOTE =
   "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `gather(task(...), task(...))` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
--- MCP names and schemas already sit in the tool array (or the tool_search
--- catalog), so point at those instead of repeating them here.
-local MCP_NOTE =
-  "\nMCP tools are callable too, with the arguments their definitions declare. Hyphens become underscores (`srv__get-docs` is `srv__get_docs`).\n"
+local WORKFLOW_OFF_NOTE = "\nNot callable: %s\n"
 local CALLABLE_TOOLS_ERR = "cannot list callable tools: "
 -- `alias` covers hyphens; what is left is a name no substitution can fix, like
 -- a leading digit. Binding it would raise a SyntaxError the model cannot act on.
 local PY_IDENTIFIER = "^[%a_][%w_]*$"
 local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
+
+local function identifier_alias(name)
+  if not name or #name == 0 or name:match("^%d") then
+    return nil
+  end
+  local alias = name:gsub("[^%w_]", "_")
+  return alias:match(PY_IDENTIFIER) and alias or nil
+end
 
 local opts = maki.api.register_options(output_limits.extend({
   timeout_secs = {
@@ -98,13 +108,14 @@ local function build_body(ctx, code)
     if shown < total then
       out[#out + 1] = { { "... (" .. (total - shown) .. " lines) (click to expand)", "dim" } }
     end
-    out[#out + 1] = { { SEPARATOR, "dim" } }
     return out
   end
 
   view:set_header(header())
+  -- Flip the flag directly: `toggle` would flush the old header first, and
+  -- each flush walks every line of a script this long.
   buf:on("click", function()
-    view:toggle()
+    view.expanded = not view.expanded
     view:set_header(header())
   end)
 
@@ -123,12 +134,17 @@ local description = [[Execute Python in a sandbox where every tool is an async f
 Use for chained/dependent tool calls and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** cheaper than sequential tool calls!
 
 - All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Parse output yourself.
+- Tool results are complete. Only what you print/return is capped.
 - Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`.
-- Available libs: re, asyncio, sys, os, json. No other imports, no classes, no filesystem/network access.
+- Available libs: re, asyncio, sys, os, json, pathlib. No other imports, no classes, no network access. `open()` works on text files, and `os`/`pathlib` can stat, list, walk, glob and mkdir.
 - Fresh sandbox each run: no state persists between executions.
 - 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
-- Skip it when a single tool call needs no transformation.
+- NEVER use as a proxy or wrapper for a single tool call. If no code logic, chaining, or output filtering is needed, invoke the tool directly.
 - NOT a thinking scratchpad. Reason in your response text.
+- Monty sandbox limitations (avoid common failures):
+  * Generator expressions `(x for ...)` materialize as `list`, and `iter()` is unavailable: DO NOT use `next(x for ...)`; use a `for` loop or `[...][0]` instead.
+  * No `:=` (walrus), no `del` (use `d.pop(k, None)`), no `*args` unpacking in calls (`f(*args)`), no `match/case`, no decorators (`@...`).
+  * Builtins NOT implemented: `iter`, `callable`, `dir`, `globals`, `locals`, `eval`, `exec`.
 ]]
 
 local schema = {
@@ -183,10 +199,10 @@ local function interpreter_tools(tools, audience, workflow)
   return out
 end
 
-local function matches_filter(name, dctx)
+local function matches_filter(name, dctx, alias)
   if dctx.only then
     for _, n in ipairs(dctx.only) do
-      if n == name then
+      if n == name or (alias and n == alias) then
         return true
       end
     end
@@ -194,7 +210,7 @@ local function matches_filter(name, dctx)
   end
   if dctx.except then
     for _, n in ipairs(dctx.except) do
-      if n == name then
+      if n == name or (alias and n == alias) then
         return false
       end
     end
@@ -224,25 +240,56 @@ local function signature(t)
     local ptype = PY_TYPES[schema_props[pname].type] or "any"
     params[#params + 1] = required[pname] and (pname .. ": " .. ptype) or (pname .. ": " .. ptype .. " = None")
   end
-  return "- " .. t.name .. "(" .. table.concat(params, ", ") .. ") -> str"
+  return "- " .. (t.alias or t.name) .. "(" .. table.concat(params, ", ") .. ") -> str"
 end
 
 -- Keep cheap: runs on every request build. get_tools skips descriptions
 -- to avoid recursion from describe callbacks.
 local function describe(dctx)
   local parts = { description, TOOLS_HEADER }
-  local has_workflow_only = false
-  for _, t in ipairs(interpreter_tools(maki.api.get_tools(), dctx.audience, dctx.workflow)) do
-    if matches_filter(t.name, dctx) then
-      has_workflow_only = has_workflow_only or t.workflow_only
-      parts[#parts + 1] = signature(t) .. "\n"
+  local has_workflow_only, gated = false, {}
+  -- Ask as if workflow were on, then hold back what it would unlock: those
+  -- names are listed as not callable, so the model stops trying them.
+  for _, t in ipairs(interpreter_tools(maki.api.get_tools(), dctx.audience, true)) do
+    if matches_filter(t.name, dctx, t.alias) then
+      if t.workflow_only and not dctx.workflow then
+        gated[#gated + 1] = t.name
+      else
+        has_workflow_only = has_workflow_only or t.workflow_only
+        parts[#parts + 1] = signature(t) .. "\n"
+      end
     end
   end
   if has_workflow_only then
     parts[#parts + 1] = WORKFLOW_TOOLS_NOTE
   end
-  if dctx.mcp then
-    parts[#parts + 1] = MCP_NOTE
+  if #gated > 0 then
+    parts[#parts + 1] = WORKFLOW_OFF_NOTE:format(table.concat(gated, ", "))
+  end
+  if dctx.mcp and dctx.mcp_libraries and #dctx.mcp_libraries > 0 then
+    local lines = {
+      "\nExternal libraries (callable in Python via `await <library_name>.<function_name>(...)`):",
+    }
+    for _, lib in ipairs(dctx.mcp_libraries) do
+      local lib_name = identifier_alias(lib.name) or lib.name
+      local desc = (lib.description and #lib.description > 0) and lib.description or "(no description)"
+      local fn_names = {}
+      local seen = {}
+      for _, fn in ipairs(lib.functions or {}) do
+        local fn_name = identifier_alias(fn) or fn
+        if not seen[fn_name] then
+          seen[fn_name] = true
+          fn_names[#fn_names + 1] = fn_name
+        end
+      end
+      local fns = #fn_names > 0 and table.concat(fn_names, ", ") or "(none)"
+      table.insert(lines, string.format("- %s: %s\n  functions: %s", lib_name, desc, fns))
+    end
+    table.insert(
+      lines,
+      'Use `library_help(library_name="...", function_name="...")` to inspect parameter schemas and function documentation.\n'
+    )
+    parts[#parts + 1] = table.concat(lines, "\n")
   end
   return table.concat(parts)
 end
@@ -256,7 +303,69 @@ local function start(input, ctx)
   highlight()
 end
 
+local function hooked(slot_names)
+  local slots = maki.api.get_slots()
+  for _, name in ipairs(slot_names) do
+    if slots[name] and #slots[name].fillers > 0 then
+      return true
+    end
+  end
+  return false
+end
+
+-- `open()` rides on the read and write tools, so hooks, plugins that replace
+-- them, permission prompts, the file lock and plan mode all still apply. The
+-- read tool numbers and caps lines, so we ask it for one line just to get its
+-- yes and record the read, then take the real content straight from disk.
+-- A read hook may have pointed that check at another file, so while one is
+-- installed we refuse rather than read the path it steered away from.
+-- A replacement write tool without `append` would drop the flag and overwrite
+-- the file, so appends are refused there.
+-- Metadata and listings (inspect) remain available to the sandbox even when
+-- the list_dir tool itself is disabled or hidden from the model, since
+-- os/pathlib inspection is a core interpreter capability. mkdir looks before
+-- it creates, so mkdir also needs `inspect`.
+local function file_access(tools, schemas, ctx)
+  local files = {}
+  if tools.read then
+    files.read = function(path)
+      if hooked(READ_INPUT_SLOTS) then
+        return nil, OPEN_READ_HOOKED_ERR
+      end
+      local _, err = tools.read({ path = path, offset = 1, limit = OPEN_READ_CHECK_LINES })
+      if err then
+        return nil, err
+      end
+      return maki.fs.read(maki.fs.abspath(path))
+    end
+  end
+  if tools.write then
+    local can_append = (schemas.write.properties or {}).append ~= nil
+    files.write = function(path, content, append)
+      if append and not can_append then
+        return nil, OPEN_APPEND_UNSUPPORTED_ERR
+      end
+      return tools.write({ path = path, content = content, append = append })
+    end
+    files.mkdir = function(path, parents)
+      local _, err = ctx:can_write(path)
+      if err then
+        return nil, err .. MKDIR_BASH_HINT
+      end
+      return maki.fs.mkdir(path, { parents = parents })
+    end
+  end
+  files.inspect = function()
+    if hooked(LIST_INPUT_SLOTS) then
+      return nil, INSPECT_HOOKED_ERR
+    end
+    return true
+  end
+  return files
+end
+
 local function handler(input, ctx)
+  local started_at = os.time()
   local timeout = input.timeout or opts.timeout_secs
 
   local buf, view, highlight = build_body(ctx, input.code)
@@ -265,25 +374,24 @@ local function handler(input, ctx)
 
   view:append({ { "Waiting for output...", "dim" } })
 
+  local max_lines, max_bytes = output_limits.resolve(opts, ctx)
+
   local waiting = true
-  local output_parts = {}
+  local collected = output_limits.collector(max_lines, max_bytes)
   local function show(line)
     if waiting then
       waiting = false
       view:clear()
     end
-    output_parts[#output_parts + 1] = line
+    collected:append(line)
     view:append(line)
   end
-
-  local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
   -- Memoized, because a cancel reaches us twice: once through the hook and
   -- again as the interpreter's error, and the view is painted only once.
   local cut_reply
   local function cut(reason)
-    cut_reply = cut_reply
-      or partial.cut(view, truncate(table.concat(output_parts, "\n"), max_lines, max_bytes), reason, timeout)
+    cut_reply = cut_reply or partial.cut(view, collected:result(), reason, timeout, started_at)
     return cut_reply
   end
 
@@ -301,13 +409,14 @@ local function handler(input, ctx)
     return { llm_output = CALLABLE_TOOLS_ERR .. callable_err, is_error = true }
   end
 
-  local tools = {}
+  local tools, schemas = {}, {}
   for _, t in ipairs(interpreter_tools(callable, ctx:audience(), ctx:workflow())) do
     local bind, name = t.alias or t.name, t.name
     if bind:match(PY_IDENTIFIER) then
+      schemas[bind] = t.schema or {}
       tools[bind] = function(tool_input)
         if t.workflow_only then
-          return maki.agent.call_tool(ctx, name, tool_input, {})
+          return maki.agent.call_tool(ctx, name, tool_input)
         end
         -- The script clock stops while a tool call is awaited, so an explicit
         -- longer timeout on the call has to win over the script budget.
@@ -318,12 +427,37 @@ local function handler(input, ctx)
     end
   end
 
+  local preamble_parts = { PREAMBLE }
+  local libs = maki.agent.mcp_libraries(ctx)
+  if libs and #libs > 0 then
+    local ns_lines = {
+      "class _McpNamespace:\n    pass\n",
+    }
+    for _, lib in ipairs(libs) do
+      local lib_name = identifier_alias(lib.name)
+      if lib_name then
+        table.insert(ns_lines, string.format("%s = _McpNamespace()\n", lib_name))
+        for _, fn in ipairs(lib.functions or {}) do
+          local fn_name = identifier_alias(fn.name)
+          if fn_name then
+            local wire = lib_name .. "__" .. fn_name
+            if tools[wire] then
+              table.insert(ns_lines, string.format("%s.%s = %s\n", lib_name, fn_name, wire))
+            end
+          end
+        end
+      end
+    end
+    table.insert(preamble_parts, table.concat(ns_lines))
+  end
+
   local result, err = maki.interpreter.run(input.code, {
     timeout = timeout,
     max_memory_mb = opts.max_memory_mb,
-    preamble = PREAMBLE,
+    preamble = table.concat(preamble_parts),
     on_output = show,
     tools = tools,
+    files = file_access(tools, schemas, ctx),
   })
 
   if err then
@@ -341,24 +475,28 @@ local function handler(input, ctx)
     -- The run is already paid for, so point a script that reached for
     -- `asyncio.gather` at the wrapper that would have kept its other results.
     local hint = input.code:find(ASYNCIO_GATHER, 1, true) and GATHER_HINT or ""
-    return { llm_output = err .. hint, is_error = true, body = buf }
+    return { llm_output = output_limits.cut_middle(err .. hint, max_lines, max_bytes), is_error = true, body = buf }
   end
 
-  local output = result.stdout or ""
   if result.output then
     show("return: " .. result.output)
-    output = (#output > 0 and output .. "\n" or "") .. "return: " .. result.output
   end
-  if #output == 0 then
-    output = NO_OUTPUT
+
+  -- Every line already went through `show`, so the collector holds the
+  -- reply and a finished run keeps its tail just like a cut one. Full mode
+  -- promises the whole output, so a cut there is an error.
+  local over_full_limit = not max_bytes and collected:truncated()
+  local llm_output = collected:result()
+  if llm_output == "" then
+    llm_output = NO_OUTPUT
     view:clear()
     view:append({ { "No output", "dim" } })
+  elseif over_full_limit then
+    llm_output = llm_output .. "\n" .. output_limits.FULL_LIMIT_NOTE
   end
-
-  local llm_output = truncate(output, max_lines, max_bytes)
   view:finish()
 
-  return { llm_output = llm_output, body = buf }
+  return { llm_output = llm_output, is_error = over_full_limit, body = buf }
 end
 
 local function header(input)

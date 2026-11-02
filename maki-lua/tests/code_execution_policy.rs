@@ -11,9 +11,12 @@ use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{
     DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry, local_tool,
 };
+use maki_config::{PluginFileConfig, PluginsConfig};
 use maki_lua::PluginHost;
+use maki_lua::test_support::runtime;
 
 const CODE_EXECUTION_SRC: &str = include_str!("../../plugins/code_execution/init.lua");
+const LIBRARY_HELP_SRC: &str = include_str!("../../plugins/library_help/init.lua");
 
 const ECHO_PREFIX: &str = "echo:";
 const FAIL_MSG: &str = "fixture blew up";
@@ -21,10 +24,11 @@ const ERROR_PREFIX: &str = "[ERROR] ";
 const GATHER_HINT_SUBSTR: &str = "`gather(...)` keeps the other results";
 const TASK_PREFIX: &str = "task:";
 const WORKFLOW_NOTE_SUBSTR: &str = "Workflow mode: orchestrate subagents";
+const WF_TASK_GATED_LINE: &str = "Not callable: wf_task";
 const INTERP_ECHO_SIG: &str = "- interp_echo(msg: str, count: int = None, flag: bool = None, items: list = None, raw: any = None) -> str";
 const WF_TASK_SIG: &str = "- wf_task(prompt: str, model_tier: str = None) -> str";
 const SUB_TOOL_SIG: &str = "- sub_tool() -> str";
-const MCP_NOTE_SUBSTR: &str = "MCP tools are callable too";
+const MCP_NOTE_SUBSTR: &str = "External libraries";
 const MCP_TOOL_QUALIFIED: &str = "srv.fetch_issue";
 const MCP_TOOL_WIRE: &str = "srv__fetch_issue";
 /// Servers publish names Python cannot spell; the sandbox binds the alias.
@@ -45,6 +49,34 @@ const MARKER_A: &str = "AAA";
 const MARKER_B: &str = "BBB";
 const EDITED_A: &str = "aaa";
 const EDITED_B: &str = "bbb";
+const OPEN_TARGET: &str = "notes.txt";
+const OPEN_ORIGINAL: &str = "hello\n";
+const PLAN_FILE: &str = "plan.md";
+const FILE_WRITE_FAILED: &str = "file write failed";
+const OPEN_REFUSED: &str = "refused";
+const BLOCKING_READ_HOOK: &str =
+    r#"maki.api.set_slot("tool.read.input", function() return nil, "blocked" end)"#;
+/// Points reads at a file that exists, so the read tool says yes.
+const REWRITING_READ_HOOK: &str = concat!(
+    r#"maki.api.set_slot("tool.read.input", function(prev, input) input.path = ""#,
+    env!("CARGO_MANIFEST_DIR"),
+    r#"/Cargo.toml" return input end)"#
+);
+const WILDCARD_INPUT_HOOK: &str =
+    r#"maki.api.set_slot("tool.*.input", function(prev, input) return input end)"#;
+const NO_POLICY: &str = "";
+const LIST_HOOK: &str =
+    r#"maki.api.set_slot("tool.list_dir.input", function(prev, input) return input end)"#;
+const RUNTIME_ERROR: &str = "RuntimeError";
+const MADE_DIR: &str = "made/deep";
+const OPEN_APPEND_REFUSED: &str = "write tool has no append option";
+const WRITE_WITHOUT_APPEND: &str = r#"maki.api.register_tool({
+    name = "write",
+    description = "replacement write without append",
+    audiences = { "main", "interpreter" },
+    schema = { type = "object", properties = { path = { type = "string" }, content = { type = "string" } } },
+    handler = function(input) maki.fs.write(input.path, input.content) return "ok" end,
+})"#;
 
 fn fixture_plugin() -> String {
     format!(
@@ -113,6 +145,19 @@ maki.api.register_tool({{
     schema = {{ type = "object", properties = {{}}, additionalProperties = false }},
     handler = function() return "" end,
 }})
+maki.api.register_tool({{
+    name = "list_dir",
+    description = "list_dir fixture",
+    audiences = {{ "main", "interpreter" }},
+    schema = {{
+        type = "object",
+        required = {{ "path" }},
+        properties = {{
+            path = {{ type = "string" }},
+        }},
+    }},
+    handler = function(input) return "listed:" .. (input.path or "") end,
+}})
 "#
     )
 }
@@ -121,6 +166,8 @@ fn setup_with(reg: Arc<ToolRegistry>) -> (Arc<ToolRegistry>, PluginHost) {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("code_execution", CODE_EXECUTION_SRC)
         .expect("real plugin should load");
+    host.load_source("library_help", LIBRARY_HELP_SRC)
+        .expect("library_help should load");
     host.load_source("policy_fixtures", &fixture_plugin())
         .expect("fixture plugin should load");
     (reg, host)
@@ -150,6 +197,7 @@ fn describe(
             audience,
             workflow,
             mcp: false,
+            mcp_libraries: None,
         })
         .into_owned()
 }
@@ -162,7 +210,8 @@ fn run_tool(
 ) -> Result<String, String> {
     let entry = reg.get(name).unwrap_or_else(|| panic!("{name} registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
-    smol::block_on(async { inv.execute(ctx).await })
+    runtime()
+        .block_on(inv.execute(ctx))
         .output
         .map(|out| match out {
             maki_agent::ToolOutput::Plain(s) => s.text,
@@ -205,7 +254,8 @@ fn describe_main_hides_workflow_and_sub_tools() {
         desc.lines().any(|l| l == INTERP_ECHO_SIG),
         "expected exact line {INTERP_ECHO_SIG:?} in: {desc}"
     );
-    assert!(!desc.contains("wf_task"), "got: {desc}");
+    assert!(!desc.contains(WF_TASK_SIG), "got: {desc}");
+    assert!(desc.lines().any(|l| l == WF_TASK_GATED_LINE), "got: {desc}");
     assert!(!desc.contains("sub_tool"), "got: {desc}");
     assert!(!desc.contains(WORKFLOW_NOTE_SUBSTR), "got: {desc}");
 }
@@ -216,6 +266,7 @@ fn describe_workflow_adds_workflow_tools_and_note() {
     let desc = describe(&reg, &ToolFilter::All, ToolAudience::MAIN, true);
     assert!(desc.contains(WF_TASK_SIG), "got: {desc}");
     assert!(desc.contains(WORKFLOW_NOTE_SUBSTR), "got: {desc}");
+    assert!(!desc.contains(WF_TASK_GATED_LINE), "got: {desc}");
     assert!(!desc.contains("sub_tool"), "got: {desc}");
 }
 
@@ -228,12 +279,13 @@ fn describe_general_sub_scopes_to_sub_audience() {
     assert!(!desc.contains("wf_task"), "got: {desc}");
 }
 
-#[test]
-fn except_filter_removes_tool_from_description() {
+#[test_case::test_case("interp_echo" ; "callable")]
+#[test_case::test_case("wf_task" ; "workflow_gated")]
+fn except_filter_removes_tool_from_description(name: &str) {
     let (reg, _host) = setup();
-    let filter = ToolFilter::AllExcept(vec!["interp_echo".to_owned()]);
+    let filter = ToolFilter::AllExcept(vec![name.to_owned()]);
     let desc = describe(&reg, &filter, ToolAudience::MAIN, false);
-    assert!(!desc.contains("interp_echo"), "got: {desc}");
+    assert!(!desc.contains(name), "got: {desc}");
 }
 
 #[test]
@@ -241,6 +293,41 @@ fn interpreter_calls_advertised_tool_end_to_end() {
     let out = run_code("result = await interp_echo(msg='hi')\nprint(result)")
         .expect("advertised tool must be callable");
     assert!(out.contains(&format!("{ECHO_PREFIX}hi")), "got: {out}");
+}
+
+#[test]
+fn describe_includes_list_dir_tool() {
+    let (reg, _host) = setup();
+    let desc = describe(&reg, &ToolFilter::All, ToolAudience::MAIN, false);
+    assert!(
+        desc.lines().any(|l| l.starts_with("- list_dir(")),
+        "expected list_dir in tool signatures: {desc}"
+    );
+}
+
+#[test]
+fn describe_excludes_list_dir_when_filtered() {
+    let (reg, _host) = setup();
+    let desc = describe(
+        &reg,
+        &ToolFilter::AllExcept(vec!["list_dir".into()]),
+        ToolAudience::MAIN,
+        false,
+    );
+    assert!(
+        !desc.lines().any(|l| l.starts_with("- list_dir(")),
+        "did not expect list_dir in tool signatures: {desc}"
+    );
+}
+
+#[test]
+fn list_dir_tool_is_callable_and_preserves_builtin_list() {
+    let out = run_code(
+        "res = await list_dir(path='test_path')\nitems = list([1, 2])\nprint(f'{res}')\nprint(f'items: {len(items)}')",
+    )
+    .expect("list_dir must be callable and builtin list must be preserved");
+    assert!(out.contains("listed:test_path"), "got: {out}");
+    assert!(out.contains("items: 2"), "got: {out}");
 }
 
 /// The list form covers a model that forgets the `*`. It must run rather than
@@ -286,6 +373,124 @@ fn parallel_edits_to_one_file_all_apply() {
         std::fs::read_to_string(&path).unwrap(),
         format!("{EDITED_A}\n{EDITED_B}\n")
     );
+}
+
+/// Binds `path` to a file holding [`OPEN_ORIGINAL`] and returns the script's
+/// result with what the file holds afterwards. `policy` is Lua loaded next to
+/// the builtins, minus the `disabled` ones.
+fn run_on_file(
+    code: &str,
+    policy: &str,
+    shape: fn(&mut ToolContext),
+    disabled: &[&str],
+) -> (Result<String, String>, String) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join(OPEN_TARGET);
+    std::fs::write(&path, OPEN_ORIGINAL).unwrap();
+    let quoted = path.to_str().expect("utf-8 temp path");
+
+    let reg = Arc::new(ToolRegistry::new());
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&PluginsConfig::from_plugins(
+        disabled
+            .iter()
+            .map(|name| {
+                let off = PluginFileConfig {
+                    enabled: Some(false),
+                    ..PluginFileConfig::default()
+                };
+                ((*name).to_owned(), off)
+            })
+            .collect(),
+    ))
+    .unwrap();
+    host.load_source("policy", policy).unwrap();
+    let out = exec_code(
+        &reg,
+        &shaped_ctx(&reg, shape),
+        &format!("path = '{quoted}'\n{code}"),
+    );
+    (out, std::fs::read_to_string(&path).unwrap())
+}
+
+#[test_case::test_case("text = open(path).read()\nwith open(path, 'w') as f:\n    f.write(text.upper())", "HELLO\n" ; "read_then_write")]
+#[test_case::test_case("with open(path, 'a') as f:\n    f.write('world\\n')\n    f.write('!')", "hello\nworld\n!" ; "append")]
+fn open_reads_and_writes_through_the_file_tools(code: &str, expected: &str) {
+    let (out, content) = run_on_file(code, NO_POLICY, |_| {}, &[]);
+    out.expect("open must be served");
+    assert_eq!(content, expected);
+}
+
+/// Validation drops the `append` flag a replacement tool does not declare, so
+/// going ahead would overwrite the file with only the new text.
+#[test]
+fn open_append_is_refused_when_the_write_tool_cannot_append() {
+    let code = "with open(path, 'a') as f:\n    f.write('world')";
+    let (out, content) = run_on_file(code, WRITE_WITHOUT_APPEND, |_| {}, &["write"]);
+    let err = out.expect_err("the append must be refused");
+    assert!(err.contains(OPEN_APPEND_REFUSED), "got: {err}");
+    assert_eq!(content, OPEN_ORIGINAL);
+}
+
+/// `open()` reads the file itself, so it cannot follow a hook that points the
+/// read somewhere else. Refusing is the only answer that never hands the
+/// script a file the hook steered it away from.
+#[test_case::test_case(BLOCKING_READ_HOOK ; "blocking_hook")]
+#[test_case::test_case(REWRITING_READ_HOOK ; "rewriting_hook")]
+#[test_case::test_case(WILDCARD_INPUT_HOOK ; "wildcard_hook")]
+fn open_reads_are_refused_while_the_read_tool_is_hooked(policy: &str) {
+    let code = format!(
+        "try:\n    out = open(path).read()\nexcept OSError:\n    out = '{OPEN_REFUSED}'\nout"
+    );
+    let (out, _) = run_on_file(&code, policy, |_| {}, &[]);
+    let out = out.expect("the refusal must reach the script as OSError");
+    assert!(out.contains(OPEN_REFUSED), "got: {out}");
+}
+
+#[test_case::test_case(|ctx| ctx.audience = ToolAudience::RESEARCH_SUB ; "write_tool_not_callable")]
+#[test_case::test_case(|ctx| ctx.mode = AgentMode::Plan(PLAN_FILE.into()) ; "plan_mode_blocks_the_write_tool")]
+fn open_for_writing_is_refused_where_the_write_tool_is(shape: fn(&mut ToolContext)) {
+    let (out, content) = run_on_file("open(path, 'w').write('x')", NO_POLICY, shape, &[]);
+    let err = out.expect_err("the write must be refused");
+    assert!(err.contains(FILE_WRITE_FAILED), "got: {err}");
+    assert_eq!(content, OPEN_ORIGINAL);
+}
+
+/// Loud on purpose, since `os.path.exists` would turn an `OSError` into False.
+#[test_case::test_case("os.path.exists(path)", LIST_HOOK, &[] ; "list_tool_hooked")]
+fn os_metadata_is_refused_where_the_list_tool_is(code: &str, policy: &str, disabled: &[&str]) {
+    let (out, _) = run_on_file(code, policy, |_| {}, disabled);
+    let err = out.expect_err("the query must be refused");
+    assert!(err.contains(RUNTIME_ERROR), "got: {err}");
+}
+
+/// Disabling `list_dir` hides the tool from LLM/code_execution, but keeps
+/// files.inspect capability in the sandbox.
+#[test_case::test_case("os.path.exists(path)" ; "exists_with_list_tool_disabled")]
+#[test_case::test_case("os.makedirs(path + '.d', exist_ok=True)" ; "mkdir_with_list_tool_disabled")]
+fn os_metadata_serves_even_when_list_dir_disabled(code: &str) {
+    let (out, _) = run_on_file(code, NO_POLICY, |_| {}, &["list_dir"]);
+    out.expect("metadata query must succeed even when list_dir is disabled");
+}
+
+#[test]
+fn list_dir_tool_not_callable_when_disabled() {
+    let (out, _) = run_on_file("await list_dir(path='.')", NO_POLICY, |_| {}, &["list_dir"]);
+    let err = out.expect_err("disabled list_dir tool must not be callable");
+    assert!(err.contains(NAME_ERROR), "got: {err}");
+}
+
+/// `build_mode` also proves metadata is served, as a refused `isdir` would raise.
+#[test_case::test_case(|_| {}, true ; "build_mode")]
+#[test_case::test_case(|ctx| ctx.mode = AgentMode::Plan(PLAN_FILE.into()), false ; "plan_mode_blocks_the_write_tool")]
+#[test_case::test_case(|ctx| ctx.audience = ToolAudience::RESEARCH_SUB, false ; "write_tool_not_callable")]
+fn os_makedirs_goes_where_the_write_tool_would(shape: fn(&mut ToolContext), made: bool) {
+    let code = format!(
+        "target = os.path.join(os.path.dirname(path), '{MADE_DIR}')\ntry:\n    os.makedirs(target)\nexcept OSError:\n    pass\nos.path.isdir(target)"
+    );
+    let (out, _) = run_on_file(&code, NO_POLICY, shape, &[]);
+    let out = out.expect("a refused mkdir raises OSError, which the script catches");
+    assert!(out.contains(&format!("return: {made}")), "got: {out}");
 }
 
 /// Only a failed tool call belongs in the results. The script's own mistake
@@ -365,10 +570,160 @@ fn agent_tools_describes_mcp_only_when_the_session_keeps_it(enabled: bool) {
 /// rather than the request's tool array.
 #[test_case::test_case(MCP_TOOL_QUALIFIED, MCP_TOOL_WIRE ; "deferred_tool_binds_its_wire_name")]
 #[test_case::test_case(HYPHEN_QUALIFIED, HYPHEN_ALIAS    ; "hyphenated_tool_binds_an_alias")]
+#[test_case::test_case(MCP_TOOL_QUALIFIED, "srv.fetch_issue" ; "module_object_style_call")]
+#[test_case::test_case(HYPHEN_QUALIFIED, "srv.get_docs" ; "hyphenated_module_object_style_call")]
 fn mcp_tool_is_callable_from_the_sandbox(qualified: &'static str, bound: &str) {
     let err = run_code_with(&format!("await {bound}()"), with_mcp(qualified))
         .expect_err("the stub transport fails every call");
     assert!(err.contains(MCP_REACHED_ERR), "got: {err}");
+}
+
+#[test]
+fn code_execution_description_aliases_hyphenated_functions() {
+    let (reg, _host) = setup_global();
+    let ctx = shaped_ctx(&reg, with_mcp(HYPHEN_QUALIFIED));
+    let desc = run_tool(
+        &reg,
+        &ctx,
+        TOOLS_MCP_PROBE,
+        serde_json::json!({ "mcp": true }),
+    )
+    .expect("probe must describe code_execution");
+    assert!(desc.contains("functions: get_docs"), "got: {desc}");
+}
+
+#[test]
+fn library_help_returns_docstring_for_hyphenated_function() {
+    let (reg, _host) = setup_global();
+    let ctx = shaped_ctx(&reg, with_mcp(HYPHEN_QUALIFIED));
+    let out = run_tool(
+        &reg,
+        &ctx,
+        "library_help",
+        serde_json::json!({
+            "library_name": "srv",
+            "function_name": "get_docs"
+        }),
+    )
+    .expect("library_help should succeed");
+    assert!(out.contains("async def get_docs("), "got: {out}");
+}
+
+#[test]
+fn library_help_returns_docstring_for_function() {
+    let (reg, _host) = setup_global();
+    let ctx = shaped_ctx(&reg, with_mcp("github.create_issue"));
+    let out = run_tool(
+        &reg,
+        &ctx,
+        "library_help",
+        serde_json::json!({
+            "library_name": "github",
+            "function_name": "create_issue"
+        }),
+    )
+    .expect("library_help should succeed");
+    assert!(out.contains("async def create_issue("), "got: {out}");
+    assert!(out.contains("Parameters:"), "got: {out}");
+}
+
+#[test]
+fn library_help_errors_when_library_not_found() {
+    let (reg, _host) = setup_global();
+    let ctx = shaped_ctx(&reg, with_mcp("github.create_issue"));
+    let err = run_tool(
+        &reg,
+        &ctx,
+        "library_help",
+        serde_json::json!({
+            "library_name": "unknown_lib",
+            "function_name": "create_issue"
+        }),
+    )
+    .expect_err("unknown library should error");
+    assert!(
+        err.contains("Library 'unknown_lib' not found"),
+        "got: {err}"
+    );
+    assert!(err.contains("github"), "should list available libraries");
+}
+
+#[test]
+fn library_help_errors_when_function_not_found() {
+    let (reg, _host) = setup_global();
+    let ctx = shaped_ctx(&reg, with_mcp("github.create_issue"));
+    let err = run_tool(
+        &reg,
+        &ctx,
+        "library_help",
+        serde_json::json!({
+            "library_name": "github",
+            "function_name": "nonexistent"
+        }),
+    )
+    .expect_err("unknown function should error");
+    assert!(
+        err.contains("Function 'nonexistent' not found in library 'github'"),
+        "got: {err}"
+    );
+    assert!(
+        err.contains("create_issue"),
+        "should list available functions"
+    );
+}
+
+#[test]
+fn library_help_is_excluded_when_no_mcp() {
+    let (reg, _host) = setup_global();
+    let model = maki_providers::Model::from_spec("responses/claude-opus-4-8").unwrap();
+    let tools = maki_agent::tools::RequestTools::build(
+        &reg,
+        &maki_agent::template::Vars::new(),
+        &model,
+        &maki_config::AgentConfig::default(),
+        &[],
+        false,
+        None,
+    );
+    let names: Vec<&str> = tools
+        .definitions()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"library_help"),
+        "library_help must not be exposed when no MCP is configured: {names:?}"
+    );
+}
+
+#[test]
+fn library_help_is_included_when_mcp_present() {
+    let (reg, _host) = setup_global();
+    let model = maki_providers::Model::from_spec("responses/claude-opus-4-8").unwrap();
+    let session = stub_session(&[("github.create_issue", "")]);
+    let modules = session.modules();
+    let tools = maki_agent::tools::RequestTools::build(
+        &reg,
+        &maki_agent::template::Vars::new(),
+        &model,
+        &maki_config::AgentConfig::default(),
+        &[],
+        false,
+        Some(&modules),
+    );
+    let names: Vec<&str> = tools
+        .definitions()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"library_help"),
+        "library_help must be exposed when MCP is configured: {names:?}"
+    );
 }
 
 fn with_client_tool(audience: ToolAudience) -> impl FnOnce(&mut ToolContext) {
@@ -431,7 +786,7 @@ fn start_preview_text(code: &str) -> String {
     let (reg, _host) = setup();
     let inv = parse_code(&reg, code);
     let (ctx, rx) = event_ctx(&reg);
-    smol::block_on(inv.start(&ctx));
+    runtime().block_on(inv.start(&ctx));
     let body = rx
         .drain()
         .find_map(|env| match env.event {
@@ -497,7 +852,8 @@ fn handler_renders_script_when_start_never_ran() {
     let (reg, _host) = setup();
     let inv = parse_code(&reg, "print('hi')");
     let (ctx, rx) = event_ctx(&reg);
-    smol::block_on(inv.execute(&ctx))
+    runtime()
+        .block_on(inv.execute(&ctx))
         .output
         .expect("execute ok");
     let text = final_body_text(&rx);
@@ -524,7 +880,8 @@ fn handler_error_keeps_script_and_drops_waiting_notice() {
     let (reg, _host) = setup();
     let inv = parse_code(&reg, "print(boom_undefined)");
     let (ctx, rx) = event_ctx(&reg);
-    let err = smol::block_on(inv.execute(&ctx))
+    let err = runtime()
+        .block_on(inv.execute(&ctx))
         .output
         .expect_err("undefined name must error");
     let text = final_body_text(&rx);

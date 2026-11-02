@@ -1,127 +1,103 @@
 use std::sync::{Arc, Mutex};
 
-use flume::Sender;
-use serde_json::Value;
-
 use maki_config::providers::{
-    Protocol, ProviderDef, ProvidersConfig, resolve_api_key_env, resolve_base_url, resolve_protocol,
+    ModelDef, ProviderDef, ProvidersConfig, resolve_api_key_env, resolve_base_url,
 };
-use maki_storage::id::SessionRef;
-use tracing::warn;
 
 use super::ResolvedAuth;
-use super::anthropic::shared;
-use super::catalog;
-use super::openai::responses;
-use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
-use crate::provider::{BoxFuture, Provider};
+use super::responses::ResponsesProvider;
+use crate::AgentError;
+use crate::model::{FastPricing, Model, ModelEntry, ModelPricing, ModelTier};
+use crate::provider::Provider;
 use crate::providers::Timeouts;
-use crate::spec::{ProviderRegistry, ProviderSpec};
-use crate::types::ThinkingFallback;
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::spec::{ProviderSpec, RESPONSES_SPEC};
 
-static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    // Custom providers resolve their own base URL (including any override) from
-    // config, so the compat-layer fallback slug is unused here.
-    slug: "",
-    api_key_env: "",
-    base_url: "",
-    max_tokens_field: "max_tokens",
-    include_stream_usage: true,
-    provider_name: "custom",
-};
-
-/// The native provider a custom slug borrows its codec and fallbacks from.
-/// Resolved through [`ProviderRegistry::get`], never `for_slug`, so the lookup
-/// cannot recurse back into here.
-fn protocol_spec(protocol: Protocol) -> Option<&'static ProviderSpec> {
-    ProviderRegistry::get(match protocol {
-        Protocol::Openai | Protocol::OpenaiResponses => super::openai::SLUG,
-        Protocol::Anthropic => super::anthropic::SLUG,
-        Protocol::Google => super::google::SLUG,
-    })
-}
-
-/// Builtins win their slug in `from_spec`/`create`, so every custom path skips
-/// them. Key off the spec (every builtin), not `builtin_provider`, which
-/// omits the `opencode` slugs and would let them shadow the builtin.
-fn is_builtin_slug(slug: &str) -> bool {
-    ProviderRegistry::get(slug).is_some()
-}
+pub const THINKING_FIELD: &str = "thinking";
 
 pub fn base_spec(slug: &str) -> Option<&'static ProviderSpec> {
-    let config = ProvidersConfig::load();
-    protocol_spec(config.get(slug)?.protocol?)
+    if slug == RESPONSES_SPEC.slug || ProvidersConfig::load().get(slug).is_some() {
+        Some(&RESPONSES_SPEC)
+    } else {
+        None
+    }
 }
 
-fn resolve_custom_auth(slug: &str) -> Result<ResolvedAuth, AgentError> {
+pub(crate) fn is_declared(slug: &str) -> bool {
+    slug == RESPONSES_SPEC.slug || ProvidersConfig::load_or_default().get(slug).is_some()
+}
+
+fn resolve_custom_auth(slug: &str) -> Result<(ResolvedAuth, String), AgentError> {
     let config = ProvidersConfig::load();
-    let def = config.get(slug).ok_or_else(|| AgentError::Config {
-        message: format!("unknown custom provider '{slug}'"),
-    })?;
+    let def = config.get(slug);
+    if def.is_none() && slug != RESPONSES_SPEC.slug {
+        return Err(AgentError::Config {
+            message: format!("unknown custom provider '{slug}'"),
+        });
+    }
 
-    let resolved_env = resolve_api_key_env(slug, Some(def));
-    let env_var = def.api_key_env.as_deref().unwrap_or(&resolved_env);
-    let pool = super::KeyPool::resolve(slug, env_var)?;
+    let env_var = resolve_api_key_env(slug, def);
+    let pool = super::KeyPool::resolve(slug, &env_var).ok();
+    let key = pool.map(|p| p.current().to_string()).unwrap_or_default();
 
-    Ok(
-        ResolvedAuth::bearer(slug, pool.current())?
-            .with_base_url(resolve_base_url(slug, Some(def))),
-    )
+    Ok((
+        ResolvedAuth::bearer(slug, &key)?.with_base_url(resolve_base_url(slug, def)),
+        env_var,
+    ))
 }
 
 pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    let config = ProvidersConfig::load();
-    let protocol = config
-        .get(slug)
-        .and_then(|def| def.protocol)
-        .ok_or_else(|| AgentError::Config {
-            message: format!("unknown custom provider '{slug}'"),
-        })?;
-    let resolved = resolve_custom_auth(slug)?;
+    let (resolved, _) = resolve_custom_auth(slug)?;
+    let base_url = resolved.base_url.clone();
     let auth = Arc::new(Mutex::new(resolved));
-
-    match protocol {
-        Protocol::Anthropic => Ok(Box::new(super::anthropic::Anthropic::with_auth(
-            auth, timeouts,
-        ))),
-        Protocol::Openai | Protocol::OpenaiResponses => Ok(Box::new(CustomOpenAiProvider {
-            compat: OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, timeouts),
-            auth,
-            protocol,
-        })),
-        Protocol::Google => Ok(Box::new(super::google::Google::with_auth(auth, timeouts))),
-    }
+    Ok(Box::new(ResponsesProvider::new(
+        slug.to_string(),
+        base_url,
+        auth,
+        timeouts,
+    )))
 }
 
 pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
-    if is_builtin_slug(slug) {
-        return None;
-    }
     let config = ProvidersConfig::load();
-    let def = config.get(slug)?;
-    let base = protocol_spec(def.protocol?)?;
-    Some(model_from_def(def, base, slug, model_id))
+    if let Some(def) = config.get(slug) {
+        Some(model_from_def(def, &RESPONSES_SPEC, slug, model_id))
+    } else if slug == RESPONSES_SPEC.slug {
+        let empty_def = ProviderDef::default();
+        Some(model_from_def(&empty_def, &RESPONSES_SPEC, slug, model_id))
+    } else {
+        None
+    }
 }
 
-/// The model id to price a subsidised-but-unpriced model from the Anthropic
-/// catalog under, or `None` when the fallback does not apply. Gated on the
-/// base spec the protocol resolved to: only Anthropic-protocol providers serve
-/// Anthropic models, so any other base must not get Anthropic catalog rates.
-/// `-1m` context variants price the same as their base model.
-fn catalog_fallback_id<'a>(
-    base: &'static ProviderSpec,
-    pricing: &ModelPricing,
-    subsidised: bool,
-    model_id: &'a str,
-) -> Option<&'a str> {
-    (pricing.is_zero() && subsidised && base.slug == super::anthropic::SLUG)
-        .then(|| shared::strip_long_context(model_id))
+impl From<&ModelDef> for ModelEntry {
+    fn from(def: &ModelDef) -> Self {
+        Self {
+            prefixes: vec![def.id.clone()],
+            tier: def.tier,
+            supports_tool_examples: def.supports_tool_examples,
+            supports_thinking: def.supports_thinking,
+            requires_thinking: def.requires_thinking.unwrap_or(false),
+            supports_vision: def.supports_vision,
+            supports_deferred_tools: None,
+            max_output_tokens: def.max_output_tokens,
+            context_window: def.context_window,
+            pricing: def.has_pricing().then(|| ModelPricing {
+                input: def.pricing_input.unwrap_or(0.0),
+                output: def.pricing_output.unwrap_or(0.0),
+                cache_write: def.pricing_cache_write.unwrap_or(0.0),
+                cache_read: def.pricing_cache_read.unwrap_or(0.0),
+                fast: def.has_fast_pricing().then(|| FastPricing {
+                    input: def.pricing_fast_input.unwrap_or(0.0),
+                    output: def.pricing_fast_output.unwrap_or(0.0),
+                }),
+            }),
+            thinking_fields: def.thinking_fields.clone(),
+            family: None,
+            default: false,
+        }
+    }
 }
 
-/// Build a model from an already-loaded provider definition so tier resolution
-/// and id lookup can share one `providers.toml` read instead of loading twice.
 fn model_from_def(
     def: &ProviderDef,
     base: &'static ProviderSpec,
@@ -129,451 +105,250 @@ fn model_from_def(
     model_id: &str,
 ) -> Model {
     let subsidy_source = def.subsidised_by.as_deref();
-    let declared = def.models.iter().find(|m| m.id == model_id);
-    let tier = declared
-        .map(|m| ModelTier::from(m.tier))
-        .unwrap_or(ModelTier::Medium);
+    let def_model = def.models.iter().find(|m| m.id == model_id);
+    let mut row = def_model.map(ModelEntry::from).unwrap_or_default();
     let discovered = crate::model_registry::discovered(slug, model_id);
     let discovered = discovered.as_ref();
-    let max_output_tokens = declared
-        .and_then(|m| m.max_output_tokens)
+    row.max_output_tokens = row
+        .max_output_tokens
         .or_else(|| discovered.and_then(|d| d.max_output_tokens))
         .or(base.fallback_max_output);
-    // Same precedence as the builtin path ([`Model::from_base`]): the `-1m`
-    // suffix only stands in for a window nothing more specific reported, so a
-    // proxy that answers /v1/models with its real cap still wins. Without this
-    // arm a -1m variant on a custom Anthropic slug (cliproxy on Claude Max)
-    // would read back as the 200K protocol default.
-    let context_window = declared
-        .and_then(|m| m.context_window)
+    row.context_window = row
+        .context_window
         .or_else(|| discovered.and_then(|d| d.context_window))
-        .or_else(|| shared::long_context_window(model_id))
-        .unwrap_or(base.fallback_context_window);
-    let supports_tool_examples_override = declared.and_then(|m| m.supports_tool_examples);
-    let declared_fields = declared.and_then(|m| m.thinking_fields.as_ref());
-    // Resolved here rather than left to `Model::supports_thinking`, which would
-    // reach the same spec through `custom::base_spec` and so re-read
-    // providers.toml on every call, and would answer from whatever the builtin
-    // slug discovered for a colliding model id.
-    let thinking_override = ThinkingSupport::from_flags(
-        declared
-            .and_then(|m| m.supports_thinking)
-            // Spelling out how a model thinks is as good as saying that it does.
-            .or_else(|| declared_fields.map(|_| true))
-            .or(Some(base.supports_thinking)),
-        declared.and_then(|m| m.requires_thinking).unwrap_or(false),
-    );
-    // Only the openai chat path merges the fragments into the body: the
-    // responses path has no thinking wiring yet, and anthropic and google spell
-    // thinking their own way. Anywhere else they would vanish without a trace.
-    let thinking_fields = match declared_fields {
-        Some(fields) if def.protocol == Some(Protocol::Openai) => Some(Box::new(fields.clone())),
-        Some(_) => {
-            warn!(
-                slug,
-                model = model_id,
-                protocol = ?def.protocol,
-                "thinking_fields only applies to openai-protocol providers, ignoring"
-            );
-            None
-        }
-        None => None,
-    };
-    let supports_vision_override = declared.and_then(|m| m.supports_vision);
-    let pricing = declared
-        .filter(|m| m.has_pricing())
-        .map(|m| ModelPricing {
-            input: m.pricing_input.unwrap_or(0.0),
-            output: m.pricing_output.unwrap_or(0.0),
-            cache_write: m.pricing_cache_write.unwrap_or(0.0),
-            cache_read: m.pricing_cache_read.unwrap_or(0.0),
-            fast: declared
-                .filter(|d| d.has_fast_pricing())
-                .map(|d| FastPricing {
-                    input: d.pricing_fast_input.unwrap_or(0.0),
-                    output: d.pricing_fast_output.unwrap_or(0.0),
-                }),
-        })
+        .or(Some(base.fallback_context_window));
+    row.supports_thinking = row
+        .supports_thinking
+        .or_else(|| discovered.and_then(|d| d.supports_thinking))
+        .or(Some(base.supports_thinking));
+    row.requires_thinking = row.requires_thinking
+        || discovered
+            .and_then(|d| d.effort.as_ref())
+            .is_some_and(|e| e.send_off == Some(false) && !e.supported.is_empty());
+    row.supports_vision = row
+        .supports_vision
+        .or_else(|| discovered.and_then(|d| d.supports_vision))
+        .or(Some(true));
+
+    let pricing = row
+        .pricing
+        .take()
+        .or_else(|| discovered.and_then(|d| d.pricing.clone()))
         .unwrap_or_default();
-    // A subsidised provider (Claude Max via cliproxy) rarely quotes its own
-    // rates -- it is free at the point of use -- so fall back to the
-    // published list price purely as the reference shown alongside the $0
-    // bill.
-    let mut pricing = pricing;
-    if let Some(base_id) = catalog_fallback_id(base, &pricing, subsidy_source.is_some(), model_id)
-        && let Some(meta) = catalog::model_meta_if_available(super::anthropic::SLUG, base_id)
-        && let Some(list) = meta.pricing
-    {
-        pricing = list;
+    row.pricing = Some(pricing);
+    let mut model = row.to_model(slug, base, model_id.to_string());
+    model.subsidised_by = subsidy_source.map(Arc::from);
+    if let Some(d) = discovered {
+        if d.pricing.as_ref().is_some_and(ModelPricing::is_zero) {
+            model.discovered_free = true;
+        }
+        if let Some(extra) = &d.extra
+            && extra
+                .get("service_tiers")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|tiers| {
+                    tiers
+                        .iter()
+                        .any(|t| t["id"] == "priority" || t["id"] == "fast")
+                })
+        {
+            model.supports_fast_override = Some(crate::model::FastSupport::Supported);
+        }
     }
-    Model {
-        id: model_id.to_string(),
-        provider: Arc::from(slug),
-        tier,
-        family: base.family,
-        supports_tool_examples_override,
-        thinking_override,
-        supports_vision_override,
-        supports_fast_override: None,
-        pricing,
-        subsidised_by: subsidy_source.map(Arc::from),
-        discovered_free: false,
-        max_output_tokens,
-        turn_output_tokens: None,
-        context_window,
-        thinking_fields,
-    }
+    model.name = def_model
+        .and_then(|m| m.name.clone())
+        .or_else(|| discovered.and_then(|d| d.name.clone()));
+    model
 }
 
-/// Specs declared statically in `providers.toml` (no HTTP).
 pub fn declared_model_specs() -> Vec<String> {
     declared_specs_from(&ProvidersConfig::load())
 }
 
 fn declared_specs_from(config: &ProvidersConfig) -> Vec<String> {
     let mut specs = Vec::new();
-    for (slug, def) in &config.providers {
-        if is_builtin_slug(slug) {
-            continue;
-        }
-        if resolve_protocol(slug, Some(def)).is_none() {
-            continue;
-        }
-        for m in &def.models {
-            specs.push(format!("{slug}/{}", m.id));
+    let mut slugs: Vec<_> = config.providers.keys().collect();
+    slugs.sort();
+    for slug in slugs {
+        if let Some(def) = config.providers.get(slug) {
+            for model in &def.models {
+                specs.push(format!("{slug}/{}", model.id));
+            }
         }
     }
     specs
 }
 
-/// Outcome of resolving a tier against `providers.toml` in a single read.
+pub fn startup_specs(tiers: &[ModelTier]) -> Vec<String> {
+    startup_specs_from(&ProvidersConfig::load(), tiers)
+}
+
+fn startup_specs_from(config: &ProvidersConfig, tiers: &[ModelTier]) -> Vec<String> {
+    let mut specs = Vec::new();
+    let mut slugs: Vec<_> = config.providers.keys().collect();
+    slugs.sort();
+    for tier in tiers {
+        for slug in &slugs {
+            if let Some(def) = config.providers.get(*slug)
+                && let Some(m) = def.models.iter().find(|m| m.tier == *tier)
+            {
+                specs.push(format!("{slug}/{}", m.id));
+            }
+        }
+    }
+    if specs.is_empty() {
+        for slug in &slugs {
+            if let Some(def) = config.providers.get(*slug)
+                && let Some(m) = def.models.first()
+            {
+                specs.push(format!("{slug}/{}", m.id));
+            }
+        }
+    }
+    specs
+}
+
 pub enum TierLookup {
     Model(Model),
-    /// Provider exists but declares no model at this tier; carries the base
-    /// spec so the caller can inherit the base protocol's default.
-    NoModelForTier(&'static ProviderSpec),
+    NoModelForTier,
     Unknown,
 }
 
 pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
-    // Builtins are never overridden through providers.toml (from_spec/create
-    // check builtin first); keep the tier path consistent with that.
-    if is_builtin_slug(slug) {
-        return TierLookup::Unknown;
-    }
     let config = ProvidersConfig::load();
     let Some(def) = config.get(slug) else {
         return TierLookup::Unknown;
     };
-    let Some(protocol) = def.protocol else {
-        return TierLookup::Unknown;
-    };
-    let Some(base) = protocol_spec(protocol) else {
-        return TierLookup::Unknown;
-    };
-    match def.models.iter().find(|m| ModelTier::from(m.tier) == tier) {
-        Some(declared) => TierLookup::Model(model_from_def(def, base, slug, &declared.id)),
-        None => TierLookup::NoModelForTier(base),
+    if let Some(m) = def.models.iter().find(|m| m.tier == tier) {
+        return TierLookup::Model(model_from_def(def, &RESPONSES_SPEC, slug, &m.id));
     }
+    TierLookup::NoModelForTier
 }
 
-/// Skip definitions handled by [`declared_model_specs`]; only HTTP `/models`
-/// goes through here, so an empty `discover_models = false` provider returns
-/// nothing and never hits the network.
-pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
+pub async fn discover_models(timeouts: Timeouts) -> Vec<String> {
     let config = ProvidersConfig::load();
+    let mut slugs: Vec<_> = config.providers.keys().collect();
+    slugs.sort();
     let mut all_specs = Vec::new();
-    for slug in config.providers.keys() {
-        if is_builtin_slug(slug) {
-            continue;
-        }
-        let def = config.get(slug).unwrap();
-        if !def.discover_models {
-            continue;
-        }
-        if resolve_protocol(slug, Some(def)).is_none() {
-            continue;
-        }
-        match create(slug, timeouts) {
-            Ok(provider) => {
-                let slug_c = slug.clone();
-                let result = smol::block_on(provider.list_models());
-                match result {
-                    Ok(mut models) => {
-                        overlay_declared_tiers(def, &mut models);
-                        crate::model_registry::set_known_models(&slug_c, models.clone());
-                        for m in models {
-                            all_specs.push(format!("{slug_c}/{}", m.id));
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(slug, error = %e, "failed to list models for custom provider");
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(slug, error = %e, "failed to create custom provider");
+    for slug in slugs {
+        if let Ok(provider) = create(slug, timeouts)
+            && let Ok(models) = provider.list_models().await
+        {
+            crate::model_registry::set_known_models(slug, models.clone());
+            for m in models {
+                all_specs.push(format!("{slug}/{}", m.id));
             }
         }
     }
     all_specs
 }
 
-/// Discovery via the openai compat layer never reports tiers, so stored models
-/// would only resolve positionally in `spec_for_tier`, shadowing tiers declared
-/// in `providers.toml`. Copying declared tiers onto the discovered entries lets
-/// the metadata candidate win and keeps declared config authoritative.
-fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
-    for model in models {
-        if let Some(declared) = def.models.iter().find(|m| m.id == model.id) {
-            model.tier = Some(ModelTier::from(declared.tier));
-        }
-    }
-}
-
-struct CustomOpenAiProvider {
-    compat: OpenAiCompatProvider,
-    auth: Arc<Mutex<ResolvedAuth>>,
-    protocol: Protocol,
-}
-
-impl Provider for CustomOpenAiProvider {
-    fn stream_message<'a>(
-        &'a self,
-        model: &'a Model,
-        messages: &'a [Message],
-        system: &'a str,
-        tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
-        opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
-    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-
-            if self.protocol == Protocol::OpenaiResponses {
-                let body = responses::build_body(model, messages, system, tools);
-                // TODO: wire thinking budget into responses API when llama.cpp supports it
-                return responses::do_stream(
-                    self.compat.client(),
-                    model,
-                    &body,
-                    event_tx,
-                    &auth,
-                    self.compat.stream_timeout(),
-                )
-                .await;
-            }
-
-            let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking
-                .apply_thinking(&mut body, model, ThinkingFallback::None);
-            self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
-                .await
-        })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
-        let auth = self.auth.lock().unwrap().clone();
-        Box::pin(async move { self.compat.do_list_models(&auth).await })
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use maki_storage::sessions::Effort::High;
-    use serde_json::json;
-    use test_case::test_case;
-
     use super::*;
-    use crate::types::ThinkingConfig;
 
-    const FIELDS_MODEL: &str =
-        r#"{"id":"m","thinking_fields":{"high":{"reasoning_effort":"xhigh"}}}"#;
-
-    fn openai_spec() -> &'static ProviderSpec {
-        ProviderRegistry::get(super::super::openai::SLUG).unwrap()
-    }
-
-    fn anthropic_spec() -> &'static ProviderSpec {
-        ProviderRegistry::get(super::super::anthropic::SLUG).unwrap()
-    }
-
-    fn openai_def(model_id: &str) -> ProviderDef {
-        serde_json::from_str(&format!(
-            r#"{{"protocol":"openai","models":[{{"id":"{model_id}"}}]}}"#
-        ))
-        .unwrap()
-    }
-
-    // `opencode` is a builtin whose slug is absent from the `builtin_provider`
-    // inventory; the old guard leaked it into the picker, where it then resolved
-    // as the builtin and silently dropped the custom model. Listing must skip
-    // every builtin slug so a providers.toml entry can never shadow one.
     #[test]
-    fn declared_specs_skip_builtin_named_entries_but_keep_custom() {
+    fn custom_lookup_returns_model_when_configured() {
         let mut config = ProvidersConfig::default();
-        config.upsert("opencode".to_string(), openai_def("shadow-model"));
-        config.upsert("my-custom".to_string(), openai_def("real-model"));
-
-        let specs = declared_specs_from(&config);
-        assert!(
-            !specs.iter().any(|s| s.starts_with("opencode/")),
-            "builtin slug must be skipped in custom listing: {specs:?}"
+        config.providers.insert(
+            "custom-gw".to_string(),
+            ProviderDef {
+                base_url: Some("http://localhost:8000/v1".to_string()),
+                models: vec![ModelDef {
+                    id: "test-model".to_string(),
+                    name: None,
+                    tier: ModelTier::Strong,
+                    context_window: Some(64000),
+                    max_output_tokens: Some(4096),
+                    supports_tool_examples: None,
+                    supports_thinking: None,
+                    requires_thinking: None,
+                    thinking_fields: None,
+                    supports_vision: None,
+                    pricing_input: None,
+                    pricing_output: None,
+                    pricing_cache_write: None,
+                    pricing_cache_read: None,
+                    pricing_fast_input: None,
+                    pricing_fast_output: None,
+                }],
+                ..Default::default()
+            },
         );
-        assert!(specs.contains(&"my-custom/real-model".to_string()));
-
-        // Resolution owns the builtin slug regardless of the providers.toml entry.
-        let model = Model::from_spec("opencode/shadow-model").unwrap();
-        assert_eq!(model.provider.as_ref(), "opencode");
+        let def = config.get("custom-gw").unwrap();
+        let model = model_from_def(def, &RESPONSES_SPEC, "custom-gw", "test-model");
+        assert_eq!(model.id, "test-model");
+        assert_eq!(model.provider.as_ref(), "custom-gw");
+        assert_eq!(model.context_window, 64000);
     }
 
-    // The exact regression this fixes: discovery parsed context_window but
-    // never stored it, so custom models always got the protocol fallback.
     #[test]
-    fn discovered_metadata_flows_into_custom_model_from_def() {
-        let slug = "custom-discovery-metadata-test";
-        let model_id = "vllm-model";
-        let expected_window: u32 = 131_072;
-        let expected_output: u32 = 8_192;
-
+    fn custom_model_inherits_discovered_requires_thinking_and_pricing() {
+        let slug = "magpie-gw";
+        let model_id = "group/grok-4.7";
         crate::model_registry::set_known_models(
             slug,
-            vec![ModelInfo {
-                context_window: Some(expected_window),
-                max_output_tokens: Some(expected_output),
-                ..ModelInfo::id_only(model_id.to_string())
+            vec![crate::model::ModelInfo {
+                id: model_id.to_string(),
+                name: None,
+                context_window: Some(500000),
+                max_output_tokens: Some(500000),
+                pricing: Some(ModelPricing {
+                    input: 2.0,
+                    output: 6.0,
+                    cache_read: 0.5,
+                    cache_write: 0.0,
+                    fast: None,
+                }),
+                supports_thinking: Some(true),
+                supports_vision: Some(true),
+                tier: None,
+                provider_info: None,
+                extra: None,
+                effort: Some(crate::model::ModelEffort {
+                    supported: vec![
+                        crate::Effort::Low,
+                        crate::Effort::Medium,
+                        crate::Effort::High,
+                        crate::Effort::XHigh,
+                    ],
+                    send_off: Some(false),
+                }),
             }],
         );
 
-        let def = openai_def(model_id);
-        let model = model_from_def(&def, openai_spec(), slug, model_id);
-        assert_eq!(model.context_window, expected_window);
-        assert_eq!(model.max_output_tokens, Some(expected_output));
-    }
-
-    #[test]
-    fn overlay_declared_tiers_sets_tier_for_declared_models_only() {
-        let def: ProviderDef = serde_json::from_str(
-            r#"{"protocol":"openai","models":[{"id":"declared","tier":"strong"}]}"#,
-        )
-        .unwrap();
-        let mut models = vec![
-            ModelInfo::id_only("declared".to_string()),
-            ModelInfo::id_only("undeclared".to_string()),
-        ];
-
-        overlay_declared_tiers(&def, &mut models);
-        assert_eq!(models[0].tier, Some(ModelTier::Strong));
-        assert_eq!(models[1].tier, None);
-    }
-
-    /// A custom `openai` entry is the one place a user can hand us a model
-    /// with its own thinking words, so the declaration has to reach the body.
-    /// A gateway that declares nothing, LiteLLM and vLLM included, keeps
-    /// sending what it always sent.
-    #[test_case(r#"{"id":"m"}"#, json!({"model": "m"}) ; "undeclared_model_sends_nothing")]
-    #[test_case(FIELDS_MODEL, json!({"model": "m", "reasoning_effort": "xhigh"}) ; "declared_level_merges")]
-    fn custom_openai_thinking_is_fields_only(model_json: &str, expected: Value) {
-        let def: ProviderDef = serde_json::from_str(&format!(
-            r#"{{"protocol":"openai","models":[{model_json}]}}"#
-        ))
-        .unwrap();
-        let model = model_from_def(&def, openai_spec(), "custom-gw", "m");
-        let mut body = json!({"model": "m"});
-        ThinkingConfig::Effort(High).apply_thinking(&mut body, &model, ThinkingFallback::None);
-        assert_eq!(body, expected);
-    }
-
-    /// Only the openai chat path merges the fragments, so carrying them
-    /// anywhere else just hides them. Dropping them loudly is how the user
-    /// finds out the keys did nothing.
-    #[test_case("openai", true ; "chat_path_reads_them")]
-    #[test_case("openai-responses", false ; "responses_path_has_no_thinking_wiring")]
-    #[test_case("anthropic", false ; "anthropic_spells_thinking_its_own_way")]
-    fn thinking_fields_reach_only_the_path_that_reads_them(protocol: &str, kept: bool) {
-        let def: ProviderDef = serde_json::from_str(&format!(
-            r#"{{"protocol":"{protocol}","models":[{FIELDS_MODEL}]}}"#
-        ))
-        .unwrap();
-        let base = protocol_spec(def.protocol.unwrap()).unwrap();
-        let model = model_from_def(&def, base, "custom-gw", "m");
-        assert_eq!(model.thinking_fields.is_some(), kept);
-    }
-
-    use crate::TokenUsage;
-
-    fn subsidised_def(protocol: &str, model_id: &str) -> ProviderDef {
-        serde_json::from_str(&format!(
-            r#"{{"protocol":"{protocol}","subsidised_by":"Max","models":[{{"id":"{model_id}"}}]}}"#
-        ))
-        .unwrap()
-    }
-
-    #[test]
-    fn catalog_fallback_only_for_unpriced_subsidised_anthropic() {
-        let zero = ModelPricing::ZERO;
-        assert_eq!(
-            catalog_fallback_id(anthropic_spec(), &zero, true, "claude-x"),
-            Some("claude-x")
-        );
-        // `-1m` context variants price the same as their base model.
-        assert_eq!(
-            catalog_fallback_id(anthropic_spec(), &zero, true, "claude-x-1m"),
-            Some("claude-x")
-        );
-        // Another protocol must never pick up Anthropic catalog rates.
-        assert_eq!(
-            catalog_fallback_id(openai_spec(), &zero, true, "claude-x"),
-            None
-        );
-        // Declared/discovered rates win over the catalog.
-        let priced = ModelPricing::per_million(3.0, 15.0, 0.0, 0.0);
-        assert_eq!(
-            catalog_fallback_id(anthropic_spec(), &priced, true, "claude-x"),
-            None
-        );
-        // No subsidy, no reference price to backfill.
-        assert_eq!(
-            catalog_fallback_id(anthropic_spec(), &zero, false, "claude-x"),
-            None
-        );
-    }
-
-    // The subsidy is stamped whichever path supplied the rates, and an
-    // unpriced non-Anthropic model must not report a false $0 bill.
-    #[test]
-    fn subsidised_def_stamps_declared_pricing() {
-        let mut def = subsidised_def("openai", "my-model");
-        def.models[0].pricing_input = Some(3.0);
-        def.models[0].pricing_output = Some(15.0);
-        let model = model_from_def(&def, openai_spec(), "my-proxy", "my-model");
-        assert_eq!(model.subsidy_source(), Some("Max"));
-        assert_eq!(model.pricing.input, 3.0);
-        let usage = TokenUsage {
-            input: 1_000_000,
-            output: 0,
-            cache_creation: 0,
-            cache_read: 0,
+        let def = ProviderDef {
+            base_url: Some("http://maclinux.ts:3425/v1".to_string()),
             ..Default::default()
         };
-        assert_eq!(model.billed_cost(&usage, false), Some(0.0));
-    }
+        let model = model_from_def(&def, &RESPONSES_SPEC, slug, model_id);
+        assert_eq!(model.id, model_id);
+        assert_eq!(model.context_window, 500000);
+        assert_eq!(model.max_output_tokens, Some(500000));
+        assert!(model.supports_thinking());
+        assert!(model.requires_thinking());
+        assert_eq!(model.pricing.input, 2.0);
+        assert_eq!(model.pricing.output, 6.0);
 
-    #[test]
-    fn subsidised_def_without_pricing_stays_unpriced() {
-        let def = subsidised_def("openai", "my-model");
-        let model = model_from_def(&def, openai_spec(), "my-proxy", "my-model");
-        assert_eq!(model.subsidy_source(), Some("Max"));
-        assert!(model.pricing.is_zero());
-        let usage = TokenUsage {
-            input: 1_000_000,
-            output: 0,
-            cache_creation: 0,
-            cache_read: 0,
-            ..Default::default()
-        };
-        assert_eq!(model.billed_cost(&usage, false), None);
+        // When user asks for Off, it is clamped to minimal (snapped to low on dialect)
+        let opts = crate::RequestOptions {
+            thinking: crate::ThinkingConfig::Off,
+            fast: false,
+        }
+        .clamped(&model);
+        assert_eq!(
+            opts.thinking,
+            crate::ThinkingConfig::Effort(crate::Effort::Minimal)
+        );
+        let discovered = crate::model_registry::discovered(slug, model_id);
+        let dialect = crate::providers::responses::responses_dialect(model_id, discovered.as_ref());
+        let mut body = serde_json::json!({});
+        crate::providers::responses::apply_responses_reasoning(
+            &mut body,
+            opts.thinking,
+            &model,
+            &dialect,
+        );
+        assert_eq!(body["reasoning"]["effort"], "low");
     }
 }

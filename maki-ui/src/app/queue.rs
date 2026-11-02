@@ -1,11 +1,17 @@
-//! Queue for messages typed while the agent is busy.
+//! Queue for messages typed while the agent is busy, and the subagent
+//! inbox a message typed in a subagent's chat goes to instead.
 
-use maki_agent::{AgentInput, ImageSource};
+use std::borrow::Cow;
 
-use super::{Action, App, Status};
+use maki_agent::{AgentInput, AgentMode, ImageSource, InputSource};
+use maki_lua::agent_autocmd::HostEvent;
+
+use super::mode::{Mode, PlanTrigger};
+use super::{Action, App, InputWriter, Status};
 
 use crate::agent::shared_queue::{Compaction, QueueItem, QueueSender, QueuedInput};
 use crate::components::queue_panel::QueueEntry;
+use crate::theme;
 
 pub(crate) use crate::agent::shared_queue::QueuedMessage;
 
@@ -38,12 +44,24 @@ impl MessageQueue {
         self.shared.as_ref().map_or(0, |s| s.len())
     }
 
-    pub(crate) fn remove(&mut self, index: usize) {
-        if let Some(ref shared) = self.shared
-            && shared.remove(index).is_some()
-        {
+    pub(crate) fn remove(&mut self, index: usize) -> Option<QueueItem> {
+        let item = self.shared.as_ref().and_then(|s| s.remove(index));
+        if item.is_some() {
             self.clamp_focus();
         }
+        item
+    }
+
+    pub(crate) fn convert_to_steer(&mut self, index: usize) -> bool {
+        self.shared
+            .as_ref()
+            .is_some_and(|s| s.convert_to_steer(index))
+    }
+
+    pub(crate) fn convert_to_queue(&mut self, index: usize) -> bool {
+        self.shared
+            .as_ref()
+            .is_some_and(|s| s.convert_to_queue(index))
     }
 
     pub(crate) fn clear(&mut self) {
@@ -124,6 +142,9 @@ impl App {
         if msg.text.trim().is_empty() && msg.images.is_empty() {
             return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR);
         }
+        if self.state.mode == Mode::Plan {
+            self.transition_plan(PlanTrigger::InteractivePrompt);
+        }
         if self.status == Status::Streaming {
             if self.queue_and_notify(msg) {
                 SubmitOutcome::Queued
@@ -146,6 +167,131 @@ impl App {
                 vec![]
             }
         }
+    }
+
+    /// A message typed in a subagent's chat is for that subagent: it waits in
+    /// the subagent's inbox until its loop reaches a turn boundary, and the
+    /// `QueueItemConsumed` relayed from there draws it in this chat. The
+    /// subagent runs its own settings, so the input carries them. A chat
+    /// without an inbox shows no input box, see `App::chat_accepts_input`.
+    pub(super) fn queue_for_subagent(&mut self, msg: QueuedMessage) -> Vec<Action> {
+        let chat = &self.chats[self.active_chat];
+        let Some(inbox) = chat.inbox.as_ref() else {
+            return vec![];
+        };
+        let (thinking, fast) = chat
+            .opts
+            .map_or((self.state.thinking, self.state.fast), |o| {
+                (o.thinking, o.fast)
+            });
+        inbox.push(AgentInput {
+            message: msg.text,
+            mode: AgentMode::Build,
+            images: msg.images,
+            preamble: Vec::new(),
+            earlier: Vec::new(),
+            thinking,
+            fast,
+            workflow: false,
+            prompt: None,
+            source: InputSource::Tui,
+        });
+        vec![]
+    }
+
+    /// The panel above the input shows the queue of the chat in front: the
+    /// session's for the main chat, the subagent's inbox otherwise.
+    pub(super) fn active_queue_len(&self) -> usize {
+        if self.is_main_chat() {
+            return self.queue.panel_len();
+        }
+        self.chats[self.active_chat]
+            .inbox
+            .as_ref()
+            .map_or(0, |inbox| inbox.len())
+    }
+
+    pub(super) fn active_queue_entries(&self) -> Vec<QueueEntry<'static>> {
+        if self.is_main_chat() {
+            return self.queue.panel_entries();
+        }
+        let color = theme::current().foreground;
+        self.chats[self.active_chat]
+            .inbox
+            .as_ref()
+            .map_or_else(Vec::new, |inbox| inbox.texts())
+            .into_iter()
+            .map(|text| QueueEntry {
+                text: Cow::Owned(text),
+                color,
+                is_steer: true,
+            })
+            .collect()
+    }
+
+    pub(super) fn pop_active_queue(&mut self) {
+        let item = if self.is_main_chat() {
+            self.queue.remove(0)
+        } else if let Some(ref inbox) = self.chats[self.active_chat].inbox {
+            inbox.remove(0).map(|input| {
+                QueueItem::Message(QueuedInput {
+                    text: input.message.clone(),
+                    input,
+                    run_id: 0,
+                    displayed: false,
+                })
+            })
+        } else {
+            None
+        };
+
+        let Some(item) = item else {
+            return;
+        };
+        let (text, images) = match item {
+            QueueItem::Message(queued) | QueueItem::Steer(queued) => {
+                (queued.text, queued.input.images)
+            }
+            QueueItem::Compact(compaction) => {
+                (compaction.instructions.unwrap_or_default(), Vec::new())
+            }
+        };
+        self.input_box.set_input(&text);
+        for img in images {
+            self.input_box.attach_image(img);
+        }
+        self.input_box.buffer.move_to_end();
+        self.input_changed(InputWriter::Anyone);
+    }
+
+    pub(super) fn convert_active_to_steer(&mut self) -> bool {
+        if self.is_main_chat() {
+            let idx = self.queue.focus().unwrap_or(0);
+            return self.queue.convert_to_steer(idx);
+        }
+        false
+    }
+
+    pub(super) fn convert_active_to_queue(&mut self) -> bool {
+        if self.is_main_chat() {
+            let idx = self.queue.focus().unwrap_or(0);
+            return self.queue.convert_to_queue(idx);
+        }
+        false
+    }
+
+    pub(super) fn steer_and_notify(&mut self, msg: QueuedMessage) -> bool {
+        let Some(ref shared) = self.queue.shared else {
+            return false;
+        };
+        let input = self.build_agent_input(&msg);
+        shared.push(QueueItem::Steer(QueuedInput {
+            text: msg.text,
+            input,
+            run_id: self.run_id,
+            displayed: false,
+        }));
+        true
     }
 
     /// Deferred path: the agent is busy, so park the message and let
@@ -189,6 +335,7 @@ impl App {
         shared.push(QueueItem::Compact(Compaction {
             run_id: self.run_id,
             instructions,
+            workflow: self.state.workflow,
         }));
     }
 
@@ -229,10 +376,13 @@ impl App {
         // New work supersedes text held for recovery after an agent error.
         self.recoverable_queue.clear();
         self.status = Status::Streaming;
-        self.fire_session_autocmd("TurnStart", serde_json::json!({}));
+        self.fire_session_event(HostEvent::TurnStart { text: &display });
         if !display.is_empty() || !input.images.is_empty() {
             self.main_chat()
                 .show_user_message(display, input.images.clone());
+        } else {
+            self.main_chat().flush();
+            self.main_chat().ensure_active_group();
         }
         vec![Action::SendMessage(Box::new(input))]
     }

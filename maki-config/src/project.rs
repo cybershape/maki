@@ -379,7 +379,7 @@ fn resolve_recorded(storage: &StateDir, project_config: ProjectConfig) -> Projec
     // bounds the grant to today's files.
     if present.is_empty() && decision != TrustDecision::Grandfathered {
         let state = match decision {
-            TrustDecision::Trusted | TrustDecision::Unrecorded => TrustState::Trusted,
+            TrustDecision::Trusted => TrustState::Trusted,
             _ => TrustState::Inert,
         };
         return ProjectDecision::new(project_config, state, None);
@@ -392,12 +392,6 @@ fn resolve_recorded(storage: &StateDir, project_config: ProjectConfig) -> Projec
     };
     match decision {
         TrustDecision::Trusted => ProjectDecision::new(project_config, TrustState::Trusted, None),
-        // An answer given before Maki recorded file sets stays good, and
-        // writing down what the folder ships today bounds it from here on.
-        TrustDecision::Unrecorded => {
-            info!(folder = %folder.path().display(), "recording what an older trust decision covers");
-            record_trust(storage, &question(Vec::new()), project_config)
-        }
         // A folder the user was already working in before folder trust existed
         // loaded its shared config without a question, and re-asking there only
         // teaches people to answer without reading. The set behind this is
@@ -633,7 +627,7 @@ fn git_checkout_boundary(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use maki_storage::sessions::{SESSIONS_DIR, Session, TitleSource};
+    use maki_storage::sessions::{SESSIONS_DIR, Session, SessionClaim, TitleSource};
     use maki_storage::trusted_folders::TrustStatus;
     use serde::{Deserialize, Serialize};
 
@@ -734,7 +728,8 @@ mod tests {
     fn record_session(storage: &StateDir, cwd: &Path) {
         let mut session: Session<StoredMessage, u32, ()> =
             Session::new(MODEL, cwd.to_str().unwrap());
-        session.save(storage).unwrap();
+        let claim = SessionClaim::acquire(session.id, storage).unwrap();
+        session.save(&claim, storage).unwrap();
     }
 
     fn setup() -> (tempfile::TempDir, tempfile::TempDir, StateDir) {
@@ -1385,34 +1380,6 @@ mod tests {
         assert!(answered.config.is_trusted());
         assert!(answered.asked.is_none());
         assert!(answered.warning.is_empty(), "{:?}", answered.warning);
-    }
-
-    /// A store written before file sets existed keeps its answers, and the
-    /// first start after the upgrade writes down what the folder ships that
-    /// day, which bounds it from then on.
-    #[test]
-    fn a_decision_from_before_file_sets_survives_and_is_bounded() {
-        let (state, project, storage) = setup();
-        let folder = CanonicalFolder::resolve(project.path()).unwrap();
-        fs::write(
-            state.path().join(TRUST_FILE),
-            serde_json::json!({"version": 1, "folders": [folder.path()]}).to_string(),
-        )
-        .unwrap();
-
-        let answered = answer_question(&storage, project_at(project.path()), ANSWER_UNUSED);
-        assert!(answered.config.is_trusted());
-        assert!(answered.asked.is_none());
-        assert!(answered.warning.is_empty(), "{:?}", answered.warning);
-
-        fs::write(project.path().join(MCP_FILE), MCP_SOURCE).unwrap();
-        let answered = answer_question(
-            &storage,
-            project_at(project.path()),
-            Some(TrustAnswer::Never),
-        );
-        assert!(!answered.config.is_trusted());
-        assert!(answered.asked_about(GatedFile::Mcp));
     }
 
     #[test_case(false, false ; "an_unreadable_store_warns_and_stays_untrusted")]

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use flume::Sender;
 use serde_json::Value;
+use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 
 use maki_config::ModelPolicy;
@@ -11,10 +12,7 @@ use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelInfo};
 use crate::model_registry::set_known_models;
-use crate::providers::catalog::{
-    available_if_warm, catalog_providers, catalog_providers_if_available, try_create,
-};
-use crate::providers::{KeyRotation, Timeouts, custom, dynamic};
+use crate::providers::{KeyRotation, Timeouts, custom, plugin};
 use crate::spec::{Owner, ProviderRegistry};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
@@ -34,6 +32,13 @@ pub trait Provider: Send + Sync {
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
+
+    /// The context window the server runs `model` with right now. Only a
+    /// server that sizes the window when it loads a model can differ from
+    /// discovery, so everyone else says `None`. Asked before every request.
+    fn served_context_window<'a>(&'a self, _model: &'a Model) -> BoxFuture<'a, Option<u32>> {
+        Box::pin(async { None })
+    }
 
     /// Fetch provider-side usage quota (remaining percentage / reset times).
     /// `Ok(None)` means the provider does not expose a programmatic usage endpoint.
@@ -63,13 +68,10 @@ pub trait Provider: Send + Sync {
 
 pub fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
     match Owner::of(slug) {
-        Owner::Builtin(new) => new(timeouts),
-        Owner::Script => dynamic::create(slug, timeouts),
         Owner::Custom => custom::create(slug, timeouts),
-        Owner::Catalog | Owner::Unknown => try_create(slug, timeouts).unwrap_or_else(|| {
-            Err(AgentError::Config {
-                message: format!("unknown provider '{slug}'"),
-            })
+        Owner::Plugin => plugin::create(slug, timeouts),
+        _ => Err(AgentError::Config {
+            message: format!("unknown provider '{slug}'"),
         }),
     }
 }
@@ -82,10 +84,7 @@ pub fn provider_available(slug: &str) -> bool {
 /// catalog-backed slugs consult only the already-warm catalog, so a cold cache
 /// reports them unavailable instead of blocking on a network fetch.
 fn provider_available_offline(slug: &str) -> bool {
-    match Owner::of(slug) {
-        Owner::Builtin(_) | Owner::Script | Owner::Custom => provider_available(slug),
-        Owner::Catalog | Owner::Unknown => available_if_warm(slug),
-    }
+    provider_available(slug)
 }
 
 pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
@@ -99,12 +98,6 @@ pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provi
 /// provider. Used to reconcile a resumed model so it matches one started
 /// fresh (e.g. inherited thinking support for a routed Aperture model).
 pub fn adjust_model(model: &mut Model, timeouts: Timeouts) -> Result<(), AgentError> {
-    // Script-backed providers adjust nothing but run their auth script at
-    // construction; resumed-session callers sit on the UI thread and must
-    // not wait on that.
-    if dynamic::display_name(&model.provider).is_some() {
-        return Ok(());
-    }
     provider_for_slug(&model.provider, timeouts)?.adjust_model(model);
     Ok(())
 }
@@ -121,7 +114,7 @@ pub fn from_model_fallback(model: &mut Model, timeouts: Timeouts) -> Box<dyn Pro
 
 struct UnconfiguredProvider;
 
-const NOT_CONFIGURED: &str = "no provider configured — run /login or `maki auth login`";
+const NOT_CONFIGURED: &str = "no provider configured: run /login or `maki auth login`";
 
 impl Provider for UnconfiguredProvider {
     fn stream_message<'a>(
@@ -156,7 +149,7 @@ pub async fn from_model_async(
 ) -> Result<Box<dyn Provider>, AgentError> {
     let slug = Arc::clone(&model.provider);
     let id = model.id.clone();
-    let provider = smol::unblock(move || provider_for_slug(&slug, timeouts)).await?;
+    let provider = spawn_blocking(move || provider_for_slug(&slug, timeouts)).await??;
     provider.adjust_model(model);
     debug!(provider = %model.provider, model = %id, "provider created");
     Ok(provider)
@@ -167,13 +160,12 @@ pub struct ModelBatch {
     pub warnings: Vec<String>,
 }
 
-/// Offline version of model discovery: returns specs from static tables
-/// and configured dynamic providers. See [`fetch_all_models`] for live lookups.
-/// Never blocks on catalog download; catalog-backed providers appear only once
-/// the catalog has warmed in the background.
+/// The offline twin of [`fetch_all_models`]. It never waits for the catalog
+/// download, so catalog-backed providers only show up once the catalog has
+/// warmed in the background.
 pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
-    let mut specs: Vec<String> = ProviderRegistry::builtins()
-        .iter()
+    let mut specs: Vec<String> = ProviderRegistry::all()
+        .into_iter()
         .filter(|m| provider_available_offline(m.slug))
         .flat_map(|m| {
             m.models()
@@ -182,32 +174,9 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
                 .map(move |p| format!("{}/{}", m.slug, p))
         })
         .collect();
-    for slug in dynamic::discovered_slugs() {
-        specs.extend(dynamic::dynamic_model_specs_for(slug));
-    }
     for spec in custom::declared_model_specs() {
         if !specs.contains(&spec) {
             specs.push(spec);
-        }
-    }
-    if let Some(catalog) = catalog_providers_if_available() {
-        for cat in catalog {
-            // Any slug the registry knows was listed above; see
-            // `spec::tests::builtins_are_the_native_and_catalog_backed_slugs`.
-            if ProviderRegistry::get(&cat.slug).is_some()
-                || matches!(Owner::of(&cat.slug), Owner::Script | Owner::Custom)
-            {
-                continue;
-            }
-            if !provider_available(&cat.slug) {
-                continue;
-            }
-            for model_id in cat.models.keys() {
-                let spec = format!("{}/{}", cat.slug, model_id);
-                if !specs.contains(&spec) {
-                    specs.push(spec);
-                }
-            }
         }
     }
     specs.retain(|spec| policy.allows(spec));
@@ -222,22 +191,25 @@ pub async fn fetch_all_models(
     let (tx, rx) = flume::unbounded();
     let timeouts = Timeouts::default();
 
-    for spec in ProviderRegistry::builtins() {
+    for spec in ProviderRegistry::all() {
         let slug = spec.slug;
-        let Ok(provider) = smol::unblock(move || provider_for_slug(slug, timeouts)).await else {
+        let Ok(provider) = spawn_blocking(move || provider_for_slug(slug, timeouts))
+            .await
+            .expect("provider construction panicked")
+        else {
             warn!(provider = slug, "failed to create provider, skipping");
             continue;
         };
         let display_name = spec.display_name;
         let tx = tx.clone();
-        smol::spawn(async move {
+        tokio::spawn(async move {
             let batch = match provider.list_models().await {
                 Ok(models) => {
                     let mut specs: Vec<String> =
                         models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
                     set_known_models(slug, models);
                     for entry in spec.models() {
-                        for prefix in entry.prefixes {
+                        for prefix in &entry.prefixes {
                             let spec = format!("{slug}/{prefix}");
                             if !specs.contains(&spec) {
                                 specs.push(spec);
@@ -259,75 +231,16 @@ pub async fn fetch_all_models(
                         .collect();
                     ModelBatch {
                         models: fallback,
-                        warnings: vec![format!(
-                            "{display_name}: {e} (using static fallback)"
-                        )],
+                        warnings: vec![format!("{display_name}: {e} (using static fallback)")],
                     }
                 }
             };
             let _ = tx.send_async(batch).await;
-        })
-        .detach();
+        });
     }
-
-    for slug in dynamic::discovered_slugs() {
-        let tx = tx.clone();
-        let slug = slug.to_string();
-        smol::spawn(async move {
-            let static_fallback = |reason: String| {
-                warn!(
-                    slug,
-                    error = reason,
-                    "dynamic model listing failed, using static fallback"
-                );
-                ModelBatch {
-                    models: dynamic::dynamic_model_specs_for(&slug),
-                    warnings: vec![format!("{slug}: {reason} (using static fallback)")],
-                }
-            };
-            let batch = match dynamic::create(&slug, timeouts) {
-                Ok(provider) => match provider.list_models().await {
-                    Ok(models) => ModelBatch {
-                        models: models.iter().map(|m| format!("{slug}/{}", m.id)).collect(),
-                        warnings: Vec::new(),
-                    },
-                    Err(e) => static_fallback(e.to_string()),
-                },
-                Err(e) => static_fallback(e.to_string()),
-            };
-            let _ = tx.send_async(batch).await;
-        })
-        .detach();
-    }
-
-    let tx_catalog = tx.clone();
-    smol::spawn(async move {
-        let catalog = smol::unblock(catalog_providers).await;
-        for cat in catalog {
-            // No `Owner::Custom` here, unlike `available_model_specs` above:
-            // a long-standing asymmetry, changing it is a behaviour change.
-            if ProviderRegistry::get(&cat.slug).is_some()
-                || matches!(Owner::of(&cat.slug), Owner::Script)
-            {
-                continue;
-            }
-            if !provider_available(&cat.slug) {
-                continue;
-            }
-            let slug = cat.slug;
-            let models: Vec<String> = cat.models.keys().map(|id| format!("{slug}/{id}")).collect();
-            let _ = tx_catalog
-                .send_async(ModelBatch {
-                    models,
-                    warnings: Vec::new(),
-                })
-                .await;
-        }
-    })
-    .detach();
 
     let tx_custom = tx.clone();
-    smol::spawn(async move {
+    tokio::spawn(async move {
         let declared = custom::declared_model_specs();
         if !declared.is_empty() {
             let _ = tx_custom
@@ -337,7 +250,7 @@ pub async fn fetch_all_models(
                 })
                 .await;
         }
-        let custom_specs = smol::unblock(move || custom::discover_models(timeouts)).await;
+        let custom_specs = custom::discover_models(timeouts).await;
         if !custom_specs.is_empty() {
             let _ = tx_custom
                 .send_async(ModelBatch {
@@ -346,8 +259,7 @@ pub async fn fetch_all_models(
                 })
                 .await;
         }
-    })
-    .detach();
+    });
 
     drop(tx);
 
@@ -380,23 +292,13 @@ mod tests {
 
     #[test]
     fn available_specs_apply_model_policy() {
-        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-model-policy") };
-        let policy = policy(&["openai/*"], &["*/gpt-5.6-terra"]);
-
+        let policy = policy(&["responses/*"], &["*/excluded"]);
         let specs = available_model_specs(&policy);
-        unsafe { std::env::remove_var("OPENAI_API_KEY") };
-
-        assert!(!specs.is_empty());
-        assert!(specs.iter().all(|spec| spec.starts_with("openai/")));
-        assert!(!specs.iter().any(|spec| spec == "openai/gpt-5.6-terra"));
+        assert!(!specs.iter().any(|spec| spec.ends_with("/excluded")));
     }
 
     #[test]
     fn provider_for_slug_unknown_returns_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        crate::providers::catalog::warm_empty_catalog_for_tests(maki_storage::StateDir::from_path(
-            tmp.path().to_path_buf(),
-        ));
         let result = provider_for_slug("nonexistent-provider-xyz", Timeouts::default());
         match result {
             Err(e) => {

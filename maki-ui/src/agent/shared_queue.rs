@@ -10,8 +10,9 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use maki_agent::{AgentInput, AgentMode, ExtractedCommand, ImageSource, InterruptSource};
-use maki_providers::Message;
+use maki_agent::{
+    AgentInput, AgentMode, EarlierInput, ExtractedCommand, ImageSource, InterruptSource,
+};
 
 use crate::components::input::Submission;
 use crate::components::queue_panel::QueueEntry;
@@ -64,8 +65,10 @@ impl QueuedInput {
             message: _,
             images: _,
             preamble: _,
+            earlier: _,
             thinking: _,
             fast: _,
+            source: _,
         } = &self.input;
         prompt.is_none().then(|| (mode.clone(), *workflow))
     }
@@ -74,6 +77,9 @@ impl QueuedInput {
 pub(crate) struct Compaction {
     pub(crate) run_id: u64,
     pub(crate) instructions: Option<String>,
+    /// The session's workflow mode when it was asked for: the frame left
+    /// behind must carry the tools the next run sends.
+    pub(crate) workflow: bool,
 }
 
 impl Compaction {
@@ -87,6 +93,7 @@ impl Compaction {
 
 pub(crate) enum QueueItem {
     Message(QueuedInput),
+    Steer(QueuedInput),
     Compact(Compaction),
 }
 
@@ -117,11 +124,31 @@ impl QueueRun {
 }
 
 impl QueueItem {
+    fn into_steer(self) -> Self {
+        match self {
+            Self::Message(queued) => Self::Steer(queued),
+            other => other,
+        }
+    }
+
+    fn into_queue(self) -> Self {
+        match self {
+            Self::Steer(queued) => Self::Message(queued),
+            other => other,
+        }
+    }
+
     fn as_queue_entry(&self) -> QueueEntry<'static> {
         match self {
             Self::Message(queued) => QueueEntry {
                 text: Cow::Owned(queued.text.clone()),
                 color: theme::current().foreground,
+                is_steer: false,
+            },
+            Self::Steer(queued) => QueueEntry {
+                text: Cow::Owned(queued.text.clone()),
+                color: theme::current().foreground,
+                is_steer: true,
             },
             Self::Compact(compaction) => QueueEntry {
                 text: compaction.label(),
@@ -129,13 +156,14 @@ impl QueueItem {
                     .queue
                     .fg
                     .unwrap_or(theme::current().foreground),
+                is_steer: false,
             },
         }
     }
 
     fn batch_key(&self) -> Option<BatchKey> {
         match self {
-            Self::Message(queued) => queued.batch_key(),
+            Self::Message(queued) | Self::Steer(queued) => queued.batch_key(),
             Self::Compact(_) => None,
         }
     }
@@ -145,7 +173,7 @@ impl QueueItem {
     /// which used to make the bubble hop up by one frame.
     fn visible_in_panel(&self) -> bool {
         match self {
-            Self::Message(queued) => !queued.displayed,
+            Self::Message(queued) | Self::Steer(queued) => !queued.displayed,
             Self::Compact(_) => true,
         }
     }
@@ -201,12 +229,32 @@ impl QueueSender {
         lock(&self.items).clear();
     }
 
+    pub(crate) fn convert_to_steer(&self, index: usize) -> bool {
+        let mut items = lock(&self.items);
+        if let Some(QueueItem::Message(_)) = items.get(index) {
+            let item = items.remove(index).unwrap();
+            items.insert(index, item.into_steer());
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn convert_to_queue(&self, index: usize) -> bool {
+        let mut items = lock(&self.items);
+        if let Some(QueueItem::Steer(_)) = items.get(index) {
+            let item = items.remove(index).unwrap();
+            items.insert(index, item.into_queue());
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn text_messages(&self) -> Vec<String> {
         lock(&self.items)
             .iter()
             .filter(|item| item.visible_in_panel())
             .filter_map(|item| match item {
-                QueueItem::Message(queued) => Some(queued.text.clone()),
+                QueueItem::Message(queued) | QueueItem::Steer(queued) => Some(queued.text.clone()),
                 QueueItem::Compact(_) => None,
             })
             .collect()
@@ -235,15 +283,21 @@ impl QueueReceiver {
         let mut items = lock(&self.items);
         let first = match items.pop_front()? {
             QueueItem::Compact(compaction) => return Some(QueueRun::Compact(compaction)),
-            QueueItem::Message(first) => first,
+            QueueItem::Message(first) | QueueItem::Steer(first) => first,
         };
         let key = first.batch_key();
         let mut run = vec![first];
         while key.is_some() && items.front().and_then(QueueItem::batch_key) == key {
-            let Some(QueueItem::Message(next)) = items.pop_front() else {
+            let Some(next) = items.pop_front() else {
                 break;
             };
-            run.push(next);
+            match next {
+                QueueItem::Message(next) | QueueItem::Steer(next) => run.push(next),
+                QueueItem::Compact(compaction) => {
+                    items.push_front(QueueItem::Compact(compaction));
+                    break;
+                }
+            }
         }
         Some(QueueRun::Messages(run))
     }
@@ -264,35 +318,46 @@ impl QueueReceiver {
 
 impl InterruptSource for QueueReceiver {
     fn poll(&self) -> Option<ExtractedCommand> {
-        Some(match self.pop_run()? {
-            QueueRun::Compact(compaction) => ExtractedCommand::Compact(compaction.instructions),
-            QueueRun::Messages(run) => {
-                ExtractedCommand::Interrupt(run.into_iter().map(|queued| queued.input).collect())
-            }
-        })
+        let mut items = lock(&self.items);
+        if let Some(compact_idx) = items
+            .iter()
+            .position(|item| matches!(item, QueueItem::Compact(_)))
+        {
+            let QueueItem::Compact(compaction) = items.remove(compact_idx).unwrap() else {
+                unreachable!()
+            };
+            return Some(ExtractedCommand::Compact(compaction.instructions));
+        }
+        let steer_idx = items
+            .iter()
+            .position(|item| matches!(item, QueueItem::Steer(_)))?;
+        let QueueItem::Steer(steer) = items.remove(steer_idx).unwrap() else {
+            unreachable!()
+        };
+        let mut steers = vec![steer.input];
+        while let Some(idx) = items
+            .iter()
+            .position(|item| matches!(item, QueueItem::Steer(_)))
+        {
+            let QueueItem::Steer(next) = items.remove(idx).unwrap() else {
+                unreachable!()
+            };
+            steers.push(next.input);
+        }
+        Some(ExtractedCommand::Interrupt(steers))
     }
 }
 
 /// Folds a run of queued messages into one agent input. The last message
 /// drives the run and the earlier ones ride in front of it as their own user
 /// messages, so each keeps its images and the model answers the burst in one
-/// request. The run shares one mode and one workflow by construction, so only
-/// the preferences (thinking, fast) come from the last message, the user's
-/// most recent intent.
+/// request. They stay messages rather than preamble, so `agent.user_message`
+/// gets to judge every one. The run shares one mode and one workflow by
+/// construction, so only the preferences (thinking, fast) come from the last
+/// message, the user's most recent intent.
 pub(crate) fn merge_inputs(mut inputs: Vec<AgentInput>) -> Option<AgentInput> {
     let mut last = inputs.pop()?;
-    let mut preamble = Vec::new();
-    for earlier in inputs {
-        preamble.extend(earlier.preamble);
-        let message = Message::user_with_images(earlier.message, earlier.images);
-        // An input with neither text nor images would become a user message
-        // with no content at all, which providers reject.
-        if !message.content.is_empty() {
-            preamble.push(message);
-        }
-    }
-    preamble.append(&mut last.preamble);
-    last.preamble = preamble;
+    last.earlier = inputs.into_iter().map(EarlierInput::from).collect();
     Some(last)
 }
 
@@ -302,7 +367,7 @@ mod tests {
     use std::sync::Barrier;
     use std::thread;
 
-    use maki_agent::{ImageMediaType, McpPromptRef};
+    use maki_agent::{ImageMediaType, InputSource, McpPromptRef};
 
     use super::*;
     use test_case::test_case;
@@ -314,8 +379,6 @@ mod tests {
     const PLAN_PATH: &str = "plan.md";
     const NOT_AN_INTERRUPT: &str = "expected an interrupt carrying the queued messages";
     const GUIDANCE: &str = "keep the failing test names";
-    /// One image block plus one text block.
-    const BLOCKS_PER_MESSAGE: usize = 2;
 
     fn input(message: &str) -> AgentInput {
         AgentInput {
@@ -323,10 +386,12 @@ mod tests {
             mode: Default::default(),
             images: Vec::new(),
             preamble: Vec::new(),
+            earlier: Vec::new(),
             thinking: Default::default(),
             fast: false,
             workflow: false,
             prompt: None,
+            source: InputSource::Tui,
         }
     }
 
@@ -341,6 +406,10 @@ mod tests {
 
     fn message(text: &str) -> QueueItem {
         QueueItem::Message(queued(text, 0))
+    }
+
+    fn steer(text: &str) -> QueueItem {
+        QueueItem::Steer(queued(text, 0))
     }
 
     fn plan_message(text: &str) -> QueueItem {
@@ -368,6 +437,7 @@ mod tests {
         QueueItem::Compact(Compaction {
             run_id: 0,
             instructions: instructions.map(str::to_string),
+            workflow: false,
         })
     }
 
@@ -456,10 +526,49 @@ mod tests {
     }
 
     #[test]
-    fn poll_hands_the_whole_message_run_to_one_turn() {
+    fn poll_only_consumes_steer_and_compact_not_queued_messages() {
+        let (tx, rx) = queue();
+        tx.push(message(FIRST));
+        assert!(
+            rx.poll().is_none(),
+            "queued messages are not polled as interrupts"
+        );
+
+        tx.push(steer(SECOND));
+        let Some(ExtractedCommand::Interrupt(inputs)) = rx.poll() else {
+            panic!("{NOT_AN_INTERRUPT}");
+        };
+        let messages: Vec<_> = inputs.iter().map(|i| i.message.as_str()).collect();
+        assert_eq!(messages, [SECOND]);
+        assert!(rx.poll().is_none());
+
+        // The queued message is still waiting for pop_run
+        assert_eq!(runs(&rx), vec![vec![FIRST]]);
+    }
+
+    #[test]
+    fn convert_between_steer_and_queue() {
+        let (tx, rx) = queue();
+        tx.push(message(FIRST));
+        assert!(rx.poll().is_none());
+
+        assert!(tx.convert_to_steer(0));
+        let Some(ExtractedCommand::Interrupt(inputs)) = rx.poll() else {
+            panic!("{NOT_AN_INTERRUPT}");
+        };
+        assert_eq!(inputs[0].message, FIRST);
+
+        tx.push(steer(SECOND));
+        assert!(tx.convert_to_queue(0));
+        assert!(rx.poll().is_none());
+        assert_eq!(runs(&rx), vec![vec![SECOND]]);
+    }
+
+    #[test]
+    fn poll_hands_the_whole_steer_run_to_one_turn() {
         let (tx, rx) = queue();
         for text in [FIRST, SECOND, THIRD] {
-            tx.push(message(text));
+            tx.push(steer(text));
         }
 
         let Some(ExtractedCommand::Interrupt(inputs)) = rx.poll() else {
@@ -482,7 +591,7 @@ mod tests {
     }
 
     #[test_case(&[FIRST] ; "single_message_stays_alone")]
-    #[test_case(&[FIRST, SECOND, THIRD] ; "earlier_messages_ride_in_the_preamble")]
+    #[test_case(&[FIRST, SECOND, THIRD] ; "earlier_messages_stay_messages")]
     fn merge_inputs_keeps_every_message_with_its_own_image(texts: &[&str]) {
         let inputs = texts
             .iter()
@@ -497,15 +606,13 @@ mod tests {
         let (last, earlier) = texts.split_last().unwrap();
         assert_eq!(merged.message, *last);
         assert_eq!(merged.images.len(), 1);
-        let preamble: Vec<_> = merged
-            .preamble
+        assert!(merged.preamble.is_empty());
+        let kept: Vec<_> = merged
+            .earlier
             .iter()
-            .map(|m| (m.user_text(), m.content.len()))
+            .map(|e| (e.message.as_str(), e.images.len()))
             .collect();
-        let expected: Vec<_> = earlier
-            .iter()
-            .map(|text| (Some(*text), BLOCKS_PER_MESSAGE))
-            .collect();
-        assert_eq!(preamble, expected);
+        let expected: Vec<_> = earlier.iter().map(|text| (*text, 1)).collect();
+        assert_eq!(kept, expected);
     }
 }

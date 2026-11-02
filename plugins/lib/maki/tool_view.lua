@@ -11,6 +11,12 @@
 local ToolView = {}
 ToolView.__index = ToolView
 
+-- Worst case is a batch child: tool body + batch body indents (2 + 2),
+-- plus the transcript's scrollbar column.
+local BODY_CHROME_COLS = 5
+local MIN_MD_WIDTH = 20
+local SEPARATOR = { { "──────", "dim" } }
+
 local function format_line_nr(fmt, idx)
   return { string.format(fmt, idx), "line_nr" }
 end
@@ -98,7 +104,8 @@ end
 
 -- opts: max_lines (default 80) shown while collapsed, keep "head"|"tail"
 -- (default "tail"), max_expand_lines (default 2000) kept for expansion,
--- max_line_bytes (optional) per-line byte cap applied at render time.
+-- max_line_bytes (optional) per-line byte cap. Lines are stored already cut,
+-- so a run of huge lines costs no more than short ones while kept for expansion.
 function ToolView.new(buf, opts)
   local self = setmetatable({}, ToolView)
   self.buf = buf
@@ -135,6 +142,7 @@ function ToolView:clear()
 end
 
 function ToolView:append(line)
+  line = truncate_line(line, self.max_line_bytes)
   local all_idx
   if #self.all_lines < self.max_expand_lines then
     self.all_lines[#self.all_lines + 1] = line
@@ -181,7 +189,7 @@ end
 
 -- Append {content} with line numbers, then syntax-highlight it for {ext}
 -- asynchronously. Returns false when {content} is empty.
-function ToolView:set_highlight(content, ext)
+function ToolView:set_highlight(content: string, ext)
   ext = ext or "md"
   if content:sub(-1) == "\n" then
     content = content:sub(1, -2)
@@ -239,6 +247,9 @@ function ToolView:flush()
   for _, h in ipairs(self.header) do
     lines[#lines + 1] = truncate_line(h, self.max_line_bytes)
   end
+  if #self.header > 0 then
+    lines[#lines + 1] = SEPARATOR
+  end
 
   if self.expanded then
     for _, line in ipairs(self.all_lines) do
@@ -269,10 +280,13 @@ function ToolView:flush()
     end
   end
 
-  self.buf:set_lines(lines)
+  -- The header says what runs, so a row that moved to the background keeps
+  -- it. The separator stays out: with the output gone it divides nothing.
+  self.buf:set_lines(lines, { head = #self.header })
 end
 
 function ToolView:update_line(all_idx, line)
+  line = truncate_line(line, self.max_line_bytes)
   self.all_lines[all_idx] = line
   for ri = 1, self.ring_count do
     if self.ring_map[ri] == all_idx then
@@ -309,11 +323,12 @@ function ToolView.restore(output, opts)
 end
 
 -- Same, for tools whose live output goes through markdown (`format =
--- "markdown"`); {opts.width} is the wrap width. Errors stay plain, as they do
--- live.
+-- "markdown"`). {opts.width} is the wrap width and defaults to the body
+-- column of the current terminal. Errors stay plain, as they do live.
 function ToolView.restore_markdown(output, is_error, opts)
   if not is_error then
-    local ok, md_lines = pcall(maki.ui.markdown, output, opts.width)
+    local width = opts.width or math.max(maki.ui.terminal_size().cols - BODY_CHROME_COLS, MIN_MD_WIDTH)
+    local ok, md_lines = pcall(maki.ui.markdown, output, width)
     if ok then
       return ToolView.restore_lines(md_lines, opts)
     end

@@ -43,8 +43,11 @@ pub fn spec_for_tier(provider: &str, tier: ModelTier) -> Option<String> {
     read().spec_for_tier(provider, tier)
 }
 
-pub fn spec_for_tier_any(tier: ModelTier) -> Option<String> {
-    read().spec_for_tier_any(tier)
+/// The model a tier resolves to, layering user overrides on top of provider
+/// defaults: the user's pick for the tier (whatever provider it names) first,
+/// then the tier within `provider`, then the tier in any provider.
+pub fn resolve_tier(provider: Option<&str>, tier: ModelTier) -> Option<String> {
+    read().resolve_tier(provider, tier)
 }
 
 pub fn discovered(provider: &str, model_id: &str) -> Option<ModelInfo> {
@@ -73,6 +76,48 @@ pub fn set_known_models(provider: &str, models: Vec<ModelInfo>) {
     write().set_known_models(provider, models);
 }
 
+pub fn all_known_models() -> HashMap<String, Vec<ModelInfo>> {
+    read().known_models.clone()
+}
+
+pub fn restore_cached_models(models: HashMap<String, Vec<ModelInfo>>) {
+    let mut reg = write();
+    for (provider, list) in models {
+        reg.known_models.entry(provider).or_insert(list);
+    }
+}
+
+/// Resolve model name: user-configured ModelDef name in ProvidersConfig takes priority,
+/// falling back to API-discovered ModelInfo.name.
+pub fn resolve_model_name(provider: &str, model_id: &str) -> Option<String> {
+    let config = maki_config::providers::ProvidersConfig::load();
+    config
+        .get(provider)
+        .and_then(|def| def.models.iter().find(|m| m.id == model_id))
+        .and_then(|m| m.name.clone())
+        .or_else(|| discovered(provider, model_id).and_then(|info| info.name))
+}
+
+pub fn resolve_model_name_for_spec(spec: &str) -> Option<String> {
+    let (provider, model_id) = spec.split_once('/')?;
+    resolve_model_name(provider, model_id)
+}
+
+pub fn resolve_model_name_or(spec: &str, fallback: &str) -> String {
+    resolve_model_name_for_spec(spec).unwrap_or_else(|| fallback.to_string())
+}
+
+/// Subagents and new sessions build their model from here, so the window a
+/// server reported belongs here too, or each of them would learn it again.
+pub fn record_context_window(provider: &str, model_id: &str, window: u32) {
+    if let Some(info) = write()
+        .known_models
+        .get_mut(provider)
+        .and_then(|models| models.iter_mut().find(|m| m.id == model_id))
+    {
+        info.context_window = Some(window);
+    }
+}
 /// Tiers whose override points at `spec`, in descending tier order.
 pub fn override_tiers(spec: &str) -> Vec<ModelTier> {
     read().override_tiers(spec)
@@ -229,16 +274,18 @@ impl ModelRegistry {
         self.overrides.iter().any(|(&t, s)| s == spec && t != tier)
     }
 
+    fn resolve_tier(&self, provider: Option<&str>, tier: ModelTier) -> Option<String> {
+        self.overrides
+            .get(&tier)
+            .cloned()
+            .or_else(|| provider.and_then(|p| self.spec_for_tier(p, tier)))
+            .or_else(|| self.spec_for_tier_any(tier))
+    }
+
     fn spec_for_tier_any(&self, tier: ModelTier) -> Option<String> {
-        if let Some(spec) = self.overrides.get(&tier) {
-            return Some(spec.clone());
-        }
-        for provider in self.known_models.keys() {
-            if let Some(spec) = self.spec_for_tier(provider, tier) {
-                return Some(spec);
-            }
-        }
-        None
+        self.known_models
+            .keys()
+            .find_map(|provider| self.spec_for_tier(provider, tier))
     }
 
     fn override_tiers(&self, spec: &str) -> Vec<ModelTier> {
@@ -270,7 +317,7 @@ fn static_prefixes(provider: &str, tier: ModelTier) -> impl Iterator<Item = &'st
         .into_iter()
         .flat_map(|spec| spec.models())
         .filter(move |entry| entry.default && entry.tier == tier)
-        .flat_map(|entry| entry.prefixes.iter().copied())
+        .flat_map(|entry| entry.prefixes.iter().map(String::as_str))
 }
 
 fn tier_for_position(pos: usize) -> ModelTier {
@@ -351,27 +398,6 @@ mod tests {
         assert_eq!(t("ollama/unknown", None), ModelTier::Medium);
     }
 
-    #[test]
-    fn curated_provider_ignores_discovered_tiers() {
-        let mut reg = ModelRegistry::default();
-        reg.set_known_models(
-            "synthetic",
-            vec![ModelInfo {
-                tier: Some(ModelTier::Strong),
-                ..ModelInfo::id_only("syn:large:vision".into())
-            }],
-        );
-
-        assert_ne!(
-            reg.tier_for("synthetic/syn:large:vision", "synthetic", None),
-            ModelTier::Strong
-        );
-        assert_ne!(
-            reg.spec_for_tier("synthetic", ModelTier::Strong),
-            Some("synthetic/syn:large:vision".into())
-        );
-    }
-
     fn make_tiered(models: &[(&str, ModelTier)]) -> ModelRegistry {
         let mut reg = ModelRegistry::default();
         reg.set_known_models(
@@ -413,8 +439,6 @@ mod tests {
         );
     }
 
-    #[test_case(&[("gpt-5.4", ModelTier::Strong), ("claude-opus-4.7", ModelTier::Strong)], "copilot/claude-opus-4.7"; "curated default beats discovered tier")]
-    #[test_case(&[("claude-opus-4.6", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/claude-opus-4.6"; "later curated prefix when first is unavailable")]
     #[test_case(&[("zeta", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/alpha"; "lowest id when no curated default is entitled")]
     fn spec_for_tier_prefers_entitled_curated_default(
         models: &[(&str, ModelTier)],
@@ -458,7 +482,26 @@ mod tests {
     }
 
     #[test]
-    fn spec_for_tier_resolution() {
+    fn resolve_tier_override_beats_the_scoped_provider() {
+        let reg = make_map(&[(ModelTier::Weak, "zai/glm-5")], &["big", "mid", "small"]);
+        assert_eq!(
+            reg.resolve_tier(Some("ollama"), ModelTier::Weak),
+            Some("zai/glm-5".into())
+        );
+        assert_eq!(
+            reg.resolve_tier(Some("ollama"), ModelTier::Medium),
+            Some("ollama/mid".into())
+        );
+        assert_eq!(
+            reg.resolve_tier(None, ModelTier::Weak),
+            Some("zai/glm-5".into())
+        );
+    }
+
+    /// `spec_for_tier` is provider-scoped: an override with another provider is
+    /// invisible to a different provider's lookup.
+    #[test]
+    fn spec_for_tier_is_provider_scoped() {
         let reg = make_map(
             &[(ModelTier::Strong, "ollama/custom")],
             &["big", "mid", "small"],
@@ -474,29 +517,6 @@ mod tests {
 
         let conflict = make_map(&[(ModelTier::Weak, "ollama/big")], &["big", "mid", "small"]);
         assert_eq!(conflict.spec_for_tier("ollama", ModelTier::Strong), None);
-    }
-
-    #[test]
-    fn spec_for_tier_any_cross_provider() {
-        let reg = make_map(
-            &[
-                (ModelTier::Weak, "zai/glm-5"),
-                (ModelTier::Strong, "openai/gpt-foo"),
-            ],
-            &["big", "mid", "small"],
-        );
-        assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Strong),
-            Some("openai/gpt-foo".into())
-        );
-        assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Weak),
-            Some("zai/glm-5".into())
-        );
-        assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Medium),
-            Some("ollama/mid".into())
-        );
     }
 
     #[test]
@@ -606,5 +626,67 @@ mod tests {
         assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/qwen3");
         assert_eq!(loaded.get(&ModelTier::Medium).unwrap(), "ollama/qwen3");
         assert_eq!(loaded.get(&ModelTier::Weak).unwrap(), "ollama/qwen3:8b");
+    }
+
+    #[test]
+    fn resolve_model_name_prefers_config_over_discovery() {
+        let mut def = maki_config::providers::ProviderDef::default();
+        def.models.push(maki_config::providers::ModelDef {
+            id: "m1".to_string(),
+            name: Some("Configured Name".to_string()),
+            tier: ModelTier::Strong,
+            context_window: None,
+            max_output_tokens: None,
+            supports_tool_examples: None,
+            supports_thinking: None,
+            requires_thinking: None,
+            thinking_fields: None,
+            supports_vision: None,
+            pricing_input: None,
+            pricing_output: None,
+            pricing_cache_write: None,
+            pricing_cache_read: None,
+            pricing_fast_input: None,
+            pricing_fast_output: None,
+        });
+        let mut config = maki_config::providers::ProvidersConfig::default();
+        config.providers.insert("my-provider".to_string(), def);
+        let _guard = maki_config::providers::set_override(config);
+
+        set_known_models(
+            "my-provider",
+            vec![ModelInfo {
+                id: "m1".to_string(),
+                name: Some("Discovered Name".to_string()),
+                ..ModelInfo::id_only("m1".to_string())
+            }],
+        );
+
+        assert_eq!(
+            resolve_model_name("my-provider", "m1"),
+            Some("Configured Name".to_string())
+        );
+
+        set_known_models(
+            "my-provider",
+            vec![ModelInfo {
+                id: "m2".to_string(),
+                name: Some("Discovered Only".to_string()),
+                ..ModelInfo::id_only("m2".to_string())
+            }],
+        );
+
+        assert_eq!(
+            resolve_model_name("my-provider", "m2"),
+            Some("Discovered Only".to_string())
+        );
+        assert_eq!(
+            resolve_model_name_or("my-provider/m2", "fallback"),
+            "Discovered Only"
+        );
+        assert_eq!(
+            resolve_model_name_or("my-provider/m3", "fallback"),
+            "fallback"
+        );
     }
 }
