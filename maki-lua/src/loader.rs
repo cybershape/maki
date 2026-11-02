@@ -105,6 +105,13 @@ struct BundledPlugin {
     dir: Dir<'static>,
 }
 
+fn enabled_plugin() -> PluginFileConfig {
+    PluginFileConfig {
+        enabled: Some(true),
+        ..PluginFileConfig::default()
+    }
+}
+
 /// `lib` is not a default builtin; it exists so plugins can
 /// `require()` shared modules across boundaries.
 static BUNDLED_PLUGINS: &[BundledPlugin] = &[
@@ -131,6 +138,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "bash",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/bash"),
+    },
+    BundledPlugin {
+        name: "powershell",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/powershell"),
     },
     BundledPlugin {
         name: "batch",
@@ -385,15 +396,9 @@ impl PluginHost {
     pub fn with_all_builtins(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
         let opt_in: HashMap<String, PluginFileConfig> = maki_config::OPTIONAL_BUILTINS
             .iter()
-            .map(|name| {
-                (
-                    (*name).to_owned(),
-                    PluginFileConfig {
-                        enabled: Some(true),
-                        ..PluginFileConfig::default()
-                    },
-                )
-            })
+            .copied()
+            .chain(std::iter::once(maki_config::PLATFORM_OFF_SHELL))
+            .map(|name| (name.to_owned(), enabled_plugin()))
             .collect();
         let mut host = Self::new(registry)?;
         host.load_builtins(&PluginsConfig::from_plugins(opt_in))?;

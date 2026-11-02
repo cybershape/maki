@@ -16,6 +16,9 @@ local LIST_INPUT_SLOTS = { "tool.list_dir.input", "tool.*.input" }
 local OPEN_READ_HOOKED_ERR = "open() cannot read while a plugin hooks the read tool, call read() instead"
 local INSPECT_HOOKED_ERR = "os and pathlib cannot look at files while a plugin hooks the list_dir tool, call list_dir() instead"
 local MKDIR_BASH_HINT = ", create the directory with the bash tool instead"
+local MKDIR_POWERSHELL_HINT = ", create the directory with the powershell tool instead"
+local REMOVAL_BASH = "use the bash tool"
+local REMOVAL_POWERSHELL = "use the powershell tool"
 local OPEN_APPEND_UNSUPPORTED_ERR = "open() cannot append because the write tool has no append option"
 local NO_OUTPUT = "(no output)"
 local CANCELLED_ERR = "cancelled"
@@ -325,6 +328,13 @@ end
 -- the list_dir tool itself is disabled or hidden from the model, since
 -- os/pathlib inspection is a core interpreter capability. mkdir looks before
 -- it creates, so mkdir also needs `inspect`.
+local function shell_hint(tools, bash_text, powershell_text)
+  if not tools.bash and tools.powershell then
+    return powershell_text
+  end
+  return bash_text
+end
+
 local function file_access(tools, schemas, ctx)
   local files = {}
   if tools.read then
@@ -350,7 +360,7 @@ local function file_access(tools, schemas, ctx)
     files.mkdir = function(path, parents)
       local _, err = ctx:can_write(path)
       if err then
-        return nil, err .. MKDIR_BASH_HINT
+        return nil, err .. shell_hint(tools, MKDIR_BASH_HINT, MKDIR_POWERSHELL_HINT)
       end
       return maki.fs.mkdir(path, { parents = parents })
     end
@@ -470,6 +480,7 @@ local function handler(input, ctx)
     if waiting then
       view:clear()
     end
+    err = shell_hint(tools, err, (err:gsub(REMOVAL_BASH, REMOVAL_POWERSHELL, 1)))
     view:append_text(err)
     view:finish()
     -- The run is already paid for, so point a script that reached for

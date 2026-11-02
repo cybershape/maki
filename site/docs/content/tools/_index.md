@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 24 built-in tools in this reference (23 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 25 built-in tools in this reference (24 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -23,6 +23,17 @@ Commands run in the session's working directory (see Environment) by default.
 | `description` | string | no |  | What the command does in 3-5 words, not the command itself |
 | `timeout` | integer | no | 120 | Timeout in seconds |
 | `workdir` | string | no | cwd | Working directory |
+
+### `powershell` {#powershell}
+
+Execute a command through Windows PowerShell.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `command` | string | yes |  | The PowerShell command to execute |
+| `tail` | integer | no |  | Return only the last N lines |
+| `timeout` | integer | no | 120 | Timeout in seconds |
+| `workdir` | string | no | current directory | Working directory |
 
 ### `list_dir` {#list_dir}
 

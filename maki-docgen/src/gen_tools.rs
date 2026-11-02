@@ -22,6 +22,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
         "File Operations",
         &[
             "bash",
+            "powershell",
             "list_dir",
             "read",
             "write",
@@ -254,7 +255,16 @@ fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
     for &sub in maki_config::EDIT_SUB_TOOLS {
         edit.opts.insert(sub.to_owned(), Value::Bool(true));
     }
-    let mut plugins = HashMap::from([("edit".to_owned(), edit)]);
+    let mut plugins = HashMap::from([
+        ("edit".to_owned(), edit),
+        (
+            maki_config::PLATFORM_OFF_SHELL.to_owned(),
+            maki_config::PluginFileConfig {
+                enabled: Some(true),
+                ..maki_config::PluginFileConfig::default()
+            },
+        ),
+    ]);
     for &(plugin, option, _) in OPTION_GATED_TOOLS {
         plugins
             .entry(plugin.to_owned())

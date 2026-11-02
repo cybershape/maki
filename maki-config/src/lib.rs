@@ -107,6 +107,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "library_help",
     "list_dir",
     "memory",
+    "powershell",
     "question",
     "read",
     "sessions",
@@ -131,6 +132,11 @@ pub const PROVIDER_BUILTINS: &[&str] = &[];
 /// A plugin belongs here while what it does is worth shipping but what it
 /// costs at scale is not yet known.
 pub const OPTIONAL_BUILTINS: &[&str] = &["completion"];
+
+/// The shell plugin that is off unless a config sets `enabled = true`.
+/// Windows ships `powershell` and leaves `bash` off. Everywhere else ships
+/// `bash` and leaves `powershell` off.
+pub const PLATFORM_OFF_SHELL: &str = if cfg!(windows) { "bash" } else { "powershell" };
 
 /// Tools the edit plugin provides alongside `edit`, toggled through its options.
 pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
@@ -2575,12 +2581,16 @@ impl PluginsConfig {
         plugins: HashMap<String, PluginFileConfig>,
         packages: &[String],
     ) -> Self {
-        let enabled = |name: &String| plugins.get(name).and_then(|t| t.enabled).unwrap_or(true);
+        let enabled = |name: &str| match plugins.get(name).and_then(|t| t.enabled) {
+            Some(enabled) => enabled,
+            None => name != PLATFORM_OFF_SHELL,
+        };
 
         let mut all: Vec<String> = DEFAULT_BUILTINS
             .iter()
-            .map(|s| (*s).to_owned())
+            .copied()
             .filter(|name| enabled(name))
+            .map(str::to_owned)
             .collect();
 
         let mut enabled_packages: Vec<String> = packages
@@ -4885,7 +4895,11 @@ mod tests {
         )
         .unwrap();
         let config = raw.into_config(&[]).unwrap();
-        assert!(config.plugins.names.contains(&"bash".to_string()));
+        assert_eq!(
+            config.plugins.names.contains(&"bash".to_string()),
+            PLATFORM_OFF_SHELL != "bash",
+            "timeout alone keeps the platform default"
+        );
         assert!(!config.plugins.names.contains(&"websearch".to_string()));
         assert!(
             config.plugins.names.contains(&"index".to_string()),
@@ -4904,7 +4918,12 @@ mod tests {
     #[test]
     fn from_plugins_default() {
         let plugins = PluginsConfig::from_plugins(HashMap::new());
-        let expected: Vec<String> = DEFAULT_BUILTINS.iter().map(|s| s.to_string()).collect();
+        let expected: Vec<String> = DEFAULT_BUILTINS
+            .iter()
+            .copied()
+            .filter(|name| *name != PLATFORM_OFF_SHELL)
+            .map(str::to_owned)
+            .collect();
         assert_eq!(plugins.names, expected);
         assert!(plugins.enabled);
     }
@@ -4926,9 +4945,10 @@ mod tests {
             plugins.names.contains(&"index".to_string()),
             "untouched builtin stays"
         );
-        assert!(
+        assert_eq!(
             plugins.names.contains(&"bash".to_string()),
-            "bash is a default builtin"
+            PLATFORM_OFF_SHELL != "bash",
+            "bash follows the platform default when the config does not name it"
         );
         assert!(
             !plugins.names.contains(&"custom_tool".to_string()),
@@ -4989,6 +5009,37 @@ mod tests {
                 pair[1]
             );
         }
+    }
+
+    #[test]
+    fn shell_plugin_follows_the_platform_until_config_says_otherwise() {
+        let plugins = PluginsConfig::from_plugins(HashMap::new());
+        let on = if cfg!(windows) { "powershell" } else { "bash" };
+        let off = PLATFORM_OFF_SHELL;
+        assert!(plugins.names.iter().any(|name| name == on));
+        assert!(!plugins.names.iter().any(|name| name == off));
+
+        let mut entries = HashMap::new();
+        entries.insert(off.to_owned(), plugin_enabled(true));
+        entries.insert(on.to_owned(), plugin_enabled(false));
+        let plugins = PluginsConfig::from_plugins(entries);
+        assert!(plugins.names.iter().any(|name| name == off));
+        assert!(!plugins.names.iter().any(|name| name == on));
+
+        let mut opts_only = HashMap::new();
+        opts_only.insert(
+            off.to_owned(),
+            PluginFileConfig {
+                opts: JsonMap::from_iter([("timeout_secs".to_owned(), serde_json::json!(180))]),
+                ..PluginFileConfig::default()
+            },
+        );
+        let plugins = PluginsConfig::from_plugins(opts_only);
+        assert!(
+            !plugins.names.iter().any(|name| name == off),
+            "options without enabled keep the platform default off"
+        );
+        assert_eq!(plugins.opts[off]["timeout_secs"], serde_json::json!(180));
     }
 
     /// A name in both lists would be on by default and documented as opt-in,
