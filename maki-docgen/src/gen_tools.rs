@@ -426,8 +426,8 @@ mod tests {
         assert!(cleaned.starts_with(remaining_prefix), "cleaned: {cleaned}");
     }
 
-    #[test]
-    fn sections_partition_registered_tools() {
+    #[tokio::test]
+    async fn sections_partition_registered_tools() {
         let (registry, _) = load_registry_with_builtins();
         let snapshot = registry.iter();
         let registered: HashSet<&str> = snapshot.iter().map(|e| e.name()).collect();

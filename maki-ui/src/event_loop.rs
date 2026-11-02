@@ -176,7 +176,7 @@ pub struct EventLoopParams {
     pub handed_over: Vec<SessionMailbox>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SessionStatus {
     Working,
     NeedsInput,
@@ -271,10 +271,12 @@ impl RunNotificationState {
 }
 
 impl SessionStatus {
+    /// Background work keeps the session working, like the status bar, so a
+    /// picker never flashes finished while a result is still to come.
     fn of(app: &App) -> Self {
         if app.awaiting_input() {
             Self::NeedsInput
-        } else if app.status == Status::Streaming {
+        } else if app.is_working() {
             Self::Working
         } else {
             Self::Idle
@@ -428,12 +430,14 @@ impl SessionRuntime {
     }
 
     /// A wake may only start a background run when the session is fully
-    /// quiescent. Idle status alone is not enough: restored queue items start
-    /// runs without `start_run` (the app only learns of them via
-    /// `QueueItemConsumed`), and `start_run` destroys text held for recovery
-    /// after an agent error.
+    /// quiescent. Not [`SessionStatus`]: background work keeps that working,
+    /// and a wake is how that work ends. Nor the turn's end alone: restored
+    /// queue items start runs without `start_run` (the app only learns of
+    /// them via `QueueItemConsumed`), and `start_run` destroys text held
+    /// for recovery after an agent error.
     fn quiescent(&self) -> bool {
-        SessionStatus::of(&self.app) == SessionStatus::Idle
+        self.app.status != Status::Streaming
+            && !self.app.awaiting_input()
             && self.handles.queue.is_empty()
             && !self.app.holds_recovery_text()
             && self.app.takes_mailbox_runs()
@@ -2534,6 +2538,8 @@ fn sanitize_task_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::tests::{MOVED_ID, app_with_moved_call, end_turn};
+    use crate::components::BackgroundOutcome;
     use maki_agent::DoneReason;
     use maki_providers::TokenUsage;
     use test_case::test_case;
@@ -2735,5 +2741,18 @@ mod tests {
         }
 
         assert_eq!(debounce.touch(current), Dirty::YES);
+    }
+
+    /// A turn that moved a call out is not over for the user: the session
+    /// picker keeps its spinner until the task ends, with no "finished"
+    /// flash in between.
+    #[test]
+    fn a_session_stays_working_while_its_background_task_runs() {
+        let (mut app, _buf) = app_with_moved_call();
+        end_turn(&mut app);
+        assert_eq!(SessionStatus::of(&app), SessionStatus::Working);
+
+        app.end_task(MOVED_ID, BackgroundOutcome::Done);
+        assert_eq!(SessionStatus::of(&app), SessionStatus::Idle);
     }
 }

@@ -1333,7 +1333,7 @@ async fn session(
             model: Some(state.params.model.spec()),
             opts: Some(state.opts),
             answer_tx: None,
-            inbox: Some(Arc::clone(&inbox)),
+            inbox: Arc::clone(&inbox),
             parent_call: None,
         };
         state.upstream.open_task(info.clone());
@@ -2023,7 +2023,7 @@ async fn prompt(
             model: Some(s.params.model.spec()),
             opts: Some(s.opts),
             answer_tx: s.answer_tx.take(),
-            inbox: Some(Arc::clone(&inbox)),
+            inbox: Arc::clone(&inbox),
             parent_call: s.cancellation.parent_call(),
         });
     }
@@ -2835,7 +2835,7 @@ mod tests {
             model: None,
             opts: None,
             answer_tx: None,
-            inbox: None,
+            inbox: Arc::default(),
             parent_call: None,
         })
         .unwrap();
