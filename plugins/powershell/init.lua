@@ -90,6 +90,8 @@ maki.api.register_tool({
       ctx:finish({ llm_output = result, is_error = code ~= 0 })
     end
 
+    -- A pipe has no console code page, so PowerShell 5.1 emits the ANSI
+    -- code page. The job reader decodes UTF-8, which turns that into mojibake.
     local job_id = maki.fn.jobstart({
       "powershell.exe",
       "-NoLogo",
@@ -98,7 +100,9 @@ maki.api.register_tool({
       "Bypass",
       "-NonInteractive",
       "-Command",
-      input.command,
+      "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+        .. "$OutputEncoding = [Console]::OutputEncoding; "
+        .. input.command,
     }, {
       cwd = input.workdir,
       on_stdout = function(_, line)
