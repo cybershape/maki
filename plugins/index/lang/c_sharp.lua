@@ -180,12 +180,47 @@ return function(U)
     return new_entry(SECTION.Type, node, text)
   end
 
+  local extract_nodes
+
   local function extract_namespace(node, source)
     local name_node = node:field("name")[1]
     if not name_node then
-      return nil
+      return {}
     end
-    return new_entry(SECTION.Module, node, get_text(name_node, source))
+    local entries = { new_entry(SECTION.Module, node, get_text(name_node, source)) }
+    -- block-scoped: members live in declaration_list; file-scoped: direct children
+    local body = find_child(node, "declaration_list") or node
+    for _, child in ipairs(body:children()) do
+      for _, e in ipairs(extract_nodes(child, source, {})) do
+        entries[#entries + 1] = e
+      end
+    end
+    return entries
+  end
+
+  extract_nodes = function(node, source, _attrs)
+    local kind = node:type()
+    if kind == "using_directive" then
+      return { simple_import(node, source, { "using%s+" }, ".") }
+    elseif kind == "namespace_declaration" or kind == "file_scoped_namespace_declaration" then
+      return extract_namespace(node, source)
+    elseif kind == "class_declaration" then
+      local e = extract_class_like(node, source, SECTION.Class, "class")
+      return e and { e } or {}
+    elseif kind == "struct_declaration" then
+      local e = extract_class_like(node, source, SECTION.Type, "struct")
+      return e and { e } or {}
+    elseif kind == "interface_declaration" then
+      local e = extract_interface(node, source)
+      return e and { e } or {}
+    elseif kind == "enum_declaration" then
+      local e = extract_enum(node, source)
+      return e and { e } or {}
+    elseif kind == "record_declaration" then
+      local e = extract_record(node, source)
+      return e and { e } or {}
+    end
+    return {}
   end
 
   return {
@@ -202,30 +237,6 @@ return function(U)
       return false
     end,
 
-    extract_nodes = function(node, source, _attrs)
-      local kind = node:type()
-      if kind == "using_directive" then
-        return { simple_import(node, source, { "using%s+" }, ".") }
-      elseif kind == "namespace_declaration" or kind == "file_scoped_namespace_declaration" then
-        local e = extract_namespace(node, source)
-        return e and { e } or {}
-      elseif kind == "class_declaration" then
-        local e = extract_class_like(node, source, SECTION.Class, "class")
-        return e and { e } or {}
-      elseif kind == "struct_declaration" then
-        local e = extract_class_like(node, source, SECTION.Type, "struct")
-        return e and { e } or {}
-      elseif kind == "interface_declaration" then
-        local e = extract_interface(node, source)
-        return e and { e } or {}
-      elseif kind == "enum_declaration" then
-        local e = extract_enum(node, source)
-        return e and { e } or {}
-      elseif kind == "record_declaration" then
-        local e = extract_record(node, source)
-        return e and { e } or {}
-      end
-      return {}
-    end,
+    extract_nodes = extract_nodes,
   }
 end

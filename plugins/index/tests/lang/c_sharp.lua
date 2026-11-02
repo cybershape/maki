@@ -66,3 +66,45 @@ public struct Vector3 : IEquatable<Vector3>
     "public struct Vector3",
   })
 end)
+
+case("csharp_block_namespace_members", function()
+  local src = [==[
+using System;
+
+namespace MyApp
+{
+    public class Scheduler
+    {
+        private readonly int _limit;
+        public Scheduler(int limit) {}
+        public void Run() {}
+    }
+
+    public interface IJob
+    {
+        void Execute();
+    }
+
+    namespace Inner
+    {
+        public enum State { Idle, Busy }
+    }
+}
+]==]
+  local out = idx(src, "c_sharp")
+  has(out, {
+    "mod:",
+    "MyApp",
+    "Inner",
+    "classes:",
+    "public class Scheduler",
+    "private readonly int _limit",
+    "public Scheduler(int limit)",
+    "public void Run()",
+    "traits:",
+    "public interface IJob",
+    "void Execute()",
+    "types:",
+    "public enum State",
+  })
+end)
