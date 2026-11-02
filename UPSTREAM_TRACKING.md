@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `1a5d0fe850cbc74733e6e34ca533090572d75708`
-  - **Commit date**: `Fri Oct 23 11:04:40 2026 +0200`
+  - **Commit SHA**: `e18f54a0955a0588b9698680ec5222d38e674ab2`
+  - **Commit date**: `Sun Nov 1 20:42:00 2026 +0100`
   - **Commit author**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
-  - **Commit message**: `fix(prompt): drop a plugin's hints when none of its tools are sent`
+  - **Commit message**: `Revert "refactor(bedrock): resolve credentials and sign through the AWS SDK"`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `1a5d0fe8`.
+> `upstream/main` has been successfully merged through commit `e18f54a0`.
 
 ---
 
@@ -124,6 +124,13 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `2a669f8e` | `feat(ui): use ↵ newline separator for compact thinking preview` | Use `↵` to separate lines in compact thinking previews |
 | `48ca0d2f` | `feat(ui): merge total and thinking time in turn stats line` | Combine total and thinking time in the turn stats line |
 | `f11423b7` | `Merge branch 'upstream/main' into main` | Merge upstream through `1a5d0fe8`, including migration from `smol` to `tokio`, migration from `isahc` to `reqwest`, the version bump to 0.7.0, and an async event loop, while preserving core fork customizations (the standalone Responses API provider, toolcall_reason, code execution sandbox, and others) |
+| `82362790` | `docs: update upstream tracking record to 1a5d0fe8` | Update the upstream tracking record to `1a5d0fe8` |
+| `f0f81c83` | `feat(tools): merge view_image into read tool` | Merge view_image into read tool |
+| `98d56206` | `Revert "feat(tools): merge view_image into read tool"` | Revert merging view_image into read tool |
+| `25a5e1fa` | `feat(index): add Vue SFC language support` | Add Vue SFC language support to the index tool |
+| `85a0338d` | `docs: clarify fork changes and translate upstream tracking to English` | Clarify fork changes in README and translate upstream tracking record to English |
+| `74865de1` | `feat(ui): add 50% min height watermark for compact detail and highlight code_execution input` | Add 50% min height watermark for compact detail popup and highlight Python code in code_execution tool calls |
+| `36f4a01f` | `Merge branch 'upstream/main' into main` | Merge upstream through `e18f54a0`, including non-blocking models.dev catalog loading, OAuth loopback refactoring, background tasks UI & `/tasks` improvements, headless turn cancel handling, and other upstream fixes while preserving core fork customizations |
 
 ---
 
