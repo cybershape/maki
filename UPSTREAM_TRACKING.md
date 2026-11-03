@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `e18f54a0955a0588b9698680ec5222d38e674ab2`
-  - **Commit date**: `Sun Nov 1 20:42:00 2026 +0100`
-  - **Commit author**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
-  - **Commit message**: `Revert "refactor(bedrock): resolve credentials and sign through the AWS SDK"`
+  - **Commit SHA**: `936726a543cd02183d5048699b723841bbff4200`
+  - **Commit date**: `Mon Nov 2 22:45:32 2026 +0000`
+  - **Commit author**: `renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>`
+  - **Commit message**: `chore(deps): update flake.lock`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `e18f54a0`.
+> `upstream/main` has been successfully merged through commit `936726a5`.
 
 ---
 
@@ -131,6 +131,17 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `85a0338d` | `docs: clarify fork changes and translate upstream tracking to English` | Clarify fork changes in README and translate upstream tracking record to English |
 | `74865de1` | `feat(ui): add 50% min height watermark for compact detail and highlight code_execution input` | Add 50% min height watermark for compact detail popup and highlight Python code in code_execution tool calls |
 | `36f4a01f` | `Merge branch 'upstream/main' into main` | Merge upstream through `e18f54a0`, including non-blocking models.dev catalog loading, OAuth loopback refactoring, background tasks UI & `/tasks` improvements, headless turn cancel handling, and other upstream fixes while preserving core fork customizations |
+| `a0dd8398` | `fix(lua): prefer Git Bash over cmd.exe on Windows` | Prefer Git Bash over cmd.exe on Windows |
+| `7104c7dd` | `Merge branch 'fix/windows-git-bash'` | Merge Windows Git Bash fix branch |
+| `63359d71` | `docs: update upstream tracking record to e18f54a0` | Update upstream tracking record to e18f54a0 |
+| `e08bd8c0` | `Merge branch 'main' of https://github.com/cybershape/maki` | Merge remote-tracking branch |
+| `79358270` | `feat(tools): ship powershell and disable bash on Windows` | Ship PowerShell tool and disable bash on Windows |
+| `d238a2c7` | `fix(tools): force PowerShell 5.1 pipe output to UTF-8` | Force PowerShell 5.1 pipe output to UTF-8 |
+| `e9364301` | `fix(ui): drop split SGR mouse reports on Windows` | Drop split SGR mouse reports on Windows ConPTY |
+| `bf30b237` | `feat(tools): prefer pwsh and describe its syntax` | Prefer pwsh and describe syntax based on PowerShell version |
+| `fad38ace` | `docs: note powershell utf-8 fix and split SGR mouse swallow` | Note PowerShell UTF-8 fix and split SGR mouse swallow in README |
+| `5290d387` | `fix(index): recurse into C# namespace bodies` | Recurse into C# block-scoped and file-scoped namespace bodies |
+| `10a4d42e` | `Merge branch 'upstream/main' into main` | Merge upstream through `936726a5`, including u64 session token counters, restore snapshot scoping to chats with the tool, current cwd adoption on session resume, dependency updates, cargo-deny workflow gate, and other upstream improvements while preserving core fork customizations |
 
 ---
 
