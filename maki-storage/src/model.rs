@@ -1,14 +1,17 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::paths;
 use crate::sessions::StoredThinking;
 use crate::{StateDir, atomic_write};
 
 const MODEL_FILE: &str = "model";
 const RECENT_FILE: &str = "recent-models";
 const THINKING_FILE: &str = "thinking";
+const PROJECT_THINKING_FILE: &str = "model_thinking.json";
 const COLLAPSED_FILE: &str = "collapsed-providers";
 const MAX_RECENTS: usize = 4;
 
@@ -34,6 +37,45 @@ pub fn persist_thinking(dir: &StateDir, thinking: StoredThinking) {
 pub fn read_thinking(dir: &StateDir) -> Option<StoredThinking> {
     let raw = fs::read_to_string(dir.path().join(THINKING_FILE)).ok()?;
     StoredThinking::parse_setting(&raw).ok()
+}
+
+pub fn project_model_thinking_path(dir: &StateDir, cwd: &Path) -> PathBuf {
+    paths::project_dir(dir, cwd).join(PROJECT_THINKING_FILE)
+}
+
+pub fn persist_project_model_thinking(
+    dir: &StateDir,
+    cwd: &Path,
+    model_spec: &str,
+    thinking: StoredThinking,
+) {
+    let path = project_model_thinking_path(dir, cwd);
+    let mut map = read_project_model_thinking_map(&path);
+    map.insert(model_spec.to_owned(), thinking.to_string());
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(&map) {
+        let _ = atomic_write(&path, &json);
+    }
+}
+
+pub fn read_project_model_thinking(
+    dir: &StateDir,
+    cwd: &Path,
+    model_spec: &str,
+) -> Option<StoredThinking> {
+    let path = project_model_thinking_path(dir, cwd);
+    let map = read_project_model_thinking_map(&path);
+    let val = map.get(model_spec)?;
+    StoredThinking::parse_setting(val).ok()
+}
+
+fn read_project_model_thinking_map(path: &Path) -> BTreeMap<String, String> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
 }
 
 /// Providers folded away in the model picker, by slug. Kept as a sorted set,
@@ -200,5 +242,84 @@ mod tests {
 
         fs::write(dir.path().join(RECENT_FILE), "  \n").unwrap();
         assert!(read_recents(&dir).is_empty());
+    }
+
+    #[test]
+    fn project_model_thinking_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let cwd = tmp.path().join("my-project");
+        fs::create_dir_all(&cwd).unwrap();
+
+        const MODEL_A: &str = "anthropic/claude-3-7-sonnet";
+        const MODEL_B: &str = "openai/gpt-5";
+
+        assert_eq!(read_project_model_thinking(&dir, &cwd, MODEL_A), None);
+        assert_eq!(read_project_model_thinking(&dir, &cwd, MODEL_B), None);
+
+        persist_project_model_thinking(&dir, &cwd, MODEL_A, StoredThinking::Adaptive);
+        persist_project_model_thinking(
+            &dir,
+            &cwd,
+            MODEL_B,
+            StoredThinking::Effort {
+                level: Effort::High,
+            },
+        );
+
+        assert_eq!(
+            read_project_model_thinking(&dir, &cwd, MODEL_A),
+            Some(StoredThinking::Adaptive)
+        );
+        assert_eq!(
+            read_project_model_thinking(&dir, &cwd, MODEL_B),
+            Some(StoredThinking::Effort {
+                level: Effort::High,
+            })
+        );
+
+        // Overwrite
+        persist_project_model_thinking(&dir, &cwd, MODEL_A, StoredThinking::Off);
+        assert_eq!(
+            read_project_model_thinking(&dir, &cwd, MODEL_A),
+            Some(StoredThinking::Off)
+        );
+        assert_eq!(
+            read_project_model_thinking(&dir, &cwd, MODEL_B),
+            Some(StoredThinking::Effort {
+                level: Effort::High,
+            })
+        );
+    }
+
+    #[test]
+    fn project_model_thinking_shares_repo_root() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let repo_root = tmp.path().join("repo");
+        let sub_dir = repo_root.join("src").join("nested");
+        fs::create_dir_all(repo_root.join(".git")).unwrap();
+        fs::create_dir_all(&sub_dir).unwrap();
+
+        const MODEL: &str = "model/spec";
+        persist_project_model_thinking(&dir, &sub_dir, MODEL, StoredThinking::Adaptive);
+        assert_eq!(
+            read_project_model_thinking(&dir, &repo_root, MODEL),
+            Some(StoredThinking::Adaptive)
+        );
+    }
+
+    #[test]
+    fn project_model_thinking_ignores_invalid_json() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let cwd = tmp.path().join("project");
+        fs::create_dir_all(&cwd).unwrap();
+
+        let path = project_model_thinking_path(&dir, &cwd);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "invalid json content").unwrap();
+
+        assert_eq!(read_project_model_thinking(&dir, &cwd, "any/model"), None);
     }
 }

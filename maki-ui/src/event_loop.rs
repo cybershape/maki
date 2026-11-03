@@ -2200,7 +2200,7 @@ impl<'t> EventLoop<'t> {
     /// together. Spread over callers, one of them always forgets a piece.
     fn apply_model(&mut self, idx: usize, slot: Arc<ModelSlot>) {
         let rt = &mut self.sessions[idx];
-        rt.app.state.update_model(&slot.model);
+        rt.app.apply_model(&slot.model);
         rt.app.usage_slot.store(None);
         rt.slot.store(slot);
     }

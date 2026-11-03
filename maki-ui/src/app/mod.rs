@@ -21,7 +21,7 @@ pub(crate) mod view;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -85,7 +85,9 @@ use maki_providers::models_cache::ModelList;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
-use maki_storage::model::persist_thinking;
+use maki_storage::model::{
+    persist_project_model_thinking, persist_thinking, read_project_model_thinking,
+};
 use maki_storage::sessions::StoredTokenUsage;
 
 use crate::storage_writer::StorageWriter;
@@ -982,7 +984,36 @@ impl App {
             .clamped(&self.state.model);
         self.state.pending_thinking = None;
         persist_thinking(&self.storage, self.state.thinking.into());
+        persist_project_model_thinking(
+            &self.storage,
+            Path::new(&self.state.session.cwd),
+            &self.state.model.spec(),
+            self.state.thinking.into(),
+        );
         Ok(self.state.thinking)
+    }
+
+    pub(crate) fn apply_model(&mut self, model: &Model) {
+        let cwd = Path::new(&self.state.session.cwd);
+        let old_spec = self.state.model.spec();
+        let new_spec = model.spec();
+
+        if self.state.model.supports_thinking() {
+            persist_project_model_thinking(
+                &self.storage,
+                cwd,
+                &old_spec,
+                self.state.thinking.into(),
+            );
+        }
+
+        let saved_thinking = if model.supports_thinking() {
+            read_project_model_thinking(&self.storage, cwd, &new_spec).map(ThinkingConfig::from)
+        } else {
+            None
+        };
+
+        self.state.update_model_with_thinking(model, saved_thinking);
     }
 
     pub(crate) fn set_fast(&mut self, fast: bool) -> Result<(), String> {

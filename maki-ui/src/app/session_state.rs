@@ -4,6 +4,7 @@ use std::sync::Arc;
 use maki_config::Effect;
 use maki_providers::{Model, RequestOptions, ThinkingConfig, TokenUsage, settle_session};
 use maki_storage::StateDir;
+use maki_storage::model::read_project_model_thinking;
 use maki_storage::sessions::{SessionClaim, StoredEffect, StoredMode, StoredRule};
 
 use crate::{AppSession, OpenSession};
@@ -100,8 +101,16 @@ impl SessionState {
 
         // Saved model may differ from the live one (updated, removed, etc), so
         // reconcile before anyone reads the toggles or prices history with them.
+        let initial_thinking = if session.messages().is_empty()
+            && let Some(saved) =
+                read_project_model_thinking(storage, Path::new(&session.cwd), &model.spec())
+        {
+            saved.into()
+        } else {
+            session.meta.thinking.into()
+        };
         let (thinking, pending_thinking, fast, pending_fast) =
-            clamp(session.meta.thinking.into(), session.meta.fast, &model);
+            clamp(initial_thinking, session.meta.fast, &model);
         let token_usage = session.token_usage;
         let cost = settle_session(&token_usage, session.usage_by_model_mut(), &model, fast);
         // Unlike `cost` there is nothing to settle: the list price was
@@ -157,15 +166,25 @@ impl SessionState {
         ) = clamp(self.thinking_intent(), fast, &self.model);
     }
 
-    pub fn update_model(&mut self, model: &Model) {
+    pub fn update_model_with_thinking(
+        &mut self,
+        model: &Model,
+        saved_thinking: Option<ThinkingConfig>,
+    ) {
+        let thinking_intent = saved_thinking.unwrap_or_else(|| self.thinking_intent());
         (
             self.thinking,
             self.pending_thinking,
             self.fast,
             self.pending_fast,
-        ) = clamp(self.thinking_intent(), self.fast_intent(), model);
+        ) = clamp(thinking_intent, self.fast_intent(), model);
         self.session_mut().set_model(model.spec());
         self.model = model.clone();
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn update_model(&mut self, model: &Model) {
+        self.update_model_with_thinking(model, None);
     }
 }
 

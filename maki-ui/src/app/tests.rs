@@ -12931,3 +12931,78 @@ fn a_session_opened_under_a_moved_call_works_once_it_runs() {
 
     assert_eq!(app.chats[tab].task_status(), TaskStatus::Working);
 }
+
+#[test]
+fn project_model_thinking_remembers_and_restores_per_model() {
+    let (_tmp, dir, _writer, mut app) = tempdir_app();
+    let model_a = test_model();
+    let model_b = test_opus_model();
+    let model_plain = test_plain_model();
+
+    // 1. Initial state on model_a, set thinking to high
+    app.apply_model(&model_a);
+    app.set_thinking("high").unwrap();
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
+
+    // 2. Switch to model_b, set thinking to low
+    app.apply_model(&model_b);
+    app.set_thinking("low").unwrap();
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::Low));
+
+    // 3. Switch to model_plain (thinking unsupported) -> clamped to Off
+    app.apply_model(&model_plain);
+    assert_eq!(app.state.thinking, ThinkingConfig::Off);
+
+    // 4. Switch back to model_a -> restores High
+    app.apply_model(&model_a);
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
+
+    // 5. Switch back to model_b -> restores Low
+    app.apply_model(&model_b);
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::Low));
+
+    // 6. Starting a fresh session in the same project inherits model's last thinking
+    let fresh_session = AppSession::new(&model_a.spec(), &app.state.session.cwd);
+    let fresh_state =
+        SessionState::from_session(OpenSession::claimed(fresh_session, &dir), &model_a, &dir);
+    assert_eq!(fresh_state.thinking, ThinkingConfig::Effort(Effort::High));
+}
+
+#[test]
+fn project_model_thinking_isolated_across_projects() {
+    let (tmp, dir, writer, mut app1) = tempdir_app();
+    let model = test_model();
+
+    let project1_dir = tmp.path().join("proj1");
+    let project2_dir = tmp.path().join("proj2");
+    std::fs::create_dir_all(&project1_dir).unwrap();
+    std::fs::create_dir_all(&project2_dir).unwrap();
+
+    // Set cwd for app1 to project1
+    app1.state
+        .session_mut()
+        .set_cwd(project1_dir.to_string_lossy().into_owned());
+    app1.apply_model(&model);
+    app1.set_thinking("high").unwrap();
+    assert_eq!(app1.state.thinking, ThinkingConfig::Effort(Effort::High));
+
+    // Create app2 pointing to project2
+    let mut app2 = build_app(dir.clone(), Arc::clone(&writer));
+    app2.state
+        .session_mut()
+        .set_cwd(project2_dir.to_string_lossy().into_owned());
+    app2.apply_model(&model);
+    app2.set_thinking("low").unwrap();
+    assert_eq!(app2.state.thinking, ThinkingConfig::Effort(Effort::Low));
+
+    // Switch model away and back in app1 (project1) -> restores High
+    let other_model = test_opus_model();
+    app1.apply_model(&other_model);
+    app1.apply_model(&model);
+    assert_eq!(app1.state.thinking, ThinkingConfig::Effort(Effort::High));
+
+    // Switch model away and back in app2 (project2) -> restores Low
+    app2.apply_model(&other_model);
+    app2.apply_model(&model);
+    assert_eq!(app2.state.thinking, ThinkingConfig::Effort(Effort::Low));
+}
