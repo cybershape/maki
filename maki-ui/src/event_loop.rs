@@ -2562,7 +2562,9 @@ fn sgr_fragment_done(pending: &str) -> bool {
     let (body, last) = rest.split_at(rest.len().saturating_sub(1));
     matches!(last, "M" | "m")
         && body.split(';').count() == 3
-        && body.split(';').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        && body
+            .split(';')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {

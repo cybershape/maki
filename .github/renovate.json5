@@ -34,6 +34,8 @@
       branchTopic: 'nix-lock-file-maintenance',
       commitMessageAction: 'update',
       commitMessageTopic: 'flake.lock',
+      // Only nix builds use it, and the Nix workflow builds it.
+      automerge: true,
     },
   },
   customManagers: [

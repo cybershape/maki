@@ -2803,7 +2803,7 @@ mod tests {
     const SESSION_MODEL: &str = "test-model";
     const NESTED_MODEL: &str = "nested-model";
 
-    const fn tokens(input: u32, output: u32) -> TokenUsage {
+    const fn tokens(input: u64, output: u64) -> TokenUsage {
         TokenUsage {
             input,
             output,

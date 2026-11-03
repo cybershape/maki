@@ -387,7 +387,7 @@ pub fn gauge_usage_update(used: u64, size: u64, cost_total: Option<f64>) -> Sess
 pub fn usage_update(event: &TurnCompleteEvent, cost_total: Option<f64>) -> SessionUpdate {
     let used = event
         .context_size
-        .unwrap_or_else(|| event.usage.context_tokens()) as u64;
+        .map_or_else(|| event.usage.context_tokens(), u64::from);
     gauge_usage_update(used, u64::from(event.context_window), cost_total)
 }
 

@@ -485,7 +485,7 @@ async fn load_session(
     let used = if restored.session.meta.context_size > 0 {
         u64::from(restored.session.meta.context_size)
     } else {
-        u64::from(restored.session.token_usage.context_tokens())
+        restored.session.token_usage.context_tokens()
     };
     session_update(
         &srv.out_tx,
@@ -1283,8 +1283,7 @@ fn start_event_pump(
                     let cost_total = cost.total();
                     let used = event
                         .context_size
-                        .unwrap_or_else(|| event.usage.context_tokens())
-                        as u64;
+                        .map_or_else(|| event.usage.context_tokens(), u64::from);
                     {
                         let mut u = usage.lock().unwrap();
                         u.used = used;

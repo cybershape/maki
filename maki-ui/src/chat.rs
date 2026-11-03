@@ -495,6 +495,10 @@ impl Chat {
         self.messages_panel.toggle_click(row, area)
     }
 
+    pub fn has_tool(&self, tool_id: &str) -> bool {
+        self.messages_panel.has_tool(tool_id)
+    }
+
     pub fn tool_snapshot(
         &mut self,
         tool_id: &str,
@@ -1235,8 +1239,8 @@ fn turn_stats_line(usage: &TokenUsage, timing: TurnTiming) -> Option<String> {
     let elapsed_secs = (timing.elapsed_ms as f64 / 1000.0).max(0.001);
     let tps = (usage.output as f64 / elapsed_secs).round() as u64;
     let total_input = usage.total_input();
-    let cache = (usage.cache_read as u64 * 100)
-        .checked_div(total_input.max(1) as u64)
+    let cache = (usage.cache_read * 100)
+        .checked_div(total_input.max(1))
         .unwrap_or(0);
     let ttft = timing
         .ttft_ms
