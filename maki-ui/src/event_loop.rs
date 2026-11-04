@@ -11,6 +11,7 @@
 use std::future::{pending, ready};
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -51,7 +52,7 @@ use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
-use maki_storage::model::persist_model;
+use maki_storage::model::{persist_model, persist_project_model};
 use maki_storage::sessions::normalize_title;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
@@ -2373,6 +2374,11 @@ impl<'t> EventLoop<'t> {
         self.apply_model(idx, slot);
         self.sessions[idx].app.record_recent_model(spec);
         persist_model(&self.ctx.storage, &picked);
+        persist_project_model(
+            &self.ctx.storage,
+            Path::new(&self.sessions[idx].app.state.session.cwd),
+            &picked,
+        );
         Ok(())
     }
 

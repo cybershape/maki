@@ -2,9 +2,11 @@
 //! inbox a message typed in a subagent's chat goes to instead.
 
 use std::borrow::Cow;
+use std::path::Path;
 
 use maki_agent::{AgentInput, AgentMode, ImageSource, InputSource};
 use maki_lua::agent_autocmd::HostEvent;
+use maki_storage::model::{persist_project_model, persist_project_model_thinking};
 
 use super::mode::{Mode, PlanTrigger};
 use super::{Action, App, InputWriter, Status};
@@ -377,6 +379,16 @@ impl App {
         self.recoverable_queue.clear();
         self.status = Status::Streaming;
         self.fire_session_event(HostEvent::TurnStart { text: &display });
+        let cwd = Path::new(&self.state.session.cwd);
+        persist_project_model(&self.storage, cwd, &self.state.model.spec());
+        if self.state.model.supports_thinking() {
+            persist_project_model_thinking(
+                &self.storage,
+                cwd,
+                &self.state.model.spec(),
+                self.state.thinking.into(),
+            );
+        }
         if !display.is_empty() || !input.images.is_empty() {
             self.main_chat()
                 .show_user_message(display, input.images.clone());

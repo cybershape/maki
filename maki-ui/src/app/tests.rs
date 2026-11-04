@@ -13021,6 +13021,68 @@ fn project_model_thinking_isolated_across_projects() {
 }
 
 #[test]
+fn project_last_model_persists_and_restores() {
+    use maki_storage::model::read_project_model;
+
+    let (_tmp, dir, _writer, mut app) = tempdir_app();
+    let model_a = test_model();
+    let model_b = test_opus_model();
+    let cwd = PathBuf::from(&app.state.session.cwd);
+
+    assert_eq!(read_project_model(&dir, &cwd), None);
+
+    app.apply_model(&model_a);
+    assert_eq!(
+        read_project_model(&dir, &cwd).as_deref(),
+        Some(model_a.spec().as_str())
+    );
+
+    app.apply_model(&model_b);
+    assert_eq!(
+        read_project_model(&dir, &cwd).as_deref(),
+        Some(model_b.spec().as_str())
+    );
+}
+
+#[test]
+fn project_last_model_isolated_across_projects() {
+    use maki_storage::model::read_project_model;
+
+    let (tmp, dir, writer, mut app1) = tempdir_app();
+    let model_a = test_model();
+    let model_b = test_opus_model();
+
+    let project1_dir = tmp.path().join("proj1");
+    let project2_dir = tmp.path().join("proj2");
+    std::fs::create_dir_all(&project1_dir).unwrap();
+    std::fs::create_dir_all(&project2_dir).unwrap();
+
+    app1.state
+        .session_mut()
+        .set_cwd(project1_dir.to_string_lossy().into_owned());
+    app1.apply_model(&model_a);
+    assert_eq!(
+        read_project_model(&dir, &project1_dir).as_deref(),
+        Some(model_a.spec().as_str())
+    );
+
+    let mut app2 = build_app(dir.clone(), Arc::clone(&writer));
+    app2.state
+        .session_mut()
+        .set_cwd(project2_dir.to_string_lossy().into_owned());
+    app2.apply_model(&model_b);
+    assert_eq!(
+        read_project_model(&dir, &project2_dir).as_deref(),
+        Some(model_b.spec().as_str())
+    );
+
+    assert_eq!(
+        read_project_model(&dir, &project1_dir).as_deref(),
+        Some(model_a.spec().as_str())
+    );
+}
+
+#[test]
 fn clicking_outside_compact_detail_closes_it() {
     use crate::components::GroupThinkingEntry;
 

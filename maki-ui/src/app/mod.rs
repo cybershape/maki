@@ -86,7 +86,8 @@ use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, a
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::{
-    persist_project_model_thinking, persist_thinking, read_project_model_thinking,
+    persist_project_model, persist_project_model_thinking, persist_thinking,
+    read_project_model_thinking,
 };
 use maki_storage::sessions::StoredTokenUsage;
 
@@ -1006,6 +1007,7 @@ impl App {
                 self.state.thinking.into(),
             );
         }
+        persist_project_model(&self.storage, cwd, &new_spec);
 
         let saved_thinking = if model.supports_thinking() {
             read_project_model_thinking(&self.storage, cwd, &new_spec).map(ThinkingConfig::from)

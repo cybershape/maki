@@ -14,7 +14,7 @@ use maki_providers::spec::ProviderRegistry;
 use maki_providers::{AgentError, Timeouts, custom, plugin};
 use maki_storage::StateDir;
 use maki_storage::log::RotatingFileWriter;
-use maki_storage::model::{read_model, read_thinking};
+use maki_storage::model::{persist_project_model, read_model, read_project_model, read_thinking};
 use serde_json::Value;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::EnvFilter;
@@ -37,6 +37,7 @@ pub async fn resolve_model(
     explicit: Option<&str>,
     provider_config: &ProviderConfig,
     storage: &StateDir,
+    cwd: Option<&Path>,
 ) -> Result<(Model, Option<String>)> {
     let policy = &provider_config.model_policy;
     if let Some(spec) = explicit {
@@ -48,21 +49,48 @@ pub async fn resolve_model(
         let model = from_spec_or_warm_catalog(spec)
             .await
             .context("invalid --model spec")?;
+        if let Some(cwd) = cwd {
+            persist_project_model(storage, cwd, &model.spec());
+        }
         return Ok((model, None));
     }
-    let Some(spec) = read_model(storage) else {
-        return Ok((fallback_model(provider_config).await?, None));
-    };
-    let skipped = match saved_model(&spec, policy).await {
-        Ok(model) => return Ok((model, None)),
-        Err(reason) => format!("saved model {spec} unavailable ({reason:#})"),
-    };
+    let project_spec = cwd.and_then(|c| read_project_model(storage, c));
+    let mut skipped_warning = None;
+    if let Some(ref spec) = project_spec {
+        match saved_model(spec, policy).await {
+            Ok(model) => return Ok((model, None)),
+            Err(reason) => {
+                skipped_warning = Some(format!(
+                    "saved project model {spec} unavailable ({reason:#})"
+                ));
+            }
+        }
+    }
+    let global_spec = read_model(storage);
+    if let Some(ref spec) = global_spec
+        && global_spec != project_spec
+    {
+        match saved_model(spec, policy).await {
+            Ok(model) => return Ok((model, skipped_warning)),
+            Err(reason) => {
+                let note = format!("saved model {spec} unavailable ({reason:#})");
+                skipped_warning = Some(match skipped_warning {
+                    Some(prev) => format!("{prev}; {note}"),
+                    None => note,
+                });
+            }
+        }
+    }
     match fallback_model(provider_config).await {
         Ok(model) => {
-            let warning = format!("{skipped}, using {}", model.spec());
-            Ok((model, Some(warning)))
+            let warning =
+                skipped_warning.map(|skipped| format!("{skipped}, using {}", model.spec()));
+            Ok((model, warning))
         }
-        Err(error) => Err(error.wrap_err(skipped)),
+        Err(error) => match skipped_warning {
+            Some(skipped) => Err(error.wrap_err(skipped)),
+            None => Err(error),
+        },
     }
 }
 

@@ -63,7 +63,7 @@ pub async fn run(
     let timeouts = maki_providers::Timeouts::from(&config.provider);
 
     let (model, warning) =
-        setup::resolve_model(model_arg.as_deref(), &config.provider, &storage).await?;
+        setup::resolve_model(model_arg.as_deref(), &config.provider, &storage, Some(&cwd)).await?;
     super::report_warnings(Vec::from_iter(warning));
     setup::remember_thinking(&mut config.session_defaults, &storage);
 

@@ -187,8 +187,13 @@ async fn build_stack(
     let commands = discover_commands(cli.no_commands, launch.cwd, &config);
 
     setup::remember_thinking(&mut config.session_defaults, launch.storage);
-    let model_result =
-        setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage).await;
+    let model_result = setup::resolve_model(
+        cli.model.as_deref(),
+        &config.provider,
+        launch.storage,
+        Some(launch.cwd),
+    )
+    .await;
     let (model, needs_login) = match (model_result, fallback_model) {
         (Ok((m, warning)), _) => {
             warnings.extend(warning);

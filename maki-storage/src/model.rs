@@ -39,6 +39,24 @@ pub fn read_thinking(dir: &StateDir) -> Option<StoredThinking> {
     StoredThinking::parse_setting(&raw).ok()
 }
 
+pub fn project_model_path(dir: &StateDir, cwd: &Path) -> PathBuf {
+    paths::project_dir(dir, cwd).join(MODEL_FILE)
+}
+
+pub fn persist_project_model(dir: &StateDir, cwd: &Path, spec: &str) {
+    let path = project_model_path(dir, cwd);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = atomic_write(&path, spec.as_bytes());
+}
+
+pub fn read_project_model(dir: &StateDir, cwd: &Path) -> Option<String> {
+    let raw = fs::read_to_string(project_model_path(dir, cwd)).ok()?;
+    let spec = raw.trim();
+    (!spec.is_empty()).then(|| spec.to_owned())
+}
+
 pub fn project_model_thinking_path(dir: &StateDir, cwd: &Path) -> PathBuf {
     paths::project_dir(dir, cwd).join(PROJECT_THINKING_FILE)
 }
@@ -321,5 +339,53 @@ mod tests {
         fs::write(&path, "invalid json content").unwrap();
 
         assert_eq!(read_project_model_thinking(&dir, &cwd, "any/model"), None);
+    }
+
+    #[test]
+    fn project_model_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let cwd = tmp.path().join("my-project");
+        fs::create_dir_all(&cwd).unwrap();
+
+        const MODEL_A: &str = "anthropic/claude-3-7-sonnet";
+        const MODEL_B: &str = "openai/gpt-5";
+
+        assert_eq!(read_project_model(&dir, &cwd), None);
+
+        persist_project_model(&dir, &cwd, MODEL_A);
+        assert_eq!(read_project_model(&dir, &cwd).as_deref(), Some(MODEL_A));
+
+        // Overwrite
+        persist_project_model(&dir, &cwd, MODEL_B);
+        assert_eq!(read_project_model(&dir, &cwd).as_deref(), Some(MODEL_B));
+    }
+
+    #[test]
+    fn project_model_shares_repo_root() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let repo_root = tmp.path().join("repo");
+        let sub_dir = repo_root.join("src").join("nested");
+        fs::create_dir_all(repo_root.join(".git")).unwrap();
+        fs::create_dir_all(&sub_dir).unwrap();
+
+        const MODEL: &str = "anthropic/claude-3-7-sonnet";
+        persist_project_model(&dir, &sub_dir, MODEL);
+        assert_eq!(read_project_model(&dir, &repo_root).as_deref(), Some(MODEL));
+    }
+
+    #[test]
+    fn project_model_ignores_empty() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let cwd = tmp.path().join("project");
+        fs::create_dir_all(&cwd).unwrap();
+
+        let path = project_model_path(&dir, &cwd);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "  \n").unwrap();
+
+        assert_eq!(read_project_model(&dir, &cwd), None);
     }
 }
