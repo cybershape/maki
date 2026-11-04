@@ -25,7 +25,6 @@ reqwest = { workspace = true, features = ["socks", "gzip", "deflate", "stream"] 
 base64 = { workspace = true }
 image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 sha2 = { workspace = true }
-hmac = { workspace = true }
 fastrand = { workspace = true }
 maki-config = { workspace = true }
 inventory = { workspace = true }

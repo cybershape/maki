@@ -26,10 +26,7 @@ Commands run in the session's working directory (see Environment) by default.
 
 ### `powershell` {#powershell}
 
-Execute a command through Windows PowerShell. PowerShell 7 or newer. `&&` and `||` work (`$?` is the previous statement, not the previous pipeline).
-- `&&` and `||` have lower precedence than `|`. Parenthesize a chain used as pipeline input: `(@(1) && @(2)) | Measure-Object`.
-- Ternary `?:` and null-coalescing `??` / `??=` work.
-- `ForEach-Object -Parallel` runs script blocks on other runspaces. It does not see variables unless you pass them with `$using:name`.
+Execute a command through Windows PowerShell. Do not use `&&` or `||`. Windows PowerShell 5.1 rejects them. Run one statement per call, or separate statements with `;`.
 - Commands run in the configured working directory or the current directory.
 - Use `workdir` instead of `Set-Location`.
 - Interactive commands are not supported.

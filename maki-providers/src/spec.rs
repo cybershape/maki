@@ -262,10 +262,21 @@ impl ProviderRegistry {
     /// A row compiled into this binary, never a plugin's.
     pub fn compiled(slug: &str) -> Option<&'static ProviderSpec> {
         if slug == RESPONSES_SPEC.slug {
-            Some(&RESPONSES_SPEC)
-        } else {
-            BUILTINS.iter().find(|s| s.slug == slug)
+            return Some(&RESPONSES_SPEC);
         }
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            if slug == TEST_COPILOT_SPEC.slug {
+                return Some(&TEST_COPILOT_SPEC);
+            }
+            if slug == TEST_OLLAMA_SPEC.slug {
+                return Some(&TEST_OLLAMA_SPEC);
+            }
+            if slug == TEST_ANTHROPIC_SPEC.slug {
+                return Some(&TEST_ANTHROPIC_SPEC);
+            }
+        }
+        BUILTINS.iter().find(|s| s.slug == slug)
     }
 
     pub fn all_compiled() -> &'static [ProviderSpec] {
@@ -309,6 +320,87 @@ impl Owner {
         Self::Unknown
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_COPILOT_SPEC: ProviderSpec = ProviderSpec {
+    slug: "copilot",
+    display_name: "copilot",
+    api_key_env: "TEST_COPILOT_API_KEY",
+    family: ModelFamily::Gpt,
+    supports_thinking: false,
+    supports_deferred_tools: false,
+    sends_thinking: sends_as_chosen,
+    thinking_fields_fallback: |_| Some(ThinkingFallback::None),
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(32_000),
+    fallback_context_window: 128_000,
+    models_toml: NO_CURATED_MODELS,
+    pricing_schedule: None,
+    build: Build::Declared(&[]),
+    aperture: None,
+    login: None,
+    docs: GeneratedDocs {
+        api_urls: &[],
+        features: None,
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Discovered("test"),
+        trailing_notes: &[],
+    },
+};
+
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_OLLAMA_SPEC: ProviderSpec = ProviderSpec {
+    slug: "ollama",
+    display_name: "ollama",
+    api_key_env: "TEST_OLLAMA_API_KEY",
+    family: ModelFamily::Gpt,
+    supports_thinking: false,
+    supports_deferred_tools: false,
+    sends_thinking: sends_as_chosen,
+    thinking_fields_fallback: |_| Some(ThinkingFallback::None),
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(32_000),
+    fallback_context_window: 128_000,
+    models_toml: NO_CURATED_MODELS,
+    pricing_schedule: None,
+    build: Build::Declared(&[]),
+    aperture: None,
+    login: None,
+    docs: GeneratedDocs {
+        api_urls: &[],
+        features: None,
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Discovered("test"),
+        trailing_notes: &[],
+    },
+};
+
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_ANTHROPIC_SPEC: ProviderSpec = ProviderSpec {
+    slug: "anthropic",
+    display_name: "anthropic",
+    api_key_env: "TEST_ANTHROPIC_API_KEY",
+    family: ModelFamily::Claude,
+    supports_thinking: false,
+    supports_deferred_tools: false,
+    sends_thinking: sends_as_chosen,
+    thinking_fields_fallback: |_| None,
+    accepts_arbitrary_models: false,
+    fallback_max_output: Some(32_000),
+    fallback_context_window: 128_000,
+    models_toml: NO_CURATED_MODELS,
+    pricing_schedule: None,
+    build: Build::Declared(&[]),
+    aperture: None,
+    login: None,
+    docs: GeneratedDocs {
+        api_urls: &[],
+        features: None,
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Discovered("test"),
+        trailing_notes: &[],
+    },
+};
 
 #[cfg(test)]
 mod tests {

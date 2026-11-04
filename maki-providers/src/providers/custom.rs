@@ -179,6 +179,34 @@ fn declared_specs_from(config: &ProvidersConfig) -> Vec<String> {
     specs
 }
 
+fn is_builtin_slug(slug: &str) -> bool {
+    slug == RESPONSES_SPEC.slug
+}
+
+/// The declared specs, plus the providers whose list they fully describe.
+/// A `discover_models` provider is left out of the second list: its declared
+/// specs show before discovery finishes, but only a successful probe proves
+/// which models it still serves.
+pub fn declared_batch() -> (Vec<String>, Vec<String>) {
+    declared_batch_from(&ProvidersConfig::load())
+}
+
+fn declared_batch_from(config: &ProvidersConfig) -> (Vec<String>, Vec<String>) {
+    let specs = declared_specs_from(config);
+    let mut providers: Vec<String> = config
+        .providers
+        .iter()
+        .filter(|(slug, def)| !def.discover_models && !is_builtin_slug(slug))
+        .map(|(slug, _)| (*slug).clone())
+        .collect();
+    providers.sort();
+    (specs, providers)
+}
+
+/// Models a custom provider can start on: its own `default_model`, then one
+/// declared model per tier. Never the protocol's default model, because a local
+/// server or proxy rarely serves it. Sorted by slug, since `providers.toml` is a
+/// map and startup should pick the same provider every run.
 pub fn startup_specs(tiers: &[ModelTier]) -> Vec<String> {
     startup_specs_from(&ProvidersConfig::load(), tiers)
 }
@@ -282,6 +310,46 @@ mod tests {
         assert_eq!(model.context_window, 64000);
     }
 
+    fn test_def(model_id: &str) -> ProviderDef {
+        ProviderDef {
+            models: vec![ModelDef {
+                id: model_id.to_string(),
+                name: None,
+                tier: ModelTier::Strong,
+                context_window: None,
+                max_output_tokens: None,
+                supports_tool_examples: None,
+                supports_thinking: None,
+                requires_thinking: None,
+                thinking_fields: None,
+                supports_vision: None,
+                pricing_input: None,
+                pricing_output: None,
+                pricing_cache_write: None,
+                pricing_cache_read: None,
+                pricing_fast_input: None,
+                pricing_fast_output: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A `discover_models` provider's declared specs still show before its
+    /// probe lands, but the batch must not claim it answered: a failed probe
+    /// would otherwise mark its undiscovered recents retired.
+    #[test]
+    fn declared_batch_leaves_discovering_providers_out() {
+        let mut config = ProvidersConfig::default();
+        config.upsert("declared".to_string(), test_def("small"));
+        let mut discovering = test_def("small");
+        discovering.discover_models = true;
+        config.upsert("discovering".to_string(), discovering);
+
+        let (specs, providers) = declared_batch_from(&config);
+        assert!(specs.contains(&"declared/small".to_string()));
+        assert!(specs.contains(&"discovering/small".to_string()));
+        assert_eq!(providers, ["declared"]);
+    }
     #[test]
     fn custom_model_inherits_discovered_requires_thinking_and_pricing() {
         let slug = "magpie-gw";

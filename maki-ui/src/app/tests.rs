@@ -263,10 +263,22 @@ pub(crate) fn enter_runtime() -> EnterGuard<'static> {
 }
 
 pub(crate) fn test_app() -> App {
-    spawned_app(
-        tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD)),
+    let id = MakiId::generate();
+    let path = env::temp_dir().join(format!("maki-test-{id}"));
+    let _ = fs::create_dir_all(&path);
+    let dir = StateDir::from_path(path);
+    let tab = OpenSession::fresh(TEST_MODEL_SPEC, TEST_CWD, &dir);
+    let writer = Arc::new(test_writer(dir.clone()));
+    let mut app = build_app_with_session(
+        dir,
+        writer,
+        LuaCommandReader::empty(),
+        tab,
         test_permissions(false),
-    )
+    );
+    let (shared_queue, _rx) = shared_queue::queue();
+    app.queue.set_shared(shared_queue);
+    app
 }
 
 /// A tab the way `Ctrl-N` and a resume build one. `App::new` takes the session
@@ -3318,6 +3330,7 @@ fn model_list_arriving_in_the_background_owes_a_frame() {
     assert_owes_one_frame(&mut app, || {
         models.store(Some(Arc::new(ModelList {
             specs: vec![LATE_MODEL_SPEC.into()],
+            live_providers: Vec::new(),
             loading: false,
         })));
     });

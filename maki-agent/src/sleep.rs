@@ -2,7 +2,6 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub const DEFAULT_SLEEP_THRESHOLD: Duration = Duration::from_secs(3);
 pub const WAKE_GRACE_DURATION: Duration = Duration::from_secs(15);
-const CLOCK_DRIFT_TOLERANCE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct SleepDetector {
@@ -40,12 +39,8 @@ impl SleepDetector {
         self.last_wall = now_wall;
         self.last_mono = now_mono;
 
-        if wall_delta >= self.threshold {
-            let sleep_duration = if wall_delta > mono_delta + CLOCK_DRIFT_TOLERANCE {
-                wall_delta.saturating_sub(mono_delta)
-            } else {
-                wall_delta
-            };
+        if wall_delta > mono_delta + self.threshold {
+            let sleep_duration = wall_delta.saturating_sub(mono_delta);
             Some(sleep_duration)
         } else {
             None
