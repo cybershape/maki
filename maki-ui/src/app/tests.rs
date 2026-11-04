@@ -13019,3 +13019,35 @@ fn project_model_thinking_isolated_across_projects() {
     app2.apply_model(&model);
     assert_eq!(app2.state.thinking, ThinkingConfig::Effort(Effort::Low));
 }
+
+#[test]
+fn clicking_outside_compact_detail_closes_it() {
+    use crate::components::GroupThinkingEntry;
+
+    let mut app = test_app();
+    app.compact_detail.open_thinking(GroupThinkingEntry {
+        id: 0,
+        text: "thinking output".into(),
+        tokens: 1,
+        active: false,
+        started_at: None,
+        duration: None,
+    });
+    assert!(app.compact_detail.is_open());
+
+    // Render to paint the modal and record its rendered area
+    let _ = rendered(&mut app);
+    assert!(app.compact_detail.is_open());
+
+    // Click inside popup: remains open
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        RENDERED_WIDTH / 2,
+        RENDERED_HEIGHT / 2,
+    ));
+    assert!(app.compact_detail.is_open());
+
+    // Click outside popup: closes the modal
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0));
+    assert!(!app.compact_detail.is_open());
+}

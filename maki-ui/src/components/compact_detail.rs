@@ -57,6 +57,7 @@ pub struct CompactDetailModal {
     current: usize,
     scroll: ModalScroll,
     watermark_height: u16,
+    rendered_area: Option<Rect>,
 }
 
 impl CompactDetailModal {
@@ -66,6 +67,7 @@ impl CompactDetailModal {
             current: 0,
             scroll: ModalScroll::new_top(),
             watermark_height: 0,
+            rendered_area: None,
         }
     }
 
@@ -88,6 +90,7 @@ impl CompactDetailModal {
             current.min(self.items.len() - 1)
         };
         self.watermark_height = 0;
+        self.rendered_area = None;
     }
 
     pub fn is_open(&self) -> bool {
@@ -99,6 +102,11 @@ impl CompactDetailModal {
         self.current = 0;
         self.scroll.reset();
         self.watermark_height = 0;
+        self.rendered_area = None;
+    }
+
+    pub fn contains(&self, pos: ratatui::layout::Position) -> bool {
+        self.rendered_area.is_some_and(|r| r.contains(pos))
     }
 
     pub fn next_item(&mut self) {
@@ -146,6 +154,7 @@ impl CompactDetailModal {
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         let Some(shown) = self.items.get(self.current) else {
+            self.rendered_area = None;
             return Rect::default();
         };
         let lines = match shown {
@@ -216,6 +225,7 @@ impl CompactDetailModal {
                 u32::from(self.scroll.offset()),
             );
         }
+        self.rendered_area = Some(popup);
         popup
     }
 }
@@ -812,5 +822,41 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(receiving_text.contains(RECEIVING), "{receiving_text}");
+    }
+
+    #[test]
+    fn contains_checks_rendered_area() {
+        use ratatui::layout::Position;
+
+        let mut modal = CompactDetailModal::new();
+        modal.open_tool(tool(CompactDetail::default()));
+
+        // Not rendered yet
+        assert!(!modal.contains(Position::new(10, 10)));
+
+        let popup = render_popup(&mut modal, 40);
+        assert!(popup.width > 0 && popup.height > 0);
+
+        // Inside popup
+        assert!(modal.contains(Position::new(popup.x, popup.y)));
+        assert!(modal.contains(Position::new(popup.x + 1, popup.y + 1)));
+        assert!(modal.contains(Position::new(
+            popup.x + popup.width - 1,
+            popup.y + popup.height - 1
+        )));
+
+        // Outside popup
+        if popup.x > 0 {
+            assert!(!modal.contains(Position::new(0, popup.y)));
+        }
+        if popup.y > 0 {
+            assert!(!modal.contains(Position::new(popup.x, 0)));
+        }
+        assert!(!modal.contains(Position::new(popup.x + popup.width + 1, popup.y)));
+        assert!(!modal.contains(Position::new(popup.x, popup.y + popup.height + 1)));
+
+        // After close
+        modal.close();
+        assert!(!modal.contains(Position::new(popup.x + 1, popup.y + 1)));
     }
 }

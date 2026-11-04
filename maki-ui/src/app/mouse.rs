@@ -7,7 +7,7 @@ use crate::selection::{
     SelectionZone,
 };
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 use crate::components::input::InputAction;
 use crate::image;
@@ -31,6 +31,13 @@ impl App {
                     .push(spawn_read(clipboard::read_primary_selection));
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.compact_detail.is_open() {
+                    let pos = Position::new(event.column, event.row);
+                    if !self.compact_detail.contains(pos) {
+                        self.compact_detail.close();
+                        return;
+                    }
+                }
                 if let Some(zone) = self.zone_at(event.row, event.column) {
                     if self.has_modal_overlay() && zone.zone != SelectionZone::Overlay {
                         return;
