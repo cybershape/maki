@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `936726a543cd02183d5048699b723841bbff4200`
-  - **Commit date**: `Mon Nov 2 22:45:32 2026 +0000`
-  - **Commit author**: `renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>`
-  - **Commit message**: `chore(deps): update flake.lock`
+  - **Commit SHA**: `ef3032d913f694c27257e3126c5306624d34164f`
+  - **Commit date**: `Tue Nov 3 18:01:39 2026 +0100`
+  - **Commit author**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
+  - **Commit message**: `fix(question): widen the answer prefix to string for the checker`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `936726a5`.
+> `upstream/main` has been successfully merged through commit `ef3032d9`.
 
 ---
 
@@ -142,6 +142,9 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `fad38ace` | `docs: note powershell utf-8 fix and split SGR mouse swallow` | Note PowerShell UTF-8 fix and split SGR mouse swallow in README |
 | `5290d387` | `fix(index): recurse into C# namespace bodies` | Recurse into C# block-scoped and file-scoped namespace bodies |
 | `10a4d42e` | `Merge branch 'upstream/main' into main` | Merge upstream through `936726a5`, including u64 session token counters, restore snapshot scoping to chats with the tool, current cwd adoption on session resume, dependency updates, cargo-deny workflow gate, and other upstream improvements while preserving core fork customizations |
+| `f5393a88` | `docs: update upstream tracking record to 936726a5` | Update upstream tracking record to `936726a5` |
+| `399206b8` | `feat(storage): remember last thinking level per model per project` | Persist and restore the last thinking level per model per project |
+| `5a1e2d5f` | `Merge branch 'upstream/main' into main` | Merge upstream through `ef3032d9`, including prompt cache reuse for `/btw`, model picker recent retired model filtering, tree-sitter-dart 0.3.0 update, lute nightly/renovate CI updates, Lua job pump wakeup refactor, headless first-turn provider discovery, and question prefix fixes while preserving core fork customizations |
 
 ---
 
