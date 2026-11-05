@@ -188,3 +188,18 @@ fn bash_keeps_both_ends_and_exit_status(exit_code: usize, stderr: bool) {
         assert_eq!(output.unwrap_err(), format!("{expected}\n{FAILURE_STATUS}"));
     }
 }
+
+#[test]
+fn bash_strips_ansi_escapes_and_overwrites() {
+    let (_host, ctx) = setup(ToolOutputMode::Compact);
+    let command = "printf '\\033[32m✓\\033[39m pass\\r✓ passed\\n\\033[1;31mFAIL\\033[0m test\\n'";
+    let output = run(&ctx, json!({ "command": command })).unwrap();
+    assert_eq!(output, "✓ passed\nFAIL test");
+}
+
+#[test]
+fn bash_injects_no_color_env() {
+    let (_host, ctx) = setup(ToolOutputMode::Compact);
+    let output = run(&ctx, json!({ "command": "printf '%s' \"$NO_COLOR\"" })).unwrap();
+    assert_eq!(output, "1");
+}

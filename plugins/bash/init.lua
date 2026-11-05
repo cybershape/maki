@@ -69,6 +69,21 @@ local function normalize_sep(s)
   return s:gsub("\\", "/")
 end
 
+local function strip_ansi(s)
+  if not s:find("\27", 1, true) and not s:find("\r", 1, true) then
+    return s
+  end
+  if s:find("\r", 1, true) then
+    s = s:match(".*\r([^\r]*)$") or s
+  end
+  s = s:gsub("\27%[[0-9;?<=>]*[@-~]", "")
+  s = s:gsub("\27%]..-\7", "")
+  s = s:gsub("\27%]..-\27\\", "")
+  s = s:gsub("\27[@-Z\\%-_]", "")
+  s = s:gsub("\27", "")
+  return s
+end
+
 local function relative_path(p)
   local np = normalize_sep(p)
   local cwd = maki.uv.cwd()
@@ -531,6 +546,12 @@ maki.api.register_tool({
     end
 
     local function capture(line, bytes)
+      local cleaned = strip_ansi(line)
+      if cleaned ~= line then
+        local diff = #line - #cleaned
+        bytes = (bytes and bytes > diff) and (bytes - diff) or #cleaned
+        line = cleaned
+      end
       if not has_output then
         has_output = true
         view:clear()
@@ -636,7 +657,10 @@ maki.api.register_tool({
 
     local job, err = maki.fn.jobstart(command, {
       cwd = workdir,
-      env = { GIT_TERMINAL_PROMPT = "0" },
+      env = {
+        GIT_TERMINAL_PROMPT = "0",
+        NO_COLOR = "1",
+      },
       max_line_bytes = max_bytes and math.max(max_bytes, LOG_LINE_BYTES),
       on_stdout = function(_, line, _, bytes)
         capture(line, bytes)
