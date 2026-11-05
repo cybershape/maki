@@ -28,6 +28,9 @@ local EXT_TO_LANG = {
   hh = "cpp",
   ixx = "cpp",
   cs = "c_sharp",
+  fs = "fsharp",
+  fsi = "fsharp_signature",
+  fsx = "fsharp",
   rb = "ruby",
   rake = "ruby",
   gemspec = "ruby",
@@ -863,6 +866,7 @@ end
 local LANG_ALIASES = {
   javascript = "typescript",
   tsx = "typescript",
+  fsharp_signature = "fsharp",
 }
 
 local KNOWN_LANGS = {}

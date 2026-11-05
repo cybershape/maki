@@ -41,6 +41,8 @@ pub enum Language {
     Make,
     Clojure,
     Vue,
+    FSharp,
+    FSharpSignature,
 }
 
 impl Language {
@@ -83,6 +85,8 @@ impl Language {
             "make" => Some(Self::Make),
             "clojure" => Some(Self::Clojure),
             "vue" => Some(Self::Vue),
+            "fsharp" | "f_sharp" => Some(Self::FSharp),
+            "fsharp_signature" => Some(Self::FSharpSignature),
             _ => None,
         }
     }
@@ -125,6 +129,8 @@ impl Language {
             "mk" => Some(Self::Make),
             "clj" | "cljs" | "cljc" | "bb" => Some(Self::Clojure),
             "vue" => Some(Self::Vue),
+            "fs" | "fsx" => Some(Self::FSharp),
+            "fsi" => Some(Self::FSharpSignature),
             _ => None,
         }
     }
@@ -168,6 +174,8 @@ impl Language {
             Self::Make => tree_sitter_make::LANGUAGE.into(),
             Self::Clojure => tree_sitter_clojure_orchard::LANGUAGE.into(),
             Self::Vue => tree_sitter_vue_next::LANGUAGE.into(),
+            Self::FSharp => tree_sitter_fsharp::LANGUAGE_FSHARP.into(),
+            Self::FSharpSignature => tree_sitter_fsharp::LANGUAGE_SIGNATURE.into(),
         }
     }
 }
@@ -230,6 +238,23 @@ mod tests {
         assert!(parses_cleanly(
             Language::from_extension("vue").unwrap(),
             "<template><div>{{ msg }}</div></template>\n<script setup lang=\"ts\">\nconst msg = 'hello';\n</script>"
+        ));
+    }
+
+    #[test_case("fs")]
+    #[test_case("fsx")]
+    fn fsharp_extension_parses_cleanly(ext: &str) {
+        assert!(parses_cleanly(
+            Language::from_extension(ext).unwrap(),
+            "module M\nlet x = 42\n"
+        ));
+    }
+
+    #[test]
+    fn fsharp_signature_extension_parses_cleanly() {
+        assert!(parses_cleanly(
+            Language::from_extension("fsi").unwrap(),
+            "module M\nval x : int\n"
         ));
     }
 }
