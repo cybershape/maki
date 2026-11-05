@@ -137,6 +137,7 @@ fn supports_osc9(value: &str) -> bool {
     )
 }
 
+#[cfg(any(windows, test))]
 fn supports_kitty_keyboard_terminal(value: &str) -> bool {
     matches!(
         normalize_terminal_id(value).as_str(),
@@ -144,6 +145,7 @@ fn supports_kitty_keyboard_terminal(value: &str) -> bool {
     )
 }
 
+#[cfg(any(windows, test))]
 fn is_kitty_keyboard_supported(env: &TerminalEnvironment<'_>, tmux: Option<&TmuxClient>) -> bool {
     if env.kitty || env.wezterm || std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some() {
         return true;
