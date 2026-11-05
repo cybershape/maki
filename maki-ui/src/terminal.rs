@@ -10,10 +10,12 @@ use crossterm::ExecutableCommand;
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 #[cfg(not(windows))]
-use crossterm::event::{DisableFocusChange, EnableFocusChange};
+use crossterm::event::{
+    DisableFocusChange, EnableFocusChange, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use maki_config::NotificationMethod;
 
@@ -25,6 +27,10 @@ const BELL_SEQUENCE: &str = "\u{7}";
 /// title outlives the session. Terminals without a title stack ignore both.
 const PUSH_WINDOW_TITLE_SEQUENCE: &str = "\u{1b}[22;2t";
 const POP_WINDOW_TITLE_SEQUENCE: &str = "\u{1b}[23;2t";
+#[cfg(windows)]
+const PUSH_KEYBOARD_ENHANCEMENT_SEQUENCE: &str = "\u{1b}[>1u";
+#[cfg(windows)]
+const POP_KEYBOARD_ENHANCEMENT_SEQUENCE: &str = "\u{1b}[<u";
 /// Raw mode is already on when the tmux query runs, so a wedged tmux server
 /// must not be able to hang startup with Ctrl-C disabled.
 const TMUX_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -129,6 +135,59 @@ fn supports_osc9(value: &str) -> bool {
             | "xtermghostty"
             | "xtermkitty"
     )
+}
+
+fn supports_kitty_keyboard_terminal(value: &str) -> bool {
+    matches!(
+        normalize_terminal_id(value).as_str(),
+        "ghostty" | "kitty" | "wezterm" | "foot" | "footextra" | "xtermghostty" | "xtermkitty"
+    )
+}
+
+fn is_kitty_keyboard_supported(env: &TerminalEnvironment<'_>, tmux: Option<&TmuxClient>) -> bool {
+    if env.kitty || env.wezterm || std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some() {
+        return true;
+    }
+    if let Some(term_program) = env.term_program.filter(|value| !value.trim().is_empty()) {
+        let norm = normalize_terminal_id(term_program);
+        if norm == "tmux" {
+            return tmux.is_some_and(|client| {
+                client
+                    .term_type
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(supports_kitty_keyboard_terminal)
+                    || supports_kitty_keyboard_terminal(&client.term_name)
+            });
+        }
+        if supports_kitty_keyboard_terminal(&norm) {
+            return true;
+        }
+    }
+    if let Some(term) = env.term.filter(|value| !value.trim().is_empty()) {
+        if supports_kitty_keyboard_terminal(term) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn supports_kitty_keyboard() -> bool {
+    let term_program = std::env::var("TERM_PROGRAM").ok();
+    let term = std::env::var("TERM").ok();
+    let env = TerminalEnvironment {
+        term_program: term_program.as_deref(),
+        wezterm: std::env::var_os("WEZTERM_VERSION").is_some(),
+        iterm: false,
+        kitty: std::env::var_os("KITTY_WINDOW_ID").is_some(),
+        term: term.as_deref(),
+    };
+    let tmux = env
+        .term_program
+        .filter(|value| normalize_terminal_id(value) == "tmux")
+        .and_then(|_| query_tmux_client());
+    is_kitty_keyboard_supported(&env, tmux.as_ref())
 }
 
 fn resolve_notifier(
@@ -345,7 +404,12 @@ fn teardown() {
 fn pop_terminal_modes() {
     write_mux_sequence(POP_WINDOW_TITLE_SEQUENCE);
     stdout().execute(crossterm::cursor::Show).ok();
+    #[cfg(not(windows))]
     stdout().execute(PopKeyboardEnhancementFlags).ok();
+    #[cfg(windows)]
+    if supports_kitty_keyboard() {
+        write_mux_sequence(POP_KEYBOARD_ENHANCEMENT_SEQUENCE);
+    }
     disable_focus_change();
     stdout().execute(DisableMouseCapture).ok();
     stdout().execute(DisableBracketedPaste).ok();
@@ -380,10 +444,16 @@ fn disable_focus_change() {
 fn disable_focus_change() {}
 
 fn push_keyboard_enhancement() {
+    #[cfg(not(windows))]
     if let Err(e) = stdout().execute(PushKeyboardEnhancementFlags(
         KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
     )) {
         tracing::warn!(error = %e, "failed to enable keyboard enhancement (Kitty protocol)");
+    }
+
+    #[cfg(windows)]
+    if supports_kitty_keyboard() {
+        write_mux_sequence(PUSH_KEYBOARD_ENHANCEMENT_SEQUENCE);
     }
 }
 
@@ -583,6 +653,51 @@ mod tests {
             ..TerminalEnvironment::default()
         };
         assert!(!auto_supports_osc9(&terminal, None));
+    }
+
+    #[test_case(Some("ghostty"), None, false, false => true ; "ghostty_term_program")]
+    #[test_case(Some("Ghostty"), None, false, false => true ; "ghostty_capitalized")]
+    #[test_case(Some("kitty"), None, false, false => true ; "kitty_term_program")]
+    #[test_case(Some("wezterm"), None, false, false => true ; "wezterm_term_program")]
+    #[test_case(Some("foot"), None, false, false => true ; "foot_term_program")]
+    #[test_case(None, Some("xterm-ghostty"), false, false => true ; "xterm_ghostty")]
+    #[test_case(None, Some("xterm-kitty"), false, false => true ; "xterm_kitty")]
+    #[test_case(None, None, true, false => true ; "kitty_env_flag")]
+    #[test_case(None, None, false, true => true ; "wezterm_env_flag")]
+    #[test_case(Some("alacritty"), Some("xterm-256color"), false, false => false ; "unsupported_alacritty")]
+    #[test_case(Some("Windows Terminal"), Some("xterm-256color"), false, false => false ; "unsupported_windows_terminal")]
+    #[test_case(None, Some("xterm-256color"), false, false => false ; "plain_xterm")]
+    #[test_case(None, None, false, false => false ; "empty_env")]
+    fn test_kitty_keyboard_support(
+        term_program: Option<&str>,
+        term: Option<&str>,
+        kitty: bool,
+        wezterm: bool,
+    ) -> bool {
+        let env = TerminalEnvironment {
+            term_program,
+            wezterm,
+            iterm: false,
+            kitty,
+            term,
+        };
+        is_kitty_keyboard_supported(&env, None)
+    }
+
+    #[test]
+    fn kitty_keyboard_support_inside_tmux() {
+        let terminal = env(Some("tmux"));
+        let ghostty = TmuxClient {
+            term_type: "ghostty 1.2.3".into(),
+            term_name: "xterm-256color".into(),
+        };
+        assert!(is_kitty_keyboard_supported(&terminal, Some(&ghostty)));
+        let unsupported = TmuxClient {
+            term_type: "alacritty".into(),
+            term_name: "xterm-256color".into(),
+        };
+        assert!(!is_kitty_keyboard_supported(&terminal, Some(&unsupported)));
+        assert!(!is_kitty_keyboard_supported(&terminal, None));
     }
 
     #[test]
