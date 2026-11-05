@@ -367,7 +367,13 @@ fn default_tool_usage(prompt: PromptId, is_tool_enabled: &impl Fn(&str) -> bool)
                 parts.push("**batch** for parallel calls");
             }
             if code_execution {
-                parts.push("**code_execution** for chained/filtered calls");
+                if !batch {
+                    parts.push(
+                        "**code_execution** for parallel/batch calls (via gather) and chained/filtered calls",
+                    );
+                } else {
+                    parts.push("**code_execution** for chained/filtered calls");
+                }
             }
             if task {
                 parts.push("**task** for delegation");
@@ -390,6 +396,8 @@ fn default_tool_usage(prompt: PromptId, is_tool_enabled: &impl Fn(&str) -> bool)
             lines.push("- Every tool result grows your context. Minimize use of verbose tool calls, prefer compact results.");
             if batch {
                 lines.push("- **Use batch** for 2+ independent reads, greps, or globs. Never call them one at a time sequentially.");
+            } else if code_execution {
+                lines.push("- **Use code_execution** (with gather) for 2+ independent reads, greps, or globs, as batch is disabled. Never call them one at a time sequentially.");
             }
             if code_execution {
                 lines.push("- **Use code_execution** for dependent/chained calls (e.g. glob then read matches) or filtering large tool outputs.");
@@ -406,7 +414,7 @@ fn default_tool_usage(prompt: PromptId, is_tool_enabled: &impl Fn(&str) -> bool)
             } else if batch {
                 lines.push("- **Use batch** for 2+ independent parallel calls.");
             } else if code_execution {
-                lines.push("- **Use code_execution** for dependent/chained calls or filtering/processing results.");
+                lines.push("- **Use code_execution** for 2+ independent parallel calls (via gather, as batch is disabled) or dependent/chained calls and filtering/processing results.");
             }
             lines.push("- Read files before editing them. Look at surrounding context and imports to match conventions.");
             lines.push("- Prefer edit/multiedit over write; targeted edits use far fewer tokens.");
@@ -892,7 +900,7 @@ mod tests {
         let is_enabled = |name: &str| name != "batch";
         let out = p.render_with_tools(PromptId::System, &Vars::default(), "", &is_enabled);
         assert!(out.contains(
-            "- Use **code_execution** for chained/filtered calls, **task** for delegation."
+            "- Use **code_execution** for parallel/batch calls (via gather) and chained/filtered calls, **task** for delegation."
         ));
         assert!(!out.contains("Combine **batch** and **task**"));
         assert!(!out.contains("**batch** for parallel calls"));
@@ -927,7 +935,9 @@ mod tests {
         let p = ResolvedPrompts::default();
         let is_enabled = |name: &str| name == "code_execution";
         let out = p.render_with_tools(PromptId::System, &Vars::default(), "", &is_enabled);
-        assert!(out.contains("- Use **code_execution** for chained/filtered calls."));
+        assert!(out.contains(
+            "- Use **code_execution** for parallel/batch calls (via gather) and chained/filtered calls."
+        ));
         assert!(!out.contains("Combine **batch** and **task**"));
         assert!(!out.contains("**batch**"));
         assert!(!out.contains("**task**"));
@@ -1010,7 +1020,12 @@ mod tests {
         let out_batch_disabled =
             p.render_with_tools(PromptId::Research, &Vars::default(), "", &|n| n != "batch");
         assert!(!out_batch_disabled.contains("**Use batch**"));
-        assert!(out_batch_disabled.contains("**Use code_execution**"));
+        assert!(out_batch_disabled.contains(
+            "- **Use code_execution** (with gather) for 2+ independent reads, greps, or globs, as batch is disabled. Never call them one at a time sequentially."
+        ));
+        assert!(out_batch_disabled.contains(
+            "- **Use code_execution** for dependent/chained calls (e.g. glob then read matches) or filtering large tool outputs."
+        ));
 
         let out_both_disabled =
             p.render_with_tools(PromptId::Research, &Vars::default(), "", &|n| {
@@ -1027,7 +1042,7 @@ mod tests {
             p.render_with_tools(PromptId::General, &Vars::default(), "", &|n| n != "batch");
         assert!(!out_batch_disabled.contains("**Use batch**"));
         assert!(out_batch_disabled.contains(
-            "- **Use code_execution** for dependent/chained calls or filtering/processing results."
+            "- **Use code_execution** for 2+ independent parallel calls (via gather, as batch is disabled) or dependent/chained calls and filtering/processing results."
         ));
 
         let out_code_disabled =

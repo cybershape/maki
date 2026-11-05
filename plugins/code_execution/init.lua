@@ -150,6 +150,24 @@ Use for chained/dependent tool calls and filtering/processing results, e.g. filt
   * Builtins NOT implemented: `iter`, `callable`, `dir`, `globals`, `locals`, `eval`, `exec`.
 ]]
 
+local description_batch_disabled = [[Execute Python in a sandbox where every tool is an async function.
+
+Use for parallel/batch calls (the batch tool is disabled; use gather), chained/dependent tool calls, and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** cheaper than sequential tool calls!
+
+- All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Parse output yourself.
+- Tool results are complete. Only what you print/return is capped.
+- Concurrency / Batch execution: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`. The batch tool is disabled; use code_execution with `await gather(...)` to run multiple independent tool calls concurrently (replacing batch).
+- Available libs: re, asyncio, sys, os, json, pathlib. No other imports, no classes, no network access. `open()` works on text files, and `os`/`pathlib` can stat, list, walk, glob and mkdir.
+- Fresh sandbox each run: no state persists between executions.
+- 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
+- NEVER use as a proxy or wrapper for a single tool call. If no code logic, chaining, or output filtering is needed, invoke the tool directly (batching 2+ independent calls via gather is allowed when batch is disabled).
+- NOT a thinking scratchpad. Reason in your response text.
+- Monty sandbox limitations (avoid common failures):
+  * Generator expressions `(x for ...)` materialize as `list`, and `iter()` is unavailable: DO NOT use `next(x for ...)`; use a `for` loop or `[...][0]` instead.
+  * No `:=` (walrus), no `del` (use `d.pop(k, None)`), no `*args` unpacking in calls (`f(*args)`), no `match/case`, no decorators (`@...`).
+  * Builtins NOT implemented: `iter`, `callable`, `dir`, `globals`, `locals`, `eval`, `exec`.
+]]
+
 local schema = {
   type = "object",
   required = { "code" },
@@ -249,7 +267,8 @@ end
 -- Keep cheap: runs on every request build. get_tools skips descriptions
 -- to avoid recursion from describe callbacks.
 local function describe(dctx)
-  local parts = { description, TOOLS_HEADER }
+  local base_desc = matches_filter("batch", dctx) and description or description_batch_disabled
+  local parts = { base_desc, TOOLS_HEADER }
   local has_workflow_only, gated = false, {}
   -- Ask as if workflow were on, then hold back what it would unlock: those
   -- names are listed as not callable, so the model stops trying them.

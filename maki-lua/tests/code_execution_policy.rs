@@ -321,6 +321,31 @@ fn describe_excludes_list_dir_when_filtered() {
 }
 
 #[test]
+fn describe_notes_batch_execution_when_batch_tool_disabled() {
+    let (reg, _host) = setup();
+    let desc_default = describe(&reg, &ToolFilter::All, ToolAudience::MAIN, false);
+    assert!(
+        !desc_default.contains("the batch tool is disabled"),
+        "did not expect batch disabled note when batch is enabled: {desc_default}"
+    );
+
+    let desc_disabled = describe(
+        &reg,
+        &ToolFilter::AllExcept(vec!["batch".into()]),
+        ToolAudience::MAIN,
+        false,
+    );
+    assert!(
+        desc_disabled.contains("the batch tool is disabled"),
+        "expected batch disabled note when batch is filtered: {desc_disabled}"
+    );
+    assert!(
+        desc_disabled.contains("await gather(...)"),
+        "expected gather note when batch is filtered: {desc_disabled}"
+    );
+}
+
+#[test]
 fn list_dir_tool_is_callable_and_preserves_builtin_list() {
     let out = run_code(
         "res = await list_dir(path='test_path')\nitems = list([1, 2])\nprint(f'{res}')\nprint(f'items: {len(items)}')",
