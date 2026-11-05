@@ -2522,7 +2522,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_models_announces_when_options_change_without_new_specs() {
         let (mut srv, .., out_rx) = test_server();
-        let target_spec = "responses/model-with-name";
+        let target_spec = "test-display-slug/model-with-name";
         srv.model_specs = vec![target_spec.to_owned()];
         srv.session.as_mut().unwrap().current_model = target_spec.to_string();
 
@@ -2532,7 +2532,7 @@ mod tests {
 
         // Model registry now discovers the friendly name
         model_registry::set_known_models(
-            "responses",
+            "test-display-slug",
             vec![ModelInfo {
                 name: Some("Resolved Friendly Name".to_string()),
                 ..ModelInfo::id_only("model-with-name".to_string())
