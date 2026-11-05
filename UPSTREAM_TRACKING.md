@@ -145,6 +145,10 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `f5393a88` | `docs: update upstream tracking record to 936726a5` | Update upstream tracking record to `936726a5` |
 | `399206b8` | `feat(storage): remember last thinking level per model per project` | Persist and restore the last thinking level per model per project |
 | `5a1e2d5f` | `Merge branch 'upstream/main' into main` | Merge upstream through `ef3032d9`, including prompt cache reuse for `/btw`, model picker recent retired model filtering, tree-sitter-dart 0.3.0 update, lute nightly/renovate CI updates, Lua job pump wakeup refactor, headless first-turn provider discovery, and question prefix fixes while preserving core fork customizations |
+| `d987ed04` | `docs: update upstream tracking record to ef3032d9` | Update upstream tracking record to `ef3032d9` |
+| `a32eb9d7` | `feat(ui): close compact detail popup when clicking outside` | Close compact detail popup when clicking outside its bounds |
+| `2fd55f84` | `feat(storage): remember last used model per project` | Persist and restore the last used model per project |
+| `53a3ac7a` | `test(acp): use dedicated provider slug in display name resolution test` | Prevent model registry collisions in parallel tests by using an isolated provider slug |
 
 ---
 
@@ -193,6 +197,12 @@ Pay particular attention to the following potential conflicts and integration re
 - **Affected files**: `plugins/code_execution/`, `maki-lua/`
 - **Key changes**:
   - Update sandbox filesystem operations to use the renamed built-in `list_dir` tool.
+
+### 3.7. Storage & Per-Project Model Memory
+
+- **Affected files**: `maki-storage/`, `maki-ui/`, `src/`
+- **Key changes**:
+  - Persist and restore the last used model and thinking level per model per project under `<state>/projects/<project-id>/`.
 
 ---
 
