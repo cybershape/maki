@@ -81,6 +81,7 @@ use maki_lua::{
     PackPreparation, Permission, PlanActionOutcome, PlanMenu, PlanRowAction, PluginReach, WinView,
     is_reserved,
 };
+use maki_markdown::parse_inline;
 use maki_providers::models_cache::ModelList;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
 use maki_storage::StateDir;
@@ -414,13 +415,91 @@ impl Notification {
     }
 }
 
-/// Lazy, so a huge response only costs the first `NOTIFICATION_PREVIEW_CHARS`
-/// characters.
+fn strip_markdown_links(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('[') {
+        let is_image = start > 0 && rest.as_bytes()[start - 1] == b'!';
+        let prefix_end = if is_image { start - 1 } else { start };
+        out.push_str(&rest[..prefix_end]);
+        let after_bracket = &rest[start + 1..];
+        if let Some(close_bracket) = after_bracket.find(']') {
+            let label = &after_bracket[..close_bracket];
+            let after_close = &after_bracket[close_bracket + 1..];
+            if after_close.starts_with('(')
+                && let Some(close_paren) = after_close.find(')')
+            {
+                out.push_str(label);
+                rest = &after_close[close_paren + 1..];
+                continue;
+            }
+        }
+        out.push_str(&rest[prefix_end..=start]);
+        rest = after_bracket;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn strip_block_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('#') {
+        let rest = rest.trim_start_matches('#');
+        if let Some(content) = rest.strip_prefix(' ') {
+            return content.trim_start();
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix('>') {
+        return rest.trim_start();
+    }
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        return trimmed[2..].trim_start();
+    }
+    trimmed
+}
+
+fn clean_markdown_line(line: &str) -> String {
+    let stripped = strip_block_prefix(line);
+    if stripped.starts_with("```") || stripped.starts_with("~~~") {
+        return String::new();
+    }
+    if stripped == "---" || stripped == "***" || stripped == "___" {
+        return String::new();
+    }
+    let without_links = strip_markdown_links(stripped);
+    let spans = parse_inline(&without_links);
+    if spans.is_empty() {
+        without_links
+    } else {
+        spans.into_iter().map(|s| s.text).collect()
+    }
+}
+
 fn notification_preview<'a>(chunks: impl Iterator<Item = &'a str>) -> Option<String> {
     let mut preview: String = chunks
-        .flat_map(str::split_whitespace)
+        .flat_map(|chunk| {
+            chunk.lines().flat_map(|line| {
+                let max_bytes = line
+                    .char_indices()
+                    .nth(NOTIFICATION_PREVIEW_CHARS * 2)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(line.len());
+                let cleaned = clean_markdown_line(&line[..max_bytes]);
+                cleaned
+                    .split_whitespace()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            })
+        })
         .enumerate()
-        .flat_map(|(i, word)| (i > 0).then_some(' ').into_iter().chain(word.chars()))
+        .flat_map(|(i, word)| {
+            let mut chars = Vec::with_capacity(word.len() + usize::from(i > 0));
+            if i > 0 {
+                chars.push(' ');
+            }
+            chars.extend(word.chars());
+            chars
+        })
         .take(NOTIFICATION_PREVIEW_CHARS)
         .collect();
     if preview.ends_with(' ') {

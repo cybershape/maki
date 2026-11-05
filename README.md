@@ -17,7 +17,7 @@
   - Prompt queue with steer shortcut (Shift-Enter) to steer a running turn, plus recall editing for queued and previous prompts.
   - Context-window usage progress bar in status bar using theme colors; compact single-width Unicode per-turn stats line upon completion (`◷` elapsed / thinking, `↑`/`↓` tokens, `»` speed, `t₁` TTFT, `⛁` cache).
   - Markdown LaTeX math expression rendering via `txm`.
-  - OSC 7501 Program Status Protocol support for terminal status reporting; inline image rendering for Rex (`TERM_PROGRAM=rex`).
+  - OSC 7501 Program Status Protocol support for terminal status reporting with markdown formatting stripped from turn completion messages; inline image rendering for Rex (`TERM_PROGRAM=rex`).
   - Stylized user messages with chevron prefix and background tint.
   - Layout and display options: `show_cost`, `prefer_model_name`, `max_width` centering (supporting column counts, viewport ratios like `0.8`, and negative offsets like `-10`), and column-boundary text wrapping.
   - Viewport resize debouncing (50ms debounce with 200ms throttle) to prevent continuous repainting and reflow thrashing during window resize animations and dragging.

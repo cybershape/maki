@@ -10693,6 +10693,23 @@ fn turn_response_stops_after_bounded_large_input() {
     assert!(!response.contains("not reached"));
 }
 
+#[test]
+fn turn_response_strips_markdown_formatting() {
+    let message = Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: "### **明确结论: 不需要改代码，维持现状**\n\n- 查看 [文档](https://example.com) 并运行 `cargo check`\n> 说明: snake_case_var 保持不变".into(),
+        }],
+        ..Default::default()
+    };
+
+    let response = turn_response(&message).unwrap();
+    assert_eq!(
+        response,
+        "明确结论: 不需要改代码，维持现状 查看 文档 并运行 cargo check 说明: snake_case_var 保持不变"
+    );
+}
+
 #[test_case(Notification::TurnComplete { response: Some("answer".into()) }, "answer", false ; "turn_response")]
 #[test_case(Notification::TurnComplete { response: None }, "Agent turn complete", false ; "turn_fallback")]
 #[test_case(Notification::PermissionRequested { tool: Some("bash".into()) }, "Permission requested: bash", true ; "permission_tool")]
