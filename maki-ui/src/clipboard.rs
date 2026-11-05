@@ -57,13 +57,13 @@ impl ClipboardState {
         if text.is_empty() {
             return Ok(CopyResult::Noop);
         }
-        let native_err = match native(text) {
-            Ok(()) => return Ok(CopyResult::Copied),
-            Err(e) => e,
-        };
-        match osc52(text) {
-            Ok(()) => Ok(CopyResult::Copied),
-            Err(osc52_err) => Err(format!("native ({native_err}); osc52 ({osc52_err})")),
+        let native_res = native(text);
+        let osc52_res = osc52(text);
+        match (native_res, osc52_res) {
+            (Ok(()), _) | (_, Ok(())) => Ok(CopyResult::Copied),
+            (Err(native_err), Err(osc52_err)) => {
+                Err(format!("native ({native_err}); osc52 ({osc52_err})"))
+            }
         }
     }
 
@@ -121,21 +121,30 @@ mod tests {
     }
 
     #[test]
-    fn native_success_skips_osc52() {
+    fn dual_write_invokes_both_backends() {
+        let native_called = Cell::new(false);
         let osc52_called = Cell::new(false);
         let result = ClipboardState::copy_text_impl(
             "hello",
-            |_| Ok(()),
+            |_| {
+                native_called.set(true);
+                Ok(())
+            },
             |_| {
                 osc52_called.set(true);
                 Ok(())
             },
         );
         assert!(matches!(result, Ok(CopyResult::Copied)));
-        assert!(
-            !osc52_called.get(),
-            "osc52 must not fire after native succeeds"
-        );
+        assert!(native_called.get());
+        assert!(osc52_called.get());
+    }
+
+    #[test]
+    fn osc52_failure_is_recovered_by_native() {
+        let result =
+            ClipboardState::copy_text_impl("hello", |_| Ok(()), |_| Err("stdout closed".into()));
+        assert!(matches!(result, Ok(CopyResult::Copied)));
     }
 
     #[test]

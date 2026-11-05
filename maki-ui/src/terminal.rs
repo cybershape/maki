@@ -166,10 +166,10 @@ fn is_kitty_keyboard_supported(env: &TerminalEnvironment<'_>, tmux: Option<&Tmux
             return true;
         }
     }
-    if let Some(term) = env.term.filter(|value| !value.trim().is_empty()) {
-        if supports_kitty_keyboard_terminal(term) {
-            return true;
-        }
+    if let Some(term) = env.term.filter(|value| !value.trim().is_empty())
+        && supports_kitty_keyboard_terminal(term)
+    {
+        return true;
     }
     false
 }
