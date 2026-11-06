@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `ef3032d913f694c27257e3126c5306624d34164f`
-  - **Commit date**: `Tue Nov 3 18:01:39 2026 +0100`
-  - **Commit author**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
-  - **Commit message**: `fix(question): widen the answer prefix to string for the checker`
+  - **Commit SHA**: `b9897ee1668a13a51ab879d108908775ad147330`
+  - **Commit date**: `Thu Nov 5 22:59:27 2026 +0200`
+  - **Commit author**: `Tony Solomonik <tony.solomonik@gmail.com>`
+  - **Commit message**: `feat(batch): report each child of a moved batch as it finishes`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `ef3032d9`.
+> `upstream/main` has been successfully merged through commit `b9897ee1`.
 
 ---
 
@@ -149,6 +149,15 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `a32eb9d7` | `feat(ui): close compact detail popup when clicking outside` | Close compact detail popup when clicking outside its bounds |
 | `2fd55f84` | `feat(storage): remember last used model per project` | Persist and restore the last used model per project |
 | `53a3ac7a` | `test(acp): use dedicated provider slug in display name resolution test` | Prevent model registry collisions in parallel tests by using an isolated provider slug |
+| `b1dfd196` | `docs: update upstream tracking record with recent local commits` | Update the upstream tracking record with recent local commits |
+| `168f982f` | `feat(index): add F# indexing support` | Add F# indexing support to the index tool using tree-sitter-fsharp |
+| `c5f51b44` | `feat(ui): strip markdown formatting from turn response previews` | Strip markdown formatting from OSC 7501 turn response previews |
+| `821c8599` | `feat(ui): activate Kitty keyboard protocol on Windows for compatible terminals` | Activate Kitty keyboard protocol on Windows for compatible terminals |
+| `5bcf5517` | `feat(code_execution): hint batch execution when batch tool is disabled` | Hint parallel tool execution via `gather()` in `code_execution` description when batch tool is disabled |
+| `9d786b19` | `fix(ui): silence unused warnings for kitty keyboard helpers on non-windows` | Silence unused warnings for Windows Kitty keyboard helpers on non-Windows platforms |
+| `fac8c88b` | `feat(bash): strip ANSI escape sequences and inject NO_COLOR in output capture` | Strip ANSI escape sequences and inject `NO_COLOR=1` in bash output capture |
+| `1d5e1764` | `fix(ui): dual-write clipboard copy to native and terminal OSC 52` | Dual-write clipboard copy to native desktop clipboard and terminal OSC 52 sequence |
+| `870ea011` | `Merge branch 'upstream/main' into main` | Merge upstream through `b9897ee1`, including removing MCP from ToolRegistry, light/dark theme auto-detection via terminal background luminance probe, community plugin directory site page, and live child reporting for moved background batches while preserving core fork customizations |
 
 ---
 
