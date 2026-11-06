@@ -457,7 +457,7 @@ impl<'h> Agent<'h> {
             .as_ref()
             .and(observation_detail(&message))
             .map(str::to_owned);
-        let end = message.settles.as_ref().map(|settled| settled.end);
+        let end = message.answered().map(|settled| settled.end);
         self.history.push(message);
         if let Some(text) = line {
             self.event_tx
@@ -4050,7 +4050,7 @@ mod tests {
         registry
             .register(
                 Arc::new(MovingTool),
-                ToolSource::Lua {
+                ToolSource {
                     plugin: MOVING_TOOL.into(),
                 },
             )

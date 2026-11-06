@@ -5,6 +5,7 @@
 
 pub mod animation;
 pub mod app;
+mod appearance;
 #[cfg(feature = "bench")]
 #[doc(hidden)]
 pub mod bench_support;
@@ -30,6 +31,7 @@ mod storage_writer;
 mod text_buffer;
 mod theme;
 mod trust_card;
+mod tty_probe;
 pub use theme::BUNDLED_THEMES;
 pub use trust_card::ask_trust;
 pub mod update;
@@ -122,6 +124,7 @@ pub async fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Res
     let report = {
         let (_guard, mut terminal) = terminal::TerminalGuard::init()?;
         color_compat::init();
+        appearance::init(params.ui_config.theme.as_ref());
         let el = event_loop::EventLoop::new(&mut terminal, params).await?;
         el.run(initial_prompt).await?
     };

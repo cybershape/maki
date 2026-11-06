@@ -4127,7 +4127,7 @@ impl LuaRuntime {
                 });
                 (
                     tool,
-                    ToolSource::Lua {
+                    ToolSource {
                         plugin: Arc::clone(&name),
                     },
                 )

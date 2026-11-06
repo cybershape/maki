@@ -49,7 +49,7 @@ use maki_lua::{
 };
 use maki_providers::{
     ContentBlock, Effort, FastPricing, FastSupport, Message, Model, ModelTier, RequestOptions,
-    Role, THINKING_USAGE, TaskSettled, ThinkingSupport, TokenUsage,
+    Role, THINKING_USAGE, TaskAnswer, TaskSettled, ThinkingSupport, TokenUsage,
 };
 use maki_storage::id::MakiId;
 use maki_storage::model::read_thinking;
@@ -12057,10 +12057,10 @@ fn moved_call_history(receipt: bool, notice: Option<(bool, bool)>) -> Vec<Messag
         );
         let mut message = Message::observation(text);
         message.display_text = Some(display);
-        message.settles = Some(TaskSettled {
+        message.answers = Some(TaskAnswer::Settles(TaskSettled {
             task: MOVED_ID.into(),
             end,
-        });
+        }));
         messages.push(message);
     }
     messages.push(Message::user("second prompt".into()));

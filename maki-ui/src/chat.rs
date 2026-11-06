@@ -825,7 +825,7 @@ pub fn history_to_display(
                 display.push(task_notice(
                     text.to_owned(),
                     observation_detail(message).map(str::to_owned),
-                    message.settles.as_ref().map(|settled| settled.end.into()),
+                    message.answered().map(|settled| settled.end.into()),
                 ));
                 continue;
             }
@@ -1280,7 +1280,7 @@ mod tests {
         TurnTiming,
     };
     use maki_config::UiConfig;
-    use maki_providers::{ImageMediaType, TaskEnd, TaskSettled, TokenUsage};
+    use maki_providers::{ImageMediaType, TaskAnswer, TaskEnd, TaskSettled, TokenUsage};
     use test_case::test_case;
 
     const IMAGE_DATA: &str = "dGVzdA==";
@@ -1828,9 +1828,11 @@ mod tests {
     ) {
         let mut observation = Message::observation(NOTICE_BODY.into());
         observation.display_text = Some(NOTICE_LINE.into());
-        observation.settles = end.map(|end| TaskSettled {
-            task: TASK_ID.into(),
-            end,
+        observation.answers = end.map(|end| {
+            TaskAnswer::Settles(TaskSettled {
+                task: TASK_ID.into(),
+                end,
+            })
         });
 
         let display = history_to_display(
