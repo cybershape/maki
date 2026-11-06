@@ -27,6 +27,8 @@ local AGE_UNITS = {
   { 3600, "h" },
   { 60, "m" },
 }
+local RIGHT_PAD = 2
+local RIGHT_MARGIN = string.rep(" ", RIGHT_PAD)
 local FILTER_KEYS = {
   { "Enter", "open" },
   { "Ctrl+N", "new" },
@@ -151,12 +153,16 @@ local function age(updated_at)
 end
 
 local function dispw(s)
-  return utf8.len(s) or #s
+  if not s or s == "" then
+    return 0
+  end
+  return maki.ui.display_width(s)
 end
 
 local function render()
   local lines = {}
-  local inner = board.width - 4
+  local width = board.width
+  local inner = width - 4
   local input = board.rename and board.rename.input or board.input
   local prefix = board.rename and RENAME_PREFIX or FILTER_PREFIX
   board.reserved = ListPicker.render_header(board.win, lines, input, prefix, inner)
@@ -177,17 +183,31 @@ local function render()
       icon_style = "spinner:" .. icon_style
     end
     local line = { { "  ", base }, { icon, icon_style } }
-    for _, sp in ipairs(ListPicker.highlight_spans(s.title, words, base, selected and "match_selected" or "match")) do
-      line[#line + 1] = sp
+
+    local fixed = 2 + dispw(icon)
+    if board.confirm == s.id then
+      fixed = fixed + dispw(CONFIRM_HINT)
     end
-    local used = 2 + dispw(icon) + dispw(s.title)
+    local right_w = dispw(right)
+    local title_room = math.max(width - fixed - right_w - RIGHT_PAD - 1, 0)
+
+    local spans = ListPicker.highlight_spans(s.title, words, base, selected and "match_selected" or "match")
+    local title_w = 0
+    for _, sp in ipairs(ListPicker.clamp_parts(spans, title_room)) do
+      line[#line + 1] = sp
+      title_w = title_w + dispw(sp[1])
+    end
+
     if board.confirm == s.id then
       line[#line + 1] = { CONFIRM_HINT, selected and "match_selected" or "error" }
-      used = used + dispw(CONFIRM_HINT)
     end
-    local pad = math.max(inner - used - dispw(right), 1)
+
+    local pad = math.max(width - fixed - title_w - right_w - RIGHT_PAD, 1)
     line[#line + 1] = { string.rep(" ", pad), base }
     line[#line + 1] = { right, right_style }
+    if RIGHT_PAD > 0 then
+      line[#line + 1] = { RIGHT_MARGIN, base }
+    end
     lines[#lines + 1] = line
     if selected then
       cursor_line = #lines
