@@ -161,7 +161,7 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `b5209d24` | `fix(sessions): handle CJK display width and clamp titles in session picker` | Handle CJK character display width and clamp titles in session picker |
 | `cf209dfd` | `feat(agent): content hash fast-path and opt-out for stale read check` | Optimize FileAccess with SHA-256 hash fast-path and opt-out for write tool |
 | `d1da689c` | `feat(code_execution): builtin urllib.parse/glob, clarify sandbox limits, and preserve child tool timeouts` | Built-in urllib.parse/glob modules, document sandbox limits, and preserve child tool timeouts |
-| pending | `Merge branch 'upstream/main' into main` | Merge upstream through `66cb4f98`, including version 0.7.1 bump, XDG layout unification, `app/mod.rs` decomposition and `KeyboardOwner` architecture, subagent `SessionControl` refactoring, derive(`Merge`) for config, default `@` completion plugin, UI collapsing and background task output dimming, and site restyling, while preserving core fork customizations |
+| `9adc3330` | `Merge branch 'upstream/main' into main` | Merge upstream through `66cb4f98`, including version 0.7.1 bump, XDG layout unification, `app/mod.rs` decomposition and `KeyboardOwner` architecture, subagent `SessionControl` refactoring, derive(`Merge`) for config, default `@` completion plugin, UI collapsing and background task output dimming, and site restyling, while preserving core fork customizations |
 
 ---
 
