@@ -7,7 +7,7 @@
 //! We adopt new fields when Claude Code adds them but never invent our own.
 //! Check their docs before changing anything here.
 
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -259,6 +259,11 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         program_status,
         background_wait,
     } = params;
+
+    // OSC 7501 status sequences share stdout with the answer itself, so a
+    // piped or redirected run must not emit them or the consumer sees escape
+    // bytes mixed into the text/JSON output.
+    let program_status = program_status && io::stdout().is_terminal();
 
     let prompt = match prompt {
         Some(p) => p,
