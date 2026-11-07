@@ -6114,6 +6114,45 @@ fn mutable_path_returns_path_from_input() {
 }
 
 #[test]
+fn stale_read_check_defaults_to_true_and_respects_opt_out() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "with_check",
+            description = "test",
+            schema = {PATH_FIELD_SCHEMA},
+            mutable_path = "path",
+            handler = function() return "" end
+        }})
+        maki.api.register_tool({{
+            name = "without_check",
+            description = "test",
+            schema = {PATH_FIELD_SCHEMA},
+            mutable_path = "path",
+            stale_read_check = false,
+            handler = function() return "" end
+        }})"#,
+    );
+    host.load_source("check_test_plugin", &src).unwrap();
+
+    let with = reg.get("with_check").expect("tool not registered");
+    let inv_with = with
+        .tool
+        .parse(&serde_json::json!({ "path": "/tmp/a.txt" }))
+        .expect("parse failed");
+    assert!(inv_with.stale_read_check());
+
+    let without = reg.get("without_check").expect("tool not registered");
+    let inv_without = without
+        .tool
+        .parse(&serde_json::json!({ "path": "/tmp/b.txt" }))
+        .expect("parse failed");
+    assert!(!inv_without.stale_read_check());
+}
+
+#[test]
 fn pure_functions_not_guarded() {
     let src = perm_tool_src(
         "pure_test",

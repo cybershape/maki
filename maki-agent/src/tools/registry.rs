@@ -239,6 +239,9 @@ pub trait ToolInvocation: Send + Sync {
     fn mutable_path(&self) -> Option<&Path> {
         None
     }
+    fn stale_read_check(&self) -> bool {
+        true
+    }
     fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
         Box::pin(std::future::ready(None))
     }

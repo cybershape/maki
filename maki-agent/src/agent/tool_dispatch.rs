@@ -989,6 +989,7 @@ async fn run_native_tool(
         Some(key) => {
             let guard = ctx.file_access.acquire(key).await;
             if ctx.config.stale_read_check
+                && invocation.stale_read_check()
                 && let Err(message) = ctx.file_access.check_before_edit(key)
             {
                 return done_error(message);
@@ -3611,6 +3612,89 @@ mod tests {
         .await;
 
         assert!(views[0].cancelled_while_running);
+    }
+
+    struct StaleCheckMockTool {
+        path: PathBuf,
+        check: bool,
+    }
+
+    struct StaleCheckMockInvocation {
+        path: PathBuf,
+        check: bool,
+    }
+
+    impl Tool for StaleCheckMockTool {
+        fn name(&self) -> &str {
+            "stale_check_mock"
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            "test".into()
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(StaleCheckMockInvocation {
+                path: self.path.clone(),
+                check: self.check,
+            }))
+        }
+    }
+
+    impl ToolInvocation for StaleCheckMockInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain("stale_check_mock".into()))
+        }
+        fn mutable_path(&self) -> Option<&Path> {
+            Some(&self.path)
+        }
+        fn stale_read_check(&self) -> bool {
+            self.check
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move { Ok(ToolOutput::Plain("ok".into())).into() })
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_read_check_opt_out_skips_check() {
+        use crate::tools::FileKey;
+        use crate::tools::test_support::future_mtime;
+        use std::fs;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, "initial").unwrap();
+        let key = FileKey::new(&path);
+
+        let ctx = stub_ctx(&AgentMode::Build);
+        ctx.file_access.record_read(&key);
+        fs::write(&path, "modified").unwrap();
+        future_mtime(&path);
+
+        let check_tool = Arc::new(StaleCheckMockTool {
+            path: path.clone(),
+            check: true,
+        });
+        let mut ctx_with_check = ctx.clone();
+        ctx_with_check.registry = registered(check_tool);
+        let done = dispatch(&ctx_with_check, "stale_check_mock", &serde_json::json!({})).await;
+        assert!(done.is_error, "expected stale read rejection");
+
+        let no_check_tool = Arc::new(StaleCheckMockTool {
+            path: path.clone(),
+            check: false,
+        });
+        let mut ctx_without_check = ctx.clone();
+        ctx_without_check.registry = registered(no_check_tool);
+        let done = dispatch(
+            &ctx_without_check,
+            "stale_check_mock",
+            &serde_json::json!({}),
+        )
+        .await;
+        assert!(!done.is_error, "expected opt-out to succeed");
     }
 }
 

@@ -4,10 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::SystemTime;
 
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tracing::{debug, warn};
 
 const STALE_READ_MSG: &str = "file changed since last read";
+const MAX_HASH_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Dead `Weak`s are only ever cleared once the map grows to this many entries,
 /// so the map is bounded by construction instead of by a drop hook.
@@ -30,6 +32,13 @@ impl FileKey {
     }
 }
 
+#[derive(Clone, Debug)]
+struct RecordedRead {
+    mtime: SystemTime,
+    len: u64,
+    sha256: Option<[u8; 32]>,
+}
+
 type FileLock = Arc<AsyncMutex<()>>;
 pub type FileGuard = OwnedMutexGuard<()>;
 type FileLocks = Mutex<HashMap<FileKey, Weak<AsyncMutex<()>>>>;
@@ -39,12 +48,16 @@ type FileLocks = Mutex<HashMap<FileKey, Weak<AsyncMutex<()>>>>;
 /// with agents working next to this one, see [`FileAccess::sharing_locks`].
 #[derive(Default)]
 pub struct FileAccess {
-    mtimes: Mutex<HashMap<FileKey, SystemTime>>,
+    records: Mutex<HashMap<FileKey, RecordedRead>>,
     locks: Arc<FileLocks>,
 }
 
-fn get_mtime(path: &Path) -> Option<SystemTime> {
-    fs::metadata(path).and_then(|m| m.modified()).ok()
+fn compute_hash(path: &Path, len: u64) -> Option<[u8; 32]> {
+    if len > MAX_HASH_BYTES {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    Some(Sha256::digest(&bytes).into())
 }
 
 impl FileAccess {
@@ -59,7 +72,7 @@ impl FileAccess {
     /// edits of one file still take turns.
     pub fn sharing_locks(&self) -> Arc<Self> {
         Arc::new(Self {
-            mtimes: Mutex::default(),
+            records: Mutex::default(),
             locks: Arc::clone(&self.locks),
         })
     }
@@ -104,33 +117,72 @@ impl FileAccess {
     }
 
     pub fn record_read(&self, key: &FileKey) {
-        match get_mtime(key.as_path()) {
-            Some(mtime) => {
-                self.mtimes.lock().unwrap().insert(key.clone(), mtime);
+        let path = key.as_path();
+        let metadata = match fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => {
+                warn!(
+                    path = %path.display(),
+                    "record_read: could not get metadata, file will not be tracked"
+                );
+                return;
             }
-            None => warn!(
-                path = %key.as_path().display(),
-                "record_read: could not get mtime, file will not be tracked"
-            ),
-        }
+        };
+        let mtime = match metadata.modified() {
+            Ok(t) => t,
+            Err(_) => {
+                warn!(
+                    path = %path.display(),
+                    "record_read: could not get mtime, file will not be tracked"
+                );
+                return;
+            }
+        };
+        let len = metadata.len();
+        let sha256 = compute_hash(path, len);
+        self.records
+            .lock()
+            .unwrap()
+            .insert(key.clone(), RecordedRead { mtime, len, sha256 });
     }
 
     pub fn check_before_edit(&self, key: &FileKey) -> Result<(), String> {
-        let mut guard = self.mtimes.lock().unwrap();
-        let Some(&recorded) = guard.get(key) else {
+        let mut guard = self.records.lock().unwrap();
+        let Some(recorded) = guard.get(key) else {
             return Ok(());
         };
-        let Some(current) = get_mtime(key.as_path()) else {
+        let Ok(metadata) = fs::metadata(key.as_path()) else {
             guard.remove(key);
             return Ok(());
         };
-        if recorded != current {
-            return Err(format!(
-                "{STALE_READ_MSG}: {} - re-read using read tool before editing",
-                key.as_path().display(),
-            ));
+        let Ok(current_mtime) = metadata.modified() else {
+            guard.remove(key);
+            return Ok(());
+        };
+        if recorded.mtime == current_mtime {
+            return Ok(());
         }
-        Ok(())
+
+        let current_len = metadata.len();
+        if let Some(recorded_hash) = recorded.sha256
+            && current_len == recorded.len
+            && let Some(current_hash) = compute_hash(key.as_path(), current_len)
+            && current_hash == recorded_hash
+        {
+            debug!(
+                path = %key.as_path().display(),
+                "mtime changed but content hash matched; refreshing recorded mtime"
+            );
+            if let Some(entry) = guard.get_mut(key) {
+                entry.mtime = current_mtime;
+            }
+            return Ok(());
+        }
+
+        Err(format!(
+            "{STALE_READ_MSG}: {} - re-read using read tool before editing",
+            key.as_path().display(),
+        ))
     }
 }
 
@@ -156,9 +208,20 @@ mod tests {
     #[test_case(|access, key, path| {
         access.record_read(key);
         future_mtime(path);
-    } => false ; "changed_after_the_read")]
+    } => true ; "mtime_changed_same_content")]
     #[test_case(|access, key, path| {
         access.record_read(key);
+        fs::write(path, "diff_len").unwrap();
+        future_mtime(path);
+    } => false ; "diff_len_after_the_read")]
+    #[test_case(|access, key, path| {
+        access.record_read(key);
+        fs::write(path, "diff_ct").unwrap();
+        future_mtime(path);
+    } => false ; "diff_content_same_len_after_the_read")]
+    #[test_case(|access, key, path| {
+        access.record_read(key);
+        fs::write(path, "changed").unwrap();
         future_mtime(path);
         access.record_read(key);
     } => true ; "changed_then_read_again")]
@@ -207,6 +270,23 @@ mod tests {
         );
         drop(held);
         assert!(access.acquire(&path).now_or_never().is_some());
+    }
+
+    #[test]
+    fn mtime_heals_after_hash_match() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(FILE);
+        fs::write(&path, CONTENT).unwrap();
+        let key = FileKey::new(&path);
+
+        let access = FileAccess::default();
+        access.record_read(&key);
+        future_mtime(&path);
+
+        let new_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(access.check_before_edit(&key).is_ok());
+        let recorded = access.records.lock().unwrap().get(&key).unwrap().mtime;
+        assert_eq!(recorded, new_mtime);
     }
 
     #[tokio::test]

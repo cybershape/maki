@@ -1235,6 +1235,7 @@ mod tests {
         let background = old.tool_context(CancelToken::none());
 
         old.file_access.record_read(&key);
+        fs::write(&path, "changed").unwrap();
         future_mtime(&path);
         background.file_access.record_read(&key);
         assert!(old.file_access.check_before_edit(&key).is_err());
