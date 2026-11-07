@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_agent::{AgentEvent, Envelope, SubagentInfo, ToolDoneEvent};
+use maki_lua::agent_autocmd::HostEvent;
 use maki_providers::{TokenUsage, add_cost};
 use maki_storage::sessions::StoredTokenUsage;
 
@@ -473,6 +474,14 @@ impl App {
                 self.terminalize_turn(MISSING_TOOL_COMPLETION);
                 self.chat_index.clear();
                 self.status = Status::Idle;
+                if self.state.mode == Mode::Plan && self.plan_answers.pending_offer {
+                    self.plan_answers.pending_offer = false;
+                    let path = self.state.plan.path().map(|p| p.display().to_string());
+                    self.offer_plan_form(path.as_deref());
+                    if let Some(path) = path {
+                        self.fire_session_event(HostEvent::PlanReady { path: &path });
+                    }
+                }
                 if let Some(ExitOnDone { background_wait }) = self.exit_on_done {
                     self.exit_request = ExitRequest::Success;
                     self.background_deadline = self
@@ -481,6 +490,7 @@ impl App {
                 }
             }
             ChatEventResult::Error(message) => {
+                self.plan_answers.abandon();
                 self.status = Status::error(message.clone());
                 self.status_bar.clear_flash();
                 self.main_chat().push(DisplayMessage::new(

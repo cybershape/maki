@@ -38,6 +38,8 @@ pub(crate) struct PlanAnswers {
     pub(super) form: Option<(Instant, Receiver<Option<PlanMenu>>)>,
     /// In flight answer from a picked plugin row.
     pub(super) action: Option<PlanAction>,
+    /// Plan was written while streaming, pending presentation once the turn ends.
+    pub(super) pending_offer: bool,
     /// Bumped by every pick the plan form makes, and by every path that walks
     /// away from a draft. Without it an outcome from a pick nobody waits on
     /// any more fires a second implement prompt on top of the one already
@@ -55,6 +57,7 @@ impl PlanAnswers {
     pub(super) fn abandon(&mut self) -> u64 {
         self.form = None;
         self.action = None;
+        self.pending_offer = false;
         self.pick += 1;
         self.pick
     }

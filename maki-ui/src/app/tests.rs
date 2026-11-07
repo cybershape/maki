@@ -6631,7 +6631,7 @@ fn plan_app() -> App {
 
 #[test_case(Mode::Plan,  true  ; "plan_mode_tooldone_opens_form")]
 #[test_case(Mode::Build, false ; "build_mode_tooldone_no_form")]
-fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
+fn tool_done_write_waits_for_done_to_open_plan_form(mode: Mode, expect_form: bool) {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -6649,10 +6649,12 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
         written_path: Some("/tmp/plans/test.md".into()),
         backgrounded: false,
     }))));
-    assert_eq!(app.plan_form.is_visible(), expect_form);
-    if expect_form {
+    assert!(!app.plan_form.is_visible());
+    if mode == Mode::Plan {
         assert!(app.state.plan.is_ready());
     }
+    app.update(done_event());
+    assert_eq!(app.plan_form.is_visible(), expect_form);
 }
 
 #[test]
@@ -6814,8 +6816,50 @@ fn prompt_in_plan_mode_reopens_form_on_next_write() {
     assert!(matches!(app.state.plan, PlanState::Drafting(_)));
 
     rewrite_plan(&mut app);
+    assert!(!app.plan_form.is_visible());
+    assert!(app.state.plan.is_ready());
+
+    app.update(agent_msg_with_run_id(done(), app.run_id));
     assert!(app.plan_form.is_visible());
     assert!(app.state.plan.is_ready());
+}
+
+#[test]
+fn plan_does_not_open_form_while_streaming_additional_tools_after_write() {
+    let mut app = plan_app();
+    assert!(app.plan_form.is_visible());
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(!app.plan_form.is_visible());
+    assert!(matches!(app.state.plan, PlanState::Drafting(_)));
+
+    app.submit_prompt(queued_msg("refine plan"));
+    assert_eq!(app.status, Status::Streaming);
+
+    rewrite_plan(&mut app);
+    assert!(!app.plan_form.is_visible(), "must not open while streaming");
+    assert!(app.state.plan.is_ready());
+
+    // Agent executes additional inspection tools while streaming
+    app.update(agent_msg_with_run_id(
+        AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            call: None,
+            id: "t3".into(),
+            tool: "read".into(),
+            output: Arc::new(ToolOutput::Plain("file content".into())),
+            is_error: false,
+            annotation: None,
+            written_path: None,
+            backgrounded: false,
+        })),
+        app.run_id,
+    ));
+    assert!(!app.plan_form.is_visible(), "still must not open during subsequent tools");
+
+    // Agent completes turn
+    app.update(agent_msg_with_run_id(done(), app.run_id));
+    assert_eq!(app.status, Status::Idle);
+    assert!(app.plan_form.is_visible(), "re-opens once turn completes");
 }
 
 #[test]

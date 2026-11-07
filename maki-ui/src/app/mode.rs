@@ -10,7 +10,7 @@ use maki_storage::StateDir;
 use maki_storage::plans;
 use ratatui::style::{Color, Modifier, Style};
 
-use super::App;
+use super::{App, Status};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -84,15 +84,20 @@ impl App {
                     return;
                 }
                 self.state.plan.mark_ready();
-                let path = self.state.plan.path().map(|p| p.display().to_string());
-                self.offer_plan_form(path.as_deref());
-                // The path is the whole point here, so with no path we stay
-                // quiet instead of handing a plugin an empty one to open.
-                if let Some(path) = path {
-                    self.fire_session_event(HostEvent::PlanReady { path: &path });
+                if self.status == Status::Streaming {
+                    self.plan_answers.pending_offer = true;
+                } else {
+                    let path = self.state.plan.path().map(|p| p.display().to_string());
+                    self.offer_plan_form(path.as_deref());
+                    // The path is the whole point here, so with no path we stay
+                    // quiet instead of handing a plugin an empty one to open.
+                    if let Some(path) = path {
+                        self.fire_session_event(HostEvent::PlanReady { path: &path });
+                    }
                 }
             }
             PlanTrigger::InteractivePrompt => {
+                self.plan_answers.abandon();
                 self.state.plan.mark_drafting();
                 self.plan_form.on_plan_drafting();
             }
