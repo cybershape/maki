@@ -338,10 +338,12 @@ impl History {
 
     pub fn replace(&mut self, messages: Vec<Message>) {
         self.rewrite(|msgs| *msgs = messages);
+        self.message_timestamps.clear();
     }
 
     pub fn truncate(&mut self, len: usize) {
         self.rewrite(|msgs| msgs.truncate(len));
+        self.message_timestamps.truncate(len);
     }
 
     /// Drops every thinking block and thought signature, the one edit that
@@ -1189,5 +1191,43 @@ mod tests {
         assert_ne!(snap.epoch, epoch);
         assert_eq!(snap.messages.len(), 1);
         assert_eq!(snap.messages[0].user_text(), Some(SECOND));
+    }
+
+    /// Compaction replaces the whole transcript, so a stale per-position time
+    /// would land on whatever slides into the old message's place.
+    #[test]
+    fn replace_and_truncate_realign_timestamps() {
+        let mut history = History::restored_with_timestamps(
+            vec![
+                Message::user(FIRST.into()),
+                Message::user(SECOND.into()),
+                Message::user("third".into()),
+            ],
+            vec![Some(1), Some(2), Some(3)],
+        );
+
+        history.replace(vec![Message::user(FIRST.into())]);
+        let times: Vec<_> = history
+            .messages_with_timestamps()
+            .iter()
+            .map(|(_, t)| *t)
+            .collect();
+        assert_eq!(times, [None]);
+
+        let mut history = History::restored_with_timestamps(
+            vec![
+                Message::user(FIRST.into()),
+                Message::user(SECOND.into()),
+                Message::user("third".into()),
+            ],
+            vec![Some(1), Some(2), Some(3)],
+        );
+        history.truncate(2);
+        let times: Vec<_> = history
+            .messages_with_timestamps()
+            .iter()
+            .map(|(_, t)| *t)
+            .collect();
+        assert_eq!(times, [Some(1), Some(2)]);
     }
 }
