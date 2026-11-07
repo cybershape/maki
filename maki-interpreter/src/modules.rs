@@ -687,7 +687,13 @@ fn walk_glob_dir(
             results.push(rel_str.clone());
         }
 
-        if path.is_dir() && (is_recursive || pattern.contains('/')) {
+        // CPython's recursive glob does not descend into symlinked
+        // directories, and following them here could cycle forever.
+        let is_real_dir = entry
+            .file_type()
+            .map(|kind| kind.is_dir())
+            .unwrap_or(false);
+        if is_real_dir && (is_recursive || pattern.contains('/')) {
             let _ = walk_glob_dir(&path, pattern, base, results);
         }
     }
@@ -706,9 +712,12 @@ fn match_parts(pattern: &[&str], candidate: &[&str]) -> bool {
     }
     if pattern[0] == "**" {
         if pattern.len() == 1 {
-            return true;
+            return !candidate.iter().any(|c| is_hidden(c));
         }
         for i in 0..=candidate.len() {
+            if candidate[..i].iter().any(|c| is_hidden(c)) {
+                break;
+            }
             if match_parts(&pattern[1..], &candidate[i..]) {
                 return true;
             }
@@ -725,7 +734,16 @@ fn match_parts(pattern: &[&str], candidate: &[&str]) -> bool {
     }
 }
 
+/// CPython's glob never matches a dotfile with a component that does not
+/// start with a dot itself.
+fn is_hidden(name: &str) -> bool {
+    name.starts_with('.')
+}
+
 fn simple_component_match(pat: &str, cand: &str) -> bool {
+    if is_hidden(cand) && !is_hidden(pat) {
+        return false;
+    }
     if pat == "*" {
         return true;
     }
@@ -809,5 +827,17 @@ mod tests {
         assert!(glob_match("*.rs", "main.rs"));
         assert!(glob_match("src/**/*.rs", "src/modules/url.rs"));
         assert!(!glob_match("*.rs", "main.py"));
+    }
+
+    #[test]
+    fn test_glob_dotfiles() {
+        assert!(!glob_match("*", ".env"));
+        assert!(!glob_match("*.md", ".hidden.md"));
+        assert!(glob_match(".env", ".env"));
+        assert!(glob_match(".*", ".env"));
+        assert!(!glob_match("**", "a/.git/config"));
+        assert!(glob_match(".git/**", ".git/config"));
+        assert!(!glob_match("src/**/*.rs", "src/.private/mod.rs"));
+        assert!(glob_match("*", "visible.txt"));
     }
 }
