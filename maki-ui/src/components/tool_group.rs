@@ -969,7 +969,10 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(header_text.contains("Waiting for response... (1.52s)"));
+        // The elapsed time grows between building `waiting_since` and the
+        // render, so assert the timer's shape, not a rounded instant.
+        assert!(header_text.contains("Waiting for response... (1."));
+        assert!(header_text.ends_with("s)"));
     }
 
     #[test]
