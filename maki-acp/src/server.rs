@@ -1342,6 +1342,15 @@ fn start_event_pump(
                     // whole file a `write` was carrying stays pinned forever.
                     tool_inputs.clear();
                     cost.settle(totals.cost);
+                    {
+                        // The ledger moved, so the snapshot a later config
+                        // refresh reads must follow it or it re-emits the
+                        // pre-error cost. `used` stays: a failed turn commits
+                        // no new context, and `totals` only carries the whole
+                        // run's cumulative tokens, not the live context size.
+                        let mut u = usage.lock().unwrap();
+                        u.cost = cost.total();
+                    }
                     if let Some(id) = finish_turn(&pending) {
                         let error = if auth {
                             AcpError::auth_required()
