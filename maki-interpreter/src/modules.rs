@@ -452,7 +452,7 @@ fn parse_qsl_internal(
             Some((k, v)) => (k, v),
             None => (item, ""),
         };
-        if raw_v.is_empty() && !keep_blank && item.contains('=') {
+        if raw_v.is_empty() && !keep_blank {
             continue;
         }
         let k = unquote_str(raw_k, true);
@@ -813,6 +813,21 @@ mod tests {
                 ("b".into(), "2".into()),
                 ("a".into(), "3".into())
             ]
+        );
+    }
+
+    #[test]
+    fn test_parse_qsl_blank_and_bare() {
+        let pairs = parse_qsl_internal(&[Value::String("a&b=1".into())], &[]).unwrap();
+        assert_eq!(pairs, vec![("b".into(), "1".into())]);
+        let pairs = parse_qsl_internal(
+            &[Value::String("a&b=1".into())],
+            &[("keep_blank_values".to_owned(), Value::Bool(true))],
+        )
+        .unwrap();
+        assert_eq!(
+            pairs,
+            vec![("a".into(), "".into()), ("b".into(), "1".into())]
         );
     }
 
