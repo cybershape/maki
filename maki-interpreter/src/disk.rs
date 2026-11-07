@@ -53,7 +53,7 @@ impl Cleared {
         })
     }
 
-    fn on_disk(&self) -> &Path {
+    pub(crate) fn on_disk(&self) -> &Path {
         Path::new(&self.disk)
     }
 }

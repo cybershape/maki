@@ -609,9 +609,10 @@ fn scan_glob(pattern: &str, host: &mut OsHost<'_>) -> Result<Vec<String>, MontyE
     };
 
     let search_dir = base_dir.to_string_lossy().to_string();
-    host.query(&search_dir, |_cleared| {
+    host.query(&search_dir, |cleared| {
+        let disk_dir = cleared.on_disk();
         if sub_pat.is_empty() {
-            return Ok(if base_dir.exists() {
+            return Ok(if disk_dir.exists() {
                 vec![pattern.to_owned()]
             } else {
                 Vec::new()
@@ -619,7 +620,7 @@ fn scan_glob(pattern: &str, host: &mut OsHost<'_>) -> Result<Vec<String>, MontyE
         }
 
         let mut results = Vec::new();
-        walk_glob_dir(&base_dir, sub_pat, &base_dir, &mut results)?;
+        walk_glob_dir(disk_dir, sub_pat, disk_dir, &mut results)?;
         results.sort_unstable();
 
         let out = results
