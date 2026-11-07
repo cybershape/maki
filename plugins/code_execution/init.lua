@@ -46,7 +46,6 @@ import sys
 import os
 import json
 import urllib.parse
-import glob
 async def gather(*calls):
     if len(calls) == 1 and isinstance(calls[0], list):
         calls = calls[0]
