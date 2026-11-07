@@ -652,7 +652,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     prompt_slots: Arc::clone(&params.prompt_slots),
                     subagent_cancels: Arc::new(CancelMap::new()),
                     ledger: turn.ledger(),
-                    registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
                     model_policy: Arc::clone(&params.model_policy),
                 },
@@ -762,6 +761,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use futures::FutureExt;
+    use maki_config::project::{self, TrustMode};
     use maki_config::providers::Protocol;
     use maki_providers::model::ModelTier;
     use maki_providers::plugin::{
@@ -813,10 +813,10 @@ mod tests {
     const DROPPED_RELAY_FREES_CHANNEL: &str =
         "a dropped relay must not take the next turn's cancel";
     const RELAY_WAIT: Duration = Duration::from_secs(5);
-    const LISTED_PROVIDER: &str = "copilot";
+    const LISTED_PROVIDER: &str = "responses";
     const LISTED_MODEL: &str = "listed-model";
     const UNLISTED_MODEL: &str = "unlisted-model";
-    const NEVER_LISTED_PROVIDER: &str = "ollama";
+    const NEVER_LISTED_PROVIDER: &str = "responses";
     const LISTED_WINDOW: u32 = 123_456;
     const LISTING_FAILED: &str = "no listing";
     const ONLY_LISTS_MODELS: &str = "only asked for its models";
@@ -990,7 +990,8 @@ mod tests {
             defaults: SessionDefaults::default(),
             model_policy: Arc::default(),
             plugin_rules: Arc::default(),
-            project_config: ProjectConfig::for_project(tmp.path()),
+            project_config: project::resolve_noninteractive(tmp.path(), TrustMode::Session)
+                .project_config,
             local_tools: LocalTools::default(),
             background: BackgroundMode::Blocking,
             stop: CancelToken::none(),
@@ -1220,6 +1221,7 @@ mod tests {
         mailbox.settle(
             TASK_ID,
             Some(BackgroundNotice {
+                markdown: false,
                 text: NOTICE_BODY.into(),
                 display: None,
                 wake: true,

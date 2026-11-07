@@ -376,7 +376,7 @@ async fn handle_request(
             Err(e) => Err(e),
         },
         "session/set_mode" => handle_set_mode(srv, raw),
-        "session/set_config_option" => handle_set_config(srv, raw),
+        "session/set_config_option" => handle_set_config(srv, raw).await,
         _ => Err(AcpError::method_not_found()),
     };
     srv.respond(id, result);
@@ -470,8 +470,9 @@ async fn load_session(
     }
     // Priced against the model the session recorded, not the one selected now
     // (which may cost 10x more or less). Later turns add their own exact cost.
-    let recorded_model =
-        Model::from_spec(&restored.session.model).unwrap_or_else(|_| params.model.clone());
+    let recorded_model = Model::from_spec_or_warm_catalog(&restored.session.model)
+        .await
+        .unwrap_or_else(|_| params.model.clone());
     // Settling writes today's estimate into entries that never recorded a cost.
     // The run saves this session back, so we settle a copy and keep that
     // estimate off disk.
@@ -973,20 +974,16 @@ fn parse_thinking_value(
     }
 }
 
-fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
+async fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
     let req: SetSessionConfigOptionRequest = parse_params(raw)?;
     if req.config_id.0.as_ref() == methods::MODEL_CONFIG_ID {
         let SessionConfigOptionValue::ValueId { value } = req.value else {
             return Err(AcpError::invalid_params().data(json_str(&"model must be a value id")));
         };
         let spec = value.0.to_string();
-        if !srv.model_policy.allows(&spec) {
-            return Err(
-                AcpError::invalid_params().data(json_str(&"model is not allowed by policy"))
-            );
-        }
-        let model =
-            Model::from_spec(&spec).map_err(|e| AcpError::invalid_params().data(json_str(&e)))?;
+        let model = Model::from_spec_with_policy(&spec, &srv.model_policy)
+            .await
+            .map_err(|e| AcpError::invalid_params().data(json_str(&e)))?;
 
         let session = srv.session.as_mut().ok_or_else(no_session)?;
         session
@@ -1015,7 +1012,8 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
         ))
     } else if methods::is_thought_level_config_id(req.config_id.0.as_ref()) {
         let session = srv.session.as_mut().ok_or_else(no_session)?;
-        let model = Model::from_spec(&session.current_model)
+        let model = Model::from_spec_with_policy(&session.current_model, &srv.model_policy)
+            .await
             .map_err(|e| AcpError::invalid_params().data(json_str(&e)))?;
 
         let thinking = match req.value {
@@ -1506,7 +1504,7 @@ mod tests {
         assert!(trusted.is_trusted());
         assert_eq!(
             trusted.config_root(),
-            ProjectConfig::for_project(project.path()).config_root()
+            ProjectConfig::discover(project.path()).config_root()
         );
         let rules = maki_config::load_permissions(&trusted).rules;
         assert!(
@@ -1657,7 +1655,8 @@ mod tests {
             permissions: Arc::new(PermissionManager::new(
                 maki_config::PermissionsConfig::default(),
                 PathBuf::from("/project"),
-                ProjectConfig::for_project(Path::new("/project")),
+                project::resolve_noninteractive(Path::new("/project"), TrustMode::Session)
+                    .project_config,
                 Arc::default(),
             )),
             task: AbortOnDropHandle::new(tokio::spawn(async { SessionEnd::default() })),
@@ -1837,7 +1836,7 @@ mod tests {
             model: None,
             opts: None,
             answer_tx,
-            inbox: Arc::default(),
+            control: Arc::default(),
             parent_call: None,
         }
     }
@@ -2143,6 +2142,7 @@ mod tests {
                 .send(AgentEvent::ObservationLine {
                     text: NOTICE_LINE.to_owned(),
                     detail: None,
+                    markdown: false,
                     end: None,
                 })
                 .unwrap();
@@ -2156,6 +2156,7 @@ mod tests {
                     event: AgentEvent::ObservationLine {
                         text: CHILD_NOTICE_LINE.to_owned(),
                         detail: None,
+                        markdown: false,
                         end: None,
                     },
                     subagent: Some(subagent(None)),
@@ -2965,7 +2966,9 @@ mod tests {
                 "value": "high"
             }
         });
-        let res = handle_set_config(&mut srv, &raw).expect("set thought_level to high");
+        let res = handle_set_config(&mut srv, &raw)
+            .await
+            .expect("set thought_level to high");
         let AgentResponse::SetSessionConfigOptionResponse(resp) = res else {
             panic!("expected SetSessionConfigOptionResponse");
         };
@@ -2992,7 +2995,9 @@ mod tests {
                 "value": "low"
             }
         });
-        handle_set_config(&mut srv, &raw_alias).expect("set reasoning_effort to low");
+        handle_set_config(&mut srv, &raw_alias)
+            .await
+            .expect("set reasoning_effort to low");
         assert_eq!(
             srv.session.as_ref().unwrap().current_thinking,
             ThinkingConfig::Effort(maki_storage::sessions::Effort::Low)
@@ -3007,7 +3012,9 @@ mod tests {
                 "value": false
             }
         });
-        handle_set_config(&mut srv, &raw_bool).expect("set thought_level to false");
+        handle_set_config(&mut srv, &raw_bool)
+            .await
+            .expect("set thought_level to false");
         assert_eq!(
             srv.session.as_ref().unwrap().current_thinking,
             ThinkingConfig::Off
@@ -3026,7 +3033,9 @@ mod tests {
                 "value": "invalid_mode_xyz"
             }
         });
-        let err = handle_set_config(&mut srv, &raw).expect_err("should reject invalid thinking");
+        let err = handle_set_config(&mut srv, &raw)
+            .await
+            .expect_err("should reject invalid thinking");
         assert_eq!(err.code, AcpError::invalid_params().code);
     }
 
@@ -3147,7 +3156,9 @@ mod tests {
                 "value": target_spec
             }
         });
-        let resp = handle_set_config(&mut srv, &raw).expect("set_config succeeds");
+        let resp = handle_set_config(&mut srv, &raw)
+            .await
+            .expect("set_config succeeds");
         assert!(matches!(
             resp,
             AgentResponse::SetSessionConfigOptionResponse(_)

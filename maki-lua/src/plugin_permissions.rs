@@ -923,6 +923,8 @@ mod tests {
         assert_eq!(caller.first_missing(&needed), expected);
     }
 
+    static FIRST_MISSING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A bundled provider's address skips the private-address guard, so even
     /// a plugin allowed every public host falls short of it. The owner checking
     /// itself also proves the provider list is not locked twice.
@@ -933,6 +935,7 @@ mod tests {
         caller: fn(&PluginReach) -> PluginReach,
         expected: Option<Missing>,
     ) {
+        let _guard = FIRST_MISSING_LOCK.lock().unwrap();
         register_bundled(
             json!({
                 "slug": LOCAL_PROVIDER_SLUG,

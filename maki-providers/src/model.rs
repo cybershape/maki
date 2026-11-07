@@ -434,14 +434,14 @@ fn deferral_endpoint(
 }
 
 /// The thinking keys a `providers.toml` entry may lend a builtin local model
-/// (see [`maki_config::providers::overlays_local_thinking`]). Everything else
-/// about those slugs stays compiled in, so this reads no base URLs and no
-/// keys, and leaves auth wiring alone.
+/// (see [`maki_config::providers::is_local_endpoint`]). Base URL and protocol
+/// are read by `LocalEndpoint` itself, so this reads only the thinking keys
+/// and leaves auth wiring alone.
 fn local_thinking_overlay(
     slug: &str,
     model_id: &str,
 ) -> (Option<ThinkingSupport>, Option<Box<ThinkingFields>>) {
-    if !maki_config::providers::overlays_local_thinking(slug) {
+    if !maki_config::providers::is_local_endpoint(slug) {
         return (None, None);
     }
     let config = maki_config::providers::ProvidersConfig::load();
@@ -958,11 +958,14 @@ impl Model {
         Err(ModelError::UnsupportedProvider(slug.to_string()))
     }
 
-    pub fn from_spec_with_policy(spec: &str, policy: &ModelPolicy) -> Result<Self, ModelError> {
+    pub async fn from_spec_with_policy(
+        spec: &str,
+        policy: &ModelPolicy,
+    ) -> Result<Self, ModelError> {
         if !policy.allows(spec) {
             return Err(ModelError::NotAllowed(spec.to_string()));
         }
-        Self::from_spec(spec)
+        Self::from_spec_or_warm_catalog(spec).await
     }
 
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
@@ -981,6 +984,10 @@ impl Model {
         }
 
         Err(ModelError::UnsupportedProvider(slug.to_string()))
+    }
+
+    pub async fn from_spec_or_warm_catalog(spec: &str) -> Result<Self, ModelError> {
+        Self::from_spec(spec)
     }
 
     pub fn is_free(&self) -> bool {
@@ -1321,12 +1328,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn from_spec_with_policy_rejects_disallowed_exact_spec() {
+    #[tokio::test]
+    async fn from_spec_with_policy_rejects_disallowed_exact_spec() {
         let policy = policy(&["allowed/*"], &[]);
         let spec = "responses/disallowed-model";
 
-        let error = Model::from_spec_with_policy(spec, &policy).unwrap_err();
+        let error = Model::from_spec_with_policy(spec, &policy)
+            .await
+            .unwrap_err();
 
         assert!(matches!(error, ModelError::NotAllowed(disallowed) if disallowed == spec));
     }
@@ -1356,11 +1365,13 @@ mod tests {
         assert_eq!(model.output_tokens(), expected);
     }
 
-    #[test]
-    fn from_spec_with_policy_resolves_allowed_exact_spec() {
+    #[tokio::test]
+    async fn from_spec_with_policy_resolves_allowed_exact_spec() {
         let policy = policy(&["responses/test-model"], &[]);
 
-        let model = Model::from_spec_with_policy("responses/test-model", &policy).unwrap();
+        let model = Model::from_spec_with_policy("responses/test-model", &policy)
+            .await
+            .unwrap();
 
         assert_eq!(model.spec(), "responses/test-model");
     }

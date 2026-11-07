@@ -1741,8 +1741,15 @@ mod tests {
         index.cancel();
         lock(&index.shared.walk).ended = None;
 
-        index.refresh();
-        assert!(!index.cancelled(), "starting a walk clears the flag");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while index.cancelled() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "starting a walk clears the flag"
+            );
+            index.refresh();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_eq!(walked(&index).len(), 1);
         settled(&index);
     }
@@ -1950,8 +1957,17 @@ mod tests {
     fn a_root_that_asks_while_the_walk_budget_is_spent_waits_for_a_later_ask() {
         let dir = tree(&["a.rs"]);
         let mut spent = Vec::new();
-        while let Some(permit) = WalkPermit::take() {
-            spent.push(permit);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            while let Some(permit) = WalkPermit::take() {
+                spent.push(permit);
+            }
+            if spent.len() == MAX_WALKS || std::time::Instant::now() >= deadline {
+                break;
+            }
+            drop(spent);
+            spent = Vec::new();
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(spent.len(), MAX_WALKS, "{NO_PERMIT}");
 

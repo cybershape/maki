@@ -45,8 +45,6 @@ libc = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
-maki-config = { workspace = true, features = ["test-util"] }
-maki-lua = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
 
 [workspace]
@@ -70,7 +68,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"
@@ -241,6 +239,14 @@ debug = false
 [profile.dev.build-override]
 debug = false
 
+# Fat LTO made the UI hot paths about 8% faster and the binary 8% smaller, but
+# its 2.5 minutes of link time on an M3 Pro were too much for `cargo install`
+# and `cargo build --release`. Thin LTO keeps part of the gain at a fraction of
+# that; the released binaries get the full treatment below.
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
 # crossterm 0.29.0 has no VT input on Windows, so bracketed paste never decodes and a
 # multiline paste submits at the first newline (#336). Pinned to the head of
 # crossterm-rs/crossterm#1030, which lives in refs/pull/1030/head on the upstream repo.

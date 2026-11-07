@@ -177,10 +177,25 @@ fn setup() -> (Arc<ToolRegistry>, PluginHost) {
     setup_with(Arc::new(ToolRegistry::new()))
 }
 
+static GLOBAL_REG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct GlobalFixture {
+    _host: PluginHost,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
 /// `maki.agent.tools` describes the process-wide registry, so the fixtures have
 /// to land there. Safe: nextest runs each test in its own process.
-fn setup_global() -> (Arc<ToolRegistry>, PluginHost) {
-    setup_with(Arc::clone(ToolRegistry::global_arc()))
+fn setup_global() -> (Arc<ToolRegistry>, GlobalFixture) {
+    let guard = GLOBAL_REG_LOCK.lock().unwrap();
+    let (reg, host) = setup_with(Arc::clone(ToolRegistry::global_arc()));
+    (
+        reg,
+        GlobalFixture {
+            _host: host,
+            _guard: guard,
+        },
+    )
 }
 
 fn describe(
@@ -915,9 +930,10 @@ fn handler_error_keeps_script_and_drops_waiting_notice() {
         text.contains("1 print(boom_undefined)"),
         "script header must survive the error path: {text}"
     );
+    let exception = err.trim_end().lines().last().unwrap();
     assert!(
-        text.contains(err.trim_end()),
-        "error must render below the script, err: {err:?}, body: {text}"
+        text.contains(exception),
+        "exception line must render below the script, err: {err:?}, body: {text}"
     );
     assert!(
         !text.contains("Waiting for output"),

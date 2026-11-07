@@ -660,21 +660,17 @@ pub(crate) async fn parse_sse(
             return Err(AgentError::api(500, message));
         }
 
-        let parsed_event = if current_event.is_empty() {
-            serde_json::from_str::<Value>(data)
-                .ok()
-                .and_then(|value| value["type"].as_str().map(ToOwned::to_owned))
-                .unwrap_or_default()
+        let Ok(parsed) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        let event = if current_event.is_empty() {
+            parsed["type"].as_str().unwrap_or_default()
         } else {
-            current_event.clone()
+            current_event.as_str()
         };
 
-        match parsed_event.as_str() {
+        match event {
             "response.output_text.delta" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 if let Some(delta) = parsed["delta"].as_str()
                     && !delta.is_empty()
                 {
@@ -694,10 +690,6 @@ pub(crate) async fn parse_sse(
             }
 
             "response.output_item.added" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 let item = &parsed["item"];
                 let output_index = parsed["output_index"]
                     .as_u64()
@@ -728,10 +720,6 @@ pub(crate) async fn parse_sse(
             }
 
             "response.function_call_arguments.delta" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 let delta: Cow<'_, str> = if let Some(s) = parsed["delta"].as_str() {
                     Cow::Borrowed(s)
                 } else if let Some(obj) = parsed["delta"].as_object() {
@@ -768,10 +756,6 @@ pub(crate) async fn parse_sse(
             }
 
             "response.in_progress" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 if let Some(pp) = parsed.get("prompt_progress") {
                     let processed = pp["processed"].as_u64().unwrap_or(0) as u32;
                     let total = pp["total"].as_u64().unwrap_or(0) as u32;
@@ -787,10 +771,6 @@ pub(crate) async fn parse_sse(
             }
 
             "response.output_item.done" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 let item = &parsed["item"];
                 if item["type"].as_str() == Some("function_call") {
                     let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
@@ -853,10 +833,6 @@ pub(crate) async fn parse_sse(
             }
 
             "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 if let Some(delta) = parsed["delta"].as_str()
                     && !delta.is_empty()
                 {
@@ -874,18 +850,10 @@ pub(crate) async fn parse_sse(
             }
 
             "response.completed" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let resp = &parsed["response"];
-
-                if let Some(u) = resp.get("usage") {
-                    usage = parse_usage(u);
-                    usage.cost = copilot_usd(&parsed["copilot_usage"]);
+                if let Some(parsed_usage) = parse_usage(&parsed) {
+                    usage = parsed_usage;
                 }
-
-                let status = resp["status"].as_str().unwrap_or("completed");
+                let status = parsed["response"]["status"].as_str().unwrap_or("completed");
                 stop_reason = Some(match status {
                     "completed" => {
                         if tool_accumulators.is_empty() {
@@ -900,23 +868,13 @@ pub(crate) async fn parse_sse(
             }
 
             "response.incomplete" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let resp = &parsed["response"];
-                if let Some(u) = resp.get("usage") {
-                    usage = parse_usage(u);
-                    usage.cost = copilot_usd(&parsed["copilot_usage"]);
+                if let Some(parsed_usage) = parse_usage(&parsed) {
+                    usage = parsed_usage;
                 }
                 stop_reason = Some(StopReason::MaxTokens);
             }
 
             "response.failed" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 let error = &parsed["response"]["error"];
                 let message = error["message"]
                     .as_str()
@@ -973,7 +931,9 @@ pub(crate) async fn parse_sse(
     })
 }
 
-fn parse_usage(u: &Value) -> TokenUsage {
+/// The usage a `response.completed` or `response.incomplete` event carries.
+fn parse_usage(event: &Value) -> Option<TokenUsage> {
+    let u = event["response"].get("usage")?;
     let input_tokens = u["input_tokens"].as_u64().unwrap_or(0);
     let output_tokens = u["output_tokens"].as_u64().unwrap_or(0);
 
@@ -981,13 +941,13 @@ fn parse_usage(u: &Value) -> TokenUsage {
         .as_u64()
         .unwrap_or(0);
 
-    TokenUsage {
+    Some(TokenUsage {
         input: input_tokens.saturating_sub(cached),
         output: output_tokens,
         cache_read: cached,
         cache_creation: 0,
-        cost: None,
-    }
+        cost: copilot_usd(&event["copilot_usage"]),
+    })
 }
 
 #[cfg(test)]

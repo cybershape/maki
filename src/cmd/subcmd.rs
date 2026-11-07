@@ -611,7 +611,9 @@ pub async fn prompt(
                 .default_model
                 .as_deref()
                 .unwrap_or(default_spec);
-            let model = Model::from_spec(model_spec).context("invalid default model")?;
+            let model = Model::from_spec_or_warm_catalog(model_spec)
+                .await
+                .context("invalid default model")?;
             let tools = RequestTools::build(reg, &vars, &model, &config.agent, &[], false, None);
             let prompt = build_system_prompt(&vars, &instructions, &slots, &model, &tools);
             // Plan mode reaches the model as a context update after the

@@ -6,7 +6,6 @@
 pub mod animation;
 pub mod app;
 mod appearance;
-#[cfg(feature = "bench")]
 #[doc(hidden)]
 pub mod bench_support;
 pub mod chat;
@@ -40,6 +39,7 @@ pub mod wrap;
 mod agent;
 mod event_loop;
 mod input;
+mod present;
 mod terminal;
 mod terminal_image;
 

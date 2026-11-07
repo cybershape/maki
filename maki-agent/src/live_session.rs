@@ -96,12 +96,26 @@ impl TaskLabel {
     }
 }
 
+/// Work that goes on without the user. Both flags come from one lock on
+/// purpose. Settling trades a receipt for its wake in a single step, and two
+/// separate reads could land on either side of it, see neither, and make the
+/// session look idle for a moment.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Backlog {
+    /// Some receipt's work still runs.
+    pub running: bool,
+    /// A notice waits to start a run, see [`SessionMailbox::claim_wake`].
+    pub wake: bool,
+}
+
 /// The result of a background task, for the run that holds its receipt.
 pub struct BackgroundNotice<'a> {
     pub text: String,
     pub display: Option<&'a str>,
     pub wake: bool,
     pub end: TaskEnd,
+    /// `text` is markdown, see [`Message::markdown`].
+    pub markdown: bool,
 }
 
 impl Mailbox {
@@ -172,6 +186,7 @@ fn lost_notice(id: &str, label: &TaskLabel) -> Message {
         TaskAnswer::Settles(settled(id, TaskEnd::Lost)),
         text,
         Some(&display),
+        false,
     )
 }
 
@@ -258,9 +273,10 @@ fn settled(task: &str, end: TaskEnd) -> TaskSettled {
     }
 }
 
-fn answering(answer: TaskAnswer, text: String, display: Option<&str>) -> Message {
+fn answering(answer: TaskAnswer, text: String, display: Option<&str>, markdown: bool) -> Message {
     Message {
         answers: Some(answer),
+        markdown,
         ..observation(text, display)
     }
 }
@@ -392,7 +408,10 @@ impl SessionMailbox {
             }
             if let Some(notice) = notice {
                 let answer = TaskAnswer::Settles(settled(id, notice.end));
-                state.push(answering(answer, notice.text, notice.display), notice.wake);
+                state.push(
+                    answering(answer, notice.text, notice.display, notice.markdown),
+                    notice.wake,
+                );
             }
         });
     }
@@ -407,7 +426,10 @@ impl SessionMailbox {
                 return false;
             }
             let answer = TaskAnswer::Part(settled(id, notice.end));
-            state.push(answering(answer, notice.text, notice.display), notice.wake);
+            state.push(
+                answering(answer, notice.text, notice.display, notice.markdown),
+                notice.wake,
+            );
             true
         })
     }
@@ -442,6 +464,14 @@ impl SessionMailbox {
     /// Background work still running for this mailbox's receipts.
     pub fn outstanding(&self) -> usize {
         lock(&self.live.mailbox).outstanding.len()
+    }
+
+    pub fn backlog(&self) -> Backlog {
+        let mailbox = lock(&self.live.mailbox);
+        Backlog {
+            running: !mailbox.outstanding.is_empty(),
+            wake: mailbox.wake,
+        }
     }
 
     /// The receipts a stored session left unsettled, each answered with a
@@ -833,6 +863,7 @@ mod tests {
 
     fn result(wake: bool) -> Option<BackgroundNotice<'static>> {
         Some(BackgroundNotice {
+            markdown: false,
             text: NOTICE_BODY.into(),
             display: None,
             wake,
@@ -845,10 +876,22 @@ mod tests {
         let mailbox = SessionMailbox::register(MakiId::generate());
         mailbox.track(TASK_ID);
         assert_eq!(mailbox.unsettled(), [TASK_ID]);
-        assert_eq!(mailbox.outstanding(), 1);
+        assert_eq!(
+            mailbox.backlog(),
+            Backlog {
+                running: true,
+                wake: false
+            }
+        );
 
         mailbox.settle(TASK_ID, result(true));
-        assert_eq!(mailbox.outstanding(), 0);
+        assert_eq!(
+            mailbox.backlog(),
+            Backlog {
+                running: false,
+                wake: true
+            }
+        );
         assert_eq!(mailbox.unsettled(), [TASK_ID]);
 
         assert_eq!(text(&mailbox.claim_wake()[0]), NOTICE_BODY);
@@ -1057,6 +1100,7 @@ mod tests {
         mailbox.settle(
             TASK_ID,
             Some(BackgroundNotice {
+                markdown: false,
                 text,
                 display: Some(&display),
                 wake: false,

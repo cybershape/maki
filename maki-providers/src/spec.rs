@@ -21,6 +21,7 @@ pub static RESPONSES_SPEC: ProviderSpec = ProviderSpec {
     sends_thinking: sends_as_chosen,
     thinking_fields_fallback: |_| Some(ThinkingFallback::BudgetField),
     accepts_arbitrary_models: true,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(32_000),
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
@@ -73,6 +74,12 @@ pub struct ProviderSpec {
     /// whether a toggle fragment can carry an explicit token budget.
     pub thinking_fields_fallback: fn(&Model) -> Option<ThinkingFallback>,
     pub accepts_arbitrary_models: bool,
+    /// The live listing is the account's entitlement: an answered listing is
+    /// the whole list, with no curated rows from [`ProviderSpec::models`]
+    /// appended, and tier defaults stay inside it. A 401/403 lists nothing,
+    /// the offline list leaves the provider to discovery, and any other
+    /// failure falls back to the curated rows.
+    pub catalog_is_authoritative: bool,
     pub fallback_max_output: Option<u32>,
     pub fallback_context_window: u32,
     /// This provider's curated table, embedded from `models/<slug>.toml`. Read
@@ -264,7 +271,7 @@ impl ProviderRegistry {
         if slug == RESPONSES_SPEC.slug {
             return Some(&RESPONSES_SPEC);
         }
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
         {
             if slug == TEST_COPILOT_SPEC.slug {
                 return Some(&TEST_COPILOT_SPEC);
@@ -321,7 +328,7 @@ impl Owner {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub static TEST_COPILOT_SPEC: ProviderSpec = ProviderSpec {
     slug: "copilot",
     display_name: "copilot",
@@ -332,6 +339,7 @@ pub static TEST_COPILOT_SPEC: ProviderSpec = ProviderSpec {
     sends_thinking: sends_as_chosen,
     thinking_fields_fallback: |_| Some(ThinkingFallback::None),
     accepts_arbitrary_models: true,
+    catalog_is_authoritative: true,
     fallback_max_output: Some(32_000),
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
@@ -348,7 +356,7 @@ pub static TEST_COPILOT_SPEC: ProviderSpec = ProviderSpec {
     },
 };
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub static TEST_OLLAMA_SPEC: ProviderSpec = ProviderSpec {
     slug: "ollama",
     display_name: "ollama",
@@ -359,6 +367,7 @@ pub static TEST_OLLAMA_SPEC: ProviderSpec = ProviderSpec {
     sends_thinking: sends_as_chosen,
     thinking_fields_fallback: |_| Some(ThinkingFallback::None),
     accepts_arbitrary_models: true,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(32_000),
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
@@ -375,7 +384,7 @@ pub static TEST_OLLAMA_SPEC: ProviderSpec = ProviderSpec {
     },
 };
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub static TEST_ANTHROPIC_SPEC: ProviderSpec = ProviderSpec {
     slug: "anthropic",
     display_name: "anthropic",
@@ -386,6 +395,7 @@ pub static TEST_ANTHROPIC_SPEC: ProviderSpec = ProviderSpec {
     sends_thinking: sends_as_chosen,
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: false,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(32_000),
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,

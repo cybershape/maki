@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `b9897ee1668a13a51ab879d108908775ad147330`
-  - **Commit date**: `Thu Nov 5 22:59:27 2026 +0200`
+  - **Commit SHA**: `66cb4f98d80c7c512b027eb0258ec4f7f0909247`
+  - **Commit date**: `Sat Nov 7 01:05:38 2026 +0200`
   - **Commit author**: `Tony Solomonik <tony.solomonik@gmail.com>`
-  - **Commit message**: `feat(batch): report each child of a moved batch as it finishes`
+  - **Commit message**: `fix(ui): dim background task results by 0.7 instead of 0.3`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `b9897ee1`.
+> `upstream/main` has been successfully merged through commit `66cb4f98`.
 
 ---
 
@@ -158,6 +158,10 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `fac8c88b` | `feat(bash): strip ANSI escape sequences and inject NO_COLOR in output capture` | Strip ANSI escape sequences and inject `NO_COLOR=1` in bash output capture |
 | `1d5e1764` | `fix(ui): dual-write clipboard copy to native and terminal OSC 52` | Dual-write clipboard copy to native desktop clipboard and terminal OSC 52 sequence |
 | `870ea011` | `Merge branch 'upstream/main' into main` | Merge upstream through `b9897ee1`, including removing MCP from ToolRegistry, light/dark theme auto-detection via terminal background luminance probe, community plugin directory site page, and live child reporting for moved background batches while preserving core fork customizations |
+| `b5209d24` | `fix(sessions): handle CJK display width and clamp titles in session picker` | Handle CJK character display width and clamp titles in session picker |
+| `cf209dfd` | `feat(agent): content hash fast-path and opt-out for stale read check` | Optimize FileAccess with SHA-256 hash fast-path and opt-out for write tool |
+| `d1da689c` | `feat(code_execution): builtin urllib.parse/glob, clarify sandbox limits, and preserve child tool timeouts` | Built-in urllib.parse/glob modules, document sandbox limits, and preserve child tool timeouts |
+| pending | `Merge branch 'upstream/main' into main` | Merge upstream through `66cb4f98`, including version 0.7.1 bump, XDG layout unification, `app/mod.rs` decomposition and `KeyboardOwner` architecture, subagent `SessionControl` refactoring, derive(`Merge`) for config, default `@` completion plugin, UI collapsing and background task output dimming, and site restyling, while preserving core fork customizations |
 
 ---
 

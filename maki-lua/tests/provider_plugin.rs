@@ -37,6 +37,7 @@ use test_case::test_case;
 const SLUG: &str = "acmelua";
 const DISPLAY_NAME: &str = "Acme (Lua)";
 const MODEL: &str = "acme-1";
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// The origin a user points the slug at, which is the one a hook's side
 /// requests reach unguarded, loopback included.
 const BASE_URL_ENV: &str = "ACMELUA_BASE_URL";
@@ -328,6 +329,7 @@ fn stream(
 /// the key the hook deleted never reaches the wire.
 #[test]
 fn a_recorded_turn_streams_its_events_and_posts_the_body_the_hook_built() {
+    let _lock = TEST_LOCK.lock().unwrap();
     let fixture = Fixture::start(CHAT_SCRIPT);
 
     let (events, result) = fixture.stream(ThinkingConfig::Effort(ASKED_EFFORT));
@@ -376,6 +378,7 @@ fn a_recorded_turn_streams_its_events_and_posts_the_body_the_hook_built() {
 /// holds the token the refresh minted and wrote.
 #[test]
 fn the_auth_hooks_drive_the_credential_lifecycle() {
+    let _lock = TEST_LOCK.lock().unwrap();
     let fixture = Fixture::start(REFRESH_SCRIPT);
 
     fixture.stream(ThinkingConfig::Off).1.expect(STREAM_FAILED);
@@ -400,6 +403,7 @@ fn the_auth_hooks_drive_the_credential_lifecycle() {
 /// the call below comes back as a hook timeout rather than as a token.
 #[test]
 fn a_refresh_hook_persists_the_token_it_minted() {
+    let _lock = TEST_LOCK.lock().unwrap();
     let fixture = Fixture::start(NO_REQUESTS);
 
     runtime()
@@ -417,6 +421,7 @@ fn a_refresh_hook_persists_the_token_it_minted() {
 /// absent from it.
 #[test]
 fn list_models_and_fetch_usage_answer_from_their_hooks() {
+    let _lock = TEST_LOCK.lock().unwrap();
     let fixture = Fixture::start(MODELS_SCRIPT);
 
     let models = runtime()
@@ -453,6 +458,7 @@ fn map_error_restates_the_status_and_keeps_retry_after(
     expected_message: &str,
     expected_kind: Option<RetryKind>,
 ) {
+    let _lock = TEST_LOCK.lock().unwrap();
     let fixture = Fixture::start(script);
 
     let error = fixture.stream(ThinkingConfig::Off).1.unwrap_err();
@@ -474,6 +480,7 @@ fn map_error_restates_the_status_and_keeps_retry_after(
 /// raise for it, `Retry-After` included.
 #[test]
 fn a_refused_side_request_is_the_native_error() {
+    let _lock = TEST_LOCK.lock().unwrap();
     let fixture = Fixture::start(OVERLOADED_SCRIPT);
 
     let error = runtime()
@@ -492,6 +499,7 @@ fn a_refused_side_request_is_the_native_error() {
 /// it is, not as a broken hook.
 #[test]
 fn a_side_request_that_cannot_connect_is_a_transport_error() {
+    let _lock = TEST_LOCK.lock().unwrap();
     let closed = TcpListener::bind((LOOPBACK_HOST, 0)).expect(IO_FAILED);
     let base_url = format!("http://{}", closed.local_addr().expect(IO_FAILED));
     drop(closed);
@@ -508,6 +516,7 @@ fn a_side_request_that_cannot_connect_is_a_transport_error() {
 /// plugin provider an auth target, and both halves run against a real host.
 #[test]
 fn a_login_hook_is_what_makes_the_slug_an_auth_target() {
+    let _lock = TEST_LOCK.lock().unwrap();
     let _fixture = Fixture::start(NO_REQUESTS);
 
     assert!(
@@ -544,6 +553,7 @@ maki.provider.register({{
 /// branch builds its body somewhere else entirely, so it gets its own case.
 #[test]
 fn the_responses_codec_applies_the_body_hook_too() {
+    let _lock = TEST_LOCK.lock().unwrap();
     let _state = isolated_state();
     let (base_url, server) = serve(RESPONSES_SCRIPT);
     let host = plugin_host();
@@ -646,6 +656,7 @@ fn wait_for(path: &Path) {
 /// A parked host would otherwise hang the test for good instead of failing it.
 #[test]
 fn a_credential_write_does_not_park_the_plugin_host() {
+    let _lock = TEST_LOCK.lock().unwrap();
     let state = isolated_state();
     let entered = state.path().join("entered");
     let done = state.path().join("done");
@@ -681,6 +692,7 @@ fn a_credential_write_does_not_park_the_plugin_host() {
 /// on belong to the handle and go only once nobody holds it.
 #[test]
 fn an_in_flight_hook_call_survives_a_plugin_reload() {
+    let _lock = TEST_LOCK.lock().unwrap();
     let state = isolated_state();
     let started = state.path().join("started");
     let release = state.path().join("release");
@@ -704,6 +716,7 @@ fn an_in_flight_hook_call_survives_a_plugin_reload() {
 /// maki ships stays reserved, even when its bundled plugin is turned off.
 #[test]
 fn a_third_party_plugin_cannot_take_a_builtin_slug() {
+    let _lock = TEST_LOCK.lock().unwrap();
     let _state = isolated_state();
     let host = plugin_host();
     plugin::begin_load();
@@ -809,6 +822,7 @@ fn every_registered_slug_needs_the_grant_a_package_load_carries() {
 /// does.
 #[test]
 fn a_failed_package_load_keeps_its_granted_slug_owned() {
+    let _lock = TEST_LOCK.lock().unwrap();
     let _state = isolated_state();
     takeover_catalog_cached();
 
