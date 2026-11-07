@@ -221,7 +221,6 @@ inventory = "0.3"
 
 [profile.release]
 strip = true
-panic = "abort"
 lto = "thin"
 
 [profile.bench]
