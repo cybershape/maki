@@ -1050,10 +1050,6 @@ pub fn routed_view(name: &str, _input: &Value) -> Option<RoutedView> {
     }
 }
 
-fn take_toolcall_reason(input: &mut Value) -> Option<String> {
-    strip_toolcall_reason(true, input)
-}
-
 /// MCP, local, and search tools never go through invocation parsing,
 /// so there is no parsed input to show; the UI gets the raw JSON instead.
 fn emit_raw_start(
@@ -1297,7 +1293,7 @@ async fn execute_mcp_tool(
     hook: Option<&Hook<'_>>,
 ) -> ToolDoneEvent {
     let mut input = input.clone();
-    let reason = take_toolcall_reason(&mut input);
+    let reason = strip_toolcall_reason(mcp.reason_injected(&tool), &mut input);
     let view = RoutedView::mcp(&tool);
     let summary = reason.unwrap_or(view.summary.clone());
     emit_raw_start(ctx, origin, id, &tool, summary, &input);
@@ -3010,6 +3006,47 @@ mod tests {
         let mcp = stub_mcp(&[PROBE_QUALIFIED]);
         let done = dispatch(&mcp_ctx(&mcp), PROBE_WIRE, &serde_json::json!({})).await;
         assert_eq!(done.tool.as_ref(), PROBE_QUALIFIED, "must route to MCP");
+    }
+
+    /// An injected `toolcall_reason` is our narration: stripped from the args
+    /// and shown as the summary. One the server declared itself is the tool's
+    /// argument and must reach it untouched.
+    #[tokio::test]
+    async fn mcp_toolcall_reason_follows_who_declared_it() {
+        use crate::mcp::test_support::echo_session;
+        use crate::tools::schema::TOOLCALL_REASON_FIELD;
+
+        let injected = echo_session(&[(PROBE_QUALIFIED, json!({ "type": "object" }))]);
+        let done = dispatch(
+            &mcp_ctx(&injected),
+            PROBE_WIRE,
+            &json!({ TOOLCALL_REASON_FIELD: "checking things" }),
+        )
+        .await;
+        assert!(!done.is_error);
+        assert_eq!(done.output.as_text(), "{}", "injected reason is stripped");
+
+        let declared = echo_session(&[(
+            PROBE_QUALIFIED,
+            json!({
+                "type": "object",
+                "properties": {
+                    TOOLCALL_REASON_FIELD: { "type": "string", "description": "the tool's own" },
+                },
+            }),
+        )]);
+        let done = dispatch(
+            &mcp_ctx(&declared),
+            PROBE_WIRE,
+            &json!({ TOOLCALL_REASON_FIELD: "server argument" }),
+        )
+        .await;
+        assert!(!done.is_error);
+        assert_eq!(
+            done.output.as_text(),
+            format!("{{\"{TOOLCALL_REASON_FIELD}\":\"server argument\"}}"),
+            "declared reason reaches the server"
+        );
     }
 
     #[tokio::test]

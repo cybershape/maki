@@ -246,6 +246,9 @@ impl ToolDescriptor {
 struct ToolRef {
     raw_name: String,
     transport: Arc<dyn McpTransport>,
+    /// Whether the published schema carries a `toolcall_reason` we injected.
+    /// A field the server declared itself belongs to the tool, not to us.
+    reason_injected: bool,
 }
 
 struct PromptRef {
@@ -676,6 +679,17 @@ impl McpHandle {
                 .then(|| interned(&internal_tool_name(name)))
                 .flatten()
         })
+    }
+
+    /// Whether the published schema of this tool carries a `toolcall_reason`
+    /// we injected. A field the server declared itself belongs to the tool,
+    /// so its value must reach the server untouched.
+    pub fn reason_injected(&self, qualified_name: &str) -> bool {
+        self.index
+            .load()
+            .tools
+            .get(qualified_name)
+            .is_some_and(|t| t.reason_injected)
     }
 
     pub async fn call_tool(&self, qualified_name: &str, args: &Value) -> Result<String, McpError> {
@@ -1158,15 +1172,16 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
                 .unwrap_or_else(|| "(no description)".to_string());
             let mut functions = Vec::with_capacity(entry.tools.len());
             for t in &entry.tools {
+                let mut sanitized_schema = sanitize_tool_input_schema(t.input_schema.clone());
+                let reason_injected = inject_toolcall_reason(&mut sanitized_schema);
                 tools.insert(
                     Arc::clone(&t.qualified_name),
                     ToolRef {
                         raw_name: t.raw_name.clone(),
                         transport: Arc::clone(transport),
+                        reason_injected,
                     },
                 );
-                let mut sanitized_schema = sanitize_tool_input_schema(t.input_schema.clone());
-                inject_toolcall_reason(&mut sanitized_schema);
                 functions.push(McpFunctionInfo {
                     name: t.raw_name.clone(),
                     description: t.description.clone(),
@@ -1318,6 +1333,56 @@ pub mod test_support {
         (session, ready_tx)
     }
 
+    /// A session whose tools answer with the JSON of the args they received,
+    /// so a test can see exactly what reached the server. `schemas` maps each
+    /// qualified name to its declared input schema.
+    pub fn echo_session(tools: &[(&str, Value)]) -> McpSession {
+        let mut server_map: HashMap<&str, Vec<McpToolDef>> = HashMap::new();
+        for (qualified, schema) in tools {
+            let (server, raw) = qualified
+                .split_once(SEPARATOR)
+                .unwrap_or(("stub", *qualified));
+            server_map.entry(server).or_default().push(McpToolDef {
+                qualified_name: Arc::from(*qualified),
+                raw_name: raw.into(),
+                description: String::new(),
+                input_schema: schema.clone(),
+            });
+        }
+        let mut srv_names: Vec<_> = server_map.keys().copied().collect();
+        srv_names.sort();
+        let entries = srv_names
+            .into_iter()
+            .map(|server| ServerEntry {
+                name: server.into(),
+                config: None,
+                transport_kind: "stub",
+                origin: PathBuf::new(),
+                status: McpServerStatus::Running,
+                transport: Some(Arc::new(EchoTransport)),
+                tools: server_map.remove(server).unwrap(),
+                prompts: Vec::new(),
+            })
+            .collect();
+        let inner = McpManagerInner {
+            entries,
+            generation: 0,
+        };
+        let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
+        let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
+        publish(&inner, &index, &snapshot);
+        McpSession::new(
+            McpHandle {
+                cmd_tx: flume::unbounded().0,
+                index,
+                snapshot,
+                defer_tools: 0,
+                ready_rx: flume::bounded(0).1,
+            },
+            &[],
+        )
+    }
+
     /// Fails every call with `UnknownTool`, which is how a test proves the call
     /// reached MCP at all.
     struct StubTransport;
@@ -1329,6 +1394,29 @@ pub mod test_support {
             _args: &'a Value,
         ) -> BoxFuture<'a, Result<String, McpError>> {
             Box::pin(async move { Err(McpError::UnknownTool { name: name.into() }) })
+        }
+        fn get_prompt<'a>(
+            &'a self,
+            name: &'a str,
+            _arguments: &'a HashMap<String, String>,
+        ) -> BoxFuture<'a, Result<Vec<PromptMessage>, McpError>> {
+            Box::pin(async move { Err(McpError::UnknownPrompt { name: name.into() }) })
+        }
+        fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    /// Answers every call with the JSON of the args it received.
+    struct EchoTransport;
+
+    impl McpTransport for EchoTransport {
+        fn call_tool<'a>(
+            &'a self,
+            _name: &'a str,
+            args: &'a Value,
+        ) -> BoxFuture<'a, Result<String, McpError>> {
+            Box::pin(async move { Ok(args.to_string()) })
         }
         fn get_prompt<'a>(
             &'a self,
@@ -1469,6 +1557,7 @@ fn intern(name: String) -> Arc<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::schema::TOOLCALL_REASON_FIELD;
     use config::{RawHttpFields, RawServerConfig, RawStdioFields, RawTransport};
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(unix)]
@@ -1675,6 +1764,24 @@ mod tests {
     fn resolve_maps_published_names_only(name: &str, expected: Option<&str>) {
         let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
         assert_eq!(handle.resolve(name).as_deref(), expected);
+    }
+
+    /// A `toolcall_reason` the server declares itself is the tool's argument,
+    /// not our narration: publish must remember which side owns the field.
+    #[test_case(json!({ "type": "object" }), true ; "injected")]
+    #[test_case(
+        json!({
+            "type": "object",
+            "properties": { TOOLCALL_REASON_FIELD: { "type": "string", "description": "the tool's own" } },
+        }),
+        false ; "server_declared"
+    )]
+    fn reason_injected_tracks_who_declared_the_field(schema: Value, expected: bool) {
+        let mut entry = fake_entry("srv", FakeTransport::new());
+        entry.tools[0].input_schema = schema;
+        let (_inner, handle) = setup(vec![entry]);
+        assert_eq!(handle.reason_injected(TOOL_NAME), expected);
+        assert!(!handle.reason_injected("gone.tool"), "unknown tool owns nothing");
     }
 
     /// `ready` carries the correctness of connecting in the background: a prompt
