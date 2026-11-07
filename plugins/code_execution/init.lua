@@ -45,6 +45,8 @@ import asyncio
 import sys
 import os
 import json
+import urllib.parse
+import glob
 async def gather(*calls):
     if len(calls) == 1 and isinstance(calls[0], list):
         calls = calls[0]
@@ -132,41 +134,42 @@ local function build_body(ctx, code)
   return buf, view, highlight
 end
 
-local description = [[Execute Python in a sandbox where every tool is an async function.
+local function build_description(batch_disabled)
+  local use_prefix = batch_disabled
+      and "Use for parallel/batch calls (the batch tool is disabled; use gather), "
+    or "Use for "
+  local concurrency = batch_disabled
+      and "- Concurrency / Batch execution: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`. The batch tool is disabled; use code_execution with `await gather(...)` to run multiple independent tool calls concurrently (replacing batch)."
+    or "- Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`."
+  local single_call = batch_disabled
+      and "- NEVER use as a proxy or wrapper for a single tool call. If no code logic, chaining, or output filtering is needed, invoke the tool directly (batching 2+ independent calls via gather is allowed when batch is disabled)."
+    or "- NEVER use as a proxy or wrapper for a single tool call. If no code logic, chaining, or output filtering is needed, invoke the tool directly."
 
-Use for chained/dependent tool calls and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** cheaper than sequential tool calls!
+  return ([[Execute Python in a sandbox where every tool is an async function.
+
+%schained/dependent tool calls and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** cheaper than sequential tool calls!
 
 - All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Parse output yourself.
 - Tool results are complete. Only what you print/return is capped.
-- Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`.
-- Available libs: re, asyncio, sys, os, json, pathlib. No other imports, no classes, no network access. `open()` works on text files, and `os`/`pathlib` can stat, list, walk, glob and mkdir.
+%s
+- Available libs: re, asyncio, sys, os, json, pathlib, urllib.parse, glob. No other imports, no classes, no network access. `open()` works on text files, and `os`/`pathlib` can stat, listdir, walk, and mkdir. For file matching, prefer `Path.glob()`.
 - Fresh sandbox each run: no state persists between executions.
 - 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
-- NEVER use as a proxy or wrapper for a single tool call. If no code logic, chaining, or output filtering is needed, invoke the tool directly.
+%s
 - NOT a thinking scratchpad. Reason in your response text.
 - Monty sandbox limitations (avoid common failures):
   * Generator expressions `(x for ...)` materialize as `list`, and `iter()` is unavailable: DO NOT use `next(x for ...)`; use a `for` loop or `[...][0]` instead.
   * No `:=` (walrus), no `del` (use `d.pop(k, None)`), no `*args` unpacking in calls (`f(*args)`), no `match/case`, no decorators (`@...`).
   * Builtins NOT implemented: `iter`, `callable`, `dir`, `globals`, `locals`, `eval`, `exec`.
-]]
+  * Synchronous context restriction: DO NOT call file/OS operations (like `stat()`, `read_text()`) inside `sorted(key=...)`, `max(key=...)`, or `map()` (cannot suspend); extract attributes beforehand via list comprehension.
+  * `open()` supports basic text read/write only: NO `errors=` or `encoding=` parameter.
+  * `pathlib.Path` does NOT support `.relative_to()`.
+  * `re.sub()` replacement must be a string: callable/lambda replacements are NOT supported.
+]]):format(use_prefix, concurrency, single_call)
+end
 
-local description_batch_disabled = [[Execute Python in a sandbox where every tool is an async function.
-
-Use for parallel/batch calls (the batch tool is disabled; use gather), chained/dependent tool calls, and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** cheaper than sequential tool calls!
-
-- All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Parse output yourself.
-- Tool results are complete. Only what you print/return is capped.
-- Concurrency / Batch execution: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`. The batch tool is disabled; use code_execution with `await gather(...)` to run multiple independent tool calls concurrently (replacing batch).
-- Available libs: re, asyncio, sys, os, json, pathlib. No other imports, no classes, no network access. `open()` works on text files, and `os`/`pathlib` can stat, list, walk, glob and mkdir.
-- Fresh sandbox each run: no state persists between executions.
-- 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
-- NEVER use as a proxy or wrapper for a single tool call. If no code logic, chaining, or output filtering is needed, invoke the tool directly (batching 2+ independent calls via gather is allowed when batch is disabled).
-- NOT a thinking scratchpad. Reason in your response text.
-- Monty sandbox limitations (avoid common failures):
-  * Generator expressions `(x for ...)` materialize as `list`, and `iter()` is unavailable: DO NOT use `next(x for ...)`; use a `for` loop or `[...][0]` instead.
-  * No `:=` (walrus), no `del` (use `d.pop(k, None)`), no `*args` unpacking in calls (`f(*args)`), no `match/case`, no decorators (`@...`).
-  * Builtins NOT implemented: `iter`, `callable`, `dir`, `globals`, `locals`, `eval`, `exec`.
-]]
+local description = build_description(false)
+local description_batch_disabled = build_description(true)
 
 local schema = {
   type = "object",
@@ -187,7 +190,7 @@ local schema = {
 local examples = {
   {
     code = [[files = (await glob(pattern='**/*.rs')).strip().split('\n')
-results = await gather(*[read(path=f, offset=1, limit=0) for f in files if f.strip()])
+results = await gather([read(path=f, offset=1, limit=0) for f in files if f.strip()])
 for f, c in zip(files, results):
     if 'fn main' in c: print(f)]],
   },
@@ -447,11 +450,17 @@ local function handler(input, ctx)
         if t.workflow_only then
           return maki.agent.call_tool(ctx, name, tool_input)
         end
-        -- The script clock stops while a tool call is awaited, so an explicit
-        -- longer timeout on the call has to win over the script budget.
+        -- The script clock stops while a tool call is awaited. Child tools keep
+        -- their own default timeout unless overridden explicitly or relaxed by
+        -- an outer script timeout.
         local explicit = type(tool_input) == "table" and tonumber(tool_input.timeout) or nil
-        local deadline = math.max(timeout, explicit or 0)
-        return maki.agent.call_tool(ctx, name, tool_input, { timeout = deadline })
+        local tool_opts
+        if explicit then
+          tool_opts = { timeout = explicit }
+        elseif input.timeout and input.timeout > opts.timeout_secs then
+          tool_opts = { timeout = input.timeout }
+        end
+        return maki.agent.call_tool(ctx, name, tool_input, tool_opts)
       end
     end
   end

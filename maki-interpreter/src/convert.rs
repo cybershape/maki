@@ -71,7 +71,9 @@ pub fn monty_to_json(obj: ObjectRef<'_>) -> Value {
             MontyNode::Repr(text) => Some(Value::String(text.clone())),
             _ => None,
         },
-        _ => None,
+        _ => obj
+            .items()
+            .map(|items| Value::Array(items.into_iter().map(monty_to_json).collect())),
     }
     .unwrap_or_else(|| Value::String(obj.py_repr()))
 }

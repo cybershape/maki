@@ -26,6 +26,7 @@ use crate::alloc::SandboxScope;
 use crate::convert::{json_to_monty, monty_to_json};
 use crate::disk::{self, Cleared};
 use crate::error::InterpreterError;
+use crate::modules;
 
 const DEFAULT_MAX_RECURSION: usize = 100;
 const SCRIPT_NAME: &str = "agent.py";
@@ -235,7 +236,16 @@ fn drive(
                     "interpreter: function call"
                 );
 
-                if resolver.is_some() && tools.contains_key(name.as_str()) {
+                if modules::is_module_fn(&name) {
+                    let result =
+                        match modules::call_module_fn(&name, &args_json, &kwargs_json, host) {
+                            Ok(val) => ExtFunctionResult::Return(val),
+                            Err(exc) => ExtFunctionResult::Error(exc),
+                        };
+                    progress = call
+                        .resume(result, print_writer.reborrow())
+                        .map_err(|e| InterpreterError::Runtime(e.to_string()))?;
+                } else if resolver.is_some() && tools.contains_key(name.as_str()) {
                     let call_id = call.call_id;
                     pending_calls.insert(
                         call_id,
@@ -281,6 +291,14 @@ fn drive(
                     .map_err(|e| InterpreterError::Runtime(e.to_string()))?;
             }
             RunProgress::OsCall(mut call) => {
+                if let OsFunctionCall::Import(ref mod_name) = call.function_call
+                    && let Some(module) = modules::serve_import(mod_name)
+                {
+                    progress = call
+                        .resume(ExtFunctionResult::Return(module), print_writer.reborrow())
+                        .map_err(|e| InterpreterError::Runtime(e.to_string()))?;
+                    continue;
+                }
                 if host.files.is_none() {
                     return Err(InterpreterError::Sandboxed(OS_CALLS_DENIED.into()));
                 }
@@ -334,10 +352,10 @@ fn drive(
 /// or above it, or the end of the run. A loop of `f.write` then turns into a single host write,
 /// and a cancelled run drops what is still waiting here. Paths are matched once
 /// made absolute, so `a` and `./a` share one entry and the last write wins.
-struct OsHost<'a> {
+pub(crate) struct OsHost<'a> {
     files: Option<&'a FileFn>,
     pending: Vec<FileWrite>,
-    cwd: String,
+    pub(crate) cwd: String,
     clock: HostClock,
 }
 
@@ -408,7 +426,7 @@ impl OsHost<'_> {
     /// an empty tree. The host gets the absolute path rather than the script's
     /// spelling, since it would expand `~` or a relative path its own way and
     /// could approve a different file than the one we read.
-    fn query<T>(
+    pub(crate) fn query<T>(
         &mut self,
         path: &str,
         read: impl FnOnce(&Cleared) -> Result<T, MontyException>,
@@ -540,7 +558,7 @@ impl OsHost<'_> {
 /// raised in the script, like CPython does. Anything else ends the run, since
 /// the script could catch it, and a walk or glob would swallow it as an
 /// `OSError` (`TimeoutError` is one) and quietly lose a failed buffered write.
-enum Fault {
+pub(crate) enum Fault {
     Raise(MontyException),
     Abort(InterpreterError),
 }
@@ -1619,5 +1637,48 @@ await main()
             msg.contains("boom"),
             "expected error message containing 'boom', got {msg}"
         );
+    }
+
+    #[test_case(
+        "import urllib.parse\np = urllib.parse.urlparse('https://example.com:8080/path?q=1#frag')\n[p.scheme, p.netloc, p.path, p.query, p.fragment]",
+        json!(["https", "example.com:8080", "/path", "q=1", "frag"])
+        ; "urllib_parse_urlparse"
+    )]
+    #[test_case(
+        "from urllib.parse import urlsplit, urlunsplit\ns = urlsplit('https://example.com/api?x=1#top')\n[s.scheme, s.netloc, s.path, s.query, s.fragment, urlunsplit(s)]",
+        json!(["https", "example.com", "/api", "x=1", "top", "https://example.com/api?x=1#top"])
+        ; "urllib_parse_urlsplit"
+    )]
+    #[test_case(
+        "from urllib.parse import quote, unquote, quote_plus, unquote_plus\n[quote('hello world/a'), unquote('hello%20world/a'), quote_plus('hello world'), unquote_plus('hello+world')]",
+        json!(["hello%20world/a", "hello world/a", "hello+world", "hello world"])
+        ; "urllib_parse_quote_unquote"
+    )]
+    #[test_case(
+        "from urllib.parse import parse_qs, parse_qsl, urlencode\nqs = 'a=1&b=2&a=3'\n[parse_qs(qs)['a'], parse_qsl(qs), urlencode({'x': '1', 'y': '2'})]",
+        json!([["1", "3"], [["a", "1"], ["b", "2"], ["a", "3"]], "x=1&y=2"])
+        ; "urllib_parse_qs_and_urlencode"
+    )]
+    #[test_case(
+        "from urllib.parse import urljoin\n[urljoin('https://example.com/sub/a.html', 'b.html'), urljoin('https://example.com/sub/', '/root.html')]",
+        json!(["https://example.com/sub/b.html", "https://example.com/root.html"])
+        ; "urllib_parse_urljoin"
+    )]
+    #[test_case(
+        "import glob\nglob.escape('foo*bar?[baz]')",
+        json!("foo[*]bar[?][[]baz]")
+        ; "glob_escape"
+    )]
+    fn host_provided_modules_evaluate(code: &str, expected: Value) {
+        let result = run_code(code, &empty_tools(), None, default_limits()).unwrap();
+        assert_eq!(result.output, Some(expected));
+    }
+
+    #[test]
+    fn glob_on_disk_finds_files() {
+        let tree = disk_tree();
+        let code = "import glob\nfiles = glob.glob(root + '/**/*.txt')\nlen(files)";
+        let result = run_on_disk(code, tree.path(), default_limits()).unwrap();
+        assert_eq!(result.output, Some(json!(2)));
     }
 }
