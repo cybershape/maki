@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `66cb4f98d80c7c512b027eb0258ec4f7f0909247`
-  - **Commit date**: `Sat Nov 7 01:05:38 2026 +0200`
-  - **Commit author**: `Tony Solomonik <tony.solomonik@gmail.com>`
-  - **Commit message**: `fix(ui): dim background task results by 0.7 instead of 0.3`
+  - **Commit SHA**: `1748888f245792674d11393fb688959e6d3b3e7e`
+  - **Commit date**: `Sun Nov 8 01:22:56 2026 +0500`
+  - **Commit author**: `gmanka <gmankab@gmail.com>`
+  - **Commit message**: `docs(providers): add gpt-6.1-terra to openai`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `66cb4f98`.
+> `upstream/main` has been successfully merged through commit `1748888f`.
 
 ---
 
@@ -162,6 +162,19 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `cf209dfd` | `feat(agent): content hash fast-path and opt-out for stale read check` | Optimize FileAccess with SHA-256 hash fast-path and opt-out for write tool |
 | `d1da689c` | `feat(code_execution): builtin urllib.parse/glob, clarify sandbox limits, and preserve child tool timeouts` | Built-in urllib.parse/glob modules, document sandbox limits, and preserve child tool timeouts |
 | `9adc3330` | `Merge branch 'upstream/main' into main` | Merge upstream through `66cb4f98`, including version 0.7.1 bump, XDG layout unification, `app/mod.rs` decomposition and `KeyboardOwner` architecture, subagent `SessionControl` refactoring, derive(`Merge`) for config, default `@` completion plugin, UI collapsing and background task output dimming, and site restyling, while preserving core fork customizations |
+| `9f3ffaee` | `docs: update upstream tracking record to 66cb4f98` | Update the upstream tracking record to `66cb4f98` |
+| `e66df122` | `fix(agent): realign message timestamps on history replace and truncate` | Realign message timestamps on history replace and truncate |
+| `9b660863` | `fix(code_execution): glob against the native disk path, not the sandbox spelling` | Glob against the native disk path rather than sandbox path |
+| `d342ad78` | `fix(code_execution): match CPython glob dotfile rule and skip symlinked dirs` | Match CPython glob dotfile rule and avoid descending into symlinked directories |
+| `743ecc19` | `fix(code_execution): parse_qsl drops bare keys like CPython` | Drop bare keys in parse_qsl like CPython |
+| `3643d0c6` | `build: drop panic=abort from the release profile` | Drop panic=abort from the release profile |
+| `f0a1dd65` | `fix(headless): gate OSC program-status on a real terminal` | Gate OSC program-status on a real terminal |
+| `58638ddd` | `fix(acp): sync the usage cost snapshot when a turn ends in Error` | Sync usage cost snapshot in ACP when a turn ends in Error |
+| `48d0e973` | `fix(mcp): stop stealing a server-declared toolcall_reason parameter` | Avoid stealing server-declared toolcall_reason parameter |
+| `3d08126f` | `fix(code_execution): stop preamble import glob from shadowing the glob tool` | Stop preamble import glob from shadowing the glob tool |
+| `65c7959d` | `test(ui): make waiting timer assertion robust to elapsed-time drift` | Make waiting timer assertion robust to elapsed-time drift |
+| `6e1715d0` | `fix(ui): defer plan form popup until agent turn completes` | Defer plan form popup until agent turn completes |
+| `4fb237f2` | `Merge branch 'upstream/main' into main` | Merge upstream through `1748888f`, including plugin session data root (`data/<id>/`) and lifecycle sweep on session delete, Unix domain socket support in `maki.net`, OSC 7501 Program Status Protocol reporting, theme scrollbar thumb styling, session archive persistence until session deletion, prompt background guidance, and gpt-6.1-terra support, while preserving core fork customizations |
 
 ---
 
