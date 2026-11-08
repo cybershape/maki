@@ -30,8 +30,8 @@ end
 
 local function apply_highlights(view, lines, ext, prefix)
   local opts = prefix and { prefix = prefix } or nil
-  local highlighted = maki.ui.highlight(table.concat(lines, "\n"), ext, opts)
-  if not highlighted then
+  local ok, highlighted = pcall(maki.ui.highlight, table.concat(lines, "\n"), ext, opts)
+  if not ok or not highlighted then
     return
   end
   for i, hl_spans in ipairs(highlighted) do
@@ -94,14 +94,29 @@ local function build_file_view(lines, start_line, total_lines, path, ctx, prefix
 
   view:finish()
 
+  local view_opts = read_view_opts(ctx)
+  local max_lines = view_opts.max_lines
   local ext = path:match("%.([^%.]+)$") or ""
-  maki.async.run(function()
-    apply_highlights(view, lines, ext, prefix)
-  end)
+  local highlighted = false
+  local function trigger_highlight()
+    if ext ~= "" and not highlighted then
+      highlighted = true
+      maki.async.run(function()
+        pcall(apply_highlights, view, lines, ext, prefix)
+      end)
+    end
+  end
 
   buf:on("click", function()
     view:toggle()
+    if view.expanded then
+      trigger_highlight()
+    end
   end)
+
+  if max_lines > 0 then
+    trigger_highlight()
+  end
   return buf
 end
 

@@ -87,8 +87,8 @@ local function apply_highlights(view, hl_entries, ext)
   for _, e in ipairs(hl_entries) do
     texts[#texts + 1] = e.text
   end
-  local highlighted = maki.ui.highlight(table.concat(texts, "\n"), ext, { independent = true })
-  if not highlighted then
+  local ok, highlighted = pcall(maki.ui.highlight, table.concat(texts, "\n"), ext, { independent = true })
+  if not ok or not highlighted then
     return
   end
   for i, e in ipairs(hl_entries) do
@@ -110,21 +110,33 @@ end
 
 local function render_index(skeleton, ctx, ext, line_meta)
   local tol = ctx:tool_output_lines()
+  local max_lines = (tol and tol.index) or 0
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, {
-    max_lines = (tol and tol.index) or 0,
+    max_lines = max_lines,
     keep = "head",
   })
+  local hl_entries = render_skeleton(view, skeleton, line_meta)
+  local highlighted = false
+  local function trigger_highlight()
+    if ext and not highlighted then
+      highlighted = true
+      maki.async.run(function()
+        pcall(apply_highlights, view, hl_entries, ext)
+      end)
+    end
+  end
+
   buf:on("click", function()
     view:toggle()
+    if view.expanded then
+      trigger_highlight()
+    end
   end)
-  local hl_entries = render_skeleton(view, skeleton, line_meta)
   view:finish()
 
-  if ext then
-    maki.async.run(function()
-      apply_highlights(view, hl_entries, ext)
-    end)
+  if max_lines > 0 then
+    trigger_highlight()
   end
   return buf
 end

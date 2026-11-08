@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, c_int};
 use std::fmt::Display;
 use std::future::{Future, pending};
-use std::panic::catch_unwind;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::pin::{Pin, pin};
 use std::ptr;
@@ -15,6 +15,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use event_listener::Event;
+use futures::FutureExt;
 
 use include_dir::Dir;
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
@@ -3410,6 +3411,14 @@ fn report_keybind_done(lua: &Lua, ticket: u64) {
     host_ui_send(lua, UiAction::KeybindDone(ticket));
 }
 
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>")
+}
+
 fn spawn_async_task(lua: &Lua, gate: &Rc<InflightGate>, task: PendingAsyncTask) {
     if task.cancel.is_cancelled() {
         tracing::debug!(
@@ -3439,11 +3448,18 @@ fn spawn_async_task(lua: &Lua, gate: &Rc<InflightGate>, task: PendingAsyncTask) 
         let scope = TaskScope::new(&lua, cell);
         let handle = Arc::clone(scope.handle());
         let run = run_work_fn(&lua, &task.work_fn, &handle);
-        let result = covered(
+        let fut = AssertUnwindSafe(covered(
             slot,
             scope.scope_future(Narrowed::under(&lua, task.ceiling.clone(), run)),
-        )
-        .await;
+        ));
+        let result = match fut.catch_unwind().await {
+            Ok(res) => res,
+            Err(payload) => {
+                let msg = panic_payload_message(&*payload);
+                tracing::warn!(%msg, "async.run: task panicked");
+                Err(mlua::Error::runtime(msg))
+            }
+        };
         if let Err(e) = &result {
             let tool_id = task.live_ctx.as_ref().map(|l| l.tool_use_id.as_str());
             tracing::debug!(error = %e, tool_id, "async.run: task failed");

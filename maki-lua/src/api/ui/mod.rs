@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use futures::FutureExt;
 
 use maki_agent::UiWaker;
 use maki_agent::tools::compact_duration;
@@ -329,15 +332,21 @@ async fn highlight(lua: Lua, code: String, lang: String, opts: Option<Table>) ->
     let prefix = opts
         .and_then(|t| t.get::<String>("prefix").ok())
         .unwrap_or_default();
-    let segments = maki_highlight::pool::run_async(move || {
+    let fut = AssertUnwindSafe(maki_highlight::pool::run_async(move || {
         if independent {
             maki_highlight::highlight_lines_independent(&lang, &code)
         } else {
             maki_highlight::highlight_code(&lang, &code, &prefix)
         }
-    })
-    .await;
-    segments_to_lua_lines(&lua, &segments)
+    }));
+    let segments = match fut.catch_unwind().await {
+        Ok(s) => s,
+        Err(_) => return lua.create_table(),
+    };
+    match segments_to_lua_lines(&lua, &segments) {
+        Ok(tbl) => Ok(tbl),
+        Err(_) => lua.create_table(),
+    }
 }
 
 /// Renders Markdown into styled lines ready to display in a buffer.

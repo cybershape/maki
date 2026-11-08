@@ -471,8 +471,22 @@ pub fn highlight_block(lang: &str, code: &str) -> BlockSegments {
 
 pub fn highlight_lines_independent(lang: &str, code: &str) -> Vec<Vec<StyledSegment>> {
     let syntax = syntax_for_token(lang);
+    let theme = theme();
+    let syn_hl = SynHighlighter::new(&theme);
+    let mut parse_state = ParseState::new(syntax);
+    let mut highlight_state = HighlightState::new(&syn_hl, ScopeStack::new());
     LinesWithEndings::from(code)
-        .map(|raw| Highlighter::for_syntax(syntax).highlight_line(raw))
+        .map(|raw| {
+            parse_state = ParseState::new(syntax);
+            highlight_state = HighlightState::new(&syn_hl, ScopeStack::new());
+            let ops = match parse_state.parse_line(raw, syntax_set()) {
+                Ok(ops) => ops,
+                Err(_) => return vec![StyledSegment::fallback(normalize_text(raw))],
+            };
+            let iter = HighlightIterator::new(&mut highlight_state, &ops, raw, &syn_hl);
+            iter.map(|(style, text)| StyledSegment::from_syntect(style, normalize_text(text)))
+                .collect()
+        })
         .collect()
 }
 
