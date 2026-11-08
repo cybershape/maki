@@ -20,7 +20,6 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
 use crate::app::tasks::TaskStatus;
-use crate::components::Status;
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent as CtMouseEvent,
     MouseEventKind,
@@ -85,7 +84,7 @@ use crate::theme;
 use crate::{AppSession, OpenSession};
 
 use crate::storage_writer::StorageWriter;
-use crate::terminal;
+use crate::terminal::{self, BlockedKind, ProgramState, ProgramStatusReporter};
 
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
@@ -200,6 +199,7 @@ struct RunNotificationState {
     response_candidate: Option<String>,
     pending_completion: Option<PendingCompletion>,
     last_attention: Option<Notification>,
+    outcome: Option<ProgramState>,
 }
 
 impl RunNotificationState {
@@ -210,6 +210,7 @@ impl RunNotificationState {
     fn on_queue_item_consumed(&mut self) {
         self.response_candidate = None;
         self.pending_completion = None;
+        self.outcome = None;
     }
 
     fn on_turn_complete(&mut self, message: &Message) {
@@ -218,10 +219,14 @@ impl RunNotificationState {
 
     fn on_done(&mut self, event: &AgentEvent) {
         let notification = match event {
-            AgentEvent::Done { .. } => Notification::TurnComplete {
-                response: self.response_candidate.take(),
-            },
+            AgentEvent::Done { .. } => {
+                self.outcome = Some(ProgramState::Done);
+                Notification::TurnComplete {
+                    response: self.response_candidate.take(),
+                }
+            }
             AgentEvent::Error { .. } => {
+                self.outcome = Some(ProgramState::Error);
                 self.response_candidate = None;
                 Notification::error_completion()
             }
@@ -320,6 +325,32 @@ fn select_notification(
         (selected @ Some(_), _) => selected,
         (None, candidate) => candidate,
     }
+}
+
+fn blocked_kind(attention: Option<&Notification>) -> BlockedKind {
+    match attention {
+        Some(Notification::AuthenticationRequired) => BlockedKind::Auth,
+        Some(Notification::QuestionRequested) => BlockedKind::Question,
+        _ => BlockedKind::Permission,
+    }
+}
+
+fn program_state_rank(state: ProgramState) -> u8 {
+    match state {
+        ProgramState::Idle => 0,
+        ProgramState::Done => 1,
+        ProgramState::Error => 2,
+        ProgramState::Working => 3,
+        ProgramState::Blocked(_) => 4,
+    }
+}
+
+fn select_program_status<T>(
+    candidates: impl Iterator<Item = (ProgramState, bool, T)>,
+) -> Option<(ProgramState, T)> {
+    candidates
+        .max_by_key(|&(state, focused, _)| (program_state_rank(state), focused))
+        .map(|(state, _, payload)| (state, payload))
 }
 
 /// Maki never turns focus reporting on under Windows, so anything that looks
@@ -427,6 +458,19 @@ struct SessionRuntime {
 impl SessionRuntime {
     fn id(&self) -> MakiId {
         self.app.state.session.id
+    }
+
+    fn program_state(&self) -> (ProgramState, Option<String>) {
+        let state = match self.last_status {
+            SessionStatus::NeedsInput => {
+                let attention = self.app.attention();
+                let msg = attention.as_ref().map(Notification::message);
+                return (ProgramState::Blocked(blocked_kind(attention.as_ref())), msg);
+            }
+            SessionStatus::Working => ProgramState::Working,
+            SessionStatus::Idle => self.notifications.outcome.unwrap_or(ProgramState::Idle),
+        };
+        (state, None)
     }
 
     /// New work cancels an `exit_on_done` exit still waiting on its drain.
@@ -543,6 +587,7 @@ pub(crate) struct EventLoop<'t> {
     last_mode: InputMode,
     focus: Focus,
     notifier: Option<terminal::TerminalNotifier>,
+    program_status: Option<ProgramStatusReporter>,
     ctx: SpawnCtx,
     slots: ModelSlots,
     input: InputReader,
@@ -560,8 +605,6 @@ pub(crate) struct EventLoop<'t> {
     /// clones and locks.
     pack_running: bool,
     _model_fetch_task: AbortOnDropHandle<()>,
-    program_status_enabled: bool,
-    last_program_status: Option<crate::program_status::ProgramStatusReport>,
     sleep_detector: SleepDetector,
     resize_debounce: Option<ResizeDebounce>,
 }
@@ -748,7 +791,7 @@ impl<'t> EventLoop<'t> {
         let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
 
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
-        let program_status_enabled = ui_config.program_status;
+        let program_status = ui_config.program_status.then(ProgramStatusReporter::new);
         let ctx = SpawnCtx {
             storage,
             config,
@@ -808,7 +851,7 @@ impl<'t> EventLoop<'t> {
         }
 
         let (pack_tx, pack_rx) = flume::unbounded();
-        let mut loop_instance = Self {
+        Ok(Self {
             terminal,
             sessions: runtimes,
             focused,
@@ -816,6 +859,7 @@ impl<'t> EventLoop<'t> {
             last_mode: InputMode::Insert,
             focus: Focus::default(),
             notifier,
+            program_status,
             ctx,
             slots,
             input: InputReader::new().context("watch terminal input")?,
@@ -830,17 +874,9 @@ impl<'t> EventLoop<'t> {
             pack_rx,
             pack_running: false,
             _model_fetch_task: bg.task,
-            program_status_enabled,
-            last_program_status: None,
             sleep_detector: SleepDetector::new(),
             resize_debounce: None,
-        };
-        if loop_instance.program_status_enabled {
-            let report = crate::program_status::ProgramStatusReport::idle();
-            let _ = crate::program_status::emit_program_status(&report);
-            loop_instance.last_program_status = Some(report);
-        }
-        Ok(loop_instance)
+        })
     }
 
     fn focused_app(&mut self) -> &mut App {
@@ -1164,6 +1200,7 @@ impl<'t> EventLoop<'t> {
         }
         self.emit_task_changes();
         self.emit_notifications();
+        self.emit_program_status();
         // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
         // can never send it, so fail instead of hanging forever.
         if let Some(runtime) = self.sessions.iter().find(|rt| {
@@ -1191,7 +1228,7 @@ impl<'t> EventLoop<'t> {
                 }
             }
             UiAction::SetProgramStatus(custom) => {
-                if self.program_status_enabled
+                if self.program_status.is_some()
                     && let Some(state) = crate::program_status::State::from_str_opt(&custom.state)
                 {
                     let report = crate::program_status::ProgramStatusReport {
@@ -1409,7 +1446,7 @@ impl<'t> EventLoop<'t> {
                             plugin: task.plugin.map(|plugin| &**plugin),
                         },
                     );
-                    if self.program_status_enabled {
+                    if self.program_status.is_some() {
                         let sanitized = sanitize_task_id(task.id);
                         let state = match task.status {
                             TaskStatus::Working => crate::program_status::State::Working,
@@ -1435,7 +1472,7 @@ impl<'t> EventLoop<'t> {
             Some(&self.sessions[idx].app.state.session.id),
             HostEvent::TaskStopped { id, plugin },
         );
-        if self.program_status_enabled {
+        if self.program_status.is_some() {
             let sanitized = sanitize_task_id(id);
             let report = crate::program_status::ProgramStatusReport::clear(Some(sanitized));
             let _ = crate::program_status::emit_program_status(&report);
@@ -1457,63 +1494,35 @@ impl<'t> EventLoop<'t> {
             warn!(notifier = ?notifier.notifier(), %error, "terminal notifications disabled after write failure");
             self.notifier = None;
         }
-        self.emit_program_status(selected.as_ref());
     }
 
-    fn emit_program_status(&mut self, completion: Option<&Notification>) {
-        if !self.program_status_enabled {
-            return;
+    fn clear_program_status(&mut self) {
+        if let Some(reporter) = &mut self.program_status
+            && let Err(error) = reporter.clear()
+        {
+            warn!(%error, "failed to clear program status");
         }
-        let rt = &self.sessions[self.focused];
-        let report = match rt.app.attention() {
-            Some(Notification::PermissionRequested { tool }) => {
-                let msg = tool
-                    .map(|t| format!("Permission requested: {t}"))
-                    .unwrap_or_else(|| "Permission requested".into());
-                crate::program_status::ProgramStatusReport::blocked(
-                    crate::program_status::Kind::Permission,
-                    Some(msg),
-                )
-            }
-            Some(Notification::AuthenticationRequired) => {
-                crate::program_status::ProgramStatusReport::blocked(
-                    crate::program_status::Kind::Auth,
-                    Some("Authentication required".into()),
-                )
-            }
-            Some(Notification::QuestionRequested) => {
-                crate::program_status::ProgramStatusReport::blocked(
-                    crate::program_status::Kind::Question,
-                    Some("Question requested".into()),
-                )
-            }
-            Some(Notification::PlanReady) => crate::program_status::ProgramStatusReport::blocked(
-                crate::program_status::Kind::Permission,
-                Some("Plan ready".into()),
-            ),
-            _ => {
-                if let Some(Notification::TurnComplete { response }) = completion {
-                    crate::program_status::ProgramStatusReport::done(response.clone())
-                } else if let Some(Notification::AgentError { message }) = completion {
-                    crate::program_status::ProgramStatusReport::error(Some(message.clone()))
-                } else if rt.app.status == Status::Streaming {
-                    crate::program_status::ProgramStatusReport::working(None)
-                } else if let Some(ref last) = self.last_program_status
-                    && matches!(
-                        last.state,
-                        crate::program_status::State::Done | crate::program_status::State::Error
-                    )
-                {
-                    return;
-                } else {
-                    crate::program_status::ProgramStatusReport::idle()
-                }
-            }
-        };
+    }
 
-        if self.last_program_status.as_ref() != Some(&report) {
-            let _ = crate::program_status::emit_program_status(&report);
-            self.last_program_status = Some(report);
+    fn emit_program_status(&mut self) {
+        let Some(reporter) = &mut self.program_status else {
+            return;
+        };
+        let focused = self.focused;
+        let candidates = self.sessions.iter().enumerate().map(|(i, rt)| {
+            let (state, msg) = rt.program_state();
+            (
+                state,
+                i == focused,
+                (rt.app.state.session.title.as_str(), msg),
+            )
+        });
+        let Some((state, (title, msg))) = select_program_status(candidates) else {
+            return;
+        };
+        if let Err(error) = reporter.report(state, title, msg.as_deref()) {
+            warn!(%error, "program status reporting disabled after write failure");
+            self.program_status = None;
         }
     }
 
@@ -1549,7 +1558,6 @@ impl<'t> EventLoop<'t> {
             HostEvent::TaskFocusChanged { id: &task_id },
         );
         if switched {
-            self.last_program_status = None;
             self.focused_app().announce_input();
         }
     }
@@ -1991,15 +1999,6 @@ impl<'t> EventLoop<'t> {
     /// Handles one input event plus any leftover produced while coalescing
     /// bursts of scroll/drag events.
     fn handle_input(&mut self, raw: Event) {
-        if let Some(ref last) = self.last_program_status
-            && matches!(
-                last.state,
-                crate::program_status::State::Done | crate::program_status::State::Error
-            )
-            && matches!(raw, Event::Key(_) | Event::FocusGained)
-        {
-            self.last_program_status = None;
-        }
         let mut pending = Some(raw);
         while let Some(ev) = pending.take() {
             if matches!(ev, Event::Resize(..)) {
@@ -2319,6 +2318,7 @@ impl<'t> EventLoop<'t> {
             }
             Action::PreparePack(command) => self.start_pack(idx, command),
             Action::Suspend => {
+                self.clear_program_status();
                 let _pause = self.input.pause();
                 terminal::suspend(self.terminal);
                 self.focus.on_resume();
@@ -2434,6 +2434,9 @@ impl<'t> EventLoop<'t> {
             elapsed
         };
         let exit = self.sessions[self.focused].app.exit_request.clone();
+        if !self.sessions[self.focused].app.exits_on_done() {
+            self.clear_program_status();
+        }
         // The loop already stopped draining `UiAction`, so say so before the
         // handlers run. Dropping the receiver does not, since the Lua runtime
         // holds one of its own, and a handler touching the UI would then park
@@ -2587,6 +2590,35 @@ mod tests {
         state.on_done(&done_event());
         state.on_drain();
         state
+    }
+
+    const FOCUSED_TITLE: &str = "focused";
+    const BACKGROUND_TITLE: &str = "background";
+
+    #[test_case(ProgramState::Idle, ProgramState::Working, BACKGROUND_TITLE ; "background_working_beats_focused_idle")]
+    #[test_case(ProgramState::Blocked(BlockedKind::Question), ProgramState::Working, FOCUSED_TITLE ; "blocked_beats_working")]
+    #[test_case(ProgramState::Done, ProgramState::Error, BACKGROUND_TITLE ; "error_beats_done")]
+    #[test_case(ProgramState::Done, ProgramState::Done, FOCUSED_TITLE ; "tie_goes_to_focused")]
+    fn select_program_status_cases(
+        focused: ProgramState,
+        background: ProgramState,
+        expected_title: &str,
+    ) {
+        let candidates = [
+            (background, false, BACKGROUND_TITLE),
+            (focused, true, FOCUSED_TITLE),
+            (background, false, BACKGROUND_TITLE),
+        ];
+        let (_, title) = select_program_status(candidates.into_iter()).unwrap();
+        assert_eq!(title, expected_title);
+    }
+
+    #[test]
+    fn outcome_survives_drain_and_clears_on_next_run() {
+        let mut state = due_completion();
+        assert_eq!(state.outcome, Some(ProgramState::Done));
+        state.on_queue_item_consumed();
+        assert_eq!(state.outcome, None);
     }
 
     #[test]

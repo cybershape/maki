@@ -708,6 +708,8 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///             Defaults to `max_tokens`.
 ///     `include_stream_usage` (boolean) Ask for usage on the stream.
 ///             Defaults to `true`.
+///     `usage_cost` (boolean) Price turns from `usage.cost` on the stream
+///             (in USD). Defaults to `false`.
 ///     `thinking` (table) How the API spells reasoning effort. Without it,
 ///             each model's `thinking_fields` decides.
 ///       `dialect` (string) Required. One of `"standard"`, `"codex"`,
@@ -723,11 +725,13 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///             set wins. `host`, `content-length`, `transfer-encoding` and
 ///             `connection` are refused.
 ///     `extra_body` (table) Merged into every request body.
-///     `session_id` (table) Sends the session id, as
-///             `{ header = "x-affinity" }`, `{ body_field = "prompt_cache_key" }`,
-///             or both at once.
 ///     `thinking_overrides` (table) Model id prefix to `"no"`, `"yes"` or
 ///             `"required"`, overriding the model table. Longest prefix wins.
+///   `session_id` (table) Sends the session id with every request, as
+///           `{ headers = { "x-affinity" } }`,
+///           `{ body_field = "prompt_cache_key" }`, or both at once. A
+///           listed header replaces one the credentials set. The `google`
+///           codec refuses it.
 ///   `models` (table) Static model rows, read once at registration. They
 ///            describe models and add to the runtime list. See
 ///            [model rows](/docs/providers/#model-rows).

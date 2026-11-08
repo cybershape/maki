@@ -131,6 +131,8 @@ declare maki: {
   net: {
     request: @checked (url: string, opts: any) -> (any, string?),
     connect: @checked (host: string, port: number, opts: any) -> (any, string?),
+    connect_unix: @checked (path: string, opts: any) -> (any, string?),
+    listen_unix: @checked (path: string) -> (any, string?),
   },
   pack: {
     add: @checked (specs: any, opts: any) -> (),
@@ -163,6 +165,7 @@ declare maki: {
     notify: @checked (text: string, opts: any) -> (boolean?, string?),
     set_mode: @checked (mode: string, opts: any) -> (boolean?, string?),
     set_title: @checked (opts: any) -> (boolean?, string?),
+    data_dir: @checked (opts: any) -> (string?, string?),
   },
   task: {
     list: @checked () -> (any, string?),

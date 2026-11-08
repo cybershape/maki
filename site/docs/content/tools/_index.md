@@ -18,7 +18,7 @@ Commands run in the session's working directory (see Environment) by default.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `background` | boolean | no |  | Run in the background. The result arrives as a message when it ends. |
+| `background` | boolean | no |  | Run in the background. The result arrives as a message. Prefer for slow commands whose result your next step doesn't need. |
 | `command` | string | yes |  | The bash command to execute |
 | `description` | string | no |  | What the command does in 3-5 words, not the command itself |
 | `timeout` | integer | no | 120 | Timeout in seconds |
@@ -196,7 +196,7 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `background` | boolean | no | Run in the background and continue other work: the call returns immediately and the result arrives later as a message. Launch every background task in one parallel batch, never as sequential calls, and don't sleep or poll for it; end your turn once nothing else is left. |
+| `background` | boolean | no | Run in the background. The result arrives as a message. Default to true unless your next step needs the result. Launch all in one batch. Never sleep or poll, end your turn when idle. |
 | `description` | string | yes | Short (3-5 words) description of the task |
 | `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |
 | `output_schema` | object | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
@@ -237,7 +237,7 @@ Persistent, project-scoped scratchpad for learnings, patterns, decisions, and go
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `command` | string | yes | - `list [tags]`: tag-grouped index, no bodies.<br>- `read path\|tags`: one body (path) or collated bodies (tags).<br>- `write path tags content`: create or overwrite a note.<br>- `delete path` |
+| `command` | string | yes | - `list`: tag-grouped index, no bodies; optional `tags`.<br>- `read`: one body by `path`, or collated bodies by `tags`.<br>- `write`: create/overwrite `path` with `content`; optional `tags`.<br>- `delete`: `path`. |
 | `content` | string | no | Body for write (frontmatter added automatically). |
 | `path` | string | no | Relative path, e.g. 'architecture.md'. |
 | `tags` | array | no | snake_case tags. Filter for list/read; assigned on write (defaults to filename stem). |

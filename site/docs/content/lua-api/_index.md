@@ -138,8 +138,9 @@ The rules:
 | [`maki.keymap`](#maki-keymap) | Key mappings, modeled after `vim.keymap`. |
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
 | [`maki.model`](#maki-model) | The model behind the focused session. |
-| [`maki.net`](#maki-net) | HTTP and plain TCP for plugins. |
-| [`maki.net.Conn`](#maki-net-Conn) | A TCP connection opened by `maki.net.connect`. |
+| [`maki.net`](#maki-net) | HTTP, plain TCP, and Unix sockets for plugins. |
+| [`maki.net.Conn`](#maki-net-Conn) | A TCP or Unix socket connection. |
+| [`maki.net.Listener`](#maki-net-Listener) | A Unix socket listener opened by `maki.net.listen_unix`. |
 | [`maki.provider`](#maki-provider) | Providers implemented in Lua. |
 | [`maki.provider.auth`](#maki-provider-auth) | Credential storage for the providers this plugin registered. |
 | [`maki.session`](#maki-session) | Host session primitives. |
@@ -4601,7 +4602,7 @@ if m and m.subsidised_by then print(m.subsidised_by, m.pricing.input) end
 
 ## maki.net {#maki-net}
 
-HTTP and plain TCP for plugins.
+HTTP, plain TCP, and Unix sockets for plugins.
 
 `request` traffic goes over HTTPS (plain HTTP is upgraded). Private
 and metadata IP addresses are blocked to prevent SSRF, including
@@ -4613,7 +4614,8 @@ Requests reuse a pool of clients, so calls to the same host share one
 keep-alive connection rather than pay a fresh handshake each time.
 
 `connect` follows the same rules, but only reaches hosts the plugin
-lists in `net_hosts`.
+lists in `net_hosts`. On Unix, `connect_unix` and `listen_unix` reach
+local sockets, and need the `run` permission instead.
 
 ```lua
 local res, err = maki.net.request("https://example.com")
@@ -4731,10 +4733,88 @@ maki.async.spawn(function()
 end)
 ```
 
+---
+
+### `maki.net.connect_unix()` {#maki-net-connect_unix}
+
+```lua
+maki.net.connect_unix({path}, {opts?})
+```
+
+Connect to the Unix socket at {path}. The connection is a
+`maki.net.Conn`, the same as a TCP one.
+
+{opts} fields:
+- `timeout` (`integer`) Connect timeout in seconds, max 60 (default 10).
+
+Requires the `run` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{path}` (`string`) Absolute path of the socket, or one starting with `~/`.
+- `{opts?}` (`table?`) Options (see above).
+
+**Returns:** ([`maki.net.Conn?`](#maki-net-Conn), `string?`) The connection, or nil plus an error string.
+
+**Example:**
+
+```lua
+maki.async.spawn(function()
+  local conn, err = maki.net.connect_unix("/run/user/1000/app/control.sock")
+  if not conn then return maki.log.error(err) end
+  conn:write("status\n")
+  print(conn:read())
+  conn:close()
+end)
+```
+
+---
+
+### `maki.net.listen_unix()` {#maki-net-listen_unix}
+
+```lua
+maki.net.listen_unix({path})
+```
+
+Listen on the Unix socket at {path} and answer a `maki.net.Listener`.
+
+A path this plugin already listens on is taken over, so it can listen on
+its usual path again after `/reload`. Anything else at
+{path} is an error: removing a stale socket is up to the plugin, which
+knows whether its name is still in use, and so is a private directory
+for it. The listener closes, and removes the socket file it
+bound, on `:close()`, when it is garbage collected, and when the plugin
+unloads.
+
+Requires the `run` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{path}` (`string`) Absolute path of the socket, or one starting with `~/`.
+
+**Returns:** ([`maki.net.Listener?`](#maki-net-Listener), `string?`) The listener, or nil plus an error string.
+
+**Example:**
+
+```lua
+maki.async.spawn(function()
+  local listener = assert(maki.net.listen_unix("/run/user/1000/app/inbox.sock"))
+  while true do
+    local conn = listener:accept()
+    if not conn then break end
+    print(conn:read())
+    conn:close()
+  end
+end)
+```
+
 
 ## maki.net.Conn {#maki-net-Conn}
 
-A TCP connection opened by `maki.net.connect`.
+A TCP or Unix socket connection.
+
+`maki.net.connect` opens a TCP one and `maki.net.connect_unix` a Unix
+socket one.
 
 `read` and `write` yield until done and can run at the same time.
 The connection closes on `:close()`, when the handle is garbage
@@ -4800,6 +4880,44 @@ Conn:close()
 
 Close the connection. A read or write in flight ends with an error.
 Extra calls do nothing.
+
+
+## maki.net.Listener {#maki-net-Listener}
+
+A Unix socket listener opened by `maki.net.listen_unix`.
+
+---
+
+### `Listener:accept()` {#Listener-accept}
+
+```lua
+Listener:accept()
+```
+
+Wait for the next client and answer its connection. Answers `nil, nil`
+once the listener is closed, including when it closes while waiting.
+Only one `accept` at a time: a second one while one waits is an error.
+
+**Returns:** ([`maki.net.Conn?`](#maki-net-Conn), `string?`) The connection, nil plus an error string, or nil, nil once closed.
+
+**Example:**
+
+```lua
+local conn, err = listener:accept()
+if err then return maki.log.error(err) end
+if not conn then print("listener closed") end
+```
+
+---
+
+### `Listener:close()` {#Listener-close}
+
+```lua
+Listener:close()
+```
+
+Stop listening and remove the socket file. A pending `accept` answers
+`nil, nil`. Extra calls do nothing.
 
 
 ## maki.provider {#maki-provider}
@@ -4916,6 +5034,8 @@ it does for a built-in provider.
     Defaults to `max_tokens`.
   - `include_stream_usage` (`boolean`) Ask for usage on the stream.
     Defaults to `true`.
+  - `usage_cost` (`boolean`) Price turns from `usage.cost` on the stream
+    (in USD). Defaults to `false`.
   - `thinking` (`table`) How the API spells reasoning effort. Without it,
     each model's `thinking_fields` decides.
     - `dialect` (`string`) Required. One of `"standard"`, `"codex"`,
@@ -4931,11 +5051,13 @@ it does for a built-in provider.
     set wins. `host`, `content-length`, `transfer-encoding` and
     `connection` are refused.
   - `extra_body` (`table`) Merged into every request body.
-  - `session_id` (`table`) Sends the session id, as
-    `{ header = "x-affinity" }`, `{ body_field = "prompt_cache_key" }`,
-    or both at once.
   - `thinking_overrides` (`table`) Model id prefix to `"no"`, `"yes"` or
     `"required"`, overriding the model table. Longest prefix wins.
+- `session_id` (`table`) Sends the session id with every request, as
+  `{ headers = { "x-affinity" } }`,
+  `{ body_field = "prompt_cache_key" }`, or both at once. A
+  listed header replaces one the credentials set. The `google`
+  codec refuses it.
 - `models` (`table`) Static model rows, read once at registration. They
   describe models and add to the runtime list. See
   [model rows](/docs/providers/#model-rows).
@@ -5616,6 +5738,40 @@ Requires the `session_settings` [plugin permission](#plugin-permissions).
 
 ```lua
 local _, err = maki.session.set_title({ id = id, title = "refactor" })
+```
+
+---
+
+### `maki.session.data_dir()` {#maki-session-data_dir}
+
+```lua
+maki.session.data_dir({opts?})
+```
+
+This plugin's directory for this session's data, as
+`state/sessions/data/<session>/<plugin>/`. Core owns it: the delete that
+takes the session takes everything written under it. Not created; make it
+with `maki.fs.mkdir` before the first write. A plugin's grants cover it
+like any other path.
+
+The session defaults to the one the calling agent serves, so a tool of
+a background tab gets that tab's dir rather than the one on screen, and
+to the focused session otherwise.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) `session` names another session.
+
+**Returns:** (`string|nil`, `string|nil`) The directory path, or nil and an error.
+
+**Example:**
+
+```lua
+local dir, err = maki.session.data_dir()
+if dir then
+  maki.fs.mkdir(dir, { parents = true })
+  maki.fs.write(maki.fs.joinpath(dir, "scratch.md"), text)
+end
 ```
 
 

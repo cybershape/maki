@@ -5152,7 +5152,7 @@ const STORED_RECEIPT_ID: &str = "toolu_stored";
 const RECEIPTS_KEPT: &str = "a checkpoint must never erase receipts it cannot read";
 
 /// What the agent hands the app, see `AgentHandles::apply_to_app`.
-fn hold_mailbox(app: &mut App) -> SessionMailbox {
+pub(crate) fn hold_mailbox(app: &mut App) -> SessionMailbox {
     let mailbox = SessionMailbox::register(app.state.session.id);
     app.mailbox = Some(mailbox.clone());
     mailbox
@@ -6854,7 +6854,10 @@ fn plan_does_not_open_form_while_streaming_additional_tools_after_write() {
         })),
         app.run_id,
     ));
-    assert!(!app.plan_form.is_visible(), "still must not open during subsequent tools");
+    assert!(
+        !app.plan_form.is_visible(),
+        "still must not open during subsequent tools"
+    );
 
     // Agent completes turn
     app.update(agent_msg_with_run_id(done(), app.run_id));
@@ -12727,7 +12730,7 @@ fn a_restored_receipt_nobody_answered_reads_lost() {
         started_at: None,
         ended_at: None,
     }]);
-    session.set_subagent_messages(RECEIPT_TURN_ID.into(), vec![]);
+    session.set_subagent_messages(RECEIPT_TURN_ID.into(), vec![], |_: &Message| Vec::new());
 
     app.restore_resumed_session();
 

@@ -689,10 +689,7 @@ fn walk_glob_dir(
 
         // CPython's recursive glob does not descend into symlinked
         // directories, and following them here could cycle forever.
-        let is_real_dir = entry
-            .file_type()
-            .map(|kind| kind.is_dir())
-            .unwrap_or(false);
+        let is_real_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
         if is_real_dir && (is_recursive || pattern.contains('/')) {
             let _ = walk_glob_dir(&path, pattern, base, results);
         }

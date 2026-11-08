@@ -32,7 +32,9 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
 pub const DEFAULT_FLASH_DURATION_MS: u64 = 1500;
 pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
-pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
+/// macOS terminals already send more wheel events the faster you scroll, so
+/// one line per event is enough there.
+pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = if cfg!(target_os = "macos") { 1 } else { 3 };
 pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
 pub const DEFAULT_THINKING_LINES: usize = 3;
 pub const DEFAULT_COMPACT_LINES: usize = 10;
@@ -687,8 +689,8 @@ pub struct UiFileConfig {
     pub splash_animation: Option<bool>,
     pub scrollbar: Option<bool>,
     pub inline_images: Option<bool>,
-    pub program_status: Option<bool>,
     pub notifications: Option<NotificationMethod>,
+    pub program_status: Option<bool>,
     pub flash_duration_ms: Option<u64>,
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
@@ -1409,12 +1411,6 @@ pub struct UiConfig {
     pub inline_images: bool,
 
     #[config(
-        default = true,
-        desc = "Report program status to the terminal via OSC 7501 (Program Status Protocol)"
-    )]
-    pub program_status: bool,
-
-    #[config(
         default = NotificationMethod::Auto,
         ty = "string",
         default_doc = "auto",
@@ -1422,13 +1418,24 @@ pub struct UiConfig {
     )]
     pub notifications: NotificationMethod,
 
+    #[config(
+        default = true,
+        desc = "Report session state (idle, working, blocked, done, error) to the terminal with OSC 7501"
+    )]
+    pub program_status: bool,
+
     #[config(default = DEFAULT_FLASH_DURATION_MS, desc = "Duration of flash messages (ms)")]
     pub flash_duration_ms: u64,
 
     #[config(default = DEFAULT_TYPEWRITER_MS_PER_CHAR, desc = "Typewriter effect speed (ms/char)")]
     pub typewriter_ms_per_char: u64,
 
-    #[config(default = DEFAULT_MOUSE_SCROLL_LINES, min = MIN_MOUSE_SCROLL_LINES, desc = "Lines per mouse wheel scroll")]
+    #[config(
+        default = DEFAULT_MOUSE_SCROLL_LINES,
+        min = MIN_MOUSE_SCROLL_LINES,
+        default_doc = "1 on macOS, 3 elsewhere",
+        desc = "Lines per mouse wheel scroll. Set it to 1 if your terminal runs on a Mac and maki runs remotely (e.g. over SSH)"
+    )]
     pub mouse_scroll_lines: u32,
 
     #[config(default = DEFAULT_MAX_INPUT_LINES, min = MIN_MAX_INPUT_LINES, desc = "Maximum visible input lines")]
@@ -1495,8 +1502,8 @@ impl UiConfig {
             splash_animation: f.splash_animation.unwrap_or(true),
             scrollbar: f.scrollbar.unwrap_or(true),
             inline_images: f.inline_images.unwrap_or(true),
-            program_status: f.program_status.unwrap_or(true),
             notifications: f.notifications.unwrap_or_default(),
+            program_status: f.program_status.unwrap_or(true),
             flash_duration_ms: f.flash_duration_ms.unwrap_or(DEFAULT_FLASH_DURATION_MS),
             typewriter_ms_per_char: f
                 .typewriter_ms_per_char

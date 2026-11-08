@@ -2,10 +2,11 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use crate::provider::BoxFuture;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Value, json};
 
 use maki_config::providers::Protocol;
+use maki_storage::id::SessionRef;
 
 use super::ResolvedAuth;
 use super::responses::ResponsesProvider;
@@ -16,16 +17,50 @@ use crate::providers::Timeouts;
 use crate::spec::{ProviderSpec, RESPONSES_SPEC};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct OpenAiWire {
     pub max_tokens_field: Option<String>,
     pub include_stream_usage: Option<bool>,
+    pub usage_cost: bool,
     pub thinking: Option<ThinkingWire>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SessionCarrier {
-    Header,
-    Body,
+/// Where the session id rides, for a provider that routes a session to the
+/// same backend or keys its cache by it: headers, a body field, or both.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionCarrier {
+    #[serde(
+        skip_serializing_if = "<[_]>::is_empty",
+        deserialize_with = "deserialize_session_headers"
+    )]
+    pub headers: Cow<'static, [Cow<'static, str>]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_field: Option<Cow<'static, str>>,
+}
+
+impl SessionCarrier {
+    pub(crate) fn apply(&self, session: &SessionRef, body: &mut Value, auth: &mut ResolvedAuth) {
+        if let (Some(field), Some(object)) = (&self.body_field, body.as_object_mut()) {
+            object.insert(field.to_string(), json!(session.as_str()));
+        }
+        self.apply_headers(session, auth);
+    }
+
+    pub(crate) fn apply_headers(&self, session: &SessionRef, auth: &mut ResolvedAuth) {
+        for name in self.headers.iter() {
+            auth.set_header(name, session.as_str().to_owned());
+        }
+    }
+}
+
+fn deserialize_session_headers<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Cow<'static, [Cow<'static, str>]>, D::Error> {
+    Vec::<String>::deserialize(deserializer)?
+        .into_iter()
+        .map(|name| Ok(Cow::Owned(name.to_ascii_lowercase())))
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +97,7 @@ pub struct CodecOptions {
     pub provider_name: String,
     pub system_prefix: Option<String>,
     pub openai: OpenAiWire,
+    pub session_id: SessionCarrier,
     pub build_body: Option<Arc<dyn BodyHook>>,
 }
 
@@ -75,6 +111,7 @@ impl CodecOptions {
             slug,
             system_prefix: None,
             openai: OpenAiWire::default(),
+            session_id: SessionCarrier::default(),
             build_body: None,
         }
     }
@@ -92,6 +129,7 @@ pub fn build(
     let base_url = (!options.base_url.is_empty()).then(|| options.base_url.into_owned());
     let provider = ResponsesProvider::new(options.slug, base_url, auth, timeouts)
         .with_body_hook(options.build_body)
-        .with_system_prefix(options.system_prefix);
+        .with_system_prefix(options.system_prefix)
+        .with_session_id(options.session_id);
     Box::new(provider)
 }

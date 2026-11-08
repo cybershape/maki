@@ -37,6 +37,7 @@ mod spec;
 const BUILD_BODY_OPTION: &str = "build_body hook";
 const SYSTEM_PREFIX_OPTION: &str = "system_prefix";
 const OPENAI_OPTION: &str = "openai";
+const SESSION_ID_OPTION: &str = "session_id";
 const BASE_URL_OPTION: &str = "base_url";
 const HTTPS_SCHEME: &str = "https";
 const HTTP_SCHEME: &str = "http";
@@ -186,6 +187,8 @@ pub struct ProviderDecl {
     /// Only for `codec = "openai"`: grouped under the codec that honours them,
     /// so one rule refuses every option a different target would ignore.
     pub openai: Option<OpenAiWire>,
+    /// Above the codec tables, because every codec but google carries it.
+    pub session_id: Option<SessionCarrier>,
     /// This and the next three describe a model no row or listing covers.
     /// Each falls back to the native provider behind the codec or base. The
     /// two limits also fill in any row that leaves its own out.
@@ -405,6 +408,13 @@ fn honours_openai_wire(target: Target) -> bool {
 /// spec behind the target, because `codec = "google"` and `base = "google"`
 /// reach the same constructor and must answer alike.
 fn honours_system_prefix(_target: Target) -> bool {
+    true
+}
+
+/// The anthropic and both openai codecs stamp the session id. A base is the
+/// native provider whole, which carries its own or none, and google has no
+/// use for one.
+fn honours_session_id(_target: Target) -> bool {
     true
 }
 
@@ -708,6 +718,9 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
     }
     if decl.openai.is_some() && !honours_openai_wire(target) {
         return Err(unsupported(OPENAI_OPTION));
+    }
+    if decl.session_id.is_some() && !honours_session_id(target) {
+        return Err(unsupported(SESSION_ID_OPTION));
     }
     let states_origin =
         decl.base_url.is_some() || decl.plans.iter().any(|plan| plan.base_url.is_some());
@@ -1404,6 +1417,7 @@ fn codec_options(entry: &PluginEntry, protocol: Protocol) -> CodecOptions {
         provider_name: decl.display_name.clone(),
         system_prefix: decl.system_prefix.clone(),
         openai: decl.openai.clone().unwrap_or_default(),
+        session_id: decl.session_id.clone().unwrap_or_default(),
         build_body: entry
             .hooks
             .build_body
@@ -1627,6 +1641,7 @@ pub async fn logout(slug: &str) -> Result<bool, AgentError> {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
@@ -2457,6 +2472,71 @@ mod tests {
             .await;
 
         assert_eq!(requests.lock().unwrap().len(), 1, "{MISSED_ORIGIN}");
+    }
+
+    /// One declaration spelling, the same id in every header and the body
+    /// field, whichever codec builds the request.
+    #[test_case(Protocol::OpenaiResponses, "responses-session-plugin" ; "openai_responses")]
+    #[tokio::test]
+    async fn every_session_codec_carries_the_declared_session_id(protocol: Protocol, slug: &str) {
+        const ENV_VAR: &str = "MAKI_TEST_SESSION_CARRIER_KEY";
+        const KEY: &str = "sk-session";
+        const PROMPT: &str = "hi";
+        const SCRIPT: &[Canned] = &[Canned::json(401, r#"{"error":{"message":"no"}}"#)];
+        const SESSION_HEADERS: [&str; 2] = ["x-affinity", "x-request-group"];
+        const SESSION_FIELD: &str = "prompt_cache_key";
+        const MISSING_SESSION: &str = "the session id did not reach the wire";
+
+        let (base_url, requests) = serve(SCRIPT);
+        let host = Url::parse(&base_url)
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_owned();
+        unsafe { std::env::set_var(ENV_VAR, KEY) };
+        let mut reg = registration(slug);
+        reg.decl.codec = Some(protocol);
+        reg.decl.base_url = Some(base_url);
+        reg.decl.net_hosts = vec![host];
+        reg.decl.api_key_env = Some(ENV_VAR.to_string());
+        reg.decl.session_id = Some(SessionCarrier {
+            headers: SESSION_HEADERS.map(Cow::Borrowed).to_vec().into(),
+            body_field: Some(Cow::Borrowed(SESSION_FIELD)),
+        });
+        register_loaded(reg).unwrap();
+
+        let provider = create(slug, Timeouts::default()).unwrap();
+        let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
+        let session = SessionRef::generate();
+        let (tx, _rx) = flume::unbounded();
+        let _ = provider
+            .stream_message(
+                &model,
+                &[Message::user(PROMPT.to_owned())],
+                "",
+                &serde_json::json!([]),
+                &tx,
+                RequestOptions::default(),
+                Some(&session),
+            )
+            .await;
+
+        let recorded = requests.lock().unwrap();
+        let [request] = recorded.as_slice() else {
+            panic!("{MISSING_SESSION}");
+        };
+        for header in SESSION_HEADERS {
+            assert_eq!(
+                request.headers.get(header).map(String::as_str),
+                Some(session.as_str()),
+                "{MISSING_SESSION}"
+            );
+        }
+        assert_eq!(
+            request.json()[SESSION_FIELD],
+            session.as_str(),
+            "{MISSING_SESSION}"
+        );
     }
 
     /// Only an origin the user or maki chose skips the side-call guard, never

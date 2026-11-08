@@ -75,11 +75,11 @@ All fields are optional. Typos in field names cause an error right away.
 | `splash_animation` | bool | `true` | - | Show splash animation on startup |
 | `scrollbar` | bool | `true` | - | Show vertical scrollbar in scrollable areas |
 | `inline_images` | bool | `true` | - | Render inline images in terminals with graphics support, falling back to an [image] line where nothing else names the image |
-| `program_status` | bool | `true` | - | Report program status to the terminal via OSC 7501 (Program Status Protocol) |
 | `notifications` | string | `auto` | - | Notification method: auto, osc9, bell, notify, or off |
+| `program_status` | bool | `true` | - | Report session state (idle, working, blocked, done, error) to the terminal with OSC 7501 |
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
-| `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |
+| `mouse_scroll_lines` | u32 | `1 on macOS, 3 elsewhere` | 1 | Lines per mouse wheel scroll. Set it to 1 if your terminal runs on a Mac and maki runs remotely (e.g. over SSH) |
 | `max_input_lines` | u32 | `20` | 1 | Maximum visible input lines |
 | `thinking_lines` | integer | `3` | - | Collapse model reasoning to its header and last N lines. Click to toggle. 0 shows only the header, -1 never collapses |
 | `clock_format` | String | `system` | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |

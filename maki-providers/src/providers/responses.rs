@@ -309,6 +309,7 @@ pub struct ResponsesProvider {
     timeouts: Timeouts,
     client: Client,
     body_hook: Option<Arc<dyn super::codec::BodyHook>>,
+    session_id: super::codec::SessionCarrier,
 }
 
 fn parse_price_value(val: &Value) -> Option<f64> {
@@ -465,7 +466,13 @@ impl ResponsesProvider {
             timeouts,
             client: super::http_client(timeouts),
             body_hook: None,
+            session_id: super::codec::SessionCarrier::default(),
         }
+    }
+
+    pub fn with_session_id(mut self, session_id: super::codec::SessionCarrier) -> Self {
+        self.session_id = session_id;
+        self
     }
 
     pub fn with_body_hook(mut self, hook: Option<Arc<dyn super::codec::BodyHook>>) -> Self {
@@ -583,6 +590,9 @@ impl Provider for ResponsesProvider {
                 let discovered = crate::model_registry::discovered(&self.slug, &model.id);
                 let dialect = responses_dialect(&model.id, discovered.as_ref());
                 apply_responses_reasoning(&mut body, opts.thinking, model, &dialect);
+            }
+            if let Some(session) = _session_id {
+                self.session_id.apply(session, &mut body, &mut auth);
             }
             if let Some(hook) = &self.body_hook {
                 let ctx = super::codec::RequestCtx {

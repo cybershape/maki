@@ -1781,7 +1781,10 @@ mod tests {
         entry.tools[0].input_schema = schema;
         let (_inner, handle) = setup(vec![entry]);
         assert_eq!(handle.reason_injected(TOOL_NAME), expected);
-        assert!(!handle.reason_injected("gone.tool"), "unknown tool owns nothing");
+        assert!(
+            !handle.reason_injected("gone.tool"),
+            "unknown tool owns nothing"
+        );
     }
 
     /// `ready` carries the correctness of connecting in the background: a prompt
