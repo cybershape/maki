@@ -16,6 +16,8 @@ Maki ships with 25 built-in tools in this reference (24 on by default, 1 opt-in 
 Execute a bash command.
 Commands run in the session's working directory (see Environment) by default.
 
+[Plugin permission](/docs/lua-api/#plugin-permissions): `run`
+
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `background` | boolean | no |  | Run in the background. The result arrives as a message. Prefer for slow commands whose result your next step doesn't need. |
@@ -33,6 +35,8 @@ Execute a command through Windows PowerShell. Do not use `&&` or `||`. Windows P
 - Use `tail` to return only the last N output lines.
 - Provide a short `toolcall_reason` (3-5 words).
 
+[Plugin permission](/docs/lua-api/#plugin-permissions): `run`
+
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `command` | string | yes |  | The PowerShell command to execute |
@@ -44,6 +48,8 @@ Execute a command through Windows PowerShell. Do not use `&&` or `||`. Windows P
 
 List directory contents. Returns entry names sorted alphabetically, directories first with a trailing /.
 
+[Plugin permission](/docs/lua-api/#plugin-permissions): `fs_read`
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `path` | string | yes | Absolute path to the directory |
@@ -51,6 +57,8 @@ List directory contents. Returns entry names sorted alphabetically, directories 
 ### `read` {#read}
 
 Read a file. Returns contents with line numbers (1-indexed).
+
+[Plugin permission](/docs/lua-api/#plugin-permissions): `fs_read`
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -62,6 +70,8 @@ Read a file. Returns contents with line numbers (1-indexed).
 
 Write content to a file, replacing existing content.
 
+[Plugin permission](/docs/lua-api/#plugin-permissions): `fs_write`
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `append` | boolean | no | Add content to the end of the file instead of replacing it |
@@ -71,6 +81,8 @@ Write content to a file, replacing existing content.
 ### `edit` {#edit}
 
 Replace an exact string match in a file.
+
+[Plugin permission](/docs/lua-api/#plugin-permissions): `fs_write`
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -84,6 +96,8 @@ Replace an exact string match in a file.
 Make multiple find-and-replace edits to a single file atomically.
 Prefer this over edit when making multiple changes to the same file.
 
+[Plugin permission](/docs/lua-api/#plugin-permissions): `fs_write`
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `edits` | array | yes | Array of edit operations to apply sequentially |
@@ -92,6 +106,8 @@ Prefer this over edit when making multiple changes to the same file.
 ### `edit_lines` {#edit_lines}
 
 Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.
+
+[Plugin permission](/docs/lua-api/#plugin-permissions): `fs_write`
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -104,6 +120,8 @@ Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new
 
 Insert `new_string` after line `line`, or at the top with 0. Only include new lines, never lines already in the file. Do not use with the batch tool.
 
+[Plugin permission](/docs/lua-api/#plugin-permissions): `fs_write`
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `line` | integer | yes | Line number to insert after (1-indexed). Use 0 to insert at the top. |
@@ -114,6 +132,8 @@ Insert `new_string` after line `line`, or at the top with 0. Only include new li
 
 Find files by glob pattern.
 
+[Plugin permission](/docs/lua-api/#plugin-permissions): `fs_read`
+
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `path` | string | no | cwd | Directory to search in |
@@ -122,6 +142,8 @@ Find files by glob pattern.
 ### `grep` {#grep}
 
 Search file contents using regex.
+
+[Plugin permission](/docs/lua-api/#plugin-permissions): `fs_read`
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -136,6 +158,8 @@ Search file contents using regex.
 
 Return a compact overview of a source file: imports, type definitions, function signatures, and structure with their line numbers surrounded by []. ~70-90% more efficient than reading the full file.
 
+[Plugin permission](/docs/lua-api/#plugin-permissions): `fs_read`
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `path` | string | yes | Absolute path to the file |
@@ -143,6 +167,8 @@ Return a compact overview of a source file: imports, type definitions, function 
 ### `view_image` {#view_image}
 
 View an image file (png, jpeg, gif, webp) so you can actually see it; it is returned as vision input alongside the tool result. Use instead of `read` for images.
+
+[Plugin permission](/docs/lua-api/#plugin-permissions): `fs_read`
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -154,6 +180,8 @@ View an image file (png, jpeg, gif, webp) so you can actually see it; it is retu
 
 Executes multiple independent tool calls concurrently to reduce round-trips.
 
+[Plugin permission](/docs/lua-api/#plugin-permissions): not declared (every permission except `agent` and `input`)
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `tool_calls` | array | yes | Array of tool calls to execute in parallel |
@@ -161,6 +189,8 @@ Executes multiple independent tool calls concurrently to reduce round-trips.
 ### `code_execution` {#code_execution}
 
 Execute Python in a sandbox where every tool is an async function.
+
+[Plugin permission](/docs/lua-api/#plugin-permissions): not declared (every permission except `agent` and `input`)
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -170,6 +200,8 @@ Execute Python in a sandbox where every tool is an async function.
 ### `library_help` {#library_help}
 
 Retrieve the Python function signature, parameter types, and docstring documentation for an external library function before calling it in code_execution.
+
+[Plugin permission](/docs/lua-api/#plugin-permissions): not declared (every permission except `agent` and `input`)
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -184,6 +216,8 @@ Use this tool when you need to ask the user questions during execution. This all
 - Get decisions on implementation choices as you work
 - Offer choices to the user about what direction to take
 
+[Plugin permission](/docs/lua-api/#plugin-permissions): nothing (`{}`)
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `questions` | array | yes | List of questions to ask the user |
@@ -193,6 +227,8 @@ Use this tool when you need to ask the user questions during execution. This all
 ### `task` {#task}
 
 Launch an autonomous subagent to perform tasks independently. Best combined with batch.
+
+[Plugin permission](/docs/lua-api/#plugin-permissions): not declared (every permission except `agent` and `input`)
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -208,6 +244,8 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 Stop a background task by id.
 
+[Plugin permission](/docs/lua-api/#plugin-permissions): not declared (every permission except `agent` and `input`)
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `id` | string | yes | Task id from its receipt |
@@ -216,6 +254,8 @@ Stop a background task by id.
 
 Message a running background subagent by id, e.g. a new fact, a changed scope or "wrap up now". It reads it after its current step.
 Set interrupt only when it must act now: it cuts the current step, running tools included.
+
+[Plugin permission](/docs/lua-api/#plugin-permissions): not declared (every permission except `agent` and `input`)
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -227,6 +267,8 @@ Set interrupt only when it must act now: it cuts the current step, running tools
 
 Create or update a structured todo list to track tasks.
 
+[Plugin permission](/docs/lua-api/#plugin-permissions): nothing (`{}`)
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `todos` | array | yes | The updated todo list |
@@ -234,6 +276,8 @@ Create or update a structured todo list to track tasks.
 ### `memory` {#memory}
 
 Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions.
+
+[Plugin permission](/docs/lua-api/#plugin-permissions): not declared (every permission except `agent` and `input`)
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -246,6 +290,8 @@ Persistent, project-scoped scratchpad for learnings, patterns, decisions, and go
 
 Load a skill that provides instructions and workflows for specific tasks.
 
+[Plugin permission](/docs/lua-api/#plugin-permissions): `fs_read`
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `name` | string | yes | Name of the skill to load |
@@ -256,6 +302,8 @@ Load a skill that provides instructions and workflows for specific tasks.
 
 Fetch a URL and return its contents.
 
+[Plugin permission](/docs/lua-api/#plugin-permissions): `net`
+
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `format` | string | no |  | Output format: markdown (default), text, or html |
@@ -265,6 +313,8 @@ Fetch a URL and return its contents.
 ### `websearch` {#websearch}
 
 Search the web for real-time information using Exa AI.
+
+[Plugin permission](/docs/lua-api/#plugin-permissions): `net`
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|

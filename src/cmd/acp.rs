@@ -59,7 +59,7 @@ pub async fn run(
     legacy_notice: Option<String>,
 ) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
-    maki_providers::model_registry::load_from_storage(&storage);
+    maki_providers::model_registry::load(&storage);
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     let mut trust = project::resolve(&storage, &cwd, trust_mode);
@@ -70,13 +70,8 @@ pub async fn run(
     // The `trust.paths` policy lives in the config it gates, so a grant for the
     // launch folder means building once untrusted and again trusted, as the TUI
     // does. Dropping the old host joins its thread before `load_env_files`
-    // touches the process env. `unanswered`: a recorded `Never` stays.
-    let granted = trust
-        .state
-        .unanswered()
-        .and_then(|question| policy_grant(question, &config.trust))
-        .is_some();
-    if granted {
+    // touches the process env.
+    if policy_grant(&trust.state, &config.trust).is_some() {
         trust = project::apply_answer(&storage, trust, TrustAnswer::Trust);
         plugin_host.begin_shutdown();
         ToolRegistry::global().clear_lua();
@@ -122,6 +117,7 @@ pub async fn run(
         })),
         storage,
         background: cli.background_wait().is_some(),
+        host_prompt: cli.host_prompt(),
         stop: interrupt.stop(),
     })
     .await?;

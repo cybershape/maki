@@ -28,9 +28,10 @@ use maki_config::{
 };
 use maki_lua::test_support::{fire_autocmd, runtime};
 use maki_lua::{
-    InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, NO_UI_ERR, PERMISSION_NAME_WARNING,
+    INERT_WITH_MUTABLE_PATH_ERR, INERT_WITH_SCOPES_ERR, InitFiles, Interaction, KEY_WARNING,
+    MAX_INFLIGHT_TOOLS, MCP_HINT, NO_UI_ERR, PERMISSION_NAME_WARNING, PERMISSION_SHAPE_ERR,
     PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason,
-    WARM_TOOL_CAP, set_allowed_private_hosts,
+    UNDECLARED_REACH, UNPAID_REACH_ERR, WARM_TOOL_CAP, set_allowed_private_hosts,
 };
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -235,6 +236,29 @@ const SCOPES_WITHOUT_PERMISSION_SRC: &str =
     r#"name = "no_perm", description = "test", permission_scopes = "url""#;
 const UNKNOWN_PERMISSION_SRC: &str = r#"name = "bad_perm", description = "test", permission = "filesystem", permission_scopes = "url""#;
 const FS_WRITE_WITHOUT_MUTABLE_PATH_SRC: &str = r#"name = "no_mpath", description = "test", permission = "fs_write", permission_scopes = "url""#;
+const INERT_WITH_SCOPES_SRC: &str =
+    r#"name = "inert_scoped", description = "test", permission = {}, permission_scopes = "url""#;
+const INERT_WITH_MUTABLE_PATH_SRC: &str =
+    r#"name = "inert_writer", description = "test", permission = {}, mutable_path = "url""#;
+const PERMISSION_LIST_SRC: &str =
+    r#"name = "perm_list", description = "test", permission = { "fs_read" }"#;
+const PERMISSION_MAP_SRC: &str =
+    r#"name = "perm_map", description = "test", permission = { fs_read = true }"#;
+const INERT_TOOL: &str = "inert_";
+const SECOND_UNDECLARED_TOOL: &str = "echo2_";
+const INERT_TOOL_SRC: &str = r#"maki.api.register_tool({
+    name = "inert_",
+    description = "reaches nothing",
+    schema = { type = "object", properties = {} },
+    permission = {},
+    handler = function() return "" end,
+})"#;
+const SECOND_UNDECLARED_SRC: &str = r#"maki.api.register_tool({
+    name = "echo2_",
+    description = "declares nothing either",
+    schema = { type = "object", properties = {} },
+    handler = function() return "" end,
+})"#;
 const NON_STRING_FIELD_SCHEMA: &str = r#"{
     type = "object",
     properties = { count = { type = "integer" } },
@@ -681,6 +705,10 @@ fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
 #[test_case::test_case(SCOPES_WITHOUT_PERMISSION_SRC, STRING_FIELD_SCHEMA, "must declare 'permission'" ; "scopes_without_permission")]
 #[test_case::test_case(UNKNOWN_PERMISSION_SRC, STRING_FIELD_SCHEMA, "unknown permission 'filesystem'" ; "unknown_permission")]
 #[test_case::test_case(FS_WRITE_WITHOUT_MUTABLE_PATH_SRC, STRING_FIELD_SCHEMA, "no 'mutable_path'" ; "fs_write_without_mutable_path")]
+#[test_case::test_case(INERT_WITH_SCOPES_SRC, STRING_FIELD_SCHEMA, INERT_WITH_SCOPES_ERR ; "inert_with_scopes")]
+#[test_case::test_case(INERT_WITH_MUTABLE_PATH_SRC, STRING_FIELD_SCHEMA, INERT_WITH_MUTABLE_PATH_ERR ; "inert_with_mutable_path")]
+#[test_case::test_case(PERMISSION_LIST_SRC, MINIMAL_SCHEMA, PERMISSION_SHAPE_ERR ; "permission_list")]
+#[test_case::test_case(PERMISSION_MAP_SRC, MINIMAL_SCHEMA, PERMISSION_SHAPE_ERR ; "permission_map")]
 fn registration_validation_rejects(fields: &str, schema: &str, expected_err: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -712,11 +740,37 @@ fn permission_without_scopes_declares_reach_and_never_prompts() {
 
     assert_eq!(
         tool.reach(),
-        Some(ToolReach {
+        Some(ToolReach::Capability {
             permission: Permission::FsRead,
             prompted: false,
         })
     );
+    assert!(runtime().block_on(inv.permission_scopes()).is_none());
+}
+
+/// `{}` needs no grant, so a plugin holding nothing can declare it.
+/// `maki.NIL` reads as absent, which keeps the undeclared price.
+#[test_case::test_case("{}", Some(ToolReach::Inert) ; "empty_permission_table_declares_inert_reach")]
+#[test_case::test_case("maki.NIL", None ; "nil_permission_stays_undeclared")]
+fn a_permission_declaration_sets_the_tool_reach(permission: &str, expected: Option<ToolReach>) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "{INERT_TOOL}",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            permission = {permission},
+            handler = function() return "" end,
+        }})"#,
+    );
+    host.load_source_with_permissions("tool_owner", &src, PluginPermissions::denied())
+        .unwrap();
+
+    let tool = &reg.get(INERT_TOOL).unwrap().tool;
+    let inv = tool.parse(&json!({})).unwrap();
+
+    assert_eq!(tool.reach(), expected);
     assert!(runtime().block_on(inv.permission_scopes()).is_none());
 }
 
@@ -851,6 +905,35 @@ fn get_tool_describes_rust_routed_tools() {
 
     let out = exec_tool(&reg, "routed_probe", json!({})).unwrap();
     assert_eq!(out, "srv__thing|mcp: srv.thing/tool|plain|nil");
+}
+
+/// The list is what a plugin compares against what it holds, so a declared
+/// key reads back as a one-entry list rather than the string it registered.
+#[test_case::test_case("edit", "fs_write" ; "a_declared_key")]
+#[test_case::test_case(INERT_TOOL, "" ; "reaches_nothing")]
+#[test_case::test_case("echo_", "nil" ; "undeclared")]
+fn get_tool_reports_permission_as_a_list(tool: &str, expected: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "tool_owner",
+        &format!("{EDIT_TOOL_SRC}\n{INERT_TOOL_SRC}\n{ECHO_PLUGIN}"),
+    )
+    .unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "probe_tool",
+            description = "p",
+            schema = {MINIMAL_SCHEMA},
+            handler = function()
+                local p = maki.api.get_tool("{tool}").permission
+                return p and table.concat(p, ",") or "nil"
+            end,
+        }})"#,
+    );
+    host.load_source("probe", &src).unwrap();
+
+    assert_eq!(exec_tool(&reg, "probe_tool", json!({})).unwrap(), expected);
 }
 
 #[test]
@@ -2708,10 +2791,15 @@ fn jobstop_kills_running_job() {
     assert_eq!(out, "killed=true");
 }
 
+/// The job exits only once the test opens its gate. A `sleep` raced the
+/// 1ms `jobwait` against the clock: a Lua thread stalled past the job's exit
+/// let `jobwait` collect the result and the handler report "did not time out".
 #[test]
 fn plugin_owned_job_outlives_its_starting_tool() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("gate");
     let src = format!(
         r#"
 local output = "pending"
@@ -2722,7 +2810,7 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        local id = maki.fn.jobstart("sleep 0.1; printf plugin-output; exit 7", {{
+        local id = maki.fn.jobstart("while [ ! -e '{gate}' ]; do sleep 0.01; done; printf plugin-output; exit 7", {{
             scope = "plugin",
             on_stdout = function(_, line) output = line end,
             on_exit = function(_, code) exit_code = tostring(code) end,
@@ -2739,13 +2827,15 @@ maki.api.register_tool({{
         return output .. "/" .. exit_code
     end,
 }})
-"#
+"#,
+        gate = gate.display(),
     );
     host.load_source("plugin_job", &src).unwrap();
     assert_eq!(
         exec_tool(&reg, "start_plugin_job", json!({})).unwrap(),
         "started"
     );
+    std::fs::write(&gate, "").unwrap();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -4214,7 +4304,7 @@ fn fs_write_tools_match_file_write_tools() {
     let snapshot = reg.iter();
     let mut declared: Vec<&str> = snapshot
         .iter()
-        .filter(|t| t.tool.reach().map(|r| r.permission) == Some(Permission::FsWrite))
+        .filter(|t| t.tool.reach().and_then(ToolReach::permission) == Some(Permission::FsWrite))
         .map(|t| t.name())
         .collect();
     declared.sort_unstable();
@@ -7231,11 +7321,16 @@ mod read_tool_required_params {
     }
 
     #[test]
-    fn offset_beyond_file_returns_empty() {
+    fn offset_beyond_file_says_past_end_instead_of_empty() {
+        const NOTE: &str = "offset 100 is past the end of the file (10 lines)";
         let (reg, _host) = builtins_host();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("small.txt");
-        std::fs::write(&path, "just one line\n").unwrap();
+        let content = (1..=10i32)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &content).unwrap();
 
         let out = exec_tool(
             &reg,
@@ -7247,10 +7342,28 @@ mod read_tool_required_params {
             }),
         );
         let out = out.expect("read should succeed");
-        assert!(
-            out.is_empty(),
-            "offset beyond file should return empty, got: {out}"
-        );
+        assert!(out.contains(NOTE), "got: {out}");
+    }
+
+    #[test]
+    fn empty_file_says_so_instead_of_empty() {
+        const NOTE: &str = "(empty file)";
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 1,
+                "limit": 0
+            }),
+        )
+        .expect("read should succeed");
+        assert_eq!(out, NOTE);
     }
 }
 
@@ -8834,15 +8947,19 @@ fn background_session_scope_decides_what_ends_it(scope: &str, outlives_handler: 
     assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }
 
-/// A host where `edit` (declares `fs_write`) and `echo_` (declares nothing)
-/// are registered, plus a plugin holding only `agent` whose `open_reaching`
-/// tool calls `maki.agent.session({session_args})` and returns the error, or
-/// "nil" when the session opened.
+/// A host where `edit` (declares `fs_write`), the inert tool (declares `{}`),
+/// `echo_` and a second tool declaring nothing are registered, plus a plugin
+/// holding only `agent` whose `open_reaching` tool calls
+/// `maki.agent.session({session_args})` and returns the error, or "nil" when
+/// the session opened.
 fn reach_probe_host(session_args: &str) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source("tool_owner", &format!("{EDIT_TOOL_SRC}\n{ECHO_PLUGIN}"))
-        .unwrap();
+    host.load_source(
+        "tool_owner",
+        &format!("{EDIT_TOOL_SRC}\n{ECHO_PLUGIN}\n{INERT_TOOL_SRC}\n{SECOND_UNDECLARED_SRC}"),
+    )
+    .unwrap();
     let mut perms = maki_lua::PluginPermissions::denied();
     perms.set(maki_lua::Permission::Agent, true);
     let src = format!(
@@ -8865,17 +8982,26 @@ fn reach_probe_host(session_args: &str) -> (Arc<ToolRegistry>, PluginHost) {
 /// Nobody answers a prompt in a session of the plugin's own, so what it can
 /// reach is priced like a hook on the same tool. MCP reaches whatever its
 /// servers do, which is nothing on a chat without any.
-#[test_case::test_case(r#"{ { name = "edit" } }"#, false, false, "fs_write" ; "a_declared_capability_costs_itself")]
-#[test_case::test_case(r#"{ { name = "echo_" } }"#, false, false, "every permission" ; "undeclared_reach_costs_everything")]
-#[test_case::test_case("nil", true, true, "mcp" ; "mcp_costs_everything")]
+#[test_case::test_case(r#"{ { name = "edit" } }"#, false, false, "edit (fs_write)" ; "a_declared_capability_costs_itself")]
+#[test_case::test_case(r#"{ { name = "echo_" } }"#, false, false, UNDECLARED_REACH ; "undeclared_reach_costs_everything")]
+#[test_case::test_case("nil", true, true, MCP_HINT ; "mcp_costs_everything")]
 #[test_case::test_case("nil", true, false, "nil" ; "mcp_without_servers_costs_nothing")]
 #[test_case::test_case(r#"{ { name = "nobody_registered_this" } }"#, false, false, "nil" ; "an_unknown_name_never_dispatches")]
+#[test_case::test_case(r#"{ { name = "inert_" } }"#, false, false, "nil" ; "an_inert_tool_costs_nothing")]
 fn a_plugin_session_can_only_reach_what_its_plugin_holds(
     tools: &str,
     mcp: bool,
     servers: bool,
     expected: &str,
 ) {
+    let result = open_reaching(tools, mcp, servers);
+
+    assert!(result.contains(expected), "got: {result}");
+}
+
+/// Opens a session with {tools} from the `agent`-only plugin of
+/// [`reach_probe_host`], and returns its error or "nil".
+fn open_reaching(tools: &str, mcp: bool, servers: bool) -> String {
     let session = MakiId::generate();
     let mailbox = SessionMailbox::register(session);
     let mut seed = stub_seed(session);
@@ -8886,10 +9012,35 @@ fn a_plugin_session_can_only_reach_what_its_plugin_holds(
     let (reg, _host) = reach_probe_host(&format!(
         r#"{{ session = "{session}", tools = {tools}, mcp = {mcp} }}"#
     ));
+    exec_tool(&reg, "open_reaching", json!({})).unwrap()
+}
 
-    let result = exec_tool(&reg, "open_reaching", json!({})).unwrap();
+/// One error names every tool the plugin cannot pay for, with undeclared
+/// tools sharing one clause, so the author fixes them in one edit. MCP was
+/// not asked for, so its hint stays out.
+#[test]
+fn every_unpaid_tool_is_named_at_once() {
+    let tools = format!(
+        r#"{{ {{ name = "edit" }}, {{ name = "echo_" }}, {{ name = "{INERT_TOOL}" }}, {{ name = "{SECOND_UNDECLARED_TOOL}" }} }}"#
+    );
 
-    assert!(result.contains(expected), "got: {result}");
+    let result = open_reaching(&tools, false, false);
+
+    assert!(result.contains(UNPAID_REACH_ERR), "got: {result}");
+    assert!(!result.contains(MCP_HINT), "got: {result}");
+    assert!(result.contains("edit (fs_write)"), "got: {result}");
+    assert!(
+        result.contains(&format!(
+            "echo_, {SECOND_UNDECLARED_TOOL} {UNDECLARED_REACH}"
+        )),
+        "got: {result}"
+    );
+    assert!(
+        result.contains(&format!(
+            r#"except = {{ "edit", "echo_", "{SECOND_UNDECLARED_TOOL}" }}"#
+        )),
+        "got: {result}"
+    );
 }
 
 /// The ctx form pays the same price whether or not a user could answer: a

@@ -33,10 +33,12 @@ use mlua::{
     Value as LuaValue,
 };
 use serde_json::{Value, json};
+use tokio::sync::oneshot;
 use tokio::time::sleep;
 
 use crate::api::image::LuaImage;
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
+use crate::api::slot::permission_list;
 use crate::api::ui::buf::{BufHandle, line_to_lua};
 use crate::api::util::command::{
     CommandEntry, CommandHandlerMap, LuaCommandWriter, UiAction, publish_command_snapshot,
@@ -62,6 +64,9 @@ const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
 const PLAIN_HEADER_STYLE: &str = "tool";
+pub const PERMISSION_SHAPE_ERR: &str = "must give 'permission' as one permission name, e.g. permission = \"fs_read\", or {} when the tool reaches nothing past the conversation";
+pub const INERT_WITH_SCOPES_ERR: &str = "declares permission = {}, so it has nothing to prompt for. Remove 'permission_scopes', or name the capability it prompts for";
+pub const INERT_WITH_MUTABLE_PATH_ERR: &str = "writes the file named in 'mutable_path', so it reaches 'fs_write'. Declare permission = \"fs_write\" instead of {}";
 
 type DescribeFn = Box<dyn Fn(&str, &str, &Value) -> Option<String>>;
 
@@ -162,11 +167,37 @@ pub(crate) struct ToolPermission<S> {
     pub(crate) scopes: Option<S>,
 }
 
-impl ToolPermission<PermissionScopeSpec> {
-    pub(crate) fn kind(&self) -> ToolPermission<PermissionScopeKind> {
-        ToolPermission {
-            permission: self.permission,
-            scopes: self.scopes.as_ref().map(PermissionScopeSpec::kind),
+/// `permission = {}` or one capability. Kept as one enum so `{}` can never
+/// carry scopes.
+pub(crate) enum DeclaredReach<S> {
+    Inert,
+    Capability(ToolPermission<S>),
+}
+
+impl<S> DeclaredReach<S> {
+    fn scopes(&self) -> Option<&S> {
+        match self {
+            Self::Inert => None,
+            Self::Capability(p) => p.scopes.as_ref(),
+        }
+    }
+
+    pub(crate) fn into_scopes(self) -> Option<S> {
+        match self {
+            Self::Inert => None,
+            Self::Capability(p) => p.scopes,
+        }
+    }
+}
+
+impl DeclaredReach<PermissionScopeSpec> {
+    pub(crate) fn kind(&self) -> DeclaredReach<PermissionScopeKind> {
+        match self {
+            Self::Inert => DeclaredReach::Inert,
+            Self::Capability(p) => DeclaredReach::Capability(ToolPermission {
+                permission: p.permission,
+                scopes: p.scopes.as_ref().map(PermissionScopeSpec::kind),
+            }),
         }
     }
 }
@@ -221,7 +252,7 @@ pub(crate) struct PendingTool {
     pub(crate) header_key: Option<RegistryKey>,
     pub(crate) restore_key: Option<RegistryKey>,
     pub(crate) start_key: Option<RegistryKey>,
-    pub(crate) permission: Option<ToolPermission<PermissionScopeSpec>>,
+    pub(crate) permission: Option<DeclaredReach<PermissionScopeSpec>>,
     pub(crate) describe_key: Option<RegistryKey>,
 }
 
@@ -235,7 +266,8 @@ impl PendingTool {
             self.restore_key,
             self.start_key,
             self.describe_key,
-            self.permission.and_then(|p| p.scopes?.callback_key()),
+            self.permission
+                .and_then(|p| p.into_scopes()?.callback_key()),
         ]
         .into_iter()
         .flatten()
@@ -266,7 +298,7 @@ pub(crate) struct LuaTool {
     pub(crate) plugin: Arc<str>,
     pub(crate) has_header_fn: bool,
     pub(crate) has_start_fn: bool,
-    pub(crate) permission: Option<ToolPermission<PermissionScopeKind>>,
+    pub(crate) permission: Option<DeclaredReach<PermissionScopeKind>>,
     pub(crate) has_describe_fn: bool,
 }
 
@@ -343,9 +375,12 @@ impl Tool for LuaTool {
     }
 
     fn reach(&self) -> Option<ToolReach> {
-        self.permission.as_ref().map(|p| ToolReach {
-            permission: p.permission,
-            prompted: p.scopes.is_some(),
+        self.permission.as_ref().map(|declared| match declared {
+            DeclaredReach::Inert => ToolReach::Inert,
+            DeclaredReach::Capability(p) => ToolReach::Capability {
+                permission: p.permission,
+                prompted: p.scopes.is_some(),
+            },
         })
     }
 
@@ -355,7 +390,7 @@ impl Tool for LuaTool {
         // that one belongs to the tool.
         let reason = toolcall_reason(self.meta.schema, input);
         let validated = validate(self.meta.schema, input.clone())?;
-        let permission_state = match self.permission.as_ref().and_then(|p| p.scopes.as_ref()) {
+        let permission_state = match self.permission.as_ref().and_then(DeclaredReach::scopes) {
             Some(PermissionScopeKind::Field(field)) => {
                 let scope = validated.get(field.as_ref()).and_then(|v| v.as_str());
                 PermissionState::Ready(Some(match scope {
@@ -434,7 +469,7 @@ impl ToolInvocation for LuaToolInvocation {
         if !self.has_header_fn {
             return HeaderFuture::Ready(HeaderResult::plain(self.tool.to_string()));
         }
-        let (reply_tx, reply_rx) = flume::bounded::<HeaderResult>(1);
+        let (reply_tx, reply_rx) = oneshot::channel::<HeaderResult>();
         let tool = Arc::clone(&self.tool);
         let plugin = Arc::clone(&self.plugin);
         let input = self.input.clone();
@@ -455,7 +490,6 @@ impl ToolInvocation for LuaToolInvocation {
                     return HeaderResult::plain(fallback);
                 }
                 reply_rx
-                    .recv_async()
                     .await
                     .unwrap_or_else(|_| HeaderResult::plain(fallback))
             }),
@@ -487,7 +521,7 @@ impl ToolInvocation for LuaToolInvocation {
         let Some(id) = id else {
             return Box::pin(std::future::ready(()));
         };
-        let (reply_tx, reply_rx) = flume::bounded::<()>(1);
+        let (reply_tx, reply_rx) = oneshot::channel::<()>();
         let req = Request::StartTool {
             plugin: Arc::clone(&self.plugin),
             tool: Arc::clone(&self.tool),
@@ -503,7 +537,7 @@ impl ToolInvocation for LuaToolInvocation {
         let tx = self.tx.clone();
         Box::pin(async move {
             if tx.send_async(req).await.is_ok() {
-                let _ = reply_rx.recv_async().await;
+                let _ = reply_rx.await;
             }
         })
     }
@@ -512,7 +546,7 @@ impl ToolInvocation for LuaToolInvocation {
         match &self.permission_state {
             PermissionState::Ready(v) => Box::pin(std::future::ready(v.clone())),
             PermissionState::NeedsCompute => {
-                let (reply_tx, reply_rx) = flume::bounded(1);
+                let (reply_tx, reply_rx) = oneshot::channel();
                 let tx = self.tx.clone();
                 let plugin = Arc::clone(&self.plugin);
                 let tool = Arc::clone(&self.tool);
@@ -531,7 +565,7 @@ impl ToolInvocation for LuaToolInvocation {
                     {
                         return Some(PermissionScopes::force_prompt(fallback));
                     }
-                    match reply_rx.recv_async().await {
+                    match reply_rx.await {
                         Ok(Some(scopes)) => Some(scopes),
                         _ => Some(PermissionScopes::force_prompt(fallback)),
                     }
@@ -573,7 +607,7 @@ impl ToolInvocation for LuaToolInvocation {
                 Err(e) => return Err(e).into(),
             };
 
-            let (reply_tx, reply_rx) = flume::bounded::<ToolCallReply>(1);
+            let (reply_tx, reply_rx) = oneshot::channel::<ToolCallReply>();
             let live = ctx.tool_use_id.clone().map(|id| LiveCtx {
                 event_tx: ctx.event_tx.clone(),
                 tool_use_id: id,
@@ -597,7 +631,7 @@ impl ToolInvocation for LuaToolInvocation {
                 return Err("lua thread disconnected".to_string()).into();
             }
 
-            let recv = async { Some(reply_rx.recv_async().await) };
+            let recv = async { Some(reply_rx.await) };
             let call = ctx.call.as_deref();
             let own_call = call.is_some_and(|call| ctx.tool_use_id.as_deref() == Some(call.id()));
             let result = match effective_secs {
@@ -839,7 +873,7 @@ fn register_prompt(
 ///   describe        (function) Optional. Returns a custom description string for the current context.
 ///   examples        (table)    Optional. Array of example input objects for documentation.
 ///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
-///   permission      (string)   The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
+///   permission      (string|table) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. Pass `{}` when the tool reaches nothing past the conversation it runs in: its handler calls no guarded `maki` function and no other tool. `{}` is the tool form of `capability = {}` on slots and actions, needs no grant, makes the tool free to hand to a session, and cannot go with `permission_scopes` or `mutable_path`. Older maki versions refuse `{}`, so set `min_maki_version`. Leaving `permission` out costs those plugins every permission except `agent` and `input`.
 ///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
 ///   stale_read_check (boolean)  Whether to check if the file changed since last read before writing. Default: true. Tools that overwrite the entire file without reading first can set this to false.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
@@ -1026,7 +1060,7 @@ fn allow_is_delegated(
         // Disabled by config, or owned by a plugin nobody loaded.
         return dropped("no such tool is registered");
     };
-    let Some(ToolReach {
+    let Some(ToolReach::Capability {
         permission: required,
         prompted: true,
     }) = registered.tool.reach()
@@ -1242,9 +1276,14 @@ fn set_prompt(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> 
 /// Each entry has the tool's name, schema, audiences, and an `enabled` flag.
 /// Describe callbacks are not invoked (the static description is used).
 ///
+/// `permission` is what the tool reaches, as a list like `get_slots`
+/// `capability`: `{ "fs_read" }`, `{}` when it reaches nothing, or nil when
+/// it declared none, which costs every permission. A tool registered with
+/// `permission = "fs_read"` reads back as `{ "fs_read" }`.
+///
 /// @param opts table? Options:
 ///   config (table) Optional config table with a `disabled_tools` string[] field used to compute the `enabled` flag on each entry.
-/// @return (table[]) Array of tool entries: { name, schema, audiences, kind?, enabled }.
+/// @return (table[]) Array of tool entries: { name, schema, audiences, kind?, permission?, enabled }.
 /// @example
 /// local tools = maki.api.get_tools()
 /// for _, t in ipairs(tools) do
@@ -1289,8 +1328,13 @@ fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
 /// `background_params` lists the parameters marked `needs_background`,
 /// which only a session that can move calls to the background sees.
 ///
+/// `permission` is what the tool reaches, as a list like `get_slots`
+/// `capability`: `{ "fs_read" }`, `{}` when it reaches nothing, or nil when
+/// it declared none, which costs every permission. MCP tools and
+/// `tool_search` declare none.
+///
 /// @param name string Exact tool name.
-/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, background_params?, header?, restore?, format? }, or nil if not found.
+/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, permission?, background_params?, header?, restore?, format? }, or nil if not found.
 /// @example
 /// local t = maki.api.get_tool("bash")
 /// if t then
@@ -1401,6 +1445,9 @@ fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
     }
     t.set("schema", json_to_lua(lua, &schema)?)?;
     t.set("audiences", audiences_to_lua(lua, entry.tool.audience())?)?;
+    if let Some(reach) = entry.tool.reach() {
+        t.set("permission", permission_list(lua, reach.permission())?)?;
+    }
     if let Some(kind) = entry.tool.tool_kind() {
         t.set("kind", kind)?;
     }
@@ -1652,34 +1699,47 @@ pub(crate) fn permission_keys() -> String {
 }
 
 /// Reads both keys together, so the pair enters the runtime whole and only
-/// when the plugin holds what the tool would expose.
+/// when the plugin holds what the tool would expose. `{}` needs no grant, the
+/// same as `capability = {}` on a slot.
 fn parse_tool_permission(
     lua: &Lua,
     spec: &Table,
     tool: &str,
     schema: &Value,
     permissions: &PluginPermissions,
-) -> LuaResult<Option<ToolPermission<PermissionScopeSpec>>> {
-    let declared = spec
-        .opt::<String>("permission")?
-        .map(|key| {
-            Permission::from_key(&key).ok_or_else(|| {
-                mlua::Error::runtime(format!(
-                    "register_tool: '{tool}' declares unknown permission '{key}' (valid: {})",
-                    permission_keys()
-                ))
-            })
-        })
-        .transpose()?;
+) -> LuaResult<Option<DeclaredReach<PermissionScopeSpec>>> {
     let scopes = spec.get::<LuaValue>("permission_scopes")?;
-
-    let permission = match declared {
-        Some(permission) => permission,
+    let permission = match spec.opt::<LuaValue>("permission")? {
         None if scopes.is_nil() => return Ok(None),
         None => {
             return Err(mlua::Error::runtime(format!(
                 "register_tool: '{tool}' has 'permission_scopes', so it must declare 'permission', the capability it exposes to the model. \
                  Add it next to 'permission_scopes' in the register_tool spec, one of: {}",
+                permission_keys()
+            )));
+        }
+        // `is_empty` looks at the hash part too, so `{ fs_read = true }` is
+        // refused instead of slipping through as free.
+        Some(LuaValue::Table(t)) if t.is_empty() => {
+            if !scopes.is_nil() {
+                return Err(mlua::Error::runtime(format!(
+                    "register_tool: '{tool}' {INERT_WITH_SCOPES_ERR}"
+                )));
+            }
+            return Ok(Some(DeclaredReach::Inert));
+        }
+        Some(LuaValue::String(key)) => {
+            let key = key.to_str()?;
+            Permission::from_key(&key).ok_or_else(|| {
+                mlua::Error::runtime(format!(
+                    "register_tool: '{tool}' declares unknown permission '{key}' (valid: {})",
+                    permission_keys()
+                ))
+            })?
+        }
+        Some(_) => {
+            return Err(mlua::Error::runtime(format!(
+                "register_tool: '{tool}' {PERMISSION_SHAPE_ERR} (valid: {})",
                 permission_keys()
             )));
         }
@@ -1706,7 +1766,10 @@ fn parse_tool_permission(
             ));
         }
     };
-    Ok(Some(ToolPermission { permission, scopes }))
+    Ok(Some(DeclaredReach::Capability(ToolPermission {
+        permission,
+        scopes,
+    })))
 }
 
 fn register_tool_from_lua(
@@ -1748,10 +1811,13 @@ fn register_tool_from_lua(
     let mutable_path_field = require_schema_field(spec, "mutable_path", &schema_val)?;
     let stale_read_check = spec.opt_bool("stale_read_check").unwrap_or(true);
     let permission = parse_tool_permission(lua, spec, &name, &schema_val, permissions)?;
+    if mutable_path_field.is_some() && matches!(permission, Some(DeclaredReach::Inert)) {
+        return Err(mlua::Error::runtime(format!(
+            "register_tool: '{name}' {INERT_WITH_MUTABLE_PATH_ERR}"
+        )));
+    }
     if mutable_path_field.is_none()
-        && permission
-            .as_ref()
-            .is_some_and(|p| p.permission == Permission::FsWrite)
+        && matches!(&permission, Some(DeclaredReach::Capability(p)) if p.permission == Permission::FsWrite)
     {
         return Err(mlua::Error::runtime(format!(
             "register_tool: '{name}' declares permission 'fs_write' but no 'mutable_path', \
@@ -2312,9 +2378,11 @@ mod tests {
             tx,
             plugin: Arc::from("test"),
             has_header_fn: false,
-            permission: scopes.map(|scopes| ToolPermission {
-                permission: Permission::FsWrite,
-                scopes: Some(scopes),
+            permission: scopes.map(|scopes| {
+                DeclaredReach::Capability(ToolPermission {
+                    permission: Permission::FsWrite,
+                    scopes: Some(scopes),
+                })
             }),
             has_start_fn: false,
             has_describe_fn: false,

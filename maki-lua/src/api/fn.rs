@@ -15,8 +15,8 @@ use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::jobs::{
-    CallbackUpdate, CallbackUpdates, CheckedOutReceiver, JobCommand, JobEvent, JobOwner,
-    JobSnapshot, JobSpec, MAX_TAIL_LINES, Redirect, deliver_job_event,
+    CallbackUpdate, CallbackUpdates, JobCommand, JobEvent, JobOwner, JobSnapshot, JobSpec,
+    MAX_TAIL_LINES, Redirect, deliver_job_event,
 };
 use crate::plugin_permissions::{Ceiling, Permission, PluginPermissions, require};
 use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
@@ -78,8 +78,8 @@ const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv tabl
 ///     `jobwait` (default 20, 0 disables, max 1024).
 ///   `max_line_bytes` (integer?) longest line delivered, in bytes. A longer
 ///     line is cut at a UTF-8 boundary and ends in `...`, and its rest is
-///     skipped without being read into memory (default and `0`: 64 MiB, the
-///     `maki.fs` read limit).
+///     skipped without being read into memory (default, `0`, and max: 64 MiB,
+///     the `maki.fs` read limit).
 ///   `name` (string?) handle for `jobfind`, unique among the live jobs this
 ///     plugin can see. Starting a second job under a live name is an error.
 /// @return (integer?, string?) Job id, or nil plus an error message when the
@@ -122,8 +122,7 @@ fn jobstart(
         spec.ceiling = Ceiling::current_for(lua, &plugin);
         spec.stdout = parse_redirect(lua, opts, "stdout", spec.on_stdout.is_some(), &grants)?;
         spec.stderr = parse_redirect(lua, opts, "stderr", spec.on_stderr.is_some(), &grants)?;
-        // 0 means no cap of the caller's own, as in `maki.fs` reads.
-        if let Some(max) = opts.opt::<u64>("max_line_bytes")?.filter(|max| *max > 0) {
+        if let Some(max) = opts.opt_nonzero("max_line_bytes")? {
             spec.max_line_bytes = max;
         }
         tail = opts.opt("tail").ok().flatten();
@@ -472,16 +471,14 @@ async fn jobwait(
             snap.dropped_output,
         );
     }
-    let Some(receiver) = with_jobs(&lua, |store| store.take_receiver(job_id, task_id, &plugin))
-    else {
+    let Some(lease) = with_jobs(&lua, |store| store.lease_events(job_id, task_id, &plugin)) else {
         return Ok(err_pair(JOB_UNWAITABLE_ERR));
     };
-    let receiver = CheckedOutReceiver::new(&lua, job_id, receiver);
 
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_WAIT_MS));
     let mut deadline = pin!(sleep(timeout));
 
-    // A pump delivers until the receiver is checked out, and only the tail
+    // A pump delivers until the wait takes its lease, and only the tail
     // remembers those lines.
     let mut stdout_lines = snap.stdout_lines;
     let mut stderr_lines = snap.stderr_lines;
@@ -489,7 +486,7 @@ async fn jobwait(
     let exit_code = loop {
         let event = tokio::select! {
             biased;
-            event = receiver.get().recv_async() => event,
+            event = lease.events().recv_async() => event,
             () = &mut deadline => None,
         };
 
@@ -653,6 +650,12 @@ lua_table! {
 mod tests {
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, WinView};
+    use futures::FutureExt;
+
+    const TEST_PLUGIN: &str = "test-plugin";
+    /// Can't exit while a test runs, so only the code under test ends it.
+    const SLEEPING_JOB: &str = "sleep 600";
+    const LONG_WAIT_MS: u64 = 600_000;
 
     fn lua_with_view(tx: Option<flume::Sender<UiAction>>) -> Lua {
         let lua = Lua::new();
@@ -724,5 +727,53 @@ mod tests {
             panic!("expected winrestview request");
         };
         assert_eq!(scroll_top, expected);
+    }
+
+    enum Abandoned {
+        /// `call_async` ends the Lua call the moment its future drops.
+        HostCall,
+        /// The shape of #1345: a coroutine the plugin made, which only the
+        /// collector ever frees.
+        PluginCoroutine,
+    }
+
+    #[test_case::test_case(Abandoned::HostCall ; "host_call")]
+    #[test_case::test_case(Abandoned::PluginCoroutine ; "plugin_coroutine")]
+    #[tokio::test]
+    async fn abandoned_jobwait_releases_the_job(abandoned: Abandoned) {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        jobwait__register(
+            &t,
+            &lua,
+            &PluginPermissions::trusted(),
+            Arc::from(TEST_PLUGIN),
+        )
+        .unwrap();
+        lua.globals().set("f", t).unwrap();
+        let owner = JobOwner::Plugin(Arc::from(TEST_PLUGIN));
+        let id = with_jobs(&lua, |store| store.start(JobSpec::new(owner, SLEEPING_JOB))).unwrap();
+        let wait_src = format!("function() f.jobwait({id}, {LONG_WAIT_MS}) end");
+
+        match abandoned {
+            Abandoned::HostCall => {
+                let wait: Function = lua.load(format!("return {wait_src}")).eval().unwrap();
+                assert!(
+                    wait.call_async::<()>(()).now_or_never().is_none(),
+                    "jobwait must park"
+                );
+            }
+            Abandoned::PluginCoroutine => {
+                let resume = format!("coroutine.resume(coroutine.create({wait_src}))");
+                lua.load(resume).exec_async().await.unwrap();
+                lua.gc_collect().unwrap();
+                lua.gc_collect().unwrap();
+            }
+        }
+
+        assert!(
+            with_jobs(&lua, |store| store.lease_events(id, None, TEST_PLUGIN)).is_some(),
+            "the abandoned wait must free the job"
+        );
     }
 }

@@ -291,8 +291,8 @@ fn drive(
                     .map_err(|e| InterpreterError::Runtime(e.to_string()))?;
             }
             RunProgress::OsCall(mut call) => {
-                if let OsFunctionCall::Import(ref mod_name) = call.function_call
-                    && let Some(module) = modules::serve_import(mod_name)
+                if let OsFunctionCall::Import(ref import_args) = call.function_call
+                    && let Some(module) = modules::serve_import(&import_args.module)
                 {
                     progress = call
                         .resume(ExtFunctionResult::Return(module), print_writer.reborrow())
@@ -415,6 +415,9 @@ impl OsHost<'_> {
             | OsFunctionCall::Time(_)
             | OsFunctionCall::Import(_)
             | OsFunctionCall::ImportStubs(_)) => Err(call.on_no_handler().into()),
+            // maki sends no host functions or classes the script could ask
+            // hints for, so the empty dict is the honest answer.
+            OsFunctionCall::GetTypeHints(_) => Ok(MontyObject::dict([])),
         }
     }
 

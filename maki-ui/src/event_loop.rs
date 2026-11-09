@@ -31,10 +31,10 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::sleep::SleepDetector;
 use maki_agent::{
-    AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle,
-    SessionMailbox, Transcript, mcp,
+    AgentConfig, AgentEvent, CancelToken, Envelope, HostPrompt, McpCommand, McpConfigErrors,
+    McpHandle, SessionMailbox, Transcript, mcp,
 };
-use maki_config::project::TrustQuestion;
+use maki_config::project::TrustState;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::session_snapshot::{
@@ -175,11 +175,11 @@ pub struct EventLoopParams {
     pub model_policy: Arc<ModelPolicy>,
     pub project_config: ProjectConfig,
     /// What `/trust` would grant and what the `[restricted]` indicator reports.
-    /// `None` when the folder is trusted or has nothing to ask about.
-    pub trust_question: Option<TrustQuestion>,
+    pub trust: TrustState,
     /// The mailboxes the generation before handed over, held until this one
     /// registered its own.
     pub handed_over: Vec<SessionMailbox>,
+    pub host_prompt: HostPrompt,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -504,7 +504,8 @@ struct SpawnCtx {
     available_models: Arc<ArcSwapOption<ModelList>>,
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
-    trust_question: Option<TrustQuestion>,
+    trust: TrustState,
+    host_prompt: Arc<HostPrompt>,
 }
 
 impl SpawnCtx {
@@ -535,6 +536,7 @@ impl SpawnCtx {
                 mcp_config_errors: self.mcp_config_errors.clone(),
                 timeouts: self.timeouts,
                 model_policy: Arc::clone(&self.model_policy),
+                host_prompt: Arc::clone(&self.host_prompt),
             },
         );
         let mut app = App::new(
@@ -556,7 +558,7 @@ impl SpawnCtx {
             self.lua_event_handle.clone(),
             Arc::clone(&self.model_policy),
         );
-        app.trust_question = self.trust_question.clone();
+        app.trust = self.trust.clone();
         handles.apply_to_app(&mut app);
         if resumed {
             app.restore_resumed_session();
@@ -741,8 +743,9 @@ impl<'t> EventLoop<'t> {
             lua_event_handle,
             model_policy,
             project_config,
-            trust_question,
+            trust,
             handed_over,
+            host_prompt,
         } = params;
         // A `/reload` generation inherits the handles of the one before it,
         // so every loop has to claim the UI back for itself.
@@ -810,7 +813,8 @@ impl<'t> EventLoop<'t> {
             available_models: bg.available,
             storage_writer,
             model_policy,
-            trust_question,
+            trust,
+            host_prompt: Arc::new(host_prompt),
         };
 
         let mut runtimes: Vec<SessionRuntime> = sessions

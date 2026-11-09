@@ -236,6 +236,8 @@ fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Vec<String>>) {
 
 /// Discovery lands in batches after the client built its selector from the
 /// offline list, so every batch that adds something announces the fuller list.
+/// Running sessions need no push, each one reads its model from the registry
+/// again before its next turn.
 fn refresh_models(srv: &mut Server, batch: Vec<String>) {
     let mut added = false;
     for spec in batch {
@@ -615,8 +617,7 @@ fn start_session(
         storage: params.storage.clone(),
         yolo: params.yolo,
         unattended: false,
-        system_prompt_override: None,
-        append_system_prompt: None,
+        host_prompt: params.host_prompt.clone(),
         defaults: params.defaults,
         model_policy: Arc::clone(&params.model_policy),
         plugin_rules: Arc::clone(&params.plugin_rules),
@@ -798,16 +799,10 @@ fn trusted_project_config(
     policy: &TrustConfig,
 ) -> ProjectConfig {
     let mut decision = project::resolve(storage, cwd, mode);
-    let matched = decision
-        .state
-        .unanswered()
-        .and_then(|question| policy_grant(question, policy));
-    if let Some(pattern) = matched {
+    if let Some(pattern) = policy_grant(&decision.state, policy) {
         // ACP has no card, so policy is the only yes a cwd with no stored
         // decision can get. Recorded like any other yes so `maki trust list`
-        // shows what this server trusted on the client's behalf. `unanswered`
-        // and not `question`: a recorded `Never` is a stored decision, and
-        // granting over it would wipe the rejection out of the store.
+        // shows what this server trusted on the client's behalf.
         info!(%pattern, cwd = %cwd.display(), "ACP folder trusted by trust.paths policy");
         decision = project::apply_answer(storage, decision, TrustAnswer::Trust);
     }
@@ -1414,7 +1409,7 @@ mod tests {
     use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
     use maki_agent::tools::PermissionScopes;
     use maki_agent::{
-        CancelToken, DoneReason, EventSender, RunTotals, SubagentInfo, ToolStartEvent,
+        CancelToken, DoneReason, EventSender, HostPrompt, RunTotals, SubagentInfo, ToolStartEvent,
         TurnCompleteEvent,
     };
     use maki_config::project::TrustQuestion;
@@ -1711,6 +1706,7 @@ mod tests {
             on_session_end: None,
             storage,
             background: false,
+            host_prompt: HostPrompt::default(),
             stop: CancelToken::none(),
         }
     }

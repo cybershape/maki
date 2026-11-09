@@ -169,6 +169,7 @@ maki.api.register_tool({
   name = "skill",
   kind = "read",
   description = description,
+  permission = "fs_read",
 
   schema = {
     type = "object",

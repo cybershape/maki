@@ -10,8 +10,8 @@ use maki_agent::template::Vars;
 use maki_agent::tools::{BackgroundFor, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, AgentSeed, CancelMap,
-    CancelToken, DoneReason, Envelope, EventSender, History, Instructions, McpCommand, McpSession,
-    PromptRole, RunContext, RunContextBuilder, RunLedger, RunTotals, SessionMailbox,
+    CancelToken, DoneReason, Envelope, EventSender, History, HostPrompt, Instructions, McpCommand,
+    McpSession, PromptRole, RunContextBuilder, RunLedger, RunTotals, SessionMailbox,
     SharedMessages,
 };
 use maki_lua::EventHandle;
@@ -70,6 +70,7 @@ pub(super) struct AgentLoop {
     mailbox: SessionMailbox,
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
+    host_prompt: Arc<HostPrompt>,
 }
 
 impl AgentLoop {
@@ -86,6 +87,7 @@ impl AgentLoop {
             subagent_cancels,
         }: LoopEnds,
         lua_handle: EventHandle,
+        host_prompt: Arc<HostPrompt>,
     ) -> Self {
         let seed = mailbox.publish_seed(seed);
         Self {
@@ -103,6 +105,7 @@ impl AgentLoop {
             mailbox,
             lua_handle,
             subagent_cancels,
+            host_prompt,
         }
     }
 
@@ -217,9 +220,10 @@ impl AgentLoop {
         let slots = Arc::clone(&prompt_slots);
         let config = self.seed.config.clone();
         let mcp = self.seed.mcp.clone();
+        let host_prompt = Arc::clone(&self.host_prompt);
         let context: RunContextBuilder = Arc::new(move |model, workflow| {
             let tools = base_tools(&vars, model, &config, mcp.as_ref(), workflow);
-            RunContext::render(&vars, &instructions, &slots, model, tools)
+            host_prompt.context(&vars, &instructions, &slots, model, tools)
         });
         (context, prompt_slots)
     }

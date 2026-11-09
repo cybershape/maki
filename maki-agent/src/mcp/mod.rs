@@ -34,6 +34,7 @@ use maki_providers::{ContentBlock, DEFER_LOADING_KEY, Message, Model};
 use rmcp::model::{Prompt, PromptArgument, Tool};
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::sync::oneshot;
 use tokio::task::{JoinSet, spawn_blocking};
 use tokio::time::timeout;
 use tracing::{info, warn};
@@ -313,7 +314,7 @@ pub enum McpCommand {
     /// Drain every running transport and stop the loop. The loop sends `()` on `ack` once
     /// every shutdown has finished, so callers can wait with a timeout.
     Shutdown {
-        ack: flume::Sender<()>,
+        ack: oneshot::Sender<()>,
     },
 }
 
@@ -723,12 +724,9 @@ impl McpHandle {
     }
 
     pub async fn shutdown(&self) {
-        let (ack_tx, ack_rx) = flume::bounded(1);
+        let (ack_tx, ack_rx) = oneshot::channel();
         self.send(McpCommand::Shutdown { ack: ack_tx });
-        if timeout(MCP_SHUTDOWN_TIMEOUT, ack_rx.recv_async())
-            .await
-            .is_err()
-        {
+        if timeout(MCP_SHUTDOWN_TIMEOUT, ack_rx).await.is_err() {
             warn!("MCP shutdown timed out after {MCP_SHUTDOWN_TIMEOUT:?}");
         }
     }
@@ -850,7 +848,7 @@ async fn run(
     let connects = spawn_connects(&inner, connected_tx);
     let mut ready = Some(ready_tx);
 
-    let mut ack: Option<flume::Sender<()>> = None;
+    let mut ack: Option<oneshot::Sender<()>> = None;
     loop {
         release_ready(&inner, &mut ready);
         // A connect result that lands as the last command handle goes must
@@ -899,7 +897,7 @@ async fn run(
     inner.generation += 1;
     publish(&inner, &index, &snapshot);
     if let Some(tx) = ack {
-        let _ = tx.try_send(());
+        let _ = tx.send(());
     }
 }
 
@@ -1960,9 +1958,9 @@ mod tests {
             flume::bounded(0).0,
         ));
 
-        let (ack_tx, ack_rx) = flume::bounded(1);
+        let (ack_tx, ack_rx) = oneshot::channel();
         cmd_tx.send(McpCommand::Shutdown { ack: ack_tx }).unwrap();
-        ack_rx.recv_async().await.unwrap();
+        ack_rx.await.unwrap();
         loop_task.await.unwrap();
 
         assert_eq!(t1.shutdowns(), 1);

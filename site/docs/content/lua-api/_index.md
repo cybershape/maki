@@ -506,7 +506,7 @@ only in compact mode.
   - `describe` (`function`) Optional. Returns a custom description string for the current context.
   - `examples` (`table`) Optional. Array of example input objects for documentation.
   - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
-  - `permission` (`string`) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
+  - `permission` (`string|table`) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. Pass `{}` when the tool reaches nothing past the conversation it runs in: its handler calls no guarded `maki` function and no other tool. `{}` is the tool form of `capability = {}` on slots and actions, needs no grant, makes the tool free to hand to a session, and cannot go with `permission_scopes` or `mutable_path`. Older maki versions refuse `{}`, so set `min_maki_version`. Leaving `permission` out costs those plugins every permission except `agent` and `input`.
   - `mutable_path` (`string`) Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
   - `stale_read_check` (`boolean`) Whether to check if the file changed since last read before writing. Default: true. Tools that overwrite the entire file without reading first can set this to false.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
@@ -766,12 +766,17 @@ available tools or for checking which tools are enabled.
 Each entry has the tool's name, schema, audiences, and an `enabled` flag.
 Describe callbacks are not invoked (the static description is used).
 
+`permission` is what the tool reaches, as a list like `get_slots`
+`capability`: `{ "fs_read" }`, `{}` when it reaches nothing, or nil when
+it declared none, which costs every permission. A tool registered with
+`permission = "fs_read"` reads back as `{ "fs_read" }`.
+
 **Parameters:**
 
 - `{opts?}` (`table?`) Options:
   - `config` (`table`) Optional config table with a `disabled_tools` string[] field used to compute the `enabled` flag on each entry.
 
-**Returns:** (`table[]`) Array of tool entries: { name, schema, audiences, kind?, enabled }.
+**Returns:** (`table[]`) Array of tool entries: { name, schema, audiences, kind?, permission?, enabled }.
 
 **Example:**
 
@@ -805,11 +810,16 @@ so this is not an existence check for MCP tools.
 `background_params` lists the parameters marked `needs_background`,
 which only a session that can move calls to the background sees.
 
+`permission` is what the tool reaches, as a list like `get_slots`
+`capability`: `{ "fs_read" }`, `{}` when it reaches nothing, or nil when
+it declared none, which costs every permission. MCP tools and
+`tool_search` declare none.
+
 **Parameters:**
 
 - `{name}` (`string`) Exact tool name.
 
-**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, background_params?, header?, restore?, format? }, or nil if not found.
+**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, permission?, background_params?, header?, restore?, format? }, or nil if not found.
 
 **Example:**
 
@@ -1571,6 +1581,10 @@ Get the list of tool definitions for a given audience. Pass the result
 straight into `maki.agent.session()` or use it to inspect what tools are
 available.
 
+A session costs what its tools reach (see `maki.agent.session`). To hand
+over only what the plugin can pay for, check each tool's `permission`
+from `maki.api.get_tool`, as the second example does.
+
 Without a `ctx`, pass `session = id` in `opts` to get the tools a
 background session of that chat would have.
 
@@ -1603,6 +1617,19 @@ local defs, err = maki.agent.tools(ctx, {
 })
 if err then error(err) end
 print(#defs .. " tools available")
+
+-- Keep only tools this plugin can hand to a session. `held` is the
+-- set of permission keys the plugin was granted.
+local held = { fs_read = true, net = true }
+local affordable = {}
+for _, def in ipairs(defs) do
+  local perms = maki.api.get_tool(def.name).permission
+  local ok = perms ~= nil
+  for _, p in ipairs(perms or {}) do
+    ok = ok and held[p] == true
+  end
+  if ok then table.insert(affordable, def) end
+end
 ```
 
 ---
@@ -1752,11 +1779,18 @@ goes above the chat's current setting.
 With or without a ctx, the plugin must hold what its tools reach. A prompt
 is no gate under YOLO or an allow rule, and a background session has
 nobody to prompt. A tool declaring a permission (`bash` with `run`, `read`
-with `fs_read`) costs that one. A tool declaring none (`batch`,
-`code_execution`), or `mcp = true` on a chat with MCP servers, costs every
-permission except `agent`. `local_tools` cost nothing, they run as the
+with `fs_read`) costs that one. A tool registered with `permission = {}`
+costs nothing. A tool declaring none, or `mcp = true` on a chat with MCP
+servers, costs every permission except `agent` and `input`. See each
+tool's `permission` in `maki.api.get_tool` and on the
+[Tools](/docs/tools/) page. `local_tools` cost nothing, they run as the
 plugin. The bundled `task` hands over the whole chat, so it holds every
-permission.
+permission. If the plugin cannot pay, the error lists every tool it cannot
+pay for and the `except` list that leaves them out.
+
+The `general_sub` set in the example includes tools that declare no
+permission (`batch`, `code_execution`), so a plugin without every
+permission leaves those out.
 
 `scope` sets the lifetime. `"task"`, the default, ends the session with
 the task that opened it: an autocmd callback when it returns, a tool
@@ -2616,8 +2650,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
     `jobwait` (default 20, 0 disables, max 1024).
   - `max_line_bytes` (`integer?`) longest line delivered, in bytes. A longer
     line is cut at a UTF-8 boundary and ends in `...`, and its rest is
-    skipped without being read into memory (default and `0`: 64 MiB, the
-    `maki.fs` read limit).
+    skipped without being read into memory (default, `0`, and max: 64 MiB,
+    the `maki.fs` read limit).
   - `name` (`string?`) handle for `jobfind`, unique among the live jobs this
     plugin can see. Starting a second job under a live name is an error.
 
@@ -3056,7 +3090,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Absolute or relative file path. `~/` is expanded to the home directory.
-- `{opts?}` (`table?`) `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `count = false` stops reading after the page and leaves `total` nil.
+- `{opts?}` (`table?`) `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines (at most 64 MiB) at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `count = false` stops reading after the page and leaves `total` nil.
 
 **Returns:** (`table?`, `string?`) `{ lines = string[], total = integer? }`, or nil plus an error message.
 
@@ -3320,6 +3354,8 @@ maki.fs.dir({path}, {opts?})
 List the contents of the directory at {path}.
 Each entry is a two-element array `{name, type}` where type is one of
 `"file"`, `"directory"`, `"link"`, or `"unknown"`. Follows symlinks.
+`name` is relative to {path}, so with `depth` > 1 nested entries keep
+their directory: "d/nested.txt", unambiguous and joinable onto {path}.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
 
@@ -3336,7 +3372,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 local entries, err = maki.fs.dir("src", { depth = 2 })
 if err then return end
 for _, e in ipairs(entries) do
-  print(e[1], e[2]) -- "main.rs"  "file"
+  print(e[1], e[2]) -- "main.rs" "file", "tests/lib.rs" "file"
 end
 ```
 
@@ -4533,9 +4569,10 @@ maki.model.tier({name}, {provider?})
 
 The model maki uses for a tier, the same one a subagent asking for that
 tier gets: user's pick from the `/model` picker for that tier (whatever
-provider it names), else the curated default within `provider`, else any
-provider. `assigned` tells a pick apart from a default. Pass `provider` to
-prefer its models, the way subagents prefer the session's provider.
+provider it names), else the curated or `providers.toml`-declared default
+within `provider`, else any provider. `assigned` tells a pick apart from a
+default. Pass `provider` to prefer its models, the way subagents prefer the
+session's provider.
 
 Resolving a models.dev model can wait for that catalog to download, so
 like `get`, this can't run in a callback that must not yield.
@@ -4647,7 +4684,9 @@ one. This holds only for an origin the user set (`<SLUG>_BASE_URL`,
 - `body` (`string|buffer`) Request body, sent as is.
 - `timeout` (`integer`) Total timeout in seconds, max 120 (default 30,
   none on a provider's origin). 0 means the default.
-- `max_bytes` (`integer`) Max response size in bytes (default 5 MB).
+- `max_bytes` (`integer`) Max response size in bytes, max 64 MiB (default
+  5 MiB). 0 means the default. The whole body is held in memory, so a
+  bigger download belongs in a job such as `curl -o`.
 - `retry` (`integer`) Retries on 5xx errors (default 3).
 - `line_match` (`string`) Regex. Keep only the response lines it
   matches. Filtering happens after the body is read, so `max_bytes`
@@ -4706,6 +4745,7 @@ garbage collected, and when the plugin unloads.
 
 {opts} fields:
 - `timeout` (`integer`) Connect timeout in seconds, max 60 (default 10).
+  0 means the default.
 
 Requires the `net` [plugin permission](#plugin-permissions).
 
@@ -4746,6 +4786,7 @@ Connect to the Unix socket at {path}. The connection is a
 
 {opts} fields:
 - `timeout` (`integer`) Connect timeout in seconds, max 60 (default 10).
+  0 means the default.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 

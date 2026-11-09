@@ -7,7 +7,8 @@ use maki_config::providers::{
 use super::ResolvedAuth;
 use super::responses::ResponsesProvider;
 use crate::AgentError;
-use crate::model::{FastPricing, Model, ModelEntry, ModelPricing, ModelTier};
+use crate::model::{FastPricing, Model, ModelEntry, ModelInfo, ModelPricing, ModelTier};
+use crate::model_registry::{self, DeclaredTiers};
 use crate::provider::Provider;
 use crate::providers::Timeouts;
 use crate::spec::{ProviderSpec, RESPONSES_SPEC};
@@ -107,7 +108,7 @@ fn model_from_def(
     let subsidy_source = def.subsidised_by.as_deref();
     let def_model = def.models.iter().find(|m| m.id == model_id);
     let mut row = def_model.map(ModelEntry::from).unwrap_or_default();
-    let discovered = crate::model_registry::discovered(slug, model_id);
+    let discovered = model_registry::discovered(slug, model_id);
     let discovered = discovered.as_ref();
     row.max_output_tokens = row
         .max_output_tokens
@@ -236,6 +237,28 @@ fn startup_specs_from(config: &ProvidersConfig, tiers: &[ModelTier]) -> Vec<Stri
     specs
 }
 
+pub(crate) fn declared_tiers() -> DeclaredTiers {
+    declared_tiers_from(&ProvidersConfig::load_or_default())
+}
+
+fn declared_tiers_from(config: &ProvidersConfig) -> DeclaredTiers {
+    let mut declared = DeclaredTiers::new();
+    let mut slugs: Vec<_> = config.providers.keys().collect();
+    slugs.sort();
+    for slug in slugs {
+        if let Some(def) = config.providers.get(slug) {
+            for model in &def.models {
+                declared
+                    .entry(slug.clone())
+                    .or_default()
+                    .entry(model.tier)
+                    .or_insert_with(|| model.id.clone());
+            }
+        }
+    }
+    declared
+}
+
 pub enum TierLookup {
     Model(Model),
     NoModelForTier,
@@ -255,14 +278,18 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
 
 pub async fn discover_models(timeouts: Timeouts) -> Vec<String> {
     let config = ProvidersConfig::load();
+    model_registry::set_declared(declared_tiers_from(&config));
     let mut slugs: Vec<_> = config.providers.keys().collect();
     slugs.sort();
     let mut all_specs = Vec::new();
     for slug in slugs {
         if let Ok(provider) = create(slug, timeouts)
-            && let Ok(models) = provider.list_models().await
+            && let Ok(mut models) = provider.list_models().await
         {
-            crate::model_registry::set_known_models(slug, models.clone());
+            if let Some(def) = config.providers.get(slug) {
+                overlay_declared_tiers(def, &mut models);
+            }
+            model_registry::set_known_models(slug, models.clone());
             for m in models {
                 all_specs.push(format!("{slug}/{}", m.id));
             }
@@ -271,9 +298,18 @@ pub async fn discover_models(timeouts: Timeouts) -> Vec<String> {
     all_specs
 }
 
+fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
+    for model in models {
+        if let Some(declared) = def.models.iter().find(|m| m.id == model.id) {
+            model.tier = Some(declared.tier);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn custom_lookup_returns_model_when_configured() {
@@ -349,6 +385,38 @@ mod tests {
         assert!(specs.contains(&"declared/small".to_string()));
         assert!(specs.contains(&"discovering/small".to_string()));
         assert_eq!(providers, ["declared"]);
+    }
+    #[test]
+    fn declared_tiers_keep_the_first_model_per_tier() {
+        let config: ProvidersConfig = toml::from_str(
+            "[local]\n\
+             [[local.models]]\nid = \"first\"\ntier = \"compaction\"\n\
+             [[local.models]]\nid = \"second\"\ntier = \"compaction\"\n\
+             [[local.models]]\nid = \"big\"\ntier = \"strong\"",
+        )
+        .unwrap();
+        let local = BTreeMap::from([
+            (ModelTier::Compaction, "first".to_owned()),
+            (ModelTier::Strong, "big".to_owned()),
+        ]);
+        assert_eq!(
+            declared_tiers_from(&config),
+            DeclaredTiers::from([("local".to_owned(), local)])
+        );
+    }
+
+    #[test]
+    fn overlay_declared_tiers_sets_tier_for_declared_models_only() {
+        let def: ProviderDef =
+            serde_json::from_str(r#"{"models":[{"id":"declared","tier":"strong"}]}"#).unwrap();
+        let mut models = vec![
+            ModelInfo::id_only("declared".to_string()),
+            ModelInfo::id_only("undeclared".to_string()),
+        ];
+
+        overlay_declared_tiers(&def, &mut models);
+        assert_eq!(models[0].tier, Some(ModelTier::Strong));
+        assert_eq!(models[1].tier, None);
     }
     #[test]
     fn custom_model_inherits_discovered_requires_thinking_and_pricing() {

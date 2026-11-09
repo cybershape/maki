@@ -101,10 +101,9 @@ fn load_config(
         config.permissions.yolo = true;
     }
     cli.apply_tool_flags(&mut config.agent)?;
-    // `-p` and SDK mode only: a turn cap would cut an interactive session short.
-    if cli.print {
-        config.agent.max_turns = cli.max_turns;
-    }
+    // A turn cap would cut an interactive session short, so
+    // `Cli::check_run_path_flags` already refused it outside `-p` and SDK mode.
+    config.agent.max_turns = cli.max_turns;
     if let Some(max_width) = cli.max_width {
         config.ui.max_width = Some(max_width);
     }
@@ -292,7 +291,7 @@ async fn rebuild(
 
 pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
-    maki_providers::model_registry::load_from_storage(&storage);
+    maki_providers::model_registry::load(&storage);
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 
@@ -332,20 +331,19 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
     // in the UI's first frame. A headless run returns before the UI exists and
     // drops it; its grant is already visible through `maki trust list`.
     let mut notice = None;
-    // `unanswered` rather than `question`: a recorded `Never` is an answer, and
-    // neither the card nor the policy may overturn one.
-    let answer = trust.state.unanswered().and_then(|question| {
-        policy_grant(question, &stack.config.trust)
-            .map(|pattern| {
-                notice = Some(format!("{POLICY_GRANT_NOTICE} {pattern}"));
-                TrustAnswer::Trust
-            })
-            // `prompt = false` silences the card only: a `paths` match is an
-            // answer given in advance, not a prompt.
-            .or_else(|| {
-                (can_ask && stack.config.trust.prompt).then(|| maki_ui::ask_trust(question))
-            })
-    });
+    let answer = match policy_grant(&trust.state, &stack.config.trust) {
+        Some(pattern) => {
+            notice = Some(format!("{POLICY_GRANT_NOTICE} {pattern}"));
+            Some(TrustAnswer::Trust)
+        }
+        // `prompt = false` silences the card only: a `paths` match is an
+        // answer given in advance, not a prompt.
+        None => trust
+            .state
+            .unanswered()
+            .filter(|_| can_ask && stack.config.trust.prompt)
+            .map(maki_ui::ask_trust),
+    };
     match answer {
         Some(answer) => {
             let was_trusted = trust.project_config.is_trusted();
@@ -428,6 +426,7 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
         let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
         let background_wait = cli.background_wait();
+        let host_prompt = cli.host_prompt();
         let interrupt = crate::print::run(crate::print::PrintParams {
             model: stack.model,
             prompt: cli.initial_prompt,
@@ -442,6 +441,7 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
             project_config: trust.project_config.clone(),
+            host_prompt,
             resumed,
             claim,
             storage: storage.clone(),
@@ -524,8 +524,9 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
                 project_config: trust.project_config.clone(),
-                trust_question: trust.state.question().cloned(),
+                trust: trust.state.clone(),
                 handed_over: std::mem::take(&mut handed_over),
+                host_prompt: cli.host_prompt(),
             },
             initial_prompt.take(),
         )

@@ -5,6 +5,7 @@ use std::path::Path;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
 
+use maki_agent::HostPrompt;
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, TrustMode};
@@ -24,6 +25,7 @@ use maki_storage::auth::{
 };
 use maki_storage::model::persist_model;
 
+use crate::cli::{PromptArgs, PromptVariant};
 use crate::provider_scripts;
 
 const PROVIDERS_TOML_DOCS: &str = "https://maki.sh/docs/providers/";
@@ -545,16 +547,18 @@ pub fn mcp_logout(server: &str, storage: &StateDir) -> Result<()> {
 }
 
 pub async fn prompt(
-    variant: &crate::cli::PromptVariant,
-    plan: bool,
-    tools: bool,
-    names: bool,
+    PromptArgs {
+        variant,
+        plan,
+        tools,
+        names,
+    }: PromptArgs,
+    host_prompt: HostPrompt,
     no_plugins: bool,
     no_jit: bool,
     trust_mode: TrustMode,
 ) -> Result<()> {
-    use crate::cli::PromptVariant;
-    use maki_agent::agent::{build_system_prompt, load_instruction_text, plan_mode_update};
+    use maki_agent::agent::{load_instruction_text, plan_mode_update};
     use maki_agent::prompt::PromptId;
     use maki_agent::template;
     use maki_agent::tools::{
@@ -615,7 +619,9 @@ pub async fn prompt(
                 .await
                 .context("invalid default model")?;
             let tools = RequestTools::build(reg, &vars, &model, &config.agent, &[], false, None);
-            let prompt = build_system_prompt(&vars, &instructions, &slots, &model, &tools);
+            let prompt = host_prompt
+                .context(&vars, &instructions, &slots, &model, tools)
+                .system;
             // Plan mode reaches the model as a context update after the
             // prompt, so this shows that message too.
             if plan {
