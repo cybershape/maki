@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `1748888f245792674d11393fb688959e6d3b3e7e`
-  - **Commit date**: `Sun Nov 8 01:22:56 2026 +0500`
-  - **Commit author**: `gmanka <gmankab@gmail.com>`
-  - **Commit message**: `docs(providers): add gpt-6.1-terra to openai`
+  - **Commit SHA**: `e9ca885c272154ce6714bb83ee6cab9d9128f293`
+  - **Commit date**: `Sun Nov 8 00:26:51 2026 +0200`
+  - **Commit author**: `Tony Solomonik <tony.solomonik@gmail.com>`
+  - **Commit message**: `fix(mcp): find OAuth metadata appended to a path issuer`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `1748888f`.
+> `upstream/main` has been successfully merged through commit `e9ca885c`.
 
 ---
 
@@ -175,6 +175,9 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `65c7959d` | `test(ui): make waiting timer assertion robust to elapsed-time drift` | Make waiting timer assertion robust to elapsed-time drift |
 | `6e1715d0` | `fix(ui): defer plan form popup until agent turn completes` | Defer plan form popup until agent turn completes |
 | `4fb237f2` | `Merge branch 'upstream/main' into main` | Merge upstream through `1748888f`, including plugin session data root (`data/<id>/`) and lifecycle sweep on session delete, Unix domain socket support in `maki.net`, OSC 7501 Program Status Protocol reporting, theme scrollbar thumb styling, session archive persistence until session deletion, prompt background guidance, and gpt-6.1-terra support, while preserving core fork customizations |
+| `72481cf3` | `docs: update upstream tracking record to 1748888f` | Update the upstream tracking record to `1748888f` |
+| `0390dd4c` | `fix(lua): protect async highlight tasks and lua thread against unhandled errors` | Protect async syntax highlighting tasks and Lua thread execution against unhandled errors |
+| `5f92fe19` | `Merge branch 'upstream/main' into main` | Merge upstream through `e9ca885c`, including OAuth metadata discovery on path issuers, host system prompt overrides across all run paths, trusting empty folders without `.maki`, declared compaction model selection and empty summary retry, headless registry re-reads, inert tool permissions declaration, monty 1.5.0 update, read empty window explanation, OpenAI wire empty tool result marker, and tokio oneshot host requests, while preserving core fork customizations |
 
 ---
 
