@@ -15,6 +15,7 @@ local EXT_TO_LANG = {
   cjs = "javascript",
   gleam = "gleam",
   go = "go",
+  mod = "gomod",
   htm = "html",
   html = "html",
   java = "java",
@@ -79,6 +80,7 @@ local FILENAME_TO_LANG = {
   ["Dockerfile"] = "containerfile",
   ["GNUmakefile"] = "make",
   ["Makefile"] = "make",
+  ["go.mod"] = "gomod",
 }
 
 -- JavaScript goes through the TSX grammar because that grammar is a superset

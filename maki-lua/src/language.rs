@@ -43,6 +43,7 @@ pub enum Language {
     Vue,
     FSharp,
     FSharpSignature,
+    GoMod,
 }
 
 impl Language {
@@ -87,6 +88,7 @@ impl Language {
             "vue" => Some(Self::Vue),
             "fsharp" | "f_sharp" => Some(Self::FSharp),
             "fsharp_signature" => Some(Self::FSharpSignature),
+            "gomod" | "go_mod" => Some(Self::GoMod),
             _ => None,
         }
     }
@@ -131,6 +133,7 @@ impl Language {
             "vue" => Some(Self::Vue),
             "fs" | "fsx" => Some(Self::FSharp),
             "fsi" => Some(Self::FSharpSignature),
+            "mod" => Some(Self::GoMod),
             _ => None,
         }
     }
@@ -176,6 +179,7 @@ impl Language {
             Self::Vue => tree_sitter_vue_next::LANGUAGE.into(),
             Self::FSharp => tree_sitter_fsharp::LANGUAGE_FSHARP.into(),
             Self::FSharpSignature => tree_sitter_fsharp::LANGUAGE_SIGNATURE.into(),
+            Self::GoMod => tree_sitter_gomod_orchard::LANGUAGE.into(),
         }
     }
 }
@@ -255,6 +259,34 @@ mod tests {
         assert!(parses_cleanly(
             Language::from_extension("fsi").unwrap(),
             "module M\nval x : int\n"
+        ));
+    }
+
+    #[test]
+    fn gomod_parses_cleanly() {
+        let source = r#"
+module example.com/my/module
+
+go 1.22.0
+
+toolchain go1.22.2
+
+require (
+    github.com/gin-gonic/gin v1.9.1
+    golang.org/x/sync v0.6.0 // indirect
+)
+
+replace example.com/foo => ../foo
+exclude example.com/bad v1.0.0
+retract v1.0.1
+"#;
+        assert!(parses_cleanly(
+            Language::from_name("gomod").unwrap(),
+            source
+        ));
+        assert!(parses_cleanly(
+            Language::from_extension("mod").unwrap(),
+            source
         ));
     }
 }
