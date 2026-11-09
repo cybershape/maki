@@ -208,19 +208,20 @@ local function receipt(tail, path, max_bytes)
   return ("Running in the background. %s\n%s\n%s"):format(heading, shown, progress)
 end
 
--- The body already shows the highlighted command, so the title only carries
--- what the model says it does. Once a model pastes the command into
--- `description`, it copies its own past calls and keeps doing it, so a
--- description that is blank or just the command counts as none.
-local function description_of(input)
-  local description = input.toolcall_reason or input.description
-  if not description or not description:find("%S") then
+-- Upstream's `description` param was removed in favor of `toolcall_reason`;
+-- do NOT re-add it when merging upstream. The body already shows the
+-- highlighted command, so the title only carries the reason. Once a model
+-- pastes the command into the reason, it copies its own past calls and keeps
+-- doing it, so a reason that is blank or just the command counts as none.
+local function reason_of(input)
+  local reason = input.toolcall_reason
+  if not reason or not reason:find("%S") then
     return nil
   end
-  if description == input.command or description == parse_cd_hint(input) then
+  if reason == input.command or reason == parse_cd_hint(input) then
     return nil
   end
-  return description
+  return reason
 end
 
 local function create_bash_view(command, ctx)
@@ -370,7 +371,6 @@ maki.api.register_tool({
         type = "string",
         description = "Why you are calling this tool and what you expect.",
       },
-      description = { type = "string", description = "What the command does in 3-5 words, not the command itself" },
       background = {
         type = "boolean",
         description = "Run in the background. The result arrives as a message. Prefer for slow commands whose result your next step doesn't need.",
@@ -407,7 +407,7 @@ maki.api.register_tool({
     -- The body leaves out a leading `cd`, so the title keeps the directory.
     local _, workdir = parse_cd_hint(input)
     local dir = workdir and relative_path(workdir)
-    local title = description_of(input) or ""
+    local title = reason_of(input) or ""
     if dir and dir ~= "." then
       title = title == "" and "in " .. dir or title .. " in " .. dir
     end
