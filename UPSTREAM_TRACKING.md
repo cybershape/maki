@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `e9ca885c272154ce6714bb83ee6cab9d9128f293`
-  - **Commit date**: `Sun Nov 8 00:26:51 2026 +0200`
-  - **Commit author**: `Tony Solomonik <tony.solomonik@gmail.com>`
-  - **Commit message**: `fix(mcp): find OAuth metadata appended to a path issuer`
+  - **Commit SHA**: `857856f40098d8946e7f20005fcd909737d0226e`
+  - **Commit date**: `Mon Nov 9 22:40:25 2026 +0100`
+  - **Commit author**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
+  - **Commit message**: `refactor(pack): run git on tokio::process`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `e9ca885c`.
+> `upstream/main` has been successfully merged through commit `857856f4`.
 
 ---
 
@@ -178,6 +178,10 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `72481cf3` | `docs: update upstream tracking record to 1748888f` | Update the upstream tracking record to `1748888f` |
 | `0390dd4c` | `fix(lua): protect async highlight tasks and lua thread against unhandled errors` | Protect async syntax highlighting tasks and Lua thread execution against unhandled errors |
 | `5f92fe19` | `Merge branch 'upstream/main' into main` | Merge upstream through `e9ca885c`, including OAuth metadata discovery on path issuers, host system prompt overrides across all run paths, trusting empty folders without `.maki`, declared compaction model selection and empty summary retry, headless registry re-reads, inert tool permissions declaration, monty 1.5.0 update, read empty window explanation, OpenAI wire empty tool result marker, and tokio oneshot host requests, while preserving core fork customizations |
+| `b601d06e` | `docs: update upstream tracking record to e9ca885c` | Update the upstream tracking record to `e9ca885c` |
+| `33662c13` | `feat(index): add go.mod indexing support` | Add go.mod indexing support to the index tool using tree-sitter-gomod |
+| `1fba316e` | `fix(bash): drop upstream's description param in favor of toolcall_reason` | Drop upstream's description param on bash tool in favor of toolcall_reason |
+| `b97dc849` | `Merge branch 'upstream/main' into main` | Merge upstream through `857856f4`, including tokio::process for git operations in maki-pack, Semaphore and TaskTracker for Lua inflight gate, dropping event-listener for tokio sync primitives, isolated-home nextest setup script and test isolation, rmcp 3.9 update for RUSTSEC-2026-0462, and reasoning separators in streaming events, while preserving core fork customizations |
 
 ---
 
