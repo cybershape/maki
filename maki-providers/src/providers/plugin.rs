@@ -1646,7 +1646,6 @@ mod tests {
     use futures::FutureExt;
     use maki_config::providers::base_url_env_var;
     use maki_storage::auth::{PluginAuthData, save_plugin_auth};
-    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::spec::{UNKNOWN_MODEL_CONTEXT_WINDOW, UNKNOWN_MODEL_MAX_OUTPUT};
@@ -1654,7 +1653,7 @@ mod tests {
     use crate::model::ModelTier;
     use crate::model_registry;
     use crate::retry::RetryKind;
-    use crate::test_support::{Canned, serve};
+    use crate::test_support::{Canned, isolated_home, serve};
 
     const AUTH_HEADER: &str = "authorization";
     const CONSTANT_TOKEN: &str = "Bearer constant";
@@ -1899,21 +1898,6 @@ mod tests {
             pool: None,
             inner: Box::new(UnusedProvider),
         }
-    }
-
-    /// Points every per-user directory at a fresh temp dir, so the credential
-    /// store a test writes is its own.
-    fn isolated_home() -> TempDir {
-        let home = TempDir::new().unwrap();
-        for var in [
-            "HOME",
-            "XDG_CONFIG_HOME",
-            "XDG_STATE_HOME",
-            "XDG_CACHE_HOME",
-        ] {
-            unsafe { std::env::set_var(var, home.path()) };
-        }
-        home
     }
 
     fn token(entry: &PluginEntry) -> String {

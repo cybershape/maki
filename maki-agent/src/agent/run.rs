@@ -1369,6 +1369,7 @@ mod tests {
 
     use maki_providers::model::FastSupport;
     use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::test_support::isolated_home;
     use maki_providers::{
         ContentBlock, FastPricing, Message, Model, ModelPricing, ProviderEvent, RequestOptions,
         Role, StopReason, StreamResponse, ThinkingSupport, TokenUsage,
@@ -3189,6 +3190,7 @@ mod tests {
     /// stays completely stable and append-only across session resume.
     #[tokio::test]
     async fn resumed_session_keeps_the_mcp_part_of_its_frame() {
+        let _home = isolated_home();
         let mut h = Harness::new(Vec::new());
         let reply = || vec![text_response(StopReason::EndTurn)];
         h.run(default_input(), reply(), |agent| {

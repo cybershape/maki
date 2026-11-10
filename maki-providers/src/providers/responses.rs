@@ -857,6 +857,11 @@ pub(crate) async fn parse_sse(
 
             "response.reasoning_summary_part.added" if !reasoning_text.is_empty() => {
                 reasoning_text.push_str("\n\n");
+                event_tx
+                    .send_async(ProviderEvent::ThinkingDelta {
+                        text: "\n\n".to_string(),
+                    })
+                    .await?;
             }
 
             "response.completed" => {
@@ -1537,11 +1542,20 @@ event: response.completed\n\
 data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
 \n";
 
-        let (resp, _) = run_sse(sse).await;
+        let (resp, events) = run_sse(sse).await;
         let resp = resp.unwrap();
+        let thinking = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ThinkingDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
 
+        const EXPECTED: &str = "First part\n\nSecond part";
+        assert_eq!(thinking, EXPECTED);
         assert!(
-            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "First part\n\nSecond part")
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == EXPECTED)
         );
     }
 

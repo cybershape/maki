@@ -223,7 +223,7 @@ fn bash_restore_titles_a_call_and_shows_its_command(
     let r = restore(
         &host,
         "bash",
-        json!({ "command": command, "description": description }),
+        json!({ "command": command, "toolcall_reason": description }),
         "hi",
         None,
         Vec::new(),
@@ -240,7 +240,7 @@ fn bash_title_leaves_out_the_session_directory() {
     let r = restore(
         &host,
         "bash",
-        json!({ "command": "echo hi", "description": "print hi", "workdir": cwd }),
+        json!({ "command": "echo hi", "toolcall_reason": "print hi", "workdir": cwd }),
         "hi",
         None,
         Vec::new(),
