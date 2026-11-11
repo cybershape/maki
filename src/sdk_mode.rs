@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::mem;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 
 use color_eyre::Result;
@@ -413,7 +413,7 @@ fn maki_to_claude_tool_name(name: &str) -> &str {
 #[derive(Clone)]
 struct SdkWriter {
     session_id: SessionRef,
-    out_tx: Sender<String>,
+    out_tx: mpsc::Sender<String>,
 }
 
 impl SdkWriter {
@@ -599,7 +599,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         stop: stop.clone(),
     });
 
-    let (out_tx, out_rx) = flume::unbounded::<String>();
+    let (out_tx, out_rx) = mpsc::channel::<String>();
     let writer_thread = std::thread::spawn(move || {
         let mut stdout = io::stdout().lock();
         while let Ok(line) = out_rx.recv() {
@@ -779,7 +779,9 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
     // Reaps session-owned plugin jobs before the writer thread joins: an
     // orphan inheriting stdout would keep an orchestrator's read blocked
     // after maki exits.
-    lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
+    lua_handle
+        .end_sessions([session_id.id()], SessionEndReason::Completed)
+        .await;
     // Background work and plugin jobs are stopped by now, so nothing spends
     // any more. Dropping the track saves the full bill, also what no result
     // was left to report.
@@ -1101,6 +1103,7 @@ impl EventPump {
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting { .. }
+            | AgentEvent::CompactionStarted
             | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::AllowedByPlugin { .. }
@@ -1270,7 +1273,6 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 mod tests {
     use std::time::Duration;
 
-    use flume::Receiver;
     use maki_agent::SubagentInfo;
     use maki_config::ToolKey;
     use test_case::test_case;
@@ -1700,8 +1702,8 @@ mod tests {
     fn test_pump(
         permission_mode: PermissionMode,
         answer_tx: Sender<String>,
-    ) -> (EventPump, Receiver<String>) {
-        let (out_tx, out_rx) = flume::unbounded();
+    ) -> (EventPump, mpsc::Receiver<String>) {
+        let (out_tx, out_rx) = mpsc::channel();
         let session_id = SessionRef::from(maki_storage::id::MakiId::generate());
         let pump = EventPump {
             writer: SdkWriter {
@@ -1847,7 +1849,7 @@ mod tests {
             Ok(tagged(PermissionAnswer::AllowSession))
         );
         assert!(answer_rx.is_empty(), "{NO_ANSWER}");
-        assert!(out_rx.is_empty(), "{NO_CONTROL_REQUEST}");
+        assert!(out_rx.try_recv().is_err(), "{NO_CONTROL_REQUEST}");
         assert!(
             pump.shared
                 .lock()
@@ -1889,7 +1891,7 @@ mod tests {
         pump.handle(permission_request()).unwrap();
 
         assert_eq!(answer_rx.try_recv(), Ok(tagged(PermissionAnswer::Deny)));
-        assert!(out_rx.is_empty(), "{NO_CONTROL_REQUEST}");
+        assert!(out_rx.try_recv().is_err(), "{NO_CONTROL_REQUEST}");
     }
 
     fn top_level(event: AgentEvent) -> Envelope {

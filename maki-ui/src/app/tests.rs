@@ -46,7 +46,7 @@ use maki_config::{
 };
 use maki_lua::test_support::{
     HintWriterHandle, RequestProbe, TestBinding, hint_writer_pair, keymap_reader_from,
-    probed_event_handle, set_mode,
+    probed_event_handle, runtime, set_mode,
 };
 use maki_lua::{
     Border, BuiltinAction, Dimension, FloatConfig, HintEntry, HintReader, InputRequest,
@@ -80,6 +80,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use test_case::test_case;
 use tokio::runtime::EnterGuard;
+use tokio::sync::mpsc::{channel, unbounded_channel};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Level, Metadata, Subscriber};
 
@@ -263,7 +264,7 @@ fn build_app_with_session(
 }
 
 fn test_writer(dir: StateDir) -> StorageWriter {
-    StorageWriter::new(dir, flume::unbounded().0)
+    StorageWriter::new(dir, unbounded_channel().0)
 }
 
 /// A synchronous test that spawns tasks or blocks on them the way the UI
@@ -940,7 +941,7 @@ fn paste_loads_every_image_path_in_the_text() {
 #[test_case(None,               ""           ; "empty_selection_ignored")]
 fn primary_selection_read_lands_on_tick(selection: Option<&str>, expected: &str) {
     let mut app = test_app();
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
     app.mouse_paste_rx.push(rx);
     tx.send(selection.map(String::from)).unwrap();
     assert_eq!(app.tick(), Dirty::YES);
@@ -952,10 +953,12 @@ fn primary_selection_read_lands_on_tick(selection: Option<&str>, expected: &str)
 fn clipboard_text_lands_in_input_and_clears_flash() {
     let mut app = test_app();
     app.status_bar.flash(READING_CLIPBOARD_MSG.into());
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
     app.paste_rx.push(rx);
-    tx.send(Ok(PastedContent::Text(CLIPBOARD_TEXT.into())))
-        .unwrap();
+    assert!(
+        tx.send(Ok(PastedContent::Text(CLIPBOARD_TEXT.into())))
+            .is_ok()
+    );
     let _ = app.tick();
     assert_eq!(app.input_box.buffer.value(), CLIPBOARD_TEXT);
     assert_eq!(app.status_bar.flash_text(), None);
@@ -1233,7 +1236,7 @@ fn reset_session_clears_plan() {
     app.queue_and_notify(queued_msg("q"));
     app.queue.set_focus_at(0);
     app.help_modal.toggle();
-    let (_tx, rx) = flume::bounded::<crate::components::btw_modal::BtwEvent>(1);
+    let (_tx, rx) = channel::<BtwEvent>(1);
     app.btw_modal.open("q", rx);
     let actions = app.reset_session();
     assert!(matches!(&actions[0], Action::RestartAgent(h) if h.is_empty()));
@@ -4091,7 +4094,7 @@ fn open_usage(app: &mut App) {
 }
 
 fn open_btw(app: &mut App) {
-    let (_tx, rx) = flume::bounded::<BtwEvent>(1);
+    let (_tx, rx) = channel::<BtwEvent>(1);
     app.btw_modal.open(IME_MODAL_TEXT, rx);
 }
 
@@ -5103,10 +5106,10 @@ fn checkpoint_persists_observations_without_using_them_as_title() {
 
 fn drain_writer(app: App, writer: Arc<StorageWriter>) {
     drop(app);
-    let unsaved = Arc::try_unwrap(writer)
+    let writer = Arc::try_unwrap(writer)
         .ok()
-        .expect("app must hold the only other writer reference")
-        .shutdown(WRITER_DRAIN_TIMEOUT);
+        .expect("app must hold the only other writer reference");
+    let unsaved = runtime().block_on(writer.shutdown(WRITER_DRAIN_TIMEOUT));
     assert!(unsaved.is_empty(), "{ALL_LANDED}");
 }
 
@@ -5790,23 +5793,39 @@ fn rewind_recomputes_context_size(measured: u32, floor: u32) {
 
 /// Left at the pre-compaction value, a session compacted just before exit
 /// compacts itself again on resume.
-#[test]
-fn compaction_lowers_the_stored_context_size() {
+#[test_case(false ; "manual")]
+#[test_case(true ; "automatic")]
+fn compaction_feedback_stays_out_of_history_and_updates_context(automatic: bool) {
     const AFTER: u32 = SMALL_HISTORY;
     let mut app = test_app();
     app.run_id = 1;
     app.state.context_size = MEASURED_CONTEXT;
     app.chats[0].context_size = MEASURED_CONTEXT;
+    let history = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
+    if automatic {
+        app.update(agent_msg(AgentEvent::AutoCompacting {
+            context_size: MEASURED_CONTEXT,
+            context_window: app.state.model.context_window,
+        }));
+    }
+    app.update(agent_msg(AgentEvent::CompactionStarted));
+    assert_eq!(app.chats[0].message_count(), 1);
 
     app.update(agent_msg(AgentEvent::CompactionDone {
         context_size_before: MEASURED_CONTEXT,
         context_size_after: AFTER,
         context_window: 0,
         summary: String::new(),
+        duration_ms: 0,
     }));
+    app.checkpoint();
 
     assert_eq!(app.state.context_size, AFTER);
     assert_eq!(app.chats[0].context_size, AFTER);
+    assert_eq!(app.state.session.meta.context_size, AFTER);
+    assert_eq!(app.chats[0].message_count(), 2);
+    assert_eq!(app.chats[0].last_message_role(), Some(&DisplayRole::Notice));
+    assert_eq!(app.state.session.messages(), history.as_slice());
 }
 
 #[test]
@@ -6260,14 +6279,14 @@ fn btw_with_question_returns_action() {
 #[test]
 fn btw_modal_key_routing_and_animation() {
     let mut app = test_app();
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = channel(1);
     app.btw_modal.open("test", rx);
 
     // A pending stream is data, drained by `poll`. Only the typewriter
     // revealing the answer moves on its own.
     assert!(app.btw_modal.is_streaming());
     assert_eq!(app.btw_modal.cadence(), Cadence::IDLE);
-    tx.send(BtwEvent::TextDelta("hi".into())).unwrap();
+    tx.try_send(BtwEvent::TextDelta("hi".into())).unwrap();
     assert_eq!(app.btw_modal.poll(), Dirty::YES);
     assert_eq!(app.btw_modal.cadence(), Cadence::SMOOTH);
 
@@ -7887,7 +7906,7 @@ fn a_primary_paste_waits_behind_held_keys(paste_bound: bool) {
 
     let tab = press_bound(&mut app, &probe, KeyCode::Tab);
     type_keys(&mut app, TYPED);
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
     app.mouse_paste_rx.push(rx);
     tx.send(Some(PRIMARY_TEXT.into())).unwrap();
     // The poll alone, since a full tick lets a hold older than the slow

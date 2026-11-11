@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use flume::Sender;
 use serde_json::Value;
+use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 use tracing::{debug, warn};
@@ -218,7 +219,7 @@ pub async fn fetch_all_models(
     mut on_ready: impl FnMut(ModelBatch),
     on_done: Option<Box<dyn FnOnce() + Send>>,
 ) {
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
     let timeouts = Timeouts::default();
 
     for spec in ProviderRegistry::all() {
@@ -237,37 +238,34 @@ pub async fn fetch_all_models(
             if let Ok(models) = listed {
                 set_known_models(slug, models);
             }
-            let _ = tx.send_async(batch).await;
+            let _ = tx.send(batch);
         });
     }
+
 
     let tx_custom = tx.clone();
     tokio::spawn(async move {
         let (declared, declared_providers) = custom::declared_batch();
         if !declared.is_empty() {
-            let _ = tx_custom
-                .send_async(ModelBatch {
-                    providers: declared_providers,
-                    models: declared,
-                    warnings: Vec::new(),
-                })
-                .await;
+            let _ = tx_custom.send(ModelBatch {
+                providers: declared_providers,
+                models: declared,
+                warnings: Vec::new(),
+            });
         }
         let custom_specs = custom::discover_models(timeouts).await;
         if !custom_specs.is_empty() {
-            let _ = tx_custom
-                .send_async(ModelBatch {
-                    providers: providers_of(&custom_specs),
-                    models: custom_specs,
-                    warnings: Vec::new(),
-                })
-                .await;
+            let _ = tx_custom.send(ModelBatch {
+                providers: providers_of(&custom_specs),
+                models: custom_specs,
+                warnings: Vec::new(),
+            });
         }
     });
 
     drop(tx);
 
-    while let Ok(mut batch) = rx.recv_async().await {
+    while let Some(mut batch) = rx.recv().await {
         batch.models.retain(|spec| policy.allows(spec));
         on_ready(batch);
     }

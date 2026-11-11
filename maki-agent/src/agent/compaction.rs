@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::time::{Duration, Instant};
 
 use maki_config::AgentConfig;
 use maki_providers::retry::RetryPolicy;
@@ -176,6 +177,7 @@ pub(super) fn continue_message(added: Option<&str>) -> String {
 
 pub(super) struct Compacted {
     pub summary: String,
+    pub duration: Duration,
     /// How many unanswered messages follow the summary. Context updates are
     /// never among them, see [`History::restart`].
     pub carried: usize,
@@ -201,7 +203,8 @@ pub(super) async fn compact_history(
     retry: RetryPolicy,
     ledger: &RunLedger,
 ) -> Result<Compacted, AgentError> {
-    let compact_start = std::time::Instant::now();
+    let compact_start = Instant::now();
+    event_tx.send(AgentEvent::CompactionStarted)?;
     let summarized = history.len().saturating_sub(carry_len);
     let mut compaction_history: Vec<Message> = history.as_slice()[..summarized].to_vec();
     remove_orphaned_tool_results(&mut compaction_history);
@@ -265,14 +268,19 @@ pub(super) async fn compact_history(
                         );
                     }
                     result => {
-                        let compacted = result?;
+                        let (summary, carried) = result?;
+                        let duration = compact_start.elapsed();
                         info!(
                             model = %model.id,
-                            duration_ms = compact_start.elapsed().as_millis() as u64,
+                            duration_ms = duration.as_millis() as u64,
                             attempt,
                             "compaction completed"
                         );
-                        return Ok(compacted);
+                        return Ok(Compacted {
+                            summary,
+                            duration,
+                            carried,
+                        });
                     }
                 }
             }
@@ -299,7 +307,7 @@ fn finish_compact(
     model: &Model,
     hooks: &AgentHooks<'_>,
     config: &AgentConfig,
-) -> Result<Compacted, AgentError> {
+) -> Result<(String, usize), AgentError> {
     let response = streamed.response;
     let summary = response.message.first_text_content().map(str::to_owned);
     // An unusable summary leaves the session as it was, so it keeps its size.
@@ -339,10 +347,7 @@ fn finish_compact(
     new_history.extend_from_slice(&history.as_slice()[summarized..]);
     history.restart(new_history);
 
-    Ok(Compacted {
-        summary,
-        carried: history.len() - summary_len,
-    })
+    Ok((summary, history.len() - summary_len))
 }
 
 /// `next` is what the session would start with now. The summary goes out under
@@ -389,7 +394,9 @@ pub async fn compact(
         event_tx.send(finished(size_before))?;
         return Ok(DoneReason::Compact);
     };
-    let Compacted { summary, .. } = match compact_history(
+    let Compacted {
+        summary, duration, ..
+    } = match compact_history(
         provider,
         model,
         history,
@@ -428,6 +435,7 @@ pub async fn compact(
         context_size_after,
         context_window: hooks.model.context_window,
         summary,
+        duration_ms: duration.as_millis() as u64,
     })?;
     event_tx.send(finished(context_size_after))?;
 
@@ -955,6 +963,7 @@ mod tests {
         assert_eq!(history.as_slice()[0].user_text(), Some(KEPT_TEXT));
         let events: Vec<_> = rx.try_iter().map(|e| e.event).collect();
         let [
+            AgentEvent::CompactionStarted,
             AgentEvent::TurnComplete(first),
             AgentEvent::TurnComplete(retry),
         ] = events.as_slice()
@@ -1036,6 +1045,20 @@ mod tests {
             .filter(|reply| !matches!(reply, Reply::Overflow))
             .count();
         let events: Vec<_> = rx.try_iter().map(|e| e.event).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::CompactionStarted))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::CompactionDone { .. }))
+                .count(),
+            usize::from(summarised)
+        );
         let turns = events
             .iter()
             .filter(|event| matches!(event, AgentEvent::TurnComplete(_)))
@@ -1179,11 +1202,10 @@ mod tests {
         assert_eq!(result.unwrap(), DoneReason::Compact);
         assert_eq!(history.len(), 1);
         assert_eq!(history.as_slice()[0].user_text(), Some(KEPT_TEXT));
-        assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::CompactionDone { .. }))
-        );
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            AgentEvent::CompactionStarted | AgentEvent::CompactionDone { .. }
+        )));
         let done: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
@@ -1254,6 +1276,7 @@ mod tests {
         assert_eq!(result.unwrap(), DoneReason::Compact);
 
         let [
+            AgentEvent::CompactionStarted,
             AgentEvent::TurnComplete(turn),
             AgentEvent::CompactionDone {
                 context_size_after,

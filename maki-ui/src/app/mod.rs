@@ -90,6 +90,7 @@ use maki_storage::model::{
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
 use strum::{EnumIter, IntoEnumIterator};
+use tokio::sync::oneshot;
 
 pub(crate) use crate::agent::QueuedMessage;
 use image_paste::PastedContent;
@@ -659,8 +660,8 @@ pub struct App {
     pub(crate) trust: TrustState,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<SharedMessages>,
-    pub(crate) paste_rx: Vec<flume::Receiver<Result<PastedContent, String>>>,
-    pub(crate) mouse_paste_rx: Vec<flume::Receiver<Option<String>>>,
+    pub(crate) paste_rx: Vec<oneshot::Receiver<Result<PastedContent, String>>>,
+    pub(crate) mouse_paste_rx: Vec<oneshot::Receiver<Option<String>>>,
     storage_writer: Arc<StorageWriter>,
     last_sent: Option<Sent>,
     pub(crate) shell: shell::ShellState,

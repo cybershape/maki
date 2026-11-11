@@ -1,19 +1,19 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use flume::Sender;
+use futures::TryStreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tracing::{debug, warn};
 
 use std::sync::Arc;
 
 use crate::model::{Model, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
-use crate::providers::{ResolvedAuth, Timeouts, sse_error_status};
+use crate::providers::{ResolvedAuth, SseBody, Timeouts, ok_sse, sse_error_status};
 use crate::types::EffortDialect;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
@@ -291,12 +291,8 @@ async fn post_responses(
         "sending Responses API request"
     );
 
-    super::send_request(client, request, |response| async move {
-        if response.status().as_u16() == 200 {
-            parse_sse(super::body_reader(response), event_tx, stream_timeout).await
-        } else {
-            Err(AgentError::from_response(response).await)
-        }
+    ok_sse(client, request, stream_timeout, |body| {
+        parse_sse(body, event_tx)
     })
     .await
 }
@@ -629,33 +625,21 @@ struct ToolAccumulator {
 }
 
 pub(crate) async fn parse_sse(
-    reader: impl AsyncBufRead + Unpin,
+    mut events: SseBody,
     event_tx: &Sender<ProviderEvent>,
-    stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
-    let mut lines = reader.lines();
-
     let mut text = String::new();
     let mut reasoning_text = String::new();
     let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
     let mut is_first_content = true;
-    let mut deadline = Instant::now() + stream_timeout;
-    let mut current_event = String::new();
 
-    while let Some(line) =
-        crate::providers::next_sse_line(&mut lines, &mut deadline, stream_timeout).await?
-    {
-        if let Some(event_type) = line.strip_prefix("event:") {
-            current_event = event_type.trim().to_string();
+    while let Some(event) = events.try_next().await? {
+        let Some(data) = event.data.as_deref().map(str::trim) else {
             continue;
-        }
-
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.trim(),
-            None => continue,
         };
+        let current_event = event.event.as_deref().map_or("", str::trim);
 
         if current_event == "error" {
             if let Ok(ev) = serde_json::from_str::<crate::providers::SseErrorPayload>(data) {
@@ -676,7 +660,7 @@ pub(crate) async fn parse_sse(
         let event = if current_event.is_empty() {
             parsed["type"].as_str().unwrap_or_default()
         } else {
-            current_event.as_str()
+            current_event
         };
 
         match event {
@@ -969,12 +953,10 @@ fn parse_usage(event: &Value) -> Option<TokenUsage> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::io::Cursor;
     use test_case::test_case;
 
-    use crate::test_support::sse_event;
+    use crate::test_support::{sse_body, sse_event};
 
-    const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const OVERLOAD_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
     const BAD_REQUEST_MESSAGE: &str = "Invalid value for 'model'";
     const RATE_LIMIT_MESSAGE: &str = "Rate limit hit";
@@ -1016,7 +998,7 @@ mod tests {
 
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
         let (tx, rx) = flume::unbounded();
-        let result = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT).await;
+        let result = parse_sse(sse_body(sse.as_bytes()), &tx).await;
         (result, rx.drain().collect())
     }
 

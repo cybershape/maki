@@ -572,7 +572,7 @@ pub enum Request {
         reply: flume::Sender<Vec<crate::api::pack::Declared>>,
     },
     CollectPackageContext {
-        reply: flume::Sender<(Vec<crate::api::pack::Declared>, BTreeSet<String>)>,
+        reply: oneshot::Sender<(Vec<crate::api::pack::Declared>, BTreeSet<String>)>,
     },
     RunPackLoader {
         declared: crate::api::pack::Declared,
@@ -639,9 +639,9 @@ enum HostHook {
 pub struct EndSession {
     pub session: MakiId,
     pub reason: SessionEndReason,
-    /// Set on the paths that block on the dispatch: the instant the caller
+    /// Set on the paths that wait for the dispatch: the instant the caller
     /// stops waiting, and where to answer it. Absent on the queued paths.
-    pub wait: Option<(Instant, flume::Sender<()>)>,
+    pub wait: Option<(Instant, oneshot::Sender<()>)>,
 }
 
 pub struct RestoreItem {
@@ -3622,6 +3622,7 @@ impl LuaRuntime {
         layered: Arc<LayeredTools>,
     ) -> Result<Self, PluginError> {
         let lua = Lua::new();
+        let jit = jit && unsafe { ffi::luau_codegen_supported() != 0 };
         let compiler = install_compiler(&lua, jit);
         lua.set_memory_limit(LUA_MEMORY_LIMIT)
             .map_err(|e| PluginError::Lua {

@@ -431,6 +431,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting { .. }
+            | AgentEvent::CompactionStarted
             | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::AllowedByPlugin { .. }
@@ -506,7 +507,9 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         }
     }
     let track = headless::await_shutdown(task).await;
-    lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
+    lua_handle
+        .end_sessions([session_id.id()], SessionEndReason::Completed)
+        .await;
     // Background work and plugin jobs are stopped by now, so nothing spends
     // any more. Dropping the track saves the full bill, also what no turn
     // was left to report.
