@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `857856f40098d8946e7f20005fcd909737d0226e`
-  - **Commit date**: `Mon Nov 9 22:40:25 2026 +0100`
+  - **Commit SHA**: `01f1ebd4fc6166ddbd52ce79a279b5e4e7159936`
+  - **Commit date**: `Wed Nov 11 00:14:20 2026 +0100`
   - **Commit author**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
-  - **Commit message**: `refactor(pack): run git on tokio::process`
+  - **Commit message**: `refactor(ui): send btw events over tokio mpsc, awaiting when the modal is behind`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `857856f4`.
+> `upstream/main` has been successfully merged through commit `01f1ebd4`.
 
 ---
 
@@ -182,6 +182,7 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `33662c13` | `feat(index): add go.mod indexing support` | Add go.mod indexing support to the index tool using tree-sitter-gomod |
 | `1fba316e` | `fix(bash): drop upstream's description param in favor of toolcall_reason` | Drop upstream's description param on bash tool in favor of toolcall_reason |
 | `b97dc849` | `Merge branch 'upstream/main' into main` | Merge upstream through `857856f4`, including tokio::process for git operations in maki-pack, Semaphore and TaskTracker for Lua inflight gate, dropping event-listener for tokio sync primitives, isolated-home nextest setup script and test isolation, rmcp 3.9 update for RUSTSEC-2026-0462, and reasoning separators in streaming events, while preserving core fork customizations |
+| `d31c2f54` | `Merge branch 'upstream/main' into main` | Merge upstream through `01f1ebd4`, including migration of wire channels, event loop channels, worker queues, and MCP manager from flume to tokio/std mpsc channels, sse-stream adoption for provider SSE parsing, compaction progress and completion indicators, user messages plain text rendering, 32-bit ARM build fixes in Lua runtime, and async storage writer drain, while preserving core fork customizations |
 
 ---
 
