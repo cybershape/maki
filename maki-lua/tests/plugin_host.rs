@@ -4179,6 +4179,7 @@ fn websearch_config(provider: &str) -> PluginsConfig {
             "websearch".to_owned(),
             json_obj(serde_json::json!({ "provider": provider })),
         )]),
+        tool_hidden: Vec::new(),
     }
 }
 
@@ -4264,6 +4265,7 @@ fn edit_sub_tools_follow_edit_opts(opts: serde_json::Value, on: &[&str], off: &[
         names: vec!["edit".to_owned()],
         packages: Vec::new(),
         opts: HashMap::from([("edit".to_owned(), json_obj(opts))]),
+        tool_hidden: Vec::new(),
     };
     host.load_builtins(&config).unwrap();
     for tool in on {
@@ -4367,6 +4369,7 @@ fn opts_for_a_disabled_package_do_not_stop_the_load() {
             "my_pack".to_owned(),
             json_obj(serde_json::json!({ "timeout_secs": 5 })),
         )]),
+        tool_hidden: Vec::new(),
     };
     host.load_builtins(&config)
         .expect("a disabled package must not stop the builtins from loading");
@@ -4449,6 +4452,7 @@ fn disabled_plugin_opts_are_ignored_not_rejected() {
             "bash".to_owned(),
             json_obj(serde_json::json!({ "timeout_secs": 180 })),
         )]),
+        tool_hidden: Vec::new(),
     };
     host.load_builtins(&config).unwrap();
     assert!(reg.get("bash").is_none(), "bash stays disabled");
@@ -5571,6 +5575,94 @@ fn builtin_plugins_register_their_commands() {
     let names: Vec<&str> = snap.commands.iter().map(|c| c.name.as_ref()).collect();
     for command in BUILTIN_COMMANDS {
         assert!(names.contains(command), "missing {command} in {names:?}");
+    }
+}
+
+const TASKS_COMMAND: &str = "/tasks";
+const TASKS_KEY_DESC: &str = "Open tasks";
+const TASK_TOOL: &str = "task";
+const TASK_MESSAGE_TOOL: &str = "task_message";
+const TASK_STOP_TOOL: &str = "task_stop";
+
+/// The request's tool array, the one place a hidden tool must not reach.
+fn request_tool_names(reg: &ToolRegistry, agent: &maki_config::AgentConfig) -> Vec<String> {
+    let model = Model::from_spec("responses/claude-opus-4-8").unwrap();
+    let filter = ToolFilter::from_config(agent, &model, &[]);
+    let ctx = DescriptionContext {
+        filter: &filter,
+        audience: ToolAudience::MAIN,
+        workflow: false,
+        mcp: false,
+        mcp_libraries: None,
+    };
+    reg.definitions(&Vars::new(), &ctx, false)
+        .as_array()
+        .expect("definitions returns an array")
+        .iter()
+        .map(|def| def["name"].as_str().expect("a tool name").to_owned())
+        .collect()
+}
+
+/// Disabling task hides its delegation tools from the model, but the plugin
+/// still loads: its picker and task_stop serve the background tasks of every
+/// plugin, so a background bash keeps its /tasks, Ctrl+X and stop.
+#[test]
+fn disabling_task_hides_its_tools_but_keeps_the_tasks_ui() {
+    let raw = maki_config::RawConfig {
+        plugins: HashMap::from([(
+            TASK_TOOL.to_owned(),
+            maki_config::PluginFileConfig {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let config = raw.into_config(&[]).unwrap();
+    assert!(config.plugins.names.iter().any(|n| n == TASK_TOOL));
+    assert_eq!(config.plugins.tool_hidden, vec![TASK_TOOL.to_owned()]);
+
+    let (reg, host) = builtins_host_with(&config.plugins);
+    for tool in [TASK_TOOL, TASK_MESSAGE_TOOL, TASK_STOP_TOOL] {
+        assert!(reg.get(tool).is_some(), "{tool} must stay registered");
+    }
+
+    let names = request_tool_names(&reg, &config.agent);
+    assert!(!names.iter().any(|n| n == TASK_TOOL), "task stays hidden");
+    assert!(
+        !names.iter().any(|n| n == TASK_MESSAGE_TOOL),
+        "task_message stays hidden"
+    );
+    assert!(
+        names.iter().any(|n| n == TASK_STOP_TOOL),
+        "task_stop must reach the model"
+    );
+    assert!(names.iter().any(|n| n == "bash"), "bash is unaffected");
+
+    let commands = host.command_reader().load();
+    assert!(
+        commands.commands.iter().any(|c| c.name.as_ref() == TASKS_COMMAND),
+        "{TASKS_COMMAND} must survive the disable"
+    );
+    let keymaps = host.keymap_reader().load();
+    let tasks_key = maki_lua::Key::parse("<C-x>").unwrap();
+    let bound: Vec<_> = keymaps
+        .entries
+        .iter()
+        .filter(|e| e.key == tasks_key && e.desc == TASKS_KEY_DESC)
+        .collect();
+    assert_eq!(bound.len(), 2, "Ctrl+X binds in normal and insert mode");
+}
+
+/// With task enabled the delegation tools reach the model as before.
+#[test]
+fn enabled_task_offers_its_tools() {
+    let config = maki_config::RawConfig::default().into_config(&[]).unwrap();
+    assert!(config.plugins.tool_hidden.is_empty());
+    let (reg, _host) = builtins_host_with(&config.plugins);
+    let names = request_tool_names(&reg, &config.agent);
+    for tool in [TASK_TOOL, TASK_MESSAGE_TOOL, TASK_STOP_TOOL] {
+        assert!(names.iter().any(|n| n == tool), "{tool} must reach the model");
     }
 }
 

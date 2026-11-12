@@ -101,6 +101,8 @@ Other moved calls cannot prompt. A tool they call after the move is denied unles
 
 You can type to a moved subagent in its tab. Other task tabs have no input box, and what you type there goes to the main chat.
 
+`plugins.task.enabled = false` only hides the model's `task` and `task_message` tools. The plugin still loads, so `/tasks`, `Ctrl+X` and `task_stop` keep working for the background tasks of every other plugin.
+
 ## Stop a task
 
 - Press `Ctrl+S` on its row in `/tasks`.

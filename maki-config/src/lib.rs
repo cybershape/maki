@@ -131,6 +131,15 @@ pub const PROVIDER_BUILTINS: &[&str] = &[];
 /// so their names stay free for MCP servers and are not valid tool names.
 pub const NON_TOOL_BUILTINS: &[&str] = &["completion", "sessions", "thinking"];
 
+/// The builtin whose `enabled = false` hides its tools from the model instead
+/// of skipping the load: its picker and `task_stop` serve the background tasks
+/// of every plugin, so they must outlive the delegation tool.
+pub const TOOL_HIDDEN_BUILTINS: &[&str] = &["task"];
+
+/// Hidden together with the plugin's main tool. `task_stop` stays: the model
+/// needs it to stop background work its receipt told it about.
+pub const TASK_HIDDEN_TOOLS: &[&str] = &["task", "task_message"];
+
 /// The shell plugin that is off unless a config sets `enabled = true`.
 /// Windows ships `powershell` and leaves `bash` off. Everywhere else ships
 /// `bash` and leaves `powershell` off.
@@ -586,6 +595,14 @@ impl RawConfig {
         let mut agent = AgentConfig::from_file(self.agent);
         agent.instructions = InstructionsConfig::from_file(self.instructions)?;
         agent.instructions.compatibility = self.compatibility.clone();
+        let plugins = PluginsConfig::from_plugins_and_packages(self.plugins, packages);
+        if plugins.tool_hidden.iter().any(|name| name == "task") {
+            for &tool in TASK_HIDDEN_TOOLS {
+                if !agent.disabled_tools.iter().any(|t| t == tool) {
+                    agent.disabled_tools.push(tool.to_owned());
+                }
+            }
+        }
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             session_defaults: SessionDefaults {
@@ -605,7 +622,7 @@ impl RawConfig {
             telemetry: self.telemetry,
             compatibility: self.compatibility,
             permissions: PermissionsConfig::default(),
-            plugins: PluginsConfig::from_plugins_and_packages(self.plugins, packages),
+            plugins,
         })
     }
 
@@ -1667,8 +1684,9 @@ pub struct AgentConfig {
     #[config(skip, default = "Vec::new()")]
     pub allowed_tools: Vec<String>,
 
-    /// Only from the CLI's `--disallowed-tools`. A disabled plugin never
-    /// registers its tool, so its name stays free for another plugin to claim.
+    /// From the CLI's `--disallowed-tools` and from [`TOOL_HIDDEN_BUILTINS`]
+    /// the config disabled. Any other disabled plugin never registers its
+    /// tool, so its name stays free for another plugin to claim.
     #[config(skip, default = "Vec::new()")]
     pub disabled_tools: Vec<String>,
 
@@ -2397,6 +2415,9 @@ pub struct PluginsConfig {
     /// Per-plugin option tables, without `enabled`. Each plugin validates its
     /// own via `maki.api.register_options` at load time.
     pub opts: HashMap<String, JsonMap<String, JsonValue>>,
+    /// [`TOOL_HIDDEN_BUILTINS`] the config explicitly disabled. They load like
+    /// any enabled builtin; `into_config` hides their tools from the model.
+    pub tool_hidden: Vec<String>,
 }
 
 impl PluginsConfig {
@@ -2413,11 +2434,18 @@ impl PluginsConfig {
             Some(enabled) => enabled,
             None => name != PLATFORM_OFF_SHELL,
         };
+        let tool_hidden = |name: &str| TOOL_HIDDEN_BUILTINS.contains(&name);
 
         let mut all: Vec<String> = DEFAULT_BUILTINS
             .iter()
             .copied()
-            .filter(|name| enabled(name))
+            .filter(|name| enabled(name) || tool_hidden(name))
+            .map(str::to_owned)
+            .collect();
+        let tool_hidden: Vec<String> = DEFAULT_BUILTINS
+            .iter()
+            .copied()
+            .filter(|name| tool_hidden(name) && !enabled(name))
             .map(str::to_owned)
             .collect();
 
@@ -2453,6 +2481,7 @@ impl PluginsConfig {
             names: all,
             packages: enabled_packages,
             opts,
+            tool_hidden,
         }
     }
 }
@@ -4905,6 +4934,39 @@ mod tests {
         assert!(
             config.agent.disabled_tools.is_empty(),
             "a disabled plugin never registers, so nothing may filter its name away"
+        );
+    }
+
+    #[test]
+    fn disabling_task_loads_it_and_hides_its_delegation_tools() {
+        let raw: RawConfig = toml::from_str("[plugins.task]\nenabled = false\n").unwrap();
+        let config = raw.into_config(&[]).unwrap();
+        assert!(
+            config.plugins.names.contains(&"task".to_owned()),
+            "task loads even when disabled, for its picker and task_stop"
+        );
+        assert_eq!(config.plugins.tool_hidden, vec!["task".to_owned()]);
+        for tool in TASK_HIDDEN_TOOLS {
+            assert!(
+                config.agent.disabled_tools.iter().any(|t| t == tool),
+                "{tool} must be hidden from the model"
+            );
+        }
+        assert!(
+            !config.agent.disabled_tools.iter().any(|t| t == "task_stop"),
+            "task_stop stays available to stop background work"
+        );
+    }
+
+    #[test]
+    fn disabling_task_keeps_its_opts_for_the_load() {
+        let raw: RawConfig =
+            toml::from_str("[plugins.task]\nenabled = false\nallow_background = false\n").unwrap();
+        let config = raw.into_config(&[]).unwrap();
+        assert_eq!(
+            config.plugins.opts["task"]["allow_background"],
+            serde_json::json!(false),
+            "a tool-hidden plugin still loads, so its opts apply"
         );
     }
 
