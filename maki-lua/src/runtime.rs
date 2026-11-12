@@ -33,6 +33,7 @@ use mlua::{Function, Lua, MaybeSend, MultiValue, RegistryKey, Table, Value as Lu
 use serde_json::Value;
 use strum::{EnumString, IntoStaticStr};
 use tokio::runtime::Handle;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, watch};
@@ -195,6 +196,7 @@ const PLAN_HANDLERS_MISSING_ERR: &str = "plan row handlers not initialized";
 const PLAN_HANDLER_GONE_ERR: &str = "plan row handler was reaped";
 const NO_PLUGIN_HOST: &str = "no plugin host is running this code";
 const SPAWN_QUEUE_NOT_INIT: &str = "spawn queue not initialized";
+const QUEUE_RX_TAKEN: &str = "a queue's receiver is taken once, by the dispatcher";
 /// Without a cap, a runaway plugin OOM-kills the whole process.
 /// With one, it hits a catchable Lua error instead.
 pub(crate) const LUA_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
@@ -506,7 +508,7 @@ pub enum Request {
         /// Whether the row's built-in action still runs, and if not, whether
         /// that was the handler's decision or the host failing to take the
         /// pick at all.
-        reply: flume::Sender<PlanActionOutcome>,
+        reply: oneshot::Sender<PlanActionOutcome>,
     },
     /// Fires the two `ui.plan_form*` chains for a session whose plan just
     /// landed: whether the built-in form opens, and with which rows.
@@ -516,7 +518,7 @@ pub enum Request {
         /// The rows the host proposes, i.e. the bottom of the actions chain.
         rows: Vec<PlanFormRow>,
         /// The menu to draw, or `None` when a layer took the form over.
-        reply: flume::Sender<Option<PlanMenu>>,
+        reply: oneshot::Sender<Option<PlanMenu>>,
     },
     ComputeHeader {
         plugin: Arc<str>,
@@ -560,7 +562,9 @@ pub enum Request {
         /// handler's [`Lineage::command_depth`], so an alias cycle runs out.
         depth: u8,
     },
+    /// Session whose prompt is being built, if any; see `run_hint_callback`.
     CollectPromptSlots {
+        session: Option<String>,
         reply: flume::Sender<ResolvedPrompts>,
     },
     CollectPluginOptions {
@@ -800,7 +804,7 @@ pub(crate) struct TaskCell {
     pub(crate) root_buf: Option<Arc<SharedBuf>>,
     /// Forwards live bufs and annotations to the `maki.agent.call_tool` that
     /// dispatched this task.
-    pub(crate) live_sink: Option<flume::Sender<ToolLive>>,
+    pub(crate) live_sink: Option<UnboundedSender<ToolLive>>,
     /// When `Some`, `maki.async.run` tasks queue here instead of the global
     /// `SpawnQueue` so restore can run them inline before snapshotting.
     pub(crate) inline_spawn: Option<Vec<PendingAsyncTask>>,
@@ -1328,16 +1332,16 @@ impl LiveTask {
 pub(crate) struct MoveRequest {
     tool_use_id: String,
     trigger: MoveTrigger,
-    reply: flume::Sender<MoveOutcome>,
+    reply: oneshot::Sender<MoveOutcome>,
 }
 
 impl MoveRequest {
-    pub(crate) fn by_user(tool_use_id: String) -> (Self, flume::Receiver<MoveOutcome>) {
+    pub(crate) fn by_user(tool_use_id: String) -> (Self, oneshot::Receiver<MoveOutcome>) {
         Self::new(tool_use_id, MoveTrigger::User)
     }
 
-    fn new(tool_use_id: String, trigger: MoveTrigger) -> (Self, flume::Receiver<MoveOutcome>) {
-        let (reply, rx) = flume::bounded(1);
+    fn new(tool_use_id: String, trigger: MoveTrigger) -> (Self, oneshot::Receiver<MoveOutcome>) {
+        let (reply, rx) = oneshot::channel();
         let request = Self {
             tool_use_id,
             trigger,
@@ -1350,15 +1354,15 @@ impl MoveRequest {
 /// Where every move is asked for. [`serve_moves`] answers apart from the
 /// request queue, which would wait behind a plugin load draining the very
 /// call to move.
-struct Moves(flume::Sender<MoveRequest>);
+struct Moves(UnboundedSender<MoveRequest>);
 
 async fn serve_moves(
     lua: Lua,
     live_tasks: LiveTasks,
     plugins: PluginMap,
-    requests: flume::Receiver<MoveRequest>,
+    mut requests: UnboundedReceiver<MoveRequest>,
 ) {
-    while let Ok(request) = requests.recv_async().await {
+    while let Some(request) = requests.recv().await {
         spawn_local(serve_move(
             lua.clone(),
             Rc::clone(&live_tasks),
@@ -1393,9 +1397,7 @@ pub(crate) async fn move_self(lua: &Lua, tool_use_id: &str) -> MoveOutcome {
     if tx.send(request).is_err() {
         return not_movable(NOT_LIVE_CALL_MSG);
     }
-    rx.recv_async()
-        .await
-        .unwrap_or_else(|_| not_movable(NOT_LIVE_CALL_MSG))
+    rx.await.unwrap_or_else(|_| not_movable(NOT_LIVE_CALL_MSG))
 }
 
 /// Moves a call whose `expire = "background"` deadline passed. A call that
@@ -2239,14 +2241,14 @@ pub(crate) async fn run_detached<F: Future>(lua: &Lua, fut: F) -> F::Output {
 /// Provider hooks are called from the async side of the process, so the way
 /// back in has to be something the Lua code that registers them can pick up
 /// while it runs.
-pub(crate) struct ProviderRequests(flume::Sender<Request>);
+pub(crate) struct ProviderRequests(UnboundedSender<Request>);
 
 /// The two ways back to the Lua thread that a provider hook handle keeps: one
 /// to ask for a call, one to hand its registry keys back when it dies. Taken
 /// together because a handle without both is of no use.
 pub(crate) fn host_senders(
     lua: &Lua,
-) -> mlua::Result<(flume::Sender<Request>, flume::Sender<DeferredCallback>)> {
+) -> mlua::Result<(UnboundedSender<Request>, UnboundedSender<DeferredCallback>)> {
     let no_host = || mlua::Error::runtime(NO_PLUGIN_HOST);
     let requests = lua.app_data_ref::<ProviderRequests>().ok_or_else(no_host)?;
     let release = lua.app_data_ref::<DeferQueue>().ok_or_else(no_host)?;
@@ -3054,14 +3056,41 @@ impl Drop for BufsClaim {
 /// one arm of its biased select, so a send wakes the loop even while the
 /// enqueuing coroutine stays parked.
 pub(crate) struct SpawnQueue {
-    tx: flume::Sender<PendingAsyncTask>,
-    rx: flume::Receiver<PendingAsyncTask>,
+    tx: UnboundedSender<PendingAsyncTask>,
+    rx: QueueRx<PendingAsyncTask>,
 }
 
 impl SpawnQueue {
     fn new() -> Self {
-        let (tx, rx) = flume::unbounded();
-        Self { tx, rx }
+        let (tx, rx) = unbounded_channel();
+        Self {
+            tx,
+            rx: QueueRx::new(rx),
+        }
+    }
+}
+
+/// A queue's receiving end, kept next to its sender until the dispatcher
+/// takes it, so the queue has exactly one reader.
+pub(crate) struct QueueRx<T>(RefCell<Option<UnboundedReceiver<T>>>);
+
+impl<T> QueueRx<T> {
+    fn new(rx: UnboundedReceiver<T>) -> Self {
+        Self(RefCell::new(Some(rx)))
+    }
+
+    fn take(&self) -> UnboundedReceiver<T> {
+        self.0.take().expect(QUEUE_RX_TAKEN)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_recv(&self) -> Option<T> {
+        self.0.borrow_mut().as_mut()?.try_recv().ok()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.0.borrow().as_ref().expect(QUEUE_RX_TAKEN).is_empty()
     }
 }
 
@@ -3083,8 +3112,8 @@ pub(crate) struct DeferredCallback {
 }
 
 pub(crate) struct DeferQueue {
-    tx: flume::Sender<DeferredCallback>,
-    pub(crate) rx: flume::Receiver<DeferredCallback>,
+    tx: UnboundedSender<DeferredCallback>,
+    pub(crate) rx: QueueRx<DeferredCallback>,
     /// Timers that have not fired yet, by owner. A sleeping timer holds no
     /// [`GateGuard`], so [`drain_barrier`] walks straight past it and a reload
     /// would leave the callback to wake up against a torn down env. Cancelling
@@ -3104,10 +3133,10 @@ pub(crate) struct SpawnedTasks(CancelMap<Arc<str>>);
 
 impl DeferQueue {
     pub(crate) fn new() -> Self {
-        let (tx, rx) = flume::unbounded();
+        let (tx, rx) = unbounded_channel();
         Self {
             tx,
-            rx,
+            rx: QueueRx::new(rx),
             timers: Mutex::new(Vec::new()),
         }
     }
@@ -3120,7 +3149,7 @@ impl DeferQueue {
     /// the two can never drift apart.
     pub(crate) fn push(&self, cb: DeferredCallback) -> Result<(), DeferredCallback> {
         let pending = (Arc::clone(&cb.plugin), Arc::clone(&cb.cancel));
-        self.tx.try_send(cb).map_err(|e| e.into_inner())?;
+        self.tx.send(cb).map_err(|e| e.0)?;
         self.locked().push(pending);
         Ok(())
     }
@@ -3526,7 +3555,7 @@ fn spawn_plugin_task(lua: &Lua, spawned: SpawnedTask, task: PendingAsyncTask) {
 async fn drain_barrier(
     lua: &Lua,
     gate: &Rc<InflightGate>,
-    spawn_rx: &flume::Receiver<PendingAsyncTask>,
+    spawn_rx: &mut UnboundedReceiver<PendingAsyncTask>,
 ) {
     loop {
         gate.drain().await;
@@ -3599,7 +3628,7 @@ struct LuaRuntime {
     live_tasks: LiveTasks,
     warm_tools: WarmTools,
     registry: Arc<ToolRegistry>,
-    tx: flume::Sender<Request>,
+    tx: UnboundedSender<Request>,
     shutdown: Arc<AtomicBool>,
     bundled: BundledModules,
     codegen_queue: CodegenQueue,
@@ -3610,7 +3639,7 @@ impl LuaRuntime {
     #[allow(clippy::too_many_arguments)]
     fn new(
         registry: Arc<ToolRegistry>,
-        tx: flume::Sender<Request>,
+        tx: UnboundedSender<Request>,
         shutdown: Arc<AtomicBool>,
         bundled_dirs: &'static [&'static Dir<'static>],
         ui_action_tx: Option<flume::Sender<UiAction>>,
@@ -3806,9 +3835,26 @@ impl LuaRuntime {
         revision_guard
     }
 
-    async fn run_hint_callback(&self, plugin: &str, func: Function) -> Option<String> {
+    /// Calls a hint's content function with `{ session_id = ... }` naming the
+    /// session whose prompt is being built, or nil when there is none:
+    /// `maki.session.current()` names the focused tab, and background
+    /// sessions build prompts too.
+    async fn run_hint_callback(
+        &self,
+        plugin: &str,
+        func: Function,
+        session: Option<&str>,
+    ) -> Option<String> {
+        let ctx = match session {
+            Some(id) => {
+                let table = self.lua.create_table().ok()?;
+                table.set("session_id", id).ok()?;
+                LuaValue::Table(table)
+            }
+            None => LuaValue::Nil,
+        };
         let result: mlua::Result<LuaValue> =
-            run_detached(&self.lua, func.call_async::<LuaValue>(())).await;
+            run_detached(&self.lua, func.call_async::<LuaValue>(ctx)).await;
         match result {
             Ok(LuaValue::String(s)) => Some(s.to_string_lossy()),
             Ok(LuaValue::Nil) => None,
@@ -3823,7 +3869,7 @@ impl LuaRuntime {
         }
     }
 
-    async fn collect_prompt_slots(&self) -> ResolvedPrompts {
+    async fn collect_prompt_slots(&self, session: Option<&str>) -> ResolvedPrompts {
         struct Pending {
             plugin: Arc<str>,
             prompts: Vec<PromptId>,
@@ -3882,7 +3928,9 @@ impl LuaRuntime {
             };
             let content = match item.content {
                 PendingContent::Static(s) => Some(s),
-                PendingContent::Callback(func) => self.run_hint_callback(&item.plugin, func).await,
+                PendingContent::Callback(func) => {
+                    self.run_hint_callback(&item.plugin, func, session).await
+                }
             };
             let Some(content) = content else { continue };
             for pid in item.prompts {
@@ -4372,7 +4420,7 @@ impl LuaRuntime {
         row: usize,
         path: String,
         parallel: bool,
-        reply: flume::Sender<PlanActionOutcome>,
+        reply: oneshot::Sender<PlanActionOutcome>,
     ) {
         let found = self
             .lua
@@ -4584,7 +4632,7 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
     };
     let input_lua = json_to_lua(lua, &item.input).ok()?;
 
-    let (dummy_tx, _) = flume::unbounded();
+    let (dummy_tx, _) = unbounded_channel();
     let cell = TaskCell::new(
         CancelToken::none(),
         Some(Instant::now() + RESTORE_ITEM_TIMEOUT),
@@ -5584,9 +5632,9 @@ async fn run_tool_call(
 }
 
 pub(crate) struct LuaThread {
-    pub tx: flume::Sender<Request>,
-    pub prio_tx: flume::Sender<Request>,
-    pub moves: flume::Sender<MoveRequest>,
+    pub tx: UnboundedSender<Request>,
+    pub prio_tx: UnboundedSender<Request>,
+    pub moves: UnboundedSender<MoveRequest>,
     /// Shared with the runtime on the Lua thread, so a handle can answer "is
     /// anyone layering this" without a roundtrip.
     pub layered: Arc<LayeredTools>,
@@ -5617,10 +5665,10 @@ pub fn spawn(
     jit: bool,
     plugin_rules: Arc<PluginRuleStore>,
 ) -> Result<LuaThread, PluginError> {
-    let (tx, rx) = flume::unbounded::<Request>();
-    let (prio_tx, prio_rx) = flume::unbounded::<Request>();
+    let (tx, mut rx) = unbounded_channel::<Request>();
+    let (prio_tx, mut prio_rx) = unbounded_channel::<Request>();
     let prio_tx_thread = prio_tx.clone();
-    let (moves, move_requests) = flume::unbounded::<MoveRequest>();
+    let (moves, move_requests) = unbounded_channel::<MoveRequest>();
     let moves_thread = moves.clone();
     let tx_clone = tx.clone();
     let layered: Arc<LayeredTools> = Arc::default();
@@ -5712,12 +5760,12 @@ pub fn spawn(
             }
             let gate = Rc::new(InflightGate::new(rt.lua.clone()));
             let restores = Rc::new(RestoreTracker::default());
-            let (hook_tx, hook_rx) = flume::unbounded::<HostHook>();
+            let (hook_tx, mut hook_rx) = unbounded_channel::<HostHook>();
             {
                 let lua = rt.lua.clone();
                 let gate = Rc::clone(&gate);
                 local.spawn_local(async move {
-                    while let Ok(hook) = hook_rx.recv_async().await {
+                    while let Some(hook) = hook_rx.recv().await {
                         // Holds the drain barrier so a plugin reload waiting
                         // on `drain_barrier` cannot land mid-handler.
                         let _guard = GateGuard::hold_only(&gate);
@@ -5725,18 +5773,18 @@ pub fn spawn(
                     }
                 });
             }
-            let spawn_rx = rt
+            let mut spawn_rx = rt
                 .lua
                 .app_data_ref::<SpawnQueue>()
                 .expect("spawn queue installed at init")
                 .rx
-                .clone();
-            let defer_rx = rt
+                .take();
+            let mut defer_rx = rt
                 .lua
                 .app_data_ref::<DeferQueue>()
                 .expect("defer queue installed at init")
                 .rx
-                .clone();
+                .take();
 
             let mut codegen_armed = false;
 
@@ -5768,24 +5816,24 @@ pub fn spawn(
                     // behind the next unrelated request.
                     let next = tokio::select! {
                         biased;
-                        msg = prio_rx.recv_async() => msg.map(Some),
-                        task = spawn_rx.recv_async() => task.map(|task| {
+                        msg = prio_rx.recv() => msg.map(Some),
+                        Some(task) = spawn_rx.recv() => {
                             spawn_async_task(&rt.lua, &gate, task);
-                            None
-                        }),
-                        cb = defer_rx.recv_async() => cb.map(|cb| {
+                            Some(None)
+                        }
+                        Some(cb) = defer_rx.recv() => {
                             spawn_deferred_callback(&rt.lua, &gate, cb);
-                            None
-                        }),
-                        msg = rx.recv_async() => msg.map(Some),
+                            Some(None)
+                        }
+                        msg = rx.recv() => msg.map(Some),
                     };
                     let msg = match next {
-                        Ok(Some(m)) => m,
-                        Ok(None) => {
+                        Some(Some(m)) => m,
+                        Some(None) => {
                             yield_now().await;
                             continue;
                         }
-                        Err(_) => break,
+                        None => break,
                     };
                     match msg {
                         Request::Shutdown => break,
@@ -5803,7 +5851,7 @@ pub fn spawn(
                             context,
                             reply,
                         } => {
-                            drain_barrier(&rt.lua, &gate, &spawn_rx).await;
+                            drain_barrier(&rt.lua, &gate, &mut spawn_rx).await;
                             let res = rt
                                 .load_source(
                                     Arc::clone(&name),
@@ -5903,7 +5951,7 @@ pub fn spawn(
                             let _ = reply.send(ops);
                         }
                         Request::ClearPlugin { plugin, reply } => {
-                            drain_barrier(&rt.lua, &gate, &spawn_rx).await;
+                            drain_barrier(&rt.lua, &gate, &mut spawn_rx).await;
                             rt.clear_plugin(&plugin);
                             // The explicit unload: the one place a package's
                             // grant is released.
@@ -6021,12 +6069,12 @@ pub fn spawn(
                             plugin_dir,
                             reply,
                         } => {
-                            drain_barrier(&rt.lua, &gate, &spawn_rx).await;
+                            drain_barrier(&rt.lua, &gate, &mut spawn_rx).await;
                             let res = rt.run_init_lua(&source, scope, plugin_dir).await;
                             let _ = reply.send(res);
                         }
-                        Request::CollectPromptSlots { reply } => {
-                            let slots = rt.collect_prompt_slots().await;
+                        Request::CollectPromptSlots { session, reply } => {
+                            let slots = rt.collect_prompt_slots(session.as_deref()).await;
                             let _ = reply.send(slots);
                         }
                         Request::CollectPluginOptions { reply } => {
@@ -6047,7 +6095,7 @@ pub fn spawn(
                             context,
                             reply,
                         } => {
-                            drain_barrier(&rt.lua, &gate, &spawn_rx).await;
+                            drain_barrier(&rt.lua, &gate, &mut spawn_rx).await;
                             let result = rt.run_pack_loader(declared, context).await;
                             let _ = reply.send(result);
                         }
@@ -6120,11 +6168,10 @@ pub fn spawn(
             }));
             BackgroundTasks::of(&rt.lua).lose_all();
             // Clones of the host (`EventHandle`, `LuaTool`) can still hold
-            // a live sender, so dropping the receivers alone does not free
-            // queued requests. Drain them so their reply channels drop and
-            // no caller blocks on a dead host.
-            for _ in rx.drain() {}
-            for _ in prio_rx.drain() {}
+            // a live sender. Dropping the receivers frees the queued
+            // requests, so their reply channels drop and no caller blocks on
+            // a dead host.
+            drop((rx, prio_rx));
             // Each pooled client owns a connection pool.
             // Nothing else hands them back, so a host that fetched once would
             // keep its sockets open for the rest of the process.
@@ -6415,7 +6462,7 @@ mod tests {
     fn with_live_ctx_follows_task_live_field() {
         let lua = Lua::new();
 
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let with_live = task_cell(Some(LiveCtx {
             event_tx: maki_agent::EventSender::new(tx, 0),
             tool_use_id: "tool_abc".into(),
@@ -7170,11 +7217,11 @@ mod tests {
             let _active = scope.enter();
             spawn_src(&lua, SPAWN_PLUGIN, QUEUE_RUN_AND_PARK_SRC)
         };
-        let spawn_rx = lua.app_data_ref::<SpawnQueue>().unwrap().rx.clone();
+        let mut spawn_rx = lua.app_data_ref::<SpawnQueue>().unwrap().rx.take();
 
         let run = wake_or_fail(LocalSet::new().run_until(async {
             spawn_async_task(&lua, &Rc::new(gate()), task);
-            spawn_rx.recv_async().await.unwrap()
+            spawn_rx.recv().await.unwrap()
         }))
         .await;
 

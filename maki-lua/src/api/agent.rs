@@ -6,7 +6,6 @@ use std::pin::pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use futures::future::{Either, select};
 use maki_agent::agent::{LoadedInstructions, tool_dispatch};
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
@@ -42,6 +41,7 @@ use mlua::{
 };
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::spawn_blocking;
 use tracing::info;
 
@@ -470,8 +470,8 @@ async fn relay_session_events(
     mut sub_events: SessionEvents,
     mut upstream: Upstream,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
-    done_tx: flume::Sender<()>,
-    live_sink: Option<flume::Sender<ToolLive>>,
+    done_tx: UnboundedSender<()>,
+    live_sink: Option<UnboundedSender<ToolLive>>,
 ) {
     let mut cost = None;
     while let Some(mut envelope) = sub_events.next().await {
@@ -958,7 +958,7 @@ async fn dispatch_child(
     tctx.output_mode = ToolOutputMode::Full;
     // Open even without callbacks: when a plugin answers the child's
     // permission prompt, the user still has to see it somewhere.
-    let (live_tx, live_rx) = flume::unbounded();
+    let (live_tx, live_rx) = unbounded_channel();
     tctx.live_sink = Some(live_tx);
     let (mut on_buf, mut on_ann, mut on_usage, mut on_movable, mut on_task) =
         (None, None, None, None, None);
@@ -1250,12 +1250,12 @@ async fn session(
     let (answer_tx, answer_rx) = agent_ctx
         .user_response_rx
         .is_some()
-        .then(flume::unbounded::<String>)
+        .then(unbounded_channel::<String>)
         .map(|(tx, rx)| (tx, Arc::new(AsyncMutex::new(rx))))
         .unzip();
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
-    let (done_tx, done_rx) = flume::unbounded();
+    let (done_tx, done_rx) = unbounded_channel();
     // Doubles as the task id tools see. The fallback gets its own id: it keys
     // `subagent_cancels`, where two subagents sharing the session id would
     // collide.
@@ -1628,7 +1628,7 @@ async fn dispatch_racing_live(
     tctx: &ToolContext,
     name: &str,
     input: &JsonValue,
-    rx: flume::Receiver<ToolLive>,
+    mut rx: UnboundedReceiver<ToolLive>,
     cbs: &LiveCallbacks<'_>,
 ) -> ToolDoneEvent {
     let mut run = pin!(tool_dispatch::run(
@@ -1639,16 +1639,16 @@ async fn dispatch_racing_live(
         CallOrigin::Nested
     ));
     loop {
-        match select(run.as_mut(), pin!(rx.recv_async())).await {
-            Either::Left((done, _)) => {
+        tokio::select! {
+            biased;
+            done = &mut run => {
                 while let Ok(ev) = rx.try_recv() {
                     cbs.deliver(ev).await;
                 }
                 return done;
             }
-            Either::Right((Ok(ev), _)) => cbs.deliver(ev).await,
-            // The sender is gone but no result arrived: just wait for the run.
-            Either::Right((Err(_), _)) => return run.await,
+            // Once the sender is gone this arm is off and only the run is left.
+            Some(ev) = rx.recv() => cbs.deliver(ev).await,
         }
     }
 }
@@ -1676,8 +1676,8 @@ struct SessionState {
     /// [`EventSender`] clones alive past the run, so the relay cannot key off
     /// sender disconnect. `None` once closed.
     stream_guard: Option<EventStreamGuard>,
-    answer_rx: Option<Arc<AsyncMutex<flume::Receiver<String>>>>,
-    answer_tx: Option<flume::Sender<String>>,
+    answer_rx: Option<Arc<AsyncMutex<UnboundedReceiver<String>>>>,
+    answer_tx: Option<UnboundedSender<String>>,
     reauth: bool,
     cancellation: Arc<SessionCancellation>,
     upstream: Upstream,
@@ -1695,12 +1695,12 @@ struct SessionState {
 /// Events carry no prompt tag, so the next prompt can't tell a leftover from
 /// its own. It counts how many it is owed instead and reads past the old ones.
 struct RunDones {
-    rx: flume::Receiver<()>,
+    rx: UnboundedReceiver<()>,
     unread: usize,
 }
 
 impl RunDones {
-    fn new(rx: flume::Receiver<()>) -> Self {
+    fn new(rx: UnboundedReceiver<()>) -> Self {
         Self { rx, unread: 0 }
     }
 
@@ -1710,12 +1710,12 @@ impl RunDones {
 
     /// Safe to drop mid-wait, because a `Done` only stops being owed once it
     /// has been read.
-    async fn caught_up(&mut self) -> Result<(), flume::RecvError> {
+    async fn caught_up(&mut self) -> Option<()> {
         while self.unread > 0 {
-            self.rx.recv_async().await?;
+            self.rx.recv().await?;
             self.unread -= 1;
         }
-        Ok(())
+        Some(())
     }
 }
 
@@ -2142,7 +2142,7 @@ async fn prompt(
     // The relay reaches `Done` only after every `TurnComplete`, so once it has,
     // all our `ToolLive::Usage` messages sit in the live channel before
     // `dispatch_racing_live` drains it for the last time.
-    if s.dones.caught_up().await.is_err() {
+    if s.dones.caught_up().await.is_none() {
         tracing::warn!(name = %s.name, "subagent event relay stopped, live usage may lag");
     }
     let usage = s.params.ledger.totals().usage;
@@ -2275,6 +2275,7 @@ fn call_local_tool(
 mod tests {
     use flume::Sender;
     use futures::FutureExt;
+    use futures::future::select;
     use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
     use maki_agent::tools::test_support::{mock_tool, stub_ctx_with, stub_seed};
     use maki_agent::tools::{ToolAudience, ToolSource};
@@ -2293,7 +2294,9 @@ mod tests {
     use maki_storage::sessions::Effort;
     use mlua::AnyUserData;
     use serde_json::json;
+    use std::iter;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
     use tokio::time::timeout;
 
     use super::*;
@@ -2380,7 +2383,7 @@ mod tests {
             _messages: &'a [Message],
             _system: &'a str,
             _tools: &'a JsonValue,
-            events: &'a flume::Sender<ProviderEvent>,
+            events: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -2446,7 +2449,7 @@ mod tests {
     async fn session_close_does_not_wait_for_the_prompt_lock(dispose: bool) {
         let lua = Lua::new();
         let (started_tx, started_rx) = flume::unbounded();
-        let (event_tx, events) = flume::unbounded();
+        let (event_tx, mut events) = unbounded_channel();
         let event_tx = EventSender::new(event_tx, RUN_ID);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(PARENT_ID));
         ctx.provider = Arc::new(PendingProvider(started_tx));
@@ -2491,7 +2494,7 @@ mod tests {
                     if let AgentEvent::SubagentHistory {
                         tool_use_id,
                         messages,
-                    } = events.recv_async().await.unwrap().event
+                    } = events.recv().await.unwrap().event
                     {
                         assert_eq!(tool_use_id, PARENT_ID);
                         assert!(messages.iter().any(|message| {
@@ -2504,8 +2507,7 @@ mod tests {
                     }
                 }
                 assert!(
-                    !events
-                        .try_iter()
+                    !iter::from_fn(|| events.try_recv().ok())
                         .any(|event| matches!(event.event, AgentEvent::SubagentHistory { .. }))
                 );
             })
@@ -2530,7 +2532,7 @@ mod tests {
             _: &'a [Message],
             system: &'a str,
             _: &'a JsonValue,
-            _: &'a Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -2665,7 +2667,7 @@ mod tests {
             messages: &'a [Message],
             _: &'a str,
             _: &'a JsonValue,
-            _: &'a Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -2709,7 +2711,7 @@ mod tests {
         let lua = Lua::new();
         let (requests_tx, requests) = flume::unbounded();
         let (release, release_rx) = flume::unbounded();
-        let (event_tx, events) = flume::unbounded();
+        let (event_tx, mut events) = unbounded_channel();
         let event_tx = EventSender::new(event_tx, RUN_ID);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(PARENT_ID));
         ctx.provider = Arc::new(GatedProvider {
@@ -2755,7 +2757,7 @@ mod tests {
             .await
             .expect("the prompt never finished");
         assert!(requests.is_empty());
-        assert!(events.drain().any(|envelope| {
+        assert!(iter::from_fn(|| events.try_recv().ok()).any(|envelope| {
             matches!(&envelope.event, AgentEvent::QueueItemConsumed { text, .. } if text == NUDGE)
                 && envelope
                     .subagent
@@ -2775,7 +2777,7 @@ mod tests {
             messages: &'a [Message],
             _: &'a str,
             _: &'a JsonValue,
-            _: &'a Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -2924,7 +2926,7 @@ mod tests {
     /// halfway and asked again.
     #[tokio::test]
     async fn next_prompt_waits_past_a_leftover_done() {
-        let (tx, rx) = flume::unbounded();
+        let (tx, rx) = unbounded_channel();
         let mut dones = RunDones::new(rx);
         dones.expect_one();
         tx.send(()).unwrap();
@@ -2932,8 +2934,8 @@ mod tests {
         assert!(dones.caught_up().now_or_never().is_none());
 
         tx.send(()).unwrap();
-        assert_eq!(dones.caught_up().await, Ok(()));
-        assert!(tx.is_empty());
+        assert_eq!(dones.caught_up().await, Some(()));
+        assert!(dones.rx.is_empty());
     }
 
     const RUN_ID: u64 = 7;
@@ -3021,8 +3023,8 @@ mod tests {
         sub_events
     }
 
-    fn live_usages(rx: &flume::Receiver<ToolLive>) -> Vec<String> {
-        rx.drain()
+    fn live_usages(rx: &mut UnboundedReceiver<ToolLive>) -> Vec<String> {
+        iter::from_fn(|| rx.try_recv().ok())
             .map(|event| match event {
                 ToolLive::Usage(usage) => usage,
                 _ => panic!("relay must only publish usage"),
@@ -3042,8 +3044,8 @@ mod tests {
             .collect()
     }
 
-    fn parent_upstream() -> (Upstream, flume::Receiver<Envelope>) {
-        let (parent_raw_tx, parent_rx) = flume::unbounded();
+    fn parent_upstream() -> (Upstream, UnboundedReceiver<Envelope>) {
+        let (parent_raw_tx, parent_rx) = unbounded_channel();
         let upstream = Upstream::Parent {
             tx: EventSender::new(parent_raw_tx, RUN_ID),
             adoption: None,
@@ -3088,7 +3090,7 @@ mod tests {
         unattended: String,
         watched: bool,
     ) {
-        let (answer_tx, answer_rx) = flume::unbounded();
+        let (answer_tx, mut answer_rx) = unbounded_channel();
         let info = Arc::new(OnceLock::new());
         info.set(SubagentInfo {
             answer_tx: Some(answer_tx),
@@ -3108,14 +3110,17 @@ mod tests {
         guard.sender(RUN_ID).send(ask()).unwrap();
         drop(guard);
 
-        relay_session_events(sub_events, upstream, info, flume::unbounded().0, None).await;
+        relay_session_events(sub_events, upstream, info, unbounded_channel().0, None).await;
 
         let (answers, shown) = if watched {
             (Vec::new(), event_names(&[ask(), AgentEvent::StreamClosed]))
         } else {
             (vec![unattended], Vec::new())
         };
-        assert_eq!(answer_rx.drain().collect::<Vec<_>>(), answers);
+        assert_eq!(
+            iter::from_fn(|| answer_rx.try_recv().ok()).collect::<Vec<_>>(),
+            answers
+        );
         assert_eq!(event_names(&chat_events(&ui_rx, session)), shown);
     }
 
@@ -3127,9 +3132,9 @@ mod tests {
     /// tool result.
     #[tokio::test]
     async fn relay_to_parent_reports_each_turn_and_keeps_run_ends_behind() {
-        let (upstream, parent_rx) = parent_upstream();
-        let (done_tx, done_rx) = flume::unbounded();
-        let (live_tx, live_rx) = flume::unbounded();
+        let (upstream, mut parent_rx) = parent_upstream();
+        let (done_tx, mut done_rx) = unbounded_channel();
+        let (live_tx, mut live_rx) = unbounded_channel();
 
         relay_session_events(
             relayed_run(),
@@ -3144,10 +3149,10 @@ mod tests {
             tokens(100, 20).format_sum_cost(Some(0.25)),
             tokens(50, 10).format_sum_cost(Some(0.75)),
         ];
-        assert_eq!(live_usages(&live_rx), expected_live);
+        assert_eq!(live_usages(&mut live_rx), expected_live);
         assert_eq!(done_rx.try_recv(), Ok(()));
 
-        let forwarded = parent_rx.drain().collect::<Vec<_>>();
+        let forwarded = iter::from_fn(|| parent_rx.try_recv().ok()).collect::<Vec<_>>();
         assert_eq!(forwarded.len(), expected_live.len());
         assert!(forwarded.iter().all(|envelope| {
             matches!(envelope.event, AgentEvent::TurnComplete(_))
@@ -3162,7 +3167,7 @@ mod tests {
     /// close sends has to carry the parent's run like the relayed events do.
     #[test]
     fn history_sent_to_the_parent_carries_its_run() {
-        let (upstream, parent_rx) = parent_upstream();
+        let (upstream, mut parent_rx) = parent_upstream();
         upstream.send_history(PARENT_ID, Vec::new());
         let envelope = parent_rx.try_recv().unwrap();
         assert_eq!(envelope.run_id, RUN_ID);
@@ -3204,7 +3209,7 @@ mod tests {
     #[tokio::test]
     async fn relay_to_chat_forwards_run_ends_and_closes_the_task() {
         let session = MakiId::generate();
-        let (done_tx, done_rx) = flume::unbounded();
+        let (done_tx, mut done_rx) = unbounded_channel();
         let (ui_tx, ui_rx) = flume::unbounded();
 
         relay_session_events(
@@ -3240,7 +3245,7 @@ mod tests {
         let call = Arc::new(CallScope::new(PARENT_ID.into(), &run));
         let registry = BackgroundTasks::default();
         registry.register(call_entry(chat, PARENT_ID)).unwrap();
-        let (parent_tx, parent_rx) = flume::unbounded();
+        let (parent_tx, mut parent_rx) = unbounded_channel();
         let (ui_tx, ui_rx) = flume::unbounded();
         let upstream = Upstream::Parent {
             tx: EventSender::new(parent_tx, RUN_ID),
@@ -3254,12 +3259,12 @@ mod tests {
         };
         let (guard, sub_events) = event_stream();
         let sub_tx = guard.sender(RUN_ID);
-        let (done_tx, done_rx) = flume::unbounded();
+        let (done_tx, mut done_rx) = unbounded_channel();
         let moving = async {
             sub_tx
                 .send(turn(SESSION_MODEL, tokens(100, 20), 0.25))
                 .unwrap();
-            let before = parent_rx.recv_async().await.unwrap();
+            let before = parent_rx.recv().await.unwrap();
             let trigger = call.move_to(home(chat, PARENT_ID)).unwrap();
             let [error, done] = run_end();
             for event in [turn(SESSION_MODEL, tokens(50, 10), 0.5), error, done] {
@@ -3303,7 +3308,7 @@ mod tests {
         ledger.add(DONE_USAGE, None, None);
         drop(settle);
         drop(guard);
-        let (done_tx, done_rx) = flume::unbounded();
+        let (done_tx, done_rx) = unbounded_channel();
         let (ui_tx, ui_rx) = flume::unbounded();
 
         relay_session_events(
@@ -3682,7 +3687,7 @@ mod tests {
             messages: &'a [Message],
             system: &'a str,
             tools: &'a JsonValue,
-            _: &'a Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

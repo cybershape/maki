@@ -1485,13 +1485,13 @@ fn report(done: &ToolDoneEvent, name: &str, source: &str, input: &Value, took: D
 
 #[cfg(test)]
 mod tests {
+    use std::iter;
     use std::path::{Path, PathBuf};
     use std::pin::pin;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use flume::Receiver;
     use futures::FutureExt;
     use maki_config::project::{self, TrustMode};
     use maki_config::{Effect, Permission, PermissionRule, PermissionsConfig, ToolKey};
@@ -1499,6 +1499,8 @@ mod tests {
     use maki_storage::id::MakiId;
     use test_case::test_case;
     use tokio::sync::Mutex as AsyncMutex;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::mpsc::unbounded_channel;
     use tokio::time::sleep;
 
     use super::*;
@@ -2645,9 +2647,9 @@ mod tests {
     fn answered(
         mut ctx: ToolContext,
         answer: PermissionAnswer,
-    ) -> (ToolContext, Receiver<Envelope>) {
-        let (event_tx, events) = flume::unbounded();
-        let (answer_tx, answer_rx) = flume::unbounded();
+    ) -> (ToolContext, UnboundedReceiver<Envelope>) {
+        let (event_tx, events) = unbounded_channel();
+        let (answer_tx, answer_rx) = unbounded_channel();
         answer_tx
             .send(TaggedAnswer::new(TEST_ID, answer).encode())
             .unwrap();
@@ -2656,9 +2658,8 @@ mod tests {
         (ctx, events)
     }
 
-    fn prompts(events: &Receiver<Envelope>) -> Vec<Prompt> {
-        events
-            .try_iter()
+    fn prompts(events: &mut UnboundedReceiver<Envelope>) -> Vec<Prompt> {
+        iter::from_fn(|| events.try_recv().ok())
             .filter_map(|envelope| match envelope.event {
                 AgentEvent::PermissionRequest {
                     tool,
@@ -2721,12 +2722,12 @@ mod tests {
         answer: PermissionAnswer,
         expected_start: String,
     ) {
-        let (ctx, events) = answered(build(), answer);
+        let (ctx, mut events) = answered(build(), answer);
         let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_as_is));
         let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
         assert_eq!(
-            prompts(&events),
+            prompts(&mut events),
             vec![asked(
                 ToolKey::native(HOOK_TOOL_NAME),
                 HOOK_PLAIN.to_owned()
@@ -2740,12 +2741,12 @@ mod tests {
     /// runs, or approving one command would run another.
     #[tokio::test]
     async fn an_ask_with_a_rewrite_prompts_for_and_runs_the_rewrite() {
-        let (ctx, events) = answered(build_ctx(), PermissionAnswer::AllowOnce);
+        let (ctx, mut events) = answered(build_ctx(), PermissionAnswer::AllowOnce);
         let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_with_a_rewrite));
         let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
         assert_eq!(
-            prompts(&events),
+            prompts(&mut events),
             vec![asked(
                 ToolKey::native(HOOK_TOOL_NAME),
                 HOOK_REWRITTEN_TO.to_owned()
@@ -2761,7 +2762,7 @@ mod tests {
     /// The queued allow is the control: were the user asked, the call would run.
     #[tokio::test]
     async fn a_deny_rule_refuses_an_ask_without_prompting() {
-        let (ctx, events) = answered(
+        let (ctx, mut events) = answered(
             denying_ctx(ToolKey::native(HOOK_TOOL_NAME)),
             PermissionAnswer::AllowOnce,
         );
@@ -2771,7 +2772,7 @@ mod tests {
         assert!(done.is_error);
         let text = done.output.as_text();
         assert!(text.starts_with(PERMISSION_DENIED_PREFIX), "got: {text}");
-        assert!(prompts(&events).is_empty());
+        assert!(prompts(&mut events).is_empty());
     }
 
     fn moved_away(scope: &CallScope) -> MovedTrigger {
@@ -2787,7 +2788,7 @@ mod tests {
     /// The queued allow is the control: were the user asked, the call would run.
     #[tokio::test]
     async fn a_moved_call_asks_nobody() {
-        let (mut ctx, events) = answered(build_ctx(), PermissionAnswer::AllowOnce);
+        let (mut ctx, mut events) = answered(build_ctx(), PermissionAnswer::AllowOnce);
         let scope = Arc::new(CallScope::new(TEST_ID.to_owned(), &CancelToken::none()));
         let _task = moved_away(&scope);
         ctx.call = Some(scope);
@@ -2795,13 +2796,13 @@ mod tests {
         let done = dispatch_nested(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
         assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
-        assert!(prompts(&events).is_empty());
+        assert!(prompts(&mut events).is_empty());
     }
 
     #[tokio::test]
     async fn a_move_withdraws_the_ask_and_frees_the_prompt_channel() {
-        let (event_tx, events) = flume::unbounded();
-        let (_answer_tx, answer_rx) = flume::unbounded::<String>();
+        let (event_tx, mut events) = unbounded_channel();
+        let (_answer_tx, answer_rx) = unbounded_channel::<String>();
         let mut ctx = build_ctx();
         ctx.event_tx = EventSender::new(event_tx, 0);
         let channel = Arc::new(AsyncMutex::new(answer_rx));
@@ -2813,7 +2814,7 @@ mod tests {
         let input = call_input(HOOK_PLAIN);
         let mut done = pin!(dispatch_nested(&ctx, HOOK_TOOL_NAME, &input));
         assert!(done.as_mut().now_or_never().is_none());
-        assert_eq!(prompts(&events).len(), 1);
+        assert_eq!(prompts(&mut events).len(), 1);
 
         let _task = moved_away(&scope);
         let done = done.await;
@@ -2843,11 +2844,11 @@ mod tests {
         tool: ToolKey,
         input: Value,
     ) {
-        let (ctx, events) = answered(build(), PermissionAnswer::AllowOnce);
+        let (ctx, mut events) = answered(build(), PermissionAnswer::AllowOnce);
         ctx.registry.set_hook(RecordingHook::answering(ask_as_is));
         dispatch(&ctx, name, &input).await;
 
-        assert_eq!(prompts(&events), vec![asked(tool, input.to_string())]);
+        assert_eq!(prompts(&mut events), vec![asked(tool, input.to_string())]);
     }
 
     #[tokio::test]
@@ -2950,7 +2951,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_tool_notify_emits_tool_start_with_raw_input() {
-        let (tx, rx) = flume::unbounded::<crate::Envelope>();
+        let (tx, mut rx) = unbounded_channel::<Envelope>();
         let event_tx = crate::EventSender::new(tx, 0);
         let mut ctx =
             crate::tools::test_support::stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
@@ -2988,14 +2989,13 @@ mod tests {
         assert_eq!(view.summary, summary);
         assert_eq!(view.markdown, markdown);
 
-        let (tx, events) = flume::unbounded();
+        let (tx, mut events) = unbounded_channel();
         let ctx = with_mcp(
             stub_ctx_with(&AgentMode::Build, Some(&EventSender::new(tx, 0)), None),
             &stub_mcp(&[PROBE_QUALIFIED]),
         );
         let done = dispatch(&ctx, name, &input).await;
-        let start = events
-            .try_iter()
+        let start = iter::from_fn(|| events.try_recv().ok())
             .find_map(|envelope| match envelope.event {
                 AgentEvent::ToolStart(start) => Some(start),
                 _ => None,
@@ -3371,8 +3371,8 @@ mod tests {
     async fn time_on_a_permission_prompt_does_not_spend_the_deadline() {
         let mut ctx = rules_ctx(&AgentMode::Build, Vec::new());
         ctx.registry = registered(Arc::new(GuardedMock));
-        let (event_tx, events) = flume::unbounded();
-        let (answer_tx, answer_rx) = flume::unbounded();
+        let (event_tx, mut events) = unbounded_channel();
+        let (answer_tx, answer_rx) = unbounded_channel();
         ctx.event_tx = EventSender::new(event_tx, 0);
         ctx.user_response_rx = Some(Arc::new(AsyncMutex::new(answer_rx)));
         ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);
@@ -3380,7 +3380,7 @@ mod tests {
 
         let user = async {
             while !matches!(
-                events.recv_async().await.unwrap().event,
+                events.recv().await.unwrap().event,
                 AgentEvent::PermissionRequest { .. }
             ) {}
             sleep(PROMPT_THINK_TIME).await;
@@ -3501,7 +3501,7 @@ mod tests {
         run: CancelToken,
         on_call: impl Fn(&ToolContext) + Send + Sync + 'static,
     ) -> Vec<CallView> {
-        let (tx, _rx) = flume::unbounded::<Envelope>();
+        let (tx, _rx) = unbounded_channel::<Envelope>();
         let event_tx = EventSender::new(tx, 0);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
         ctx.cancel = run;
@@ -3559,7 +3559,7 @@ mod tests {
         const SLOW_DELAY: Duration = Duration::from_millis(50);
         const PANIC_MESSAGE: &str = "probe exploded";
 
-        let (tx, _rx) = flume::unbounded::<Envelope>();
+        let (tx, _rx) = unbounded_channel::<Envelope>();
         let event_tx = EventSender::new(tx, 0);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
         ctx.local_tools = Arc::new(HashMap::from([(
@@ -3739,7 +3739,9 @@ mod telemetry_tests {
 
 #[cfg(test)]
 mod layer_mark_tests {
+    use std::iter;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::tools::test_support::stub_ctx_with;
@@ -3757,22 +3759,20 @@ mod layer_mark_tests {
         marked_rows: &[&str],
         streamed: &[&str],
     ) {
-        let (event_tx, events) = flume::unbounded();
+        let (event_tx, mut events) = unbounded_channel();
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&EventSender::new(event_tx, 0)), row);
-        let (sink, live) = flume::unbounded();
+        let (sink, mut live) = unbounded_channel();
         ctx.live_sink = Some(sink);
 
         mark_allowed_by(&ctx, Arc::from(PLUGIN));
 
-        let rows: Vec<String> = events
-            .try_iter()
+        let rows: Vec<String> = iter::from_fn(|| events.try_recv().ok())
             .filter_map(|envelope| match envelope.event {
                 AgentEvent::AllowedByPlugin { id, plugin } if plugin == PLUGIN => Some(id),
                 _ => None,
             })
             .collect();
-        let sent: Vec<String> = live
-            .try_iter()
+        let sent: Vec<String> = iter::from_fn(|| live.try_recv().ok())
             .filter_map(|ev| match ev {
                 ToolLive::AllowedBy(plugin) => Some(plugin.to_string()),
                 _ => None,

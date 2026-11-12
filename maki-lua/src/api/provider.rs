@@ -22,6 +22,7 @@ use mlua::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
@@ -186,8 +187,8 @@ pub struct LuaHookKeys {
     keys: HashMap<HookSlot, RegistryKey>,
     /// The registering plugin's reach, which `ctx.get_json` goes out under.
     egress: NetEgress,
-    requests: flume::Sender<Request>,
-    release: flume::Sender<DeferredCallback>,
+    requests: UnboundedSender<Request>,
+    release: UnboundedSender<DeferredCallback>,
 }
 
 impl Drop for LuaHookKeys {
@@ -1090,6 +1091,7 @@ mod tests {
     use maki_providers::plugin::DeclAuthority;
     use serde_json::json;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use mlua::AnyUserData;
 
@@ -1127,8 +1129,8 @@ mod tests {
                 .map(|(slot, func)| (slot, lua.create_registry_value(func).unwrap()))
                 .collect(),
             egress: NetEgress::default(),
-            requests: flume::unbounded().0,
-            release: flume::unbounded().0,
+            requests: unbounded_channel().0,
+            release: unbounded_channel().0,
         }
     }
 
@@ -1310,7 +1312,7 @@ mod tests {
     async fn call_usage_hook(source: &str) -> Result<Option<ProviderUsage>, AgentError> {
         let lua = provider_lua(true);
         let func: Function = lua.load(source).eval().unwrap();
-        let (requests, served) = flume::unbounded();
+        let (requests, mut served) = unbounded_channel();
         let mut keys = keys_from(&lua, [(HookSlot::FetchUsage, func)]);
         keys.requests = requests;
         let bridge: LuaHook<(), Option<ProviderUsage>> = LuaHook {
@@ -1320,13 +1322,13 @@ mod tests {
             _types: PhantomData,
         };
         let host = async {
-            let Ok(Request::CallProviderHook {
+            let Some(Request::CallProviderHook {
                 hook,
                 slot,
                 payload,
                 answer,
                 ..
-            }) = served.recv_async().await
+            }) = served.recv().await
             else {
                 panic!("{HOOK_NEVER_CALLED}");
             };

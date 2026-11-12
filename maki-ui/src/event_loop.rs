@@ -55,8 +55,9 @@ use maki_storage::model::{persist_model, persist_project_model};
 use maki_storage::sessions::normalize_title;
 use ratatui::layout::Rect;
 use serde_json::json;
-use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{Notify, oneshot};
+use tokio::task::coop::unconstrained;
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::timeout;
 use tokio_util::task::AbortOnDropHandle;
@@ -636,6 +637,15 @@ async fn recv_or_pending<T>(rx: &flume::Receiver<T>) -> T {
     }
 }
 
+/// Outside tokio's coop budget: it would report an empty queue after 128
+/// envelopes in one poll and end the drain at half of [`DRAIN_BUDGET`].
+async fn next_or_pending<T>(rx: &mut UnboundedReceiver<T>) -> T {
+    match unconstrained(rx.recv()).await {
+        Some(value) => value,
+        None => pending().await,
+    }
+}
+
 /// The running package command's answer, or never, when none is running.
 ///
 /// The handle is only cleared once it has answered, so a `select!` that drops
@@ -659,9 +669,9 @@ async fn session_wake(sessions: &mut [SessionRuntime]) -> Wake {
         .iter_mut()
         .enumerate()
         .flat_map(|(i, rt)| {
-            let (agent_rx, shell_rx) = (&rt.handles.agent_rx, &mut rt.shell_rx);
+            let (agent_rx, shell_rx) = (&mut rt.handles.agent_rx, &mut rt.shell_rx);
             [
-                Box::pin(async move { Wake::Agent(i, Box::new(recv_or_pending(agent_rx).await)) })
+                Box::pin(async move { Wake::Agent(i, Box::new(next_or_pending(agent_rx).await)) })
                     as LocalBoxFuture<'_, Wake>,
                 Box::pin(async move {
                     match shell_rx.recv().await {
@@ -1279,7 +1289,7 @@ impl<'t> EventLoop<'t> {
             } => {
                 let Some(idx) = self.tab_of(session) else {
                     debug!(session = ?session, "open_win for a session open in no tab, closed");
-                    let _ = event_tx.try_send(WinEvent::Close);
+                    let _ = event_tx.send(WinEvent::Close);
                     return;
                 };
                 let app = &mut self.sessions[idx].app;
@@ -1592,7 +1602,7 @@ impl<'t> EventLoop<'t> {
     /// `List` replies from a background task (the scan can be slow); every
     /// other request is answered synchronously by the event loop, which owns
     /// the live runtimes.
-    fn handle_session_request(&mut self, req: SessionRequest, reply_tx: flume::Sender<UiReply>) {
+    fn handle_session_request(&mut self, req: SessionRequest, reply_tx: oneshot::Sender<UiReply>) {
         match req {
             SessionRequest::List => {
                 let storage = self.ctx.storage.clone();
@@ -1843,7 +1853,7 @@ impl<'t> EventLoop<'t> {
         transcript: Transcript,
         prompt: Option<String>,
         focus: bool,
-        reply_tx: flume::Sender<UiReply>,
+        reply_tx: oneshot::Sender<UiReply>,
     ) {
         let inherits_model = transcript.model.is_none();
         let open = match self.sessions[self.focused].app.session_from(transcript) {
@@ -1887,7 +1897,7 @@ impl<'t> EventLoop<'t> {
     fn answer_from_disk<T: Send + 'static>(
         &self,
         id: MakiId,
-        reply_tx: flume::Sender<Result<T, String>>,
+        reply_tx: oneshot::Sender<Result<T, String>>,
         answer: impl FnOnce(AppSession) -> Result<T, String> + Send + 'static,
     ) {
         let storage = self.ctx.storage.clone();

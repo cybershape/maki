@@ -3,6 +3,7 @@ mod common;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::iter;
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
@@ -42,6 +43,9 @@ use maki_storage::id::{MakiId, SessionRef};
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
 
 const BUILTIN_COMMANDS: &[&str] = &["/sessions", "/rename", "/tasks"];
 const BASH_HIGHLIGHT_TIMEOUT_SECS: u64 = 10;
@@ -974,7 +978,7 @@ fn restore_snapshot_text(
     let host = PluginHost::new(fresh_registry()).unwrap();
     host.load_source("restore_plugin", src).unwrap();
     let handle = host.event_handle();
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
 
     handle.request_restore(
         maki_lua::RestoreItem {
@@ -996,7 +1000,7 @@ fn restore_snapshot_text(
     handle.wait_restore_complete_for_test();
 
     let mut text = String::new();
-    for env in rx.drain() {
+    for env in iter::from_fn(|| rx.try_recv().ok()) {
         if let maki_agent::AgentEvent::ToolSnapshot { snapshot, .. } = env.event {
             for line in snapshot.lines.iter() {
                 for span in &line.spans {
@@ -2281,8 +2285,8 @@ fn warm_restore_item(id: &str, clicks: Vec<usize>) -> maki_lua::RestoreItem {
     }
 }
 
-fn snapshot_texts(rx: &flume::Receiver<maki_agent::Envelope>, id: &str) -> Vec<String> {
-    rx.drain()
+fn snapshot_texts(rx: &mut UnboundedReceiver<maki_agent::Envelope>, id: &str) -> Vec<String> {
+    iter::from_fn(|| rx.try_recv().ok())
         .filter_map(|env| match env.event {
             maki_agent::AgentEvent::ToolSnapshot {
                 id: got, snapshot, ..
@@ -2302,9 +2306,9 @@ fn warm_ctx(
     id: &str,
 ) -> (
     maki_agent::tools::ToolContext,
-    flume::Receiver<maki_agent::Envelope>,
+    UnboundedReceiver<maki_agent::Envelope>,
 ) {
-    let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
+    let (tx, rx) = unbounded_channel::<maki_agent::Envelope>();
     let event_tx = maki_agent::EventSender::new(tx, 0);
     let ctx = maki_agent::tools::test_support::stub_ctx_with(
         &maki_agent::AgentMode::Build,
@@ -2336,12 +2340,12 @@ fn exec_warm_tool(
 fn warm_click_reaches_finished_tool(is_error: bool) {
     const WARM_ID: &str = "warm-click-1";
     let (reg, host) = warm_host(is_error, true);
-    let (ctx, rx) = warm_ctx(WARM_ID);
+    let (ctx, mut rx) = warm_ctx(WARM_ID);
     let res = exec_warm_tool(&reg, WARM_TOOL_NAME, &ctx);
     assert_eq!(res.err(), is_error.then(|| WARM_ERROR_OUTPUT.to_owned()));
-    let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
+    let body = recv_live_buf(&mut rx, WARM_ID).expect("live buf published");
 
-    let (fb_tx, fb_rx) = flume::unbounded();
+    let (fb_tx, mut fb_rx) = unbounded_channel();
     let eh = host.event_handle();
     eh.request_click_with_fallback(
         WARM_ID.to_owned(),
@@ -2353,7 +2357,7 @@ fn warm_click_reaches_finished_tool(is_error: bool) {
 
     assert_eq!(body.read()[0].spans[0].text, WARM_CLICK_LINE);
     assert!(
-        snapshot_texts(&fb_rx, WARM_ID).is_empty(),
+        snapshot_texts(&mut fb_rx, WARM_ID).is_empty(),
         "warm hit must not trigger the fallback restore"
     );
 }
@@ -2365,7 +2369,7 @@ fn warm_click_reaches_finished_tool(is_error: bool) {
 fn click_fallback_restores_when_warm_missing() {
     const GONE_ID: &str = "warm-gone-1";
     let (_reg, host) = warm_host(false, true);
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
 
     let eh = host.event_handle();
     eh.request_click_with_fallback(
@@ -2377,7 +2381,7 @@ fn click_fallback_restores_when_warm_missing() {
     barrier(&host);
 
     assert_eq!(
-        snapshot_texts(&rx, GONE_ID),
+        snapshot_texts(&mut rx, GONE_ID),
         vec![WARM_RESTORE_CLICK_LINE.to_owned()],
         "fallback restore must replay the recorded clicks"
     );
@@ -2389,11 +2393,11 @@ fn click_fallback_restores_when_warm_missing() {
 fn click_fallback_restores_when_warm_buf_has_no_handler() {
     const WARM_ID: &str = "warm-nohandler-1";
     let (reg, host) = warm_host(false, false);
-    let (ctx, rx) = warm_ctx(WARM_ID);
+    let (ctx, mut rx) = warm_ctx(WARM_ID);
     exec_warm_tool(&reg, WARM_TOOL_NAME, &ctx).expect("tool output");
-    recv_live_buf(&rx, WARM_ID).expect("live buf published");
+    recv_live_buf(&mut rx, WARM_ID).expect("live buf published");
 
-    let (fb_tx, fb_rx) = flume::unbounded();
+    let (fb_tx, mut fb_rx) = unbounded_channel();
     let eh = host.event_handle();
     eh.request_click_with_fallback(
         WARM_ID.to_owned(),
@@ -2404,7 +2408,7 @@ fn click_fallback_restores_when_warm_buf_has_no_handler() {
     barrier(&host);
 
     assert_eq!(
-        snapshot_texts(&fb_rx, WARM_ID),
+        snapshot_texts(&mut fb_rx, WARM_ID),
         vec![WARM_RESTORE_CLICK_LINE.to_owned()],
         "warm hit without a click handler must fall back to restore"
     );
@@ -2417,11 +2421,11 @@ fn click_fallback_restores_when_warm_buf_has_no_handler() {
 fn restore_evicts_warm_handle() {
     const WARM_ID: &str = "warm-rebaked-1";
     let (reg, host) = warm_host(false, true);
-    let (ctx, rx) = warm_ctx(WARM_ID);
+    let (ctx, mut rx) = warm_ctx(WARM_ID);
     exec_warm_tool(&reg, WARM_TOOL_NAME, &ctx).expect("tool output");
-    let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
+    let body = recv_live_buf(&mut rx, WARM_ID).expect("live buf published");
 
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     let eh = host.event_handle();
     eh.request_restore(
         warm_restore_item(WARM_ID, Vec::new()),
@@ -2446,9 +2450,9 @@ fn warm_fifo_evicts_oldest_runtime_side() {
     let mut bufs = Vec::with_capacity(WARM_TOOL_CAP + 1);
     for i in 0..=WARM_TOOL_CAP {
         let id = format!("t{i}");
-        let (ctx, rx) = warm_ctx(&id);
+        let (ctx, mut rx) = warm_ctx(&id);
         exec_warm_tool(&reg, WARM_TOOL_NAME, &ctx).expect("tool output");
-        bufs.push(recv_live_buf(&rx, &id).expect("live buf published"));
+        bufs.push(recv_live_buf(&mut rx, &id).expect("live buf published"));
     }
 
     let eh = host.event_handle();
@@ -2474,9 +2478,9 @@ fn warm_fifo_evicts_oldest_runtime_side() {
 fn warm_map_cleared_by_load_source() {
     const WARM_ID: &str = "warm-cleared-1";
     let (reg, host) = warm_host(false, true);
-    let (ctx, rx) = warm_ctx(WARM_ID);
+    let (ctx, mut rx) = warm_ctx(WARM_ID);
     exec_warm_tool(&reg, WARM_TOOL_NAME, &ctx).expect("tool output");
-    let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
+    let body = recv_live_buf(&mut rx, WARM_ID).expect("live buf published");
 
     barrier(&host);
     let eh = host.event_handle();
@@ -2515,9 +2519,9 @@ fn warm_click_runs_async_jobs() {
     );
     host.load_source("warm_async_plugin", &src).unwrap();
 
-    let (ctx, rx) = warm_ctx(WARM_ID);
+    let (ctx, mut rx) = warm_ctx(WARM_ID);
     exec_warm_tool(&reg, "warm_async", &ctx).expect("tool output");
-    let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
+    let body = recv_live_buf(&mut rx, WARM_ID).expect("live buf published");
 
     let eh = host.event_handle();
     eh.request_click(WARM_ID.to_owned(), 0);
@@ -2568,13 +2572,13 @@ fn async_run_from_a_handler_outlives_the_call() {
     );
     host.load_source("late_async_plugin", &src).unwrap();
 
-    let (mut ctx, rx) = warm_ctx(CALL_ID);
+    let (mut ctx, mut rx) = warm_ctx(CALL_ID);
     let (_run_trigger, run) = CancelToken::new();
     let call = Arc::new(CallScope::new(CALL_ID.to_owned(), &run));
     ctx.cancel = call.cancel().clone();
     ctx.call = Some(Arc::clone(&call));
     exec_warm_tool(&reg, "late_async", &ctx).expect("tool output");
-    let body = recv_live_buf(&rx, CALL_ID).expect("live buf published");
+    let body = recv_live_buf(&mut rx, CALL_ID).expect("live buf published");
     call.end();
     exec_tool(&reg, "late_async_release", json!({})).expect("release");
 
@@ -2589,11 +2593,11 @@ fn async_run_from_a_handler_outlives_the_call() {
 fn warm_click_survives_post_completion_cancel() {
     const WARM_ID: &str = "warm-cancel-1";
     let (reg, host) = warm_host(false, true);
-    let (mut ctx, rx) = warm_ctx(WARM_ID);
+    let (mut ctx, mut rx) = warm_ctx(WARM_ID);
     let (trigger, token) = maki_agent::CancelToken::new();
     ctx.cancel = token;
     exec_warm_tool(&reg, WARM_TOOL_NAME, &ctx).expect("tool output");
-    let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
+    let body = recv_live_buf(&mut rx, WARM_ID).expect("live buf published");
     trigger.cancel();
 
     let eh = host.event_handle();
@@ -5747,7 +5751,7 @@ fn bash_finishes_without_waiting_for_highlighting(command: &str) {
 /// an error reply ending in the marker, not a bare "cancelled".
 #[test]
 fn cancelled_bash_keeps_streamed_output_as_partial() {
-    let (tx, events) = flume::unbounded();
+    let (tx, mut events) = unbounded_channel();
     let event_tx = maki_agent::EventSender::new(tx, 0);
     let (trigger, token) = maki_agent::CancelToken::new();
     let (result_tx, result_rx) = flume::bounded(1);
@@ -5770,7 +5774,7 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
     });
 
     let buf = poll_until("bash must publish its live buf", || {
-        recv_live_buf(&events, BASH_CANCEL_ID)
+        recv_live_buf(&mut events, BASH_CANCEL_ID)
     });
     poll_until("bash output never reached the live buf", || {
         buf.take().text().contains(BASH_PARTIAL_PROBE).then_some(())
@@ -5798,7 +5802,7 @@ fn restore_tool_async_ordering_and_delivery() {
     let input = serde_json::json!({"command": "echo ok", "timeout": 1});
 
     let handle = host.event_handle();
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
     let event_tx = maki_agent::EventSender::new(tx, 0);
 
     let bash_item = |id: &str| maki_lua::RestoreItem {
@@ -5836,7 +5840,7 @@ fn restore_tool_async_ordering_and_delivery() {
 
     handle.wait_restore_complete_for_test();
 
-    let snapshots: Vec<maki_agent::Envelope> = rx.drain().collect();
+    let snapshots: Vec<maki_agent::Envelope> = iter::from_fn(|| rx.try_recv().ok()).collect();
 
     let tool_ids: Vec<&str> = snapshots
         .iter()
@@ -5882,7 +5886,7 @@ fn restore_rebuilds_body_from_input_content(
 ) {
     let (_reg, host) = builtins_host();
     let handle = host.event_handle();
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
 
     handle.request_restore(
         maki_lua::RestoreItem {
@@ -5904,7 +5908,7 @@ fn restore_rebuilds_body_from_input_content(
     handle.wait_restore_complete_for_test();
 
     let mut text = String::new();
-    for env in rx.drain() {
+    for env in iter::from_fn(|| rx.try_recv().ok()) {
         if let maki_agent::AgentEvent::ToolSnapshot { snapshot, .. } = env.event {
             for line in snapshot.lines.iter() {
                 for span in &line.spans {
@@ -6328,8 +6332,8 @@ fn out_of_memory_tool_fails_alone() {
 #[test]
 fn start_hook_publishes_live_buf_for_tool_use_id() {
     let (reg, _host) = start_hook_fixture();
-    let rx = run_start(&reg, "st_tool", serde_json::json!({"code": "line1\nline2"}));
-    let body = recv_live_buf(&rx, START_TOOL_USE_ID).expect("start must publish a LiveToolBuf");
+    let mut rx = run_start(&reg, "st_tool", serde_json::json!({"code": "line1\nline2"}));
+    let body = recv_live_buf(&mut rx, START_TOOL_USE_ID).expect("start must publish a LiveToolBuf");
     let text = body.take().text();
     assert!(text.contains("line1"), "preview must render input: {text}");
 }
@@ -6345,9 +6349,9 @@ fn start_hook_error_does_not_fail_tool() {
 #[test]
 fn start_skipped_for_tool_without_start_fn() {
     let (reg, _host) = start_hook_fixture();
-    let rx = run_start(&reg, "st_plain", serde_json::json!({"code": "x"}));
+    let mut rx = run_start(&reg, "st_plain", serde_json::json!({"code": "x"}));
     assert!(
-        recv_live_buf(&rx, START_TOOL_USE_ID).is_none(),
+        recv_live_buf(&mut rx, START_TOOL_USE_ID).is_none(),
         "no start fn must mean no preview"
     );
 }
@@ -6357,8 +6361,8 @@ fn start_skipped_for_tool_without_start_fn() {
 #[test]
 fn start_ctx_capabilities() {
     let (reg, _host) = start_hook_fixture();
-    let rx = run_start(&reg, "st_probe", serde_json::json!({"code": "x"}));
-    let body = recv_live_buf(&rx, START_TOOL_USE_ID).expect("probe publishes a buf");
+    let mut rx = run_start(&reg, "st_probe", serde_json::json!({"code": "x"}));
+    let body = recv_live_buf(&mut rx, START_TOOL_USE_ID).expect("probe publishes a buf");
     let text = body.take().text();
     assert_eq!(
         text,
@@ -6435,8 +6439,8 @@ fn run_start(
     reg: &ToolRegistry,
     name: &str,
     input: serde_json::Value,
-) -> flume::Receiver<maki_agent::Envelope> {
-    let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
+) -> UnboundedReceiver<maki_agent::Envelope> {
+    let (tx, rx) = unbounded_channel::<maki_agent::Envelope>();
     let event_tx = maki_agent::EventSender::new(tx, 0);
     let ctx = maki_agent::tools::test_support::stub_ctx_with(
         &maki_agent::AgentMode::Build,
@@ -6454,10 +6458,10 @@ fn run_start(
 }
 
 fn recv_live_buf(
-    rx: &flume::Receiver<maki_agent::Envelope>,
+    rx: &mut UnboundedReceiver<maki_agent::Envelope>,
     id: &str,
 ) -> Option<Arc<maki_agent::SharedBuf>> {
-    rx.drain().find_map(|env| match env.event {
+    iter::from_fn(|| rx.try_recv().ok()).find_map(|env| match env.event {
         maki_agent::AgentEvent::LiveToolBuf { id: got, body } if got == id => Some(body),
         _ => None,
     })
@@ -8162,7 +8166,7 @@ impl Provider for TurnThenPark {
         _: &'a [Message],
         _: &'a str,
         _: &'a Value,
-        _: &'a flume::Sender<ProviderEvent>,
+        _: &'a UnboundedSender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -8558,7 +8562,7 @@ impl Provider for OptsRecorder {
         _: &'a [Message],
         _: &'a str,
         _: &'a Value,
-        _: &'a flume::Sender<ProviderEvent>,
+        _: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         _: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -8696,7 +8700,7 @@ impl Provider for CallOnce {
         messages: &'a [Message],
         _: &'a str,
         _: &'a Value,
-        _: &'a flume::Sender<ProviderEvent>,
+        _: &'a UnboundedSender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -9049,7 +9053,7 @@ fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
         .parse(&json!({}))
         .unwrap();
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-    let (_answer_tx, answer_rx) = flume::unbounded::<String>();
+    let (_answer_tx, answer_rx) = unbounded_channel::<String>();
     ctx.user_response_rx = answerable.then(|| Arc::new(tokio::sync::Mutex::new(answer_rx)));
 
     let result = runtime().block_on(inv.execute(&ctx)).output;

@@ -15,6 +15,7 @@ use maki_providers::{
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::SessionControl;
 pub const NO_FILES_FOUND: &str = "No files found";
@@ -1383,7 +1384,7 @@ pub struct SubagentInfo {
     #[serde(skip)]
     pub opts: Option<RequestOptions>,
     #[serde(skip)]
-    pub answer_tx: Option<flume::Sender<String>>,
+    pub answer_tx: Option<UnboundedSender<String>>,
     /// How a host reaches this subagent: its inbox, status and stop. Every
     /// subagent has one, so a chat without one has not heard from its
     /// subagent yet.
@@ -1398,18 +1399,18 @@ pub struct SubagentInfo {
 
 #[derive(Debug, Clone)]
 pub struct EventSender {
-    tx: Sender<Envelope>,
+    tx: UnboundedSender<Envelope>,
     run_id: u64,
 }
 
 impl EventSender {
-    pub fn new(tx: Sender<Envelope>, run_id: u64) -> Self {
+    pub fn new(tx: UnboundedSender<Envelope>, run_id: u64) -> Self {
         Self { tx, run_id }
     }
 
     pub fn send(&self, event: impl Into<AgentEvent>) -> Result<(), AgentError> {
         self.tx
-            .try_send(Envelope {
+            .send(Envelope {
                 event: event.into(),
                 subagent: None,
                 run_id: self.run_id,
@@ -1418,11 +1419,11 @@ impl EventSender {
     }
 
     pub fn send_envelope(&self, envelope: Envelope) -> Result<(), AgentError> {
-        self.tx.try_send(envelope).map_err(|_| AgentError::Channel)
+        self.tx.send(envelope).map_err(|_| AgentError::Channel)
     }
 
     pub fn try_send(&self, event: impl Into<AgentEvent>) {
-        let _ = self.tx.try_send(Envelope {
+        let _ = self.tx.send(Envelope {
             event: event.into(),
             subagent: None,
             run_id: self.run_id,
@@ -1458,7 +1459,7 @@ pub struct Envelope {
 /// [`EventSender`] clones until the VM garbage-collects them, which never
 /// happens on an idle VM.
 pub fn event_stream() -> (EventStreamGuard, SessionEvents) {
-    let (tx, rx) = flume::unbounded();
+    let (tx, rx) = unbounded_channel();
     (EventStreamGuard { tx }, SessionEvents { rx, closed: false })
 }
 
@@ -1471,7 +1472,7 @@ pub fn event_stream() -> (EventStreamGuard, SessionEvents) {
 /// collector's schedule.
 #[derive(Debug)]
 pub struct EventStreamGuard {
-    tx: Sender<Envelope>,
+    tx: UnboundedSender<Envelope>,
 }
 
 impl EventStreamGuard {
@@ -1482,7 +1483,7 @@ impl EventStreamGuard {
 
 impl Drop for EventStreamGuard {
     fn drop(&mut self) {
-        let _ = self.tx.try_send(Envelope {
+        let _ = self.tx.send(Envelope {
             event: AgentEvent::StreamClosed,
             subagent: None,
             run_id: 0,
@@ -1494,7 +1495,7 @@ impl Drop for EventStreamGuard {
 /// split the terminal item and one of them would wait forever.
 #[derive(Debug)]
 pub struct SessionEvents {
-    rx: Receiver<Envelope>,
+    rx: UnboundedReceiver<Envelope>,
     /// Kept instead of dropping `rx`, so a retained [`EventSender`] still
     /// reports success: the stream ends because the marker said so, never
     /// because a sender happened to notice a dead channel.
@@ -1507,14 +1508,14 @@ impl SessionEvents {
     /// delivered first and everything sent after it is lost. That is why a
     /// session drops its guard only once the run returned and history landed.
     ///
-    /// Cancel-safe: the only suspension point is flume's `recv_async`, which
+    /// Cancel-safe: the only suspension point is tokio's `recv`, which
     /// leaves a queued envelope in the queue when dropped.
     pub async fn next(&mut self) -> Option<Envelope> {
         if self.closed {
             return None;
         }
-        match self.rx.recv_async().await {
-            Ok(envelope) if !matches!(envelope.event, AgentEvent::StreamClosed) => Some(envelope),
+        match self.rx.recv().await {
+            Some(envelope) if !matches!(envelope.event, AgentEvent::StreamClosed) => Some(envelope),
             _ => {
                 self.closed = true;
                 None

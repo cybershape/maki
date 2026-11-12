@@ -8,6 +8,8 @@ use maki_providers::{
 };
 use maki_storage::id::SessionRef;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::sleep;
 use tracing::warn;
 
@@ -86,7 +88,7 @@ fn end_thinking_span(
 }
 
 async fn forward_provider_events(
-    prx: flume::Receiver<ProviderEvent>,
+    mut prx: UnboundedReceiver<ProviderEvent>,
     event_tx: &EventSender,
     started: Instant,
 ) -> ForwardedEvents {
@@ -95,7 +97,7 @@ async fn forward_provider_events(
     let mut thinking = Duration::ZERO;
     let mut thinking_span = None;
     let mut spans = Vec::new();
-    while let Ok(pe) = prx.recv_async().await {
+    while let Some(pe) = prx.recv().await {
         let ae = match pe {
             ProviderEvent::TextDelta { text } => {
                 end_thinking_span(&mut thinking_span, &mut thinking, &mut spans);
@@ -313,7 +315,7 @@ pub(crate) async fn stream_with_retry(
         let fitted = model.with_turn_output(budget);
         let model = &fitted;
         let started = Instant::now();
-        let (ptx, prx) = flume::unbounded();
+        let (ptx, prx) = unbounded_channel();
         let forwarder = tokio::spawn({
             let event_tx = event_tx.clone();
             async move { forward_provider_events(prx, &event_tx, started).await }
@@ -492,6 +494,7 @@ fn error_description(error: &AgentError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::iter;
     use std::sync::Mutex;
 
     use maki_providers::{
@@ -499,6 +502,7 @@ mod tests {
     };
     use serde_json::json;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
 
     use super::*;
 
@@ -762,7 +766,7 @@ mod tests {
             messages: &'a [Message],
             system: &'a str,
             tools: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -826,7 +830,7 @@ mod tests {
         gauge: Option<&mut ContextGauge>,
         retry: RetryPolicy,
     ) -> (Result<StreamedResponse, StreamError>, Vec<AgentEvent>) {
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         let result = stream_with_retry(
             StreamRequest {
                 provider,
@@ -846,7 +850,9 @@ mod tests {
         .await;
         (
             result,
-            rx.try_iter().map(|envelope| envelope.event).collect(),
+            iter::from_fn(|| rx.try_recv().ok())
+                .map(|envelope| envelope.event)
+                .collect(),
         )
     }
 
@@ -878,7 +884,7 @@ mod tests {
         };
         let (trigger, cancel) = CancelToken::new();
         trigger.cancel();
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
 
         let result = stream_with_retry(
             StreamRequest {
@@ -1030,7 +1036,7 @@ mod tests {
             _: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -1131,7 +1137,7 @@ mod tests {
             _: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
+            _: &'a tokio::sync::mpsc::UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {

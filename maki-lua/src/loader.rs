@@ -16,6 +16,7 @@ use maki_config::{
 };
 use maki_providers::plugin::{DeclAuthority, keep_granted};
 use tokio::runtime::{Builder, EnterGuard, Handle, Runtime, RuntimeFlavor};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::time::timeout_at;
 
@@ -383,8 +384,8 @@ impl PluginHost {
     pub fn begin_shutdown(&mut self) {
         self.inner.shutdown.store(true, Ordering::Release);
         let _ = self.inner.prio_tx.send(Request::Shutdown);
-        self.inner.tx = flume::unbounded().0;
-        self.inner.prio_tx = flume::unbounded().0;
+        self.inner.tx = unbounded_channel().0;
+        self.inner.prio_tx = unbounded_channel().0;
     }
 
     /// Boots the runtime and loads every default bundled plugin into
@@ -1060,10 +1061,10 @@ impl PluginHost {
 
 #[derive(Clone)]
 pub struct EventHandle {
-    pub(crate) tx: flume::Sender<Request>,
+    pub(crate) tx: UnboundedSender<Request>,
     /// User-initiated requests bypass queued bulk work (session restores).
-    prio_tx: flume::Sender<Request>,
-    moves: flume::Sender<MoveRequest>,
+    prio_tx: UnboundedSender<Request>,
+    moves: UnboundedSender<MoveRequest>,
     /// Published by the Lua thread and read without touching it: whether
     /// asking a chain can change the answer at all.
     layered: Arc<LayeredTools>,
@@ -1071,11 +1072,11 @@ pub struct EventHandle {
 }
 
 impl EventHandle {
-    pub(crate) fn from_tx(tx: flume::Sender<Request>) -> Self {
+    pub(crate) fn from_tx(tx: UnboundedSender<Request>) -> Self {
         Self {
             tx,
-            prio_tx: flume::unbounded().0,
-            moves: flume::unbounded().0,
+            prio_tx: unbounded_channel().0,
+            moves: unbounded_channel().0,
             layered: Arc::default(),
             background: BackgroundTasks::default(),
         }
@@ -1091,7 +1092,7 @@ impl EventHandle {
 
     #[doc(hidden)]
     pub fn disconnected_for_test() -> Self {
-        Self::from_tx(flume::unbounded().0)
+        Self::from_tx(unbounded_channel().0)
     }
 
     /// Whether a plugin is layering either of the plan form slots. False on a
@@ -1117,9 +1118,9 @@ impl EventHandle {
         row: usize,
         path: String,
         parallel: bool,
-    ) -> flume::Receiver<PlanActionOutcome> {
-        let (reply, rx) = flume::bounded(1);
-        let _ = self.prio_tx.try_send(Request::RunPlanAction {
+    ) -> oneshot::Receiver<PlanActionOutcome> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.prio_tx.send(Request::RunPlanAction {
             session,
             generation,
             row,
@@ -1139,9 +1140,9 @@ impl EventHandle {
         path: String,
         session: String,
         rows: Vec<PlanFormRow>,
-    ) -> flume::Receiver<Option<PlanMenu>> {
-        let (reply, rx) = flume::bounded(1);
-        let _ = self.prio_tx.try_send(Request::OpenPlanForm {
+    ) -> oneshot::Receiver<Option<PlanMenu>> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.prio_tx.send(Request::OpenPlanForm {
             path,
             session,
             rows,
@@ -1156,18 +1157,18 @@ impl EventHandle {
     /// this to skip async side effects (e.g. a restore-complete flip) that
     /// no live consumer would ever observe.
     pub fn is_disconnected(&self) -> bool {
-        self.tx.is_disconnected() && self.prio_tx.is_disconnected()
+        self.tx.is_closed() && self.prio_tx.is_closed()
     }
 
     /// Test probe sibling of `from_tx`: collapses both senders onto one
     /// channel so a `RequestProbe` sees every request, including the
     /// `prio_tx`-routed commands and keybind callbacks that `from_tx`
     /// would route to a disconnected channel.
-    pub(crate) fn probed_for_test(shared: flume::Sender<Request>) -> Self {
+    pub(crate) fn probed_for_test(shared: UnboundedSender<Request>) -> Self {
         Self {
             tx: shared.clone(),
             prio_tx: shared,
-            moves: flume::unbounded().0,
+            moves: unbounded_channel().0,
             layered: Arc::default(),
             background: BackgroundTasks::default(),
         }
@@ -1181,7 +1182,7 @@ impl EventHandle {
     }
 
     pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String, depth: u8) {
-        let _ = self.prio_tx.try_send(Request::RunCommand {
+        let _ = self.prio_tx.send(Request::RunCommand {
             plugin,
             command,
             args,
@@ -1189,9 +1190,14 @@ impl EventHandle {
         });
     }
 
-    pub fn collect_prompt_slots(&self) -> ResolvedPrompts {
+    /// Prompt builds that name no session (startup, ACP clients) hand content
+    /// callbacks nil as their context.
+    pub fn collect_prompt_slots(&self, session: Option<&str>) -> ResolvedPrompts {
         let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
+        let _ = self.tx.send(Request::CollectPromptSlots {
+            session: session.map(str::to_owned),
+            reply: tx,
+        });
         rx.recv().unwrap_or_default()
     }
 
@@ -1209,9 +1215,14 @@ impl EventHandle {
         Ok(crate::pack::PackContext::new(declared, installed, active))
     }
 
-    pub async fn collect_prompt_slots_async(&self) -> ResolvedPrompts {
+    /// `session` names the session whose prompt is being built, so content
+    /// callbacks can tell it apart from the focused tab.
+    pub async fn collect_prompt_slots_async(&self, session: Option<&str>) -> ResolvedPrompts {
         let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
+        let _ = self.tx.send(Request::CollectPromptSlots {
+            session: session.map(str::to_owned),
+            reply: tx,
+        });
         rx.recv_async().await.unwrap_or_default()
     }
 
@@ -1249,7 +1260,7 @@ impl EventHandle {
 
     /// Asks the call to move to the background. The answer arrives once its
     /// `ctx:on_background` hook ran.
-    pub fn request_background(&self, tool_use_id: String) -> flume::Receiver<MoveOutcome> {
+    pub fn request_background(&self, tool_use_id: String) -> oneshot::Receiver<MoveOutcome> {
         let (request, rx) = MoveRequest::by_user(tool_use_id);
         let _ = self.moves.send(request);
         rx
@@ -1278,7 +1289,7 @@ impl EventHandle {
     /// [`HostEventKind::fields`](crate::agent_autocmd::HostEventKind::fields)
     /// classifies. {session_id} is the session the event is about.
     pub fn fire(&self, session_id: Option<&dyn Display>, event: HostEvent<'_>) {
-        let _ = self.tx.try_send(Request::FireAutocmd {
+        let _ = self.tx.send(Request::FireAutocmd {
             event: event.name().to_owned(),
             data: event.payload(session_id),
         });
@@ -1289,9 +1300,7 @@ impl EventHandle {
     /// leaves the slot empty and answers through its event loop, which owns the
     /// live session runtimes.
     pub fn install_session_snapshot(&self, provider: crate::api::session::SessionSnapshotFn) {
-        let _ = self
-            .tx
-            .try_send(Request::InstallSessionSnapshot { provider });
+        let _ = self.tx.send(Request::InstallSessionSnapshot { provider });
     }
 
     /// Queue the kill of session-owned jobs and the `SessionEnd` dispatch,
@@ -1302,7 +1311,7 @@ impl EventHandle {
     /// Nothing waits here, so handlers get no deadline and the UI is still
     /// there to answer them.
     pub fn end_session(&self, session: MakiId, reason: SessionEndReason) {
-        let _ = self.tx.try_send(Request::EndSession(EndSession {
+        let _ = self.tx.send(Request::EndSession(EndSession {
             session,
             reason,
             wait: None,
@@ -1359,7 +1368,7 @@ impl EventHandle {
     /// for the key in the same keystroke.
     pub fn run_keybind_callback(&self, ticket: KeybindTicket) -> bool {
         self.prio_tx
-            .try_send(Request::RunKeybindCallback { ticket })
+            .send(Request::RunKeybindCallback { ticket })
             .is_ok()
     }
 }
@@ -1444,14 +1453,14 @@ mod tests {
         let handle = host.event_handle();
         host.begin_shutdown();
 
-        let slots = handle.collect_prompt_slots();
+        let slots = handle.collect_prompt_slots(None);
         assert!(
             contents(&slots, PromptId::System, Slot::ToolUsage).is_empty(),
             "dead host must yield defaults, not real slots"
         );
 
         drop(host);
-        let slots = handle.collect_prompt_slots();
+        let slots = handle.collect_prompt_slots(None);
         assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
     }
 
@@ -1460,7 +1469,7 @@ mod tests {
     fn slots_from(plugin: &str, src: &str) -> (PluginHost, ResolvedPrompts) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(plugin, src).unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = host.event_handle().collect_prompt_slots(None);
         (host, slots)
     }
 
@@ -1509,12 +1518,12 @@ mod tests {
 
     #[test]
     fn run_command_sends_correct_request() {
-        let (prio_tx, prio_rx) = flume::bounded(8);
-        let (tx, _rx) = flume::bounded(8);
+        let (prio_tx, mut prio_rx) = unbounded_channel();
+        let (tx, _rx) = unbounded_channel();
         let handle = EventHandle {
             tx,
             prio_tx,
-            moves: flume::unbounded().0,
+            moves: unbounded_channel().0,
             layered: Arc::default(),
             background: BackgroundTasks::default(),
         };
@@ -2447,6 +2456,38 @@ mod tests {
         assert!(!assemble(PromptId::Research, &slots, "").contains("never lands"));
     }
 
+    /// Content callbacks receive the session whose prompt is built, not the
+    /// focused tab.
+    #[tokio::test]
+    async fn hint_callback_names_the_prompt_session() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "sid",
+            r#"
+            maki.api.register_prompt_hint({
+                slot = "tool_usage",
+                content = function(ctx)
+                    return ctx and ctx.session_id or "no session"
+                end,
+            })
+            "#,
+        )
+        .unwrap();
+        let named = host
+            .event_handle()
+            .collect_prompt_slots_async(Some("session-x"))
+            .await;
+        assert_eq!(
+            contents(&named, PromptId::System, Slot::ToolUsage),
+            ["session-x"]
+        );
+        let unnamed = host.event_handle().collect_prompt_slots(None);
+        assert_eq!(
+            contents(&unnamed, PromptId::System, Slot::ToolUsage),
+            ["no session"]
+        );
+    }
+
     #[test]
     fn prompt_list_targets_each_listed_prompt() {
         const CONTENT: &str = "shared";
@@ -2485,7 +2526,7 @@ mod tests {
             )
             .unwrap();
         }
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = host.event_handle().collect_prompt_slots(None);
         assert_eq!(
             contents(&slots, PromptId::System, Slot::ToolUsage),
             ["from_aaa", "from_zzz"],
@@ -2507,7 +2548,7 @@ mod tests {
         .unwrap();
         let handle = host.event_handle();
 
-        let slots = handle.collect_prompt_slots();
+        let slots = handle.collect_prompt_slots(None);
         assert_eq!(
             contents(&slots, PromptId::System, Slot::ToolUsage),
             ["usage"]
@@ -2518,7 +2559,7 @@ mod tests {
         );
 
         host.unload("multi").unwrap();
-        let slots = handle.collect_prompt_slots();
+        let slots = handle.collect_prompt_slots(None);
         assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
         assert!(contents(&slots, PromptId::System, Slot::Conventions).is_empty());
     }
@@ -2567,7 +2608,7 @@ mod tests {
             r#"maki.api.set_prompt({ slot = "identity", content = "ZZZ" })"#,
         )
         .unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = host.event_handle().collect_prompt_slots(None);
         let entries = slots.get(PromptId::System, Slot::Identity);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries.last().unwrap().content, "ZZZ");
@@ -2660,7 +2701,7 @@ mod tests {
             r#"maki.api.set_prompt({ slot = "identity", content = "SET" })"#,
         )
         .unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = host.event_handle().collect_prompt_slots(None);
         assert_eq!(
             contents(&slots, PromptId::System, Slot::ToolUsage),
             ["HINT"]
@@ -2747,7 +2788,7 @@ mod tests {
             end })
             "#,
         );
-        let second = host.event_handle().collect_prompt_slots();
+        let second = host.event_handle().collect_prompt_slots(None);
         for &pid in PromptId::ALL {
             assert_eq!(contents(&first, pid, Slot::Identity), ["1"]);
             assert_eq!(contents(&second, pid, Slot::Identity), ["2"]);
@@ -2774,7 +2815,7 @@ mod tests {
         assert_eq!(
             assemble(
                 PromptId::System,
-                &host.event_handle().collect_prompt_slots(),
+                &host.event_handle().collect_prompt_slots(None),
                 INSTRUCTIONS,
             ),
             format!("Analysis policy.\n{SECTION}\n{INSTRUCTIONS}")
@@ -2830,7 +2871,7 @@ mod tests {
             r#"maki.api.set_prompt({ prompt = "plan", content = "{{conventions}}" })"#,
         )
         .unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = host.event_handle().collect_prompt_slots(None);
         assert_eq!(assemble(PromptId::Plan, &slots, ""), CONTENT);
     }
 
@@ -2854,13 +2895,13 @@ mod tests {
             maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "first section" })
             "#,
         ).unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = host.event_handle().collect_prompt_slots(None);
         assert_eq!(assemble(PromptId::System, &slots, ""), CONTENT);
         host.unload("zzz").unwrap();
         assert_eq!(
             assemble(
                 PromptId::System,
-                &host.event_handle().collect_prompt_slots(),
+                &host.event_handle().collect_prompt_slots(None),
                 ""
             ),
             "first template: first section"
@@ -2908,25 +2949,25 @@ mod tests {
         host.load_source("owned", source).unwrap();
         let handle = host.event_handle();
         assert_eq!(
-            assemble(PromptId::System, &handle.collect_prompt_slots(), ""),
+            assemble(PromptId::System, &handle.collect_prompt_slots(None), ""),
             TEMPLATE
         );
         host.unload("owned").unwrap();
-        assert!(!handle.collect_prompt_slots().has_replacements());
+        assert!(!handle.collect_prompt_slots(None).has_replacements());
         host.load_source("owned", source).unwrap();
         host.load_source(
             "owned",
             r#"maki.api.set_prompt({ prompt = "system", content = "new" })"#,
         )
         .unwrap();
-        let reloaded = handle.collect_prompt_slots();
+        let reloaded = handle.collect_prompt_slots(None);
         assert_eq!(assemble(PromptId::System, &reloaded, ""), "new");
         assert!(contents(&reloaded, PromptId::System, Slot::Identity).is_empty());
         assert!(
             host.load_source("owned", &format!("{source}\nerror('failed load')"))
                 .is_err()
         );
-        let failed = handle.collect_prompt_slots();
+        let failed = handle.collect_prompt_slots(None);
         assert!(!failed.has_replacements());
         assert!(contents(&failed, PromptId::System, Slot::Identity).is_empty());
         assert_eq!(
@@ -2960,7 +3001,7 @@ mod tests {
         assert!(
             !host
                 .event_handle()
-                .collect_prompt_slots()
+                .collect_prompt_slots(None)
                 .has_replacements()
         );
     }

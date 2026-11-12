@@ -16,7 +16,6 @@ use std::time::Instant;
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
-use flume::Sender;
 use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
@@ -37,6 +36,7 @@ use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -478,7 +478,7 @@ pub struct SdkParams {
 /// unanswered request parks the agent forever, so a request may only be
 /// recorded while a source that could answer it exists.
 struct Permissions {
-    answer_tx: Sender<String>,
+    answer_tx: UnboundedSender<String>,
     /// Wire request id to the agent-side ask it stands for. The agent only
     /// accepts an answer naming the ask it is parked on, so the id it asked
     /// with has to survive the round trip through stdin.
@@ -487,7 +487,7 @@ struct Permissions {
 }
 
 impl Permissions {
-    fn new(answer_tx: Sender<String>) -> Self {
+    fn new(answer_tx: UnboundedSender<String>) -> Self {
         Self {
             answer_tx,
             outstanding: HashMap::new(),
@@ -875,7 +875,7 @@ async fn handle_control_request(
             )
         }
         "interrupt" => {
-            let _ = handle.cancel_tx.try_send(());
+            let _ = handle.cancel_tx.send(());
             writer.emit_control_response(&cr.request_id, ok, None)
         }
         "set_permission_mode" => {
@@ -1276,6 +1276,8 @@ mod tests {
     use maki_agent::SubagentInfo;
     use maki_config::ToolKey;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
 
@@ -1701,7 +1703,7 @@ mod tests {
 
     fn test_pump(
         permission_mode: PermissionMode,
-        answer_tx: Sender<String>,
+        answer_tx: UnboundedSender<String>,
     ) -> (EventPump, mpsc::Receiver<String>) {
         let (out_tx, out_rx) = mpsc::channel();
         let session_id = SessionRef::from(maki_storage::id::MakiId::generate());
@@ -1750,7 +1752,7 @@ mod tests {
     async fn pump_ends_at_stream_close_with_a_retained_sender() {
         let (guard, events) = maki_agent::event_stream();
         let retained = guard.sender(0);
-        let (pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        let (pump, out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
         let pump = pump.spawn(events);
 
         retained
@@ -1772,7 +1774,7 @@ mod tests {
     /// agent never ends the event stream the exit path waits on.
     #[test]
     fn closing_the_answer_source_denies_outstanding_and_later_requests() {
-        let (answer_tx, answer_rx) = flume::unbounded();
+        let (answer_tx, mut answer_rx) = unbounded_channel();
         let mut permissions = Permissions::new(answer_tx);
 
         assert!(permissions.ask(OUTSTANDING_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()));
@@ -1793,7 +1795,7 @@ mod tests {
     /// auto-answer it.
     #[test]
     fn only_requests_the_agent_waits_on_get_answered() {
-        let (answer_tx, answer_rx) = flume::unbounded();
+        let (answer_tx, mut answer_rx) = unbounded_channel();
         let mut permissions = Permissions::new(answer_tx);
         assert!(permissions.ask(OUTSTANDING_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()));
 
@@ -1815,7 +1817,7 @@ mod tests {
     /// takes the one naming its ask.
     #[test]
     fn a_turn_result_keeps_requests_outstanding() {
-        let (answer_tx, answer_rx) = flume::unbounded();
+        let (answer_tx, mut answer_rx) = unbounded_channel();
         let (mut pump, _out_rx) = test_pump(PermissionMode::Default, answer_tx);
         pump.handle(permission_request()).unwrap();
 
@@ -1839,7 +1841,7 @@ mod tests {
     /// the deny on exit) would land on whatever the agent asks next.
     #[test]
     fn bypass_answers_immediately_without_recording_or_emitting() {
-        let (answer_tx, answer_rx) = flume::unbounded();
+        let (answer_tx, mut answer_rx) = unbounded_channel();
         let (mut pump, out_rx) = test_pump(PermissionMode::BypassPermissions, answer_tx);
 
         pump.handle(permission_request()).unwrap();
@@ -1865,7 +1867,7 @@ mod tests {
     /// being asked parks the agent until exit.
     #[test]
     fn permission_request_reaches_the_wire_only_while_answerable() {
-        let (answer_tx, answer_rx) = flume::unbounded();
+        let (answer_tx, mut answer_rx) = unbounded_channel();
         let (mut pump, out_rx) = test_pump(PermissionMode::Default, answer_tx);
 
         pump.handle(permission_request()).unwrap();
@@ -1907,7 +1909,7 @@ mod tests {
     #[test]
     fn a_dropped_prompt_is_an_error_with_its_reason() {
         const DROP_REASON: &str = "blocked by a plugin";
-        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
 
         pump.handle(top_level(AgentEvent::Steered {
             kind: SteerKind::MessageDropped,
@@ -1934,7 +1936,7 @@ mod tests {
     /// message. A host notice and a child's line stay out.
     #[test]
     fn an_accepted_notice_is_a_live_system_message() {
-        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
 
         pump.handle(top_level(AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
@@ -2009,7 +2011,7 @@ mod tests {
     /// own first event.
     #[test]
     fn a_woken_turn_is_timed_from_its_own_start() {
-        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
         pump.shared.lock().unwrap().turn_start = Instant::now().checked_sub(STALE_PROMPT_AGE);
 
         pump.handle(top_level(run_done(RunTotals::default())))
@@ -2049,7 +2051,7 @@ mod tests {
         late_cost: f64,
         failed: bool,
     ) {
-        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
         let tokens = |input| TokenUsage {
             input,
             ..Default::default()

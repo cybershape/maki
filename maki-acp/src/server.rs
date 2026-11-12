@@ -79,7 +79,7 @@ enum Ask {
     /// tagged with it so a waiter on any other ask refuses it.
     Permission {
         request_id: String,
-        answer_tx: Option<Sender<String>>,
+        answer_tx: Option<UnboundedSender<String>>,
     },
     Elicitation,
 }
@@ -712,17 +712,17 @@ fn question_tool(out_tx: WeakUnboundedSender<Value>, pending: PendingState) -> L
             let request = elicitation::form_request(&session_id, tool_call_id, &input)?;
             let rx = ctx.user_response_rx.as_ref().ok_or("no answer channel")?;
 
-            let guard = rx.lock().await;
+            let mut guard = rx.lock().await;
             let request = AgentRequest::CreateElicitationRequest(request);
             let id = ask_client(&out_tx, &pending, Ask::Elicitation, request);
-            let response = ctx.cancel.race(guard.recv_async()).await;
+            let response = ctx.cancel.race(guard.recv()).await;
             // Cleared while still holding the channel, so a stale id cannot
             // clobber whatever ask comes next.
             pending.lock().unwrap().asks.remove(&id);
             drop(guard);
 
             Ok(match response {
-                Ok(Ok(raw)) => elicitation::format_response(&input, &raw),
+                Ok(Some(raw)) => elicitation::format_response(&input, &raw),
                 _ => elicitation::DISMISSED.to_owned(),
             })
         })
@@ -1063,7 +1063,7 @@ fn handle_notification(srv: &Server, method: &str) {
             // and may be parked on one, and a stale answer is tagged, so
             // whoever waits next drops it.
             if let Some(session) = &srv.session {
-                let _ = session.handle.cancel_tx.try_send(());
+                let _ = session.handle.cancel_tx.send(());
             }
         }
         _ => debug!(method, "unknown notification"),
@@ -1425,9 +1425,11 @@ mod tests {
     use maki_storage::trusted_folders::{CanonicalFolder, TrustStatus, TrustedFolders};
     use std::future;
     use std::iter;
+    use tokio::sync::watch;
 
     use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::sync::Mutex as AsyncMutex;
     use tokio::sync::mpsc::UnboundedReceiver;
     use tokio::time::timeout;
     use tokio_util::task::AbortOnDropHandle;
@@ -1653,17 +1655,17 @@ mod tests {
         iter::from_fn(|| out_rx.try_recv().ok()).collect()
     }
 
-    fn test_server() -> (Server, flume::Receiver<String>, UnboundedReceiver<Value>) {
-        let (answer_tx, answer_rx) = flume::unbounded();
+    fn test_server() -> (Server, UnboundedReceiver<String>, UnboundedReceiver<Value>) {
+        let (answer_tx, answer_rx) = unbounded_channel();
         let (out_tx, out_rx) = unbounded_channel();
         let claim = SessionClaim::fresh(&StateDir::from_path(FIXTURE_CLAIMS.path().to_path_buf()));
         let handle = InteractiveHandle {
             tool_names: Vec::new(),
-            input_tx: flume::unbounded().0,
+            input_tx: unbounded_channel().0,
             answer_tx,
-            cancel_tx: flume::unbounded().0,
-            model_tx: flume::unbounded().0,
-            mode_tx: flume::unbounded().0,
+            cancel_tx: watch::channel(()).0,
+            model_tx: unbounded_channel().0,
+            mode_tx: unbounded_channel().0,
             session_id: SessionRef::from(claim.id()),
             permissions: Arc::new(PermissionManager::new(
                 maki_config::PermissionsConfig::default(),
@@ -1764,14 +1766,14 @@ mod tests {
             .pending
     }
 
-    fn permission_ask(answer_tx: Option<Sender<String>>) -> Ask {
+    fn permission_ask(answer_tx: Option<UnboundedSender<String>>) -> Ask {
         Ask::Permission {
             request_id: PARENT_TOOL_USE_ID.to_owned(),
             answer_tx,
         }
     }
 
-    fn server_with_ask(ask: Ask) -> (Server, flume::Receiver<String>, UnboundedReceiver<Value>) {
+    fn server_with_ask(ask: Ask) -> (Server, UnboundedReceiver<String>, UnboundedReceiver<Value>) {
         let (server, answer_rx, out_rx) = test_server();
         pending(&server)
             .lock()
@@ -1842,7 +1844,7 @@ mod tests {
         })
     }
 
-    fn subagent(answer_tx: Option<Sender<String>>) -> SubagentInfo {
+    fn subagent(answer_tx: Option<UnboundedSender<String>>) -> SubagentInfo {
         SubagentInfo {
             parent_tool_use_id: PARENT_TOOL_USE_ID.to_owned(),
             name: SUBAGENT_NAME.to_owned(),
@@ -1893,8 +1895,8 @@ mod tests {
     #[test_case(true ; "cancel_keeps_the_asks_a_moved_call_may_wait_on")]
     #[tokio::test]
     async fn concurrent_subagent_permissions(cancel: bool) {
-        let (srv, main_rx, mut out_rx) = test_server();
-        let children = [flume::unbounded(), flume::unbounded()];
+        let (srv, mut main_rx, mut out_rx) = test_server();
+        let children = [unbounded_channel(), unbounded_channel()];
         run_pump(&srv, None, |sender| {
             for ((answer_tx, _), child_id) in children.iter().zip(CHILD_TOOL_USE_IDS) {
                 let info = subagent(Some(answer_tx.clone()));
@@ -1953,10 +1955,10 @@ mod tests {
                 }),
             );
         }
-        let child_rx = children.map(|(_, rx)| rx);
+        let mut child_rx = children.map(|(_, rx)| rx);
         for ((rx, expected), asked_id) in child_rx
-            .iter()
-            .chain([&main_rx])
+            .iter_mut()
+            .chain([&mut main_rx])
             .zip([
                 PermissionAnswer::Deny,
                 PermissionAnswer::AllowOnce,
@@ -2000,13 +2002,12 @@ mod tests {
     /// that asked for them.
     async fn wait_for_permission(
         srv: &Server,
-        answer_rx: &flume::Receiver<String>,
+        answer_rx: &AsyncMutex<UnboundedReceiver<String>>,
         request_id: &str,
     ) -> Result<(), PermissionError> {
         let session = srv.session.as_ref().expect("a session is installed");
         let (guard, _events) = maki_agent::event_stream();
         let event_tx = guard.sender(0);
-        let rx = tokio::sync::Mutex::new(answer_rx.clone());
         session
             .handle
             .permissions
@@ -2015,7 +2016,7 @@ mod tests {
                 &PermissionScopes::single(NEXT_TURN_SCOPE.to_owned()),
                 None,
                 &event_tx,
-                Some(&rx),
+                Some(answer_rx),
                 request_id,
                 &CancelToken::none(),
                 None,
@@ -2055,6 +2056,7 @@ mod tests {
     #[tokio::test]
     async fn an_answer_for_a_cancelled_ask_is_not_consumed_by_the_next_turn() {
         let (srv, answer_rx, mut out_rx) = test_server();
+        let answer_rx = AsyncMutex::new(answer_rx);
         handle_notification(&srv, "session/cancel");
         run_pump(&srv, None, |sender| {
             sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
@@ -2076,7 +2078,7 @@ mod tests {
         assert!(outcome.is_err(), "{STALE_ALLOW}");
         assert!(!next_turn_is_allowed(&srv), "{STALE_ALLOW}");
         assert!(
-            answer_rx.is_empty(),
+            answer_rx.into_inner().is_empty(),
             "the stale answer was dropped, not left"
         );
     }
@@ -2087,6 +2089,7 @@ mod tests {
     #[tokio::test]
     async fn an_answer_naming_another_ask_is_discarded_and_the_wait_continues() {
         let (srv, answer_rx, ..) = test_server();
+        let answer_rx = AsyncMutex::new(answer_rx);
         queue_answer(&srv, PARENT_TOOL_USE_ID, PermissionAnswer::Deny);
         queue_answer(&srv, NEXT_TURN_TOOL_USE_ID, PermissionAnswer::AllowOnce);
 
@@ -2097,7 +2100,7 @@ mod tests {
             "the deny named another ask and must not have ended this wait"
         );
         assert!(
-            answer_rx.is_empty(),
+            answer_rx.into_inner().is_empty(),
             "both answers were taken off the queue"
         );
     }
@@ -2107,6 +2110,7 @@ mod tests {
     #[tokio::test]
     async fn a_matching_answer_is_applied(answer: PermissionAnswer, allowed: bool) {
         let (srv, answer_rx, ..) = test_server();
+        let answer_rx = AsyncMutex::new(answer_rx);
         queue_answer(&srv, NEXT_TURN_TOOL_USE_ID, answer);
 
         let outcome = wait_for_permission(&srv, &answer_rx, NEXT_TURN_TOOL_USE_ID).await;
@@ -2270,7 +2274,7 @@ mod tests {
     #[tokio::test]
     async fn a_subagent_permission_ignores_a_colliding_cached_input() {
         let (srv, .., mut out_rx) = test_server();
-        let (answer_tx, _answer_rx) = flume::unbounded();
+        let (answer_tx, _answer_rx) = unbounded_channel();
         run_pump(&srv, None, |sender| {
             sender
                 .send(write_tool_start(COLLIDING_TOOL_USE_ID))
@@ -2448,7 +2452,7 @@ mod tests {
     #[test_case(Value::from(UNANSWERABLE_ID), false ; "an_id_matching_no_ask_answers_nothing")]
     #[tokio::test]
     async fn a_response_is_delivered_whatever_shape_its_id_has(id: Value, delivered: bool) {
-        let (srv, answer_rx, ..) = server_with_ask(permission_ask(None));
+        let (srv, mut answer_rx, ..) = server_with_ask(permission_ask(None));
 
         handle_incoming_response(
             &srv,
@@ -2473,7 +2477,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_the_outstanding_request_id_is_answered() {
-        let (srv, answer_rx, ..) = server_with_ask(permission_ask(None));
+        let (srv, mut answer_rx, ..) = server_with_ask(permission_ask(None));
 
         handle_incoming_response(&srv, &allow_once(UNKNOWN_ID));
         assert!(answer_rx.is_empty(), "an unknown id is dropped");
@@ -2493,7 +2497,7 @@ mod tests {
 
     #[tokio::test]
     async fn elicitation_response_forwards_the_raw_result() {
-        let (srv, answer_rx, ..) = server_with_ask(Ask::Elicitation);
+        let (srv, mut answer_rx, ..) = server_with_ask(Ask::Elicitation);
         let raw = serde_json::json!({
             "id": ANSWERED_ID,
             "result": { "action": "accept", "content": { "q1": "axum" } },
@@ -3054,7 +3058,7 @@ mod tests {
     #[tokio::test]
     async fn handle_prompt_carries_session_thinking() {
         let (mut srv, .., _out_rx) = test_server();
-        let (input_tx, input_rx) = flume::unbounded();
+        let (input_tx, mut input_rx) = unbounded_channel();
         srv.session.as_mut().unwrap().handle.input_tx = input_tx;
         srv.session.as_mut().unwrap().current_thinking =
             ThinkingConfig::Effort(maki_storage::sessions::Effort::High);
@@ -3151,7 +3155,7 @@ mod tests {
     #[tokio::test]
     async fn set_config_option_model_emits_usage_update() {
         let (mut srv, _answer_rx, mut out_rx) = test_server();
-        let (model_tx, _model_rx) = flume::unbounded();
+        let (model_tx, _model_rx) = unbounded_channel();
         srv.session.as_mut().unwrap().handle.model_tx = model_tx;
         let target_spec = "responses/custom-large";
         model_registry::set_known_models(

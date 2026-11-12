@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use flume::Sender;
 use maki_agent::agent::tool_dispatch::{identifier_alias, routed_view};
 use maki_agent::permissions::is_universal_scope;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
@@ -33,6 +32,7 @@ use mlua::{
     Value as LuaValue,
 };
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 
@@ -294,7 +294,7 @@ pub(crate) type PendingRules = Arc<Mutex<Vec<PendingRule>>>;
 
 pub(crate) struct LuaTool {
     pub(crate) meta: ToolMeta,
-    pub(crate) tx: Sender<Request>,
+    pub(crate) tx: UnboundedSender<Request>,
     pub(crate) plugin: Arc<str>,
     pub(crate) has_header_fn: bool,
     pub(crate) has_start_fn: bool,
@@ -453,7 +453,7 @@ struct LuaToolInvocation {
     /// Set only when the schema does not declare [`TOOLCALL_REASON_FIELD`],
     /// so the header can lead with it without the handler ever seeing it.
     reason: Option<String>,
-    tx: Sender<Request>,
+    tx: UnboundedSender<Request>,
     permission_state: PermissionState,
     mutable_path_field: Option<Arc<str>>,
     stale_read_check: bool,
@@ -478,14 +478,12 @@ impl ToolInvocation for LuaToolInvocation {
         HeaderFuture::Pending {
             fallback: fallback.clone(),
             fut: Box::pin(async move {
-                let sent = tx
-                    .send_async(Request::ComputeHeader {
-                        plugin: Arc::clone(&plugin),
-                        tool: Arc::clone(&tool),
-                        input,
-                        reply: reply_tx,
-                    })
-                    .await;
+                let sent = tx.send(Request::ComputeHeader {
+                    plugin: Arc::clone(&plugin),
+                    tool: Arc::clone(&tool),
+                    input,
+                    reply: reply_tx,
+                });
                 if sent.is_err() {
                     return HeaderResult::plain(fallback);
                 }
@@ -536,7 +534,7 @@ impl ToolInvocation for LuaToolInvocation {
         };
         let tx = self.tx.clone();
         Box::pin(async move {
-            if tx.send_async(req).await.is_ok() {
+            if tx.send(req).is_ok() {
                 let _ = reply_rx.await;
             }
         })
@@ -554,13 +552,12 @@ impl ToolInvocation for LuaToolInvocation {
                 let fallback = input.to_string();
                 Box::pin(async move {
                     if tx
-                        .send_async(Request::ComputePermissionScopes {
+                        .send(Request::ComputePermissionScopes {
                             plugin,
                             tool,
                             input,
                             reply: reply_tx,
                         })
-                        .await
                         .is_err()
                     {
                         return Some(PermissionScopes::force_prompt(fallback));
@@ -615,7 +612,7 @@ impl ToolInvocation for LuaToolInvocation {
             let lua_ctx = LuaCtx::handler(ctx);
 
             if tx
-                .send_async(Request::CallTool {
+                .send(Request::CallTool {
                     plugin: Arc::clone(&plugin),
                     tool: Arc::clone(&tool),
                     input,
@@ -625,7 +622,6 @@ impl ToolInvocation for LuaToolInvocation {
                     live,
                     nested,
                 })
-                .await
                 .is_err()
             {
                 return Err("lua thread disconnected".to_string()).into();
@@ -1188,8 +1184,16 @@ async fn run_command(
 ///
 /// @param spec table Hint specification:
 ///   slot    (string)         Required. Aggregate slot name (e.g. "tool_usage", "conventions").
-///   content (string|function) Required. Static text, or a `function()` that returns a string. Max 1 MiB.
-///   prompt  (string|string[]) Optional. Restrict to specific prompt ids (e.g. "system").
+///   content (string|function) Required. Static text, or a `function(ctx)` that
+///                            returns a string. Max 1 MiB. `ctx` is
+///                            `{ session_id = "..." }` naming the session whose
+///                            prompt is being built, or nil when there really
+///                            is no session (startup, ACP clients).
+///   prompt  (string|string[]) Optional. Restrict to specific prompt ids
+///                            (e.g. "system"). Entries resolve with the run's
+///                            other prompt slots, so nothing caches them
+///                            across turns. One-shot clients (`maki -p`, the
+///                            SDK, ACP) resolve all hints once at startup.
 /// @return
 /// @example
 /// maki.api.register_prompt_hint({
@@ -1228,8 +1232,9 @@ fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaR
 ///
 /// Identity and tone are available in system, research, and general prompts.
 /// Sections target the main agent when `prompt` is omitted. Only identity and
-/// tone accept a function called before every run. Its first value goes in the
-/// system prompt. Later changes reach the main agent as a context update.
+/// tone accept a function called before every run; it receives `ctx` as in
+/// `register_prompt_hint`. Its first value goes in the system prompt. Later
+/// changes reach the main agent as a context update.
 /// Other replacements require static strings.
 /// A known section missing from the resolved template is ignored, with a warning
 /// for explicit prompt targets.
@@ -2208,10 +2213,12 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::task::yield_now;
+
     use super::*;
     use crate::runtime::test_support::{call_scope, moved_home};
     use crate::runtime::wake_or_fail;
-    use tokio::task::yield_now;
 
     const BACKGROUND_PARAM: &str = "background";
 
@@ -2306,7 +2313,7 @@ mod tests {
     }
 
     fn invocation(input: Value) -> LuaToolInvocation {
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         LuaToolInvocation {
             tool: Arc::from("test_tool"),
             plugin: Arc::from("test"),
@@ -2360,7 +2367,7 @@ mod tests {
             "required": ["url"],
         }))
         .unwrap();
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         LuaTool {
             meta: ToolMeta {
                 name: Arc::from("test_tool"),
@@ -2527,7 +2534,7 @@ mod tests {
     #[tokio::test]
     async fn needs_compute_fallback_on_failure() {
         // Closed channel → fallback to force_prompt
-        let (tx, rx) = flume::bounded(0);
+        let (tx, rx) = unbounded_channel();
         drop(rx);
         let inv = LuaToolInvocation {
             tool: Arc::from("bash"),
@@ -2548,7 +2555,7 @@ mod tests {
         assert!(!scopes.scopes.is_empty());
 
         // Callback returns None → fallback to force_prompt
-        let (tx2, rx2) = flume::bounded(1);
+        let (tx2, mut rx2) = unbounded_channel();
         let inv2 = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
@@ -2564,7 +2571,7 @@ mod tests {
             reason: None,
         };
         std::thread::spawn(move || {
-            if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx2.recv() {
+            if let Some(Request::ComputePermissionScopes { reply, .. }) = rx2.blocking_recv() {
                 let _ = reply.send(None);
             }
         });
@@ -2574,7 +2581,7 @@ mod tests {
 
     #[tokio::test]
     async fn needs_compute_returns_callback_result() {
-        let (tx, rx) = flume::bounded(1);
+        let (tx, mut rx) = unbounded_channel();
         let inv = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
@@ -2590,7 +2597,7 @@ mod tests {
             reason: None,
         };
         std::thread::spawn(move || {
-            if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx.recv() {
+            if let Some(Request::ComputePermissionScopes { reply, .. }) = rx.blocking_recv() {
                 let _ = reply.send(Some(PermissionScopes {
                     scopes: vec!["cargo".into(), "test".into()],
                     force_prompt: false,

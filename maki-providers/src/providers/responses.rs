@@ -3,10 +3,10 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use flume::Sender;
 use futures::TryStreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use std::sync::Arc;
@@ -241,7 +241,7 @@ pub(crate) async fn do_stream(
     client: &Client,
     model: &crate::model::Model,
     body: &Value,
-    event_tx: &Sender<ProviderEvent>,
+    event_tx: &UnboundedSender<ProviderEvent>,
     auth: &ResolvedAuth,
     stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
@@ -268,7 +268,7 @@ async fn post_responses(
     client: &Client,
     model: &crate::model::Model,
     body: &Value,
-    event_tx: &Sender<ProviderEvent>,
+    event_tx: &UnboundedSender<ProviderEvent>,
     auth: &ResolvedAuth,
     base: &str,
     stream_timeout: Duration,
@@ -565,7 +565,7 @@ impl Provider for ResponsesProvider {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -626,7 +626,7 @@ struct ToolAccumulator {
 
 pub(crate) async fn parse_sse(
     mut events: SseBody,
-    event_tx: &Sender<ProviderEvent>,
+    event_tx: &UnboundedSender<ProviderEvent>,
 ) -> Result<StreamResponse, AgentError> {
     let mut text = String::new();
     let mut reasoning_text = String::new();
@@ -676,9 +676,7 @@ pub(crate) async fn parse_sse(
                     };
                     if !delta.is_empty() {
                         text.push_str(&delta);
-                        event_tx
-                            .send_async(ProviderEvent::TextDelta { text: delta })
-                            .await?;
+                        event_tx.send(ProviderEvent::TextDelta { text: delta })?;
                     }
                 }
             }
@@ -697,12 +695,10 @@ pub(crate) async fn parse_sse(
                         .unwrap_or_default()
                         .to_string();
                     if !name.is_empty() {
-                        event_tx
-                            .send_async(ProviderEvent::ToolUseStart {
-                                id: call_id.clone(),
-                                name: name.clone(),
-                            })
-                            .await?;
+                        event_tx.send(ProviderEvent::ToolUseStart {
+                            id: call_id.clone(),
+                            name: name.clone(),
+                        })?;
                     }
                     tool_accumulators.push(ToolAccumulator {
                         output_index,
@@ -735,12 +731,10 @@ pub(crate) async fn parse_sse(
                             .unwrap_or_default();
                         if !name.is_empty() {
                             acc.name = name.to_string();
-                            event_tx
-                                .send_async(ProviderEvent::ToolUseStart {
-                                    id: acc.call_id.clone(),
-                                    name: acc.name.clone(),
-                                })
-                                .await?;
+                            event_tx.send(ProviderEvent::ToolUseStart {
+                                id: acc.call_id.clone(),
+                                name: acc.name.clone(),
+                            })?;
                         }
                     }
                     if !delta.is_empty() {
@@ -754,13 +748,11 @@ pub(crate) async fn parse_sse(
                     let processed = pp["processed"].as_u64().unwrap_or(0) as u32;
                     let total = pp["total"].as_u64().unwrap_or(0) as u32;
                     let cache = pp["cache"].as_u64().unwrap_or(0) as u32;
-                    event_tx
-                        .send_async(ProviderEvent::PromptProgress {
-                            processed,
-                            total,
-                            cache,
-                        })
-                        .await?;
+                    event_tx.send(ProviderEvent::PromptProgress {
+                        processed,
+                        total,
+                        cache,
+                    })?;
                 }
             }
 
@@ -800,21 +792,17 @@ pub(crate) async fn parse_sse(
                             acc.arguments = arguments;
                         }
                         if should_emit_start {
-                            event_tx
-                                .send_async(ProviderEvent::ToolUseStart {
-                                    id: acc.call_id.clone(),
-                                    name: acc.name.clone(),
-                                })
-                                .await?;
+                            event_tx.send(ProviderEvent::ToolUseStart {
+                                id: acc.call_id.clone(),
+                                name: acc.name.clone(),
+                            })?;
                         }
                     } else {
                         if !name.is_empty() {
-                            event_tx
-                                .send_async(ProviderEvent::ToolUseStart {
-                                    id: call_id.clone(),
-                                    name: name.clone(),
-                                })
-                                .await?;
+                            event_tx.send(ProviderEvent::ToolUseStart {
+                                id: call_id.clone(),
+                                name: name.clone(),
+                            })?;
                         }
                         tool_accumulators.push(ToolAccumulator {
                             output_index: tool_accumulators.len() as u64,
@@ -831,21 +819,17 @@ pub(crate) async fn parse_sse(
                     && !delta.is_empty()
                 {
                     reasoning_text.push_str(delta);
-                    event_tx
-                        .send_async(ProviderEvent::ThinkingDelta {
-                            text: delta.to_string(),
-                        })
-                        .await?;
+                    event_tx.send(ProviderEvent::ThinkingDelta {
+                        text: delta.to_string(),
+                    })?;
                 }
             }
 
             "response.reasoning_summary_part.added" if !reasoning_text.is_empty() => {
                 reasoning_text.push_str("\n\n");
-                event_tx
-                    .send_async(ProviderEvent::ThinkingDelta {
-                        text: "\n\n".to_string(),
-                    })
-                    .await?;
+                event_tx.send(ProviderEvent::ThinkingDelta {
+                    text: "\n\n".to_string(),
+                })?;
             }
 
             "response.completed" => {
@@ -953,7 +937,9 @@ fn parse_usage(event: &Value) -> Option<TokenUsage> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::iter;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use crate::test_support::{sse_body, sse_event};
 
@@ -997,9 +983,9 @@ mod tests {
     }
 
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         let result = parse_sse(sse_body(sse.as_bytes()), &tx).await;
-        (result, rx.drain().collect())
+        (result, iter::from_fn(|| rx.try_recv().ok()).collect())
     }
 
     const COPILOT_NANO_AIU: u64 = 375_000;

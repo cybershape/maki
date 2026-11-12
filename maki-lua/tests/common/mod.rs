@@ -3,11 +3,15 @@
 
 #![allow(dead_code, reason = "each test binary uses a different part")]
 
+use maki_lua::test_support::wait_next;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
 
 use maki_agent::agent::tool_dispatch;
 use maki_agent::tools::test_support::{stub_ctx_with, stub_seed};
@@ -16,7 +20,7 @@ use maki_agent::{
     AgentEvent, AgentMode, AgentSeed, CallScope, CancelToken, Envelope, EventSender,
     SessionMailbox, SharedBuf, ToolDoneEvent,
 };
-use maki_lua::test_support::runtime;
+use maki_lua::test_support::{runtime, wait_reply};
 use maki_lua::{EventHandle, MoveOutcome, PluginHost, SessionEndReason, UiAction};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -57,8 +61,8 @@ pub fn call_ctx(
     chat: MakiId,
     run: &CancelToken,
     call_id: &str,
-) -> (ToolContext, flume::Receiver<Envelope>) {
-    let (tx, events) = flume::unbounded();
+) -> (ToolContext, UnboundedReceiver<Envelope>) {
+    let (tx, events) = unbounded_channel();
     let mut ctx = stub_ctx_with(
         &AgentMode::Build,
         Some(&EventSender::new(tx, 0)),
@@ -100,26 +104,27 @@ pub fn done_result(done: &ToolDoneEvent) -> Result<String, String> {
 
 /// The first event of a call that {pick} takes.
 pub fn next_event<T>(
-    events: &flume::Receiver<Envelope>,
+    events: &mut UnboundedReceiver<Envelope>,
     mut pick: impl FnMut(AgentEvent) -> Option<T>,
 ) -> T {
     let deadline = Instant::now() + WAIT;
     loop {
-        let envelope = events.recv_deadline(deadline).expect("tool event");
+        let envelope = wait_next(events, deadline.saturating_duration_since(Instant::now()))
+            .expect("tool event");
         if let Some(found) = pick(envelope.event) {
             return found;
         }
     }
 }
 
-pub fn wait_movable(events: &flume::Receiver<Envelope>, call_id: &str) {
+pub fn wait_movable(events: &mut UnboundedReceiver<Envelope>, call_id: &str) {
     next_event(events, |event| {
         matches!(&event, AgentEvent::ToolMovable { id, movable: true } if id == call_id)
             .then_some(())
     });
 }
 
-pub fn wait_live_buf(events: &flume::Receiver<Envelope>, call_id: &str) -> Arc<SharedBuf> {
+pub fn wait_live_buf(events: &mut UnboundedReceiver<Envelope>, call_id: &str) -> Arc<SharedBuf> {
     next_event(events, |event| match event {
         AgentEvent::LiveToolBuf { id, body } if id == call_id => Some(body),
         _ => None,
@@ -128,10 +133,7 @@ pub fn wait_live_buf(events: &flume::Receiver<Envelope>, call_id: &str) -> Arc<S
 
 /// What Ctrl+B on the call's row gets back.
 pub fn request_move(handle: &EventHandle, call_id: &str) -> MoveOutcome {
-    handle
-        .request_background(call_id.to_owned())
-        .recv_timeout(WAIT)
-        .expect("move outcome")
+    wait_reply(handle.request_background(call_id.to_owned()), WAIT).expect("move outcome")
 }
 
 /// The next event a task tab was sent.
@@ -219,7 +221,7 @@ impl Provider for ParkedProvider {
         messages: &'a [Message],
         _: &'a str,
         _: &'a Value,
-        _: &'a flume::Sender<ProviderEvent>,
+        _: &'a UnboundedSender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

@@ -3,10 +3,12 @@
 //! move hook. Each scenario follows the move from the Ctrl+B request to what
 //! the model reads and what the transcript shows.
 
+use maki_lua::test_support::wait_next;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedSender;
 
 use arc_swap::ArcSwap;
 use maki_agent::permissions::PermissionManager;
@@ -18,6 +20,7 @@ use maki_agent::{
 };
 use maki_config::project::{self, TrustMode};
 use maki_config::{PermissionsConfig, PluginsConfig};
+use maki_lua::test_support::wait_reply;
 use maki_lua::{MoveOutcome, PluginHost, UiAction};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -271,7 +274,7 @@ impl Provider for ScriptedProvider {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        _event_tx: &'a flume::Sender<ProviderEvent>,
+        _event_tx: &'a UnboundedSender<ProviderEvent>,
         _opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -404,11 +407,11 @@ impl World {
     fn wait_for(&mut self, is_wanted: impl Fn(&AgentEvent) -> bool) {
         let deadline = Instant::now() + WAIT;
         loop {
-            let envelope = self
-                .handles
-                .agent_rx
-                .recv_deadline(deadline)
-                .expect(NO_EVENT);
+            let envelope = wait_next(
+                &mut self.handles.agent_rx,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .expect(NO_EVENT);
             let wanted = is_wanted(&envelope.event);
             self.seen.push(envelope.event);
             if wanted {
@@ -427,12 +430,8 @@ impl World {
         self.wait_for(
             |event| matches!(event, AgentEvent::ToolMovable { id: movable, movable: true } if movable == id),
         );
-        let outcome = self
-            .host
-            .event_handle()
-            .request_background(id.to_owned())
-            .recv_timeout(WAIT)
-            .expect(NO_OUTCOME);
+        let answer = self.host.event_handle().request_background(id.to_owned());
+        let outcome = wait_reply(answer, WAIT).expect(NO_OUTCOME);
         assert_eq!(outcome, MoveOutcome::Moved);
     }
 

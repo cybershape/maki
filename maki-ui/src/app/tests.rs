@@ -44,6 +44,7 @@ use maki_config::project::{self, TrustMode, TrustQuestion, TrustState};
 use maki_config::{
     Effect, MaxWidth, PermissionRule, PermissionsConfig, PluginsConfig, ToolKey, UiConfig,
 };
+use maki_lua::test_support::wait_next;
 use maki_lua::test_support::{
     HintWriterHandle, RequestProbe, TestBinding, hint_writer_pair, keymap_reader_from,
     probed_event_handle, runtime, set_mode,
@@ -80,6 +81,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use test_case::test_case;
 use tokio::runtime::EnterGuard;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::{channel, unbounded_channel};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Level, Metadata, Subscriber};
@@ -416,7 +419,7 @@ pub(crate) fn subagent_info(parent_id: &str, name: &str) -> SubagentInfo {
 fn subagent_info_with_tx(
     parent_id: &str,
     name: &str,
-    answer_tx: Option<flume::Sender<String>>,
+    answer_tx: Option<UnboundedSender<String>>,
 ) -> SubagentInfo {
     SubagentInfo {
         parent_tool_use_id: parent_id.into(),
@@ -1561,8 +1564,8 @@ fn plan_menu(rows: Vec<maki_lua::PlanFormRow>) -> maki_lua::PlanMenu {
 }
 
 /// Arms the form's answer slot with a wait that has not run out yet.
-fn awaiting_plan_form(app: &mut App) -> flume::Sender<Option<maki_lua::PlanMenu>> {
-    let (tx, rx) = flume::bounded(1);
+fn awaiting_plan_form(app: &mut App) -> oneshot::Sender<Option<maki_lua::PlanMenu>> {
+    let (tx, rx) = oneshot::channel();
     app.plan_answers.form = Some((Instant::now() + WAIT_AHEAD, rx));
     tx
 }
@@ -1634,7 +1637,7 @@ fn a_silent_plan_form_slot_leaves_the_form_closed() {
 #[test]
 fn a_plan_form_answer_that_never_comes_falls_back_to_the_builtin() {
     let mut app = test_app();
-    let (_tx, rx) = flume::bounded::<Option<maki_lua::PlanMenu>>(1);
+    let (_tx, rx) = oneshot::channel::<Option<maki_lua::PlanMenu>>();
     app.plan_answers.form = Some((Instant::now() - WAIT_AHEAD, rx));
 
     assert_eq!(app.tick_plan_form(), Dirty::YES);
@@ -1649,8 +1652,8 @@ fn a_plan_form_answer_that_never_comes_falls_back_to_the_builtin() {
 fn awaiting_plan_action(
     app: &mut App,
     then: Option<maki_lua::PlanRowAction>,
-) -> flume::Sender<PlanActionOutcome> {
-    let (tx, rx) = flume::bounded(1);
+) -> oneshot::Sender<PlanActionOutcome> {
+    let (tx, rx) = oneshot::channel();
     let pick = app.plan_answers.abandon();
     app.plan_answers.action = Some(PlanAction {
         pick,
@@ -1746,7 +1749,7 @@ fn a_pick_the_host_never_took_is_flashed() {
 #[test]
 fn a_parked_plan_row_handler_gives_up_and_flashes() {
     let mut app = test_app();
-    let (_tx, rx) = flume::bounded(1);
+    let (_tx, rx) = oneshot::channel();
     let pick = app.plan_answers.abandon();
     app.plan_answers.action = Some(PlanAction {
         pick,
@@ -1771,7 +1774,7 @@ fn a_parked_plan_row_handler_gives_up_and_flashes() {
 
 /// A pick of a plugin row that kept the implement outcome, stamped with
 /// {pick} so a test can re-arm the same one the user made.
-fn plan_pick_action(pick: u64, answer: flume::Receiver<PlanActionOutcome>) -> PlanAction {
+fn plan_pick_action(pick: u64, answer: oneshot::Receiver<PlanActionOutcome>) -> PlanAction {
     PlanAction {
         pick,
         then: Some(maki_lua::PlanRowAction::Implement),
@@ -1789,9 +1792,10 @@ fn a_stale_pick_answer_cannot_fire_a_second_implement() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
+    let (_parked_tx, parked) = oneshot::channel();
     let pick = app.plan_answers.abandon();
-    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+    app.plan_answers.action = Some(plan_pick_action(pick, parked));
 
     // The user reopens the form and picks a built-in row while the handler is
     // still parked.
@@ -1823,9 +1827,10 @@ fn a_pick_answered_after_a_session_reset_submits_nothing() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
+    let (_parked_tx, parked) = oneshot::channel();
     let pick = app.plan_answers.abandon();
-    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+    app.plan_answers.action = Some(plan_pick_action(pick, parked));
     let before = app.state.session.id;
 
     app.reset_session();
@@ -1861,9 +1866,10 @@ fn a_pick_answered_after_another_session_loaded_submits_nothing() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
+    let (_parked_tx, parked) = oneshot::channel();
     let pick = app.plan_answers.abandon();
-    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+    app.plan_answers.action = Some(plan_pick_action(pick, parked));
     let _menu_tx = awaiting_plan_form(&mut app);
 
     // The session the user switched to is planning too, with a draft of its
@@ -1910,7 +1916,7 @@ fn a_pick_answered_after_another_session_loaded_submits_nothing() {
 #[test]
 fn the_plan_form_fallback_outlasts_the_host_budget() {
     let mut app = test_app();
-    let (_tx, rx) = flume::bounded::<Option<maki_lua::PlanMenu>>(1);
+    let (_tx, rx) = oneshot::channel::<Option<maki_lua::PlanMenu>>();
     // Armed one whole host budget ago, so the chains have just run out of
     // their own time and the answer is still on its way.
     let armed = Instant::now() - PLAN_FORM_SLOT_DEADLINE;
@@ -1934,7 +1940,7 @@ fn the_plan_form_fallback_outlasts_the_host_budget() {
 #[test]
 fn the_plan_action_fallback_outlasts_the_handler_budget() {
     let mut app = test_app();
-    let (_tx, rx) = flume::bounded(1);
+    let (_tx, rx) = oneshot::channel();
     let pick = app.plan_answers.abandon();
     // Armed one whole handler budget ago, so the handler has just run out of
     // its own time and the answer is still on its way.
@@ -1968,9 +1974,10 @@ fn a_new_draft_flashes_the_pick_it_retires() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
+    let (_parked_tx, parked) = oneshot::channel();
     let pick = app.plan_answers.abandon();
-    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+    app.plan_answers.action = Some(plan_pick_action(pick, parked));
 
     app.transition_plan(PlanTrigger::WriteDone);
 
@@ -3618,8 +3625,8 @@ const CARET_EXPECTED: &str = "the input box draws a caret with nothing in its wa
 fn open_float(app: &mut App, line: SnapshotLine, config: FloatConfig, focus: bool) {
     let buf = Arc::new(SharedBuf::new());
     buf.append(line);
-    let (event_tx, _event_rx) = flume::bounded::<WinEvent>(8);
-    let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+    let (event_tx, _event_rx) = unbounded_channel::<WinEvent>();
+    let (_cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
     app.float_mgr.open(buf, config, focus, event_tx, cmd_rx);
 }
 
@@ -4478,8 +4485,8 @@ fn open_overlay_motion_reaches_app_cadence() {
     let mut app = app_without_splash();
     assert_eq!(app.cadence(), Cadence::IDLE);
 
-    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
-    let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    let (event_tx, _event_rx) = unbounded_channel::<maki_lua::WinEvent>();
+    let (_cmd_tx, cmd_rx) = unbounded_channel::<maki_lua::WinCommand>();
     app.float_mgr.open(
         Arc::new(maki_agent::SharedBuf::new()),
         maki_lua::FloatConfig::default(),
@@ -5925,7 +5932,7 @@ fn auth_retry_sends_empty_answer(submit: fn(&mut App) -> Vec<Action>) {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
     app.answer_tx = Some(tx);
 
     app.update(agent_msg(AgentEvent::AuthRequired));
@@ -5937,9 +5944,9 @@ fn auth_retry_sends_empty_answer(submit: fn(&mut App) -> Vec<Action>) {
     assert_eq!(rx.try_recv().unwrap(), "");
 }
 
-fn app_with_subagent_tx(id: &str) -> (App, flume::Receiver<String>, flume::Receiver<String>) {
-    let (sub_tx, sub_rx) = flume::unbounded();
-    let (main_tx, main_rx) = flume::unbounded();
+fn app_with_subagent_tx(id: &str) -> (App, UnboundedReceiver<String>, UnboundedReceiver<String>) {
+    let (sub_tx, sub_rx) = unbounded_channel();
+    let (main_tx, main_rx) = unbounded_channel();
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -5961,8 +5968,8 @@ fn allow_once(ask_id: &str) -> String {
 /// or that tool call waits forever.
 #[test]
 fn concurrent_subagent_permission_requests_are_each_answered() {
-    let (first_tx, first_rx) = flume::unbounded();
-    let (second_tx, second_rx) = flume::unbounded();
+    let (first_tx, mut first_rx) = unbounded_channel();
+    let (second_tx, mut second_rx) = unbounded_channel();
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -6008,7 +6015,7 @@ fn auth_required_in_subagent_shows_in_both_chats() {
 
 #[test]
 fn auth_retry_in_subagent_routes_to_subagent_channel() {
-    let (mut app, sub_rx, main_rx) = app_with_subagent_tx("sub1");
+    let (mut app, mut sub_rx, mut main_rx) = app_with_subagent_tx("sub1");
     app.update(subagent_msg(
         AgentEvent::AuthRequired,
         "sub1",
@@ -6024,7 +6031,7 @@ fn auth_retry_in_subagent_routes_to_subagent_channel() {
 
 #[test]
 fn cancel_clears_subagent_auth_retry() {
-    let (mut app, sub_rx, _main_rx) = app_with_subagent_tx("sub1");
+    let (mut app, mut sub_rx, _main_rx) = app_with_subagent_tx("sub1");
     app.update(subagent_msg(
         AgentEvent::AuthRequired,
         "sub1",
@@ -6982,12 +6989,12 @@ fn tab_through_the_plan_form_never_reaches_the_palette_behind_an_owner(below: fn
 #[test]
 fn tab_passes_through_the_plan_form_to_a_focused_window() {
     let mut app = test_app();
-    let (events, _cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
+    let (mut events, _cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
     open_plan_form(&mut app);
 
     press(&mut app, KeyCode::Tab);
 
-    assert!(took_a_key(&events), "{TAB_TOOK_THE_OWNER_BELOW}");
+    assert!(took_a_key(&mut events), "{TAB_TOOK_THE_OWNER_BELOW}");
     assert_eq!(app.state.mode, Mode::Plan, "{TAB_LEFT_THE_MODE_ALONE}");
 }
 
@@ -7227,10 +7234,10 @@ fn assert_unsent(app: &App, actions: &[Action], left: &str) {
 }
 
 /// Streams a turn on {app}, and returns where its answers to the agent go.
-fn answer_channel(app: &mut App) -> flume::Receiver<String> {
+fn answer_channel(app: &mut App) -> UnboundedReceiver<String> {
     app.status = Status::Streaming;
     app.run_id = 1;
-    let (answer_tx, answer_rx) = flume::unbounded();
+    let (answer_tx, answer_rx) = unbounded_channel();
     app.answer_tx = Some(answer_tx);
     answer_rx
 }
@@ -7337,8 +7344,8 @@ fn held_keys_follow_a_window_the_handler_opened_over_a_prompt() {
 
     let tab = press_bound(&mut app, &probe, KeyCode::Tab);
     type_keys(&mut app, "x");
-    let (event_tx, events) = flume::unbounded();
-    let (_cmd_tx, cmd_rx) = flume::unbounded();
+    let (event_tx, mut events) = unbounded_channel();
+    let (_cmd_tx, cmd_rx) = unbounded_channel();
     app.float_mgr.open(
         Arc::new(SharedBuf::new()),
         FloatConfig::default(),
@@ -7348,7 +7355,7 @@ fn held_keys_follow_a_window_the_handler_opened_over_a_prompt() {
     );
     app.keybind_done(tab.id());
 
-    assert!(took_a_key(&events), "the held key reached the window");
+    assert!(took_a_key(&mut events), "the held key reached the window");
     assert_ne!(app.status_bar.flash_text(), Some(HELD_KEYS_DROPPED));
 }
 
@@ -7572,9 +7579,9 @@ fn open_window(
     buf: &Arc<SharedBuf>,
     focus: bool,
     zindex: u16,
-) -> (flume::Receiver<WinEvent>, flume::Sender<WinCommand>) {
-    let (event_tx, event_rx) = flume::unbounded::<WinEvent>();
-    let (cmd_tx, cmd_rx) = flume::unbounded::<WinCommand>();
+) -> (UnboundedReceiver<WinEvent>, UnboundedSender<WinCommand>) {
+    let (event_tx, event_rx) = unbounded_channel::<WinEvent>();
+    let (cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
     let config = FloatConfig {
         zindex,
         ..FloatConfig::default()
@@ -7592,12 +7599,12 @@ fn open_window(
 fn windows_close_when_their_session_leaves_the_tab() {
     let mut app = test_app();
     let buf = Arc::new(SharedBuf::new());
-    let (events, _cmd_tx) = open_window(&mut app, &buf, false, WINDOW_Z);
+    let (mut events, _cmd_tx) = open_window(&mut app, &buf, false, WINDOW_Z);
 
     app.reset_session();
 
     assert!(!app.float_mgr.is_open());
-    assert!(events.try_iter().any(|ev| matches!(ev, WinEvent::Close)));
+    assert!(iter::from_fn(|| events.try_recv().ok()).any(|ev| matches!(ev, WinEvent::Close)));
 }
 
 fn owner(probe: &RequestProbe) -> Option<String> {
@@ -7650,7 +7657,7 @@ fn a_key_goes_to_the_first_binding_in_resolution_order(bound: &[&str]) -> Option
 fn a_focused_windows_binding_beats_its_recv_and_falls_back_to_it() {
     let mut app = test_app();
     let buf = Arc::new(SharedBuf::new());
-    let (events, _cmd_tx) = open_window(&mut app, &buf, true, WINDOW_Z);
+    let (mut events, _cmd_tx) = open_window(&mut app, &buf, true, WINDOW_Z);
     let probe = bind_all(
         &mut app,
         plugin_key(KeyCode::Enter, KeyModifiers::NONE),
@@ -7664,12 +7671,12 @@ fn a_focused_windows_binding_beats_its_recv_and_falls_back_to_it() {
     let ticket = probe.try_recv_ticket().expect(OVERRIDE_DISPATCHED);
     assert_eq!(ticket.plugin().as_ref(), FOCUSED_PLUGIN);
     assert!(
-        !took_a_key(&events),
+        !took_a_key(&mut events),
         "the binding took it before the window"
     );
 
     app.keybind_fallback(ticket.id());
-    assert!(took_a_key(&events), "the window got the key back");
+    assert!(took_a_key(&mut events), "the window got the key back");
 }
 
 /// A picker's `<CR>` selects and closes. The close comes over the window's
@@ -7680,7 +7687,7 @@ fn keys_held_behind_a_window_that_closed_itself_reach_the_chat_input() {
     const TYPED: &str = "hi";
     let mut app = test_app();
     let buf = Arc::new(SharedBuf::new());
-    let (events, cmd_tx) = open_window(&mut app, &buf, true, WINDOW_Z);
+    let (mut events, cmd_tx) = open_window(&mut app, &buf, true, WINDOW_Z);
     let probe = bind_all(
         &mut app,
         plugin_key(KeyCode::Enter, KeyModifiers::NONE),
@@ -7693,7 +7700,7 @@ fn keys_held_behind_a_window_that_closed_itself_reach_the_chat_input() {
     cmd_tx.send(WinCommand::Close).unwrap();
     app.keybind_done(ticket.id());
 
-    assert!(!took_a_key(&events));
+    assert!(!took_a_key(&mut events));
     assert_eq!(app.input_box.buffer.value(), TYPED);
 }
 
@@ -7854,11 +7861,11 @@ fn an_enter_behind_a_fallback_sends() {
 fn fallback_is_dropped_once_the_keyboard_moved() {
     let (mut app, probe) = app_binding(KeyCode::Char('a'));
     let pressed = press_bound(&mut app, &probe, KeyCode::Char('a'));
-    let (events, _cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
+    let (mut events, _cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
 
     app.keybind_fallback(pressed.id());
 
-    assert!(!took_a_key(&events));
+    assert!(!took_a_key(&mut events));
     assert_eq!(app.input_box.buffer.value(), "");
 }
 
@@ -8050,7 +8057,7 @@ const TABBED_PASTE_LF: &str = "a\tb\nc";
 fn a_window_paste_is_cleaned_only_for_a_binding(focus: bool, bound: bool) {
     let mut app = test_app();
     let buf = Arc::new(SharedBuf::new());
-    let (events, _cmd_tx) = open_window(&mut app, &buf, focus, WINDOW_Z);
+    let (mut events, _cmd_tx) = open_window(&mut app, &buf, focus, WINDOW_Z);
     let binds = [(FOCUSED_PLUGIN, EVERY_MODE, Some(&buf))];
     let probe = bind_all(&mut app, PASTE, if bound { &binds } else { &[] });
 
@@ -8058,7 +8065,7 @@ fn a_window_paste_is_cleaned_only_for_a_binding(focus: bool, bound: bool) {
 
     let pasted = match probe.try_recv_ticket() {
         Some(ticket) => ticket.text().map(str::to_owned),
-        None => events.drain().find_map(|e| match e {
+        None => iter::from_fn(|| events.try_recv().ok()).find_map(|e| match e {
             WinEvent::Paste { text } => Some(text),
             _ => None,
         }),
@@ -9301,16 +9308,14 @@ const POPUP_NEVER_SHOWN: &str = "the completion popup never came up";
 
 /// Plays the event loop until the completion popup is on screen with its
 /// rows, which it shows only after painting them.
-fn serve_until_popup(ui: &flume::Receiver<UiAction>) -> flume::Receiver<WinCommand> {
+fn serve_until_popup(ui: &flume::Receiver<UiAction>) -> UnboundedReceiver<WinCommand> {
     loop {
         match ui.recv_timeout(HANDLER_TIMEOUT).expect(POPUP_NEVER_SHOWN) {
             UiAction::Session { reply_tx, .. } => {
                 let _ = reply_tx.send(Ok(serde_json::json!({ "cwd": "/" })));
             }
-            UiAction::OpenWin { cmd_rx, .. } => loop {
-                let cmd = cmd_rx
-                    .recv_timeout(HANDLER_TIMEOUT)
-                    .expect(POPUP_NEVER_SHOWN);
+            UiAction::OpenWin { mut cmd_rx, .. } => loop {
+                let cmd = wait_next(&mut cmd_rx, HANDLER_TIMEOUT).expect(POPUP_NEVER_SHOWN);
                 if matches!(cmd, WinCommand::SetVisible(true)) {
                     return cmd_rx;
                 }
@@ -9574,8 +9579,8 @@ fn a_key_no_notation_names_never_reaches_the_chat_behind_a_focused_float(code: K
     app.input_box.set_input(HIDDEN_DRAFT);
     app.input_box.buffer.move_to_end();
     let mode = app.state.mode;
-    let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
-    let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+    let (event_tx, mut event_rx) = unbounded_channel::<WinEvent>();
+    let (_cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
     app.float_mgr.open(
         Arc::new(SharedBuf::new()),
         FloatConfig::default(),
@@ -9590,7 +9595,7 @@ fn a_key_no_notation_names_never_reaches_the_chat_behind_a_focused_float(code: K
     assert_eq!(app.input_box.buffer.value(), HIDDEN_DRAFT);
     assert_eq!(app.state.mode, mode);
     assert!(
-        !event_rx.drain().any(|e| matches!(e, WinEvent::Key { .. })),
+        !iter::from_fn(|| event_rx.try_recv().ok()).any(|e| matches!(e, WinEvent::Key { .. })),
         "a key no notation names has no event to send"
     );
 }
@@ -9607,9 +9612,9 @@ const CLAIM_NOT_DELIVERED: &str = "the popup must not be handed a key it never c
 fn open_claiming_popup_keys(
     app: &mut App,
     keys: &[(KeyCode, KeyModifiers)],
-) -> (flume::Receiver<WinEvent>, flume::Sender<WinCommand>) {
-    let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
-    let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+) -> (UnboundedReceiver<WinEvent>, UnboundedSender<WinCommand>) {
+    let (event_tx, event_rx) = unbounded_channel::<WinEvent>();
+    let (cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
     let config = FloatConfig {
         keys: keys.iter().map(|(c, m)| plugin_key(*c, *m)).collect(),
         ..FloatConfig::default()
@@ -9624,12 +9629,12 @@ fn open_claiming_popup(
     app: &mut App,
     key: KeyCode,
     modifiers: KeyModifiers,
-) -> (flume::Receiver<WinEvent>, flume::Sender<WinCommand>) {
+) -> (UnboundedReceiver<WinEvent>, UnboundedSender<WinCommand>) {
     open_claiming_popup_keys(app, &[(key, modifiers)])
 }
 
-fn took_a_key(events: &flume::Receiver<WinEvent>) -> bool {
-    events.drain().any(|e| matches!(e, WinEvent::Key { .. }))
+fn took_a_key(events: &mut UnboundedReceiver<WinEvent>) -> bool {
+    iter::from_fn(|| events.try_recv().ok()).any(|e| matches!(e, WinEvent::Key { .. }))
 }
 
 /// The gap every layer, scope and priority rule existed to close: a popup the
@@ -9639,14 +9644,14 @@ fn took_a_key(events: &flume::Receiver<WinEvent>) -> bool {
 fn a_key_an_unfocused_popup_claimed_never_reaches_the_chat_input() {
     const TYPED: char = '@';
     let mut app = test_app();
-    let (events, _cmd_tx) = open_claiming_popup(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    let (mut events, _cmd_tx) = open_claiming_popup(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
     app.update(Msg::Key(key(KeyCode::Char(TYPED))));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
 
     assert!(actions.is_empty(), "no turn was sent");
     assert_eq!(app.input_box.buffer.value(), TYPED.to_string());
-    assert!(took_a_key(&events), "{CLAIM_DELIVERED}");
+    assert!(took_a_key(&mut events), "{CLAIM_DELIVERED}");
 }
 
 /// Everything the popup did not claim is still the chat input's, which is the
@@ -9655,12 +9660,12 @@ fn a_key_an_unfocused_popup_claimed_never_reaches_the_chat_input() {
 fn a_key_no_popup_claimed_still_reaches_the_chat_input() {
     const TYPED: char = 'a';
     let mut app = test_app();
-    let (events, _cmd_tx) = open_claiming_popup(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    let (mut events, _cmd_tx) = open_claiming_popup(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
     app.update(Msg::Key(key(KeyCode::Char(TYPED))));
 
     assert_eq!(app.input_box.buffer.value(), TYPED.to_string());
-    assert!(!took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
+    assert!(!took_a_key(&mut events), "{CLAIM_NOT_DELIVERED}");
 }
 
 /// A claim is not a priority. The popup is up while the user works under it,
@@ -9675,7 +9680,7 @@ fn a_modal_opened_over_a_popup_outranks_the_keys_it_claimed() {
         (KeyCode::Enter, KeyModifiers::NONE),
         (KeyCode::Esc, KeyModifiers::NONE),
     ];
-    let (events, _cmd_tx) = open_claiming_popup_keys(&mut app, &claims);
+    let (mut events, _cmd_tx) = open_claiming_popup_keys(&mut app, &claims);
 
     app.update(Msg::Key(kb::FILE_PICKER.to_key_event()));
     assert!(
@@ -9684,11 +9689,11 @@ fn a_modal_opened_over_a_popup_outranks_the_keys_it_claimed() {
     );
 
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(!took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
+    assert!(!took_a_key(&mut events), "{CLAIM_NOT_DELIVERED}");
 
     app.file_picker.close();
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(took_a_key(&events), "{CLAIM_DELIVERED}");
+    assert!(took_a_key(&mut events), "{CLAIM_DELIVERED}");
 }
 
 /// The command palette is one of those overlays, so it is answered with the
@@ -9703,7 +9708,7 @@ fn the_command_palette_outranks_the_keys_a_popup_claimed() {
         (KeyCode::Enter, KeyModifiers::NONE),
         (KeyCode::Tab, KeyModifiers::NONE),
     ];
-    let (events, _cmd_tx) = open_claiming_popup_keys(&mut app, &claims);
+    let (mut events, _cmd_tx) = open_claiming_popup_keys(&mut app, &claims);
 
     type_slash(&mut app);
     app.update(Msg::Key(key(KeyCode::Char('n'))));
@@ -9720,7 +9725,7 @@ fn the_command_palette_outranks_the_keys_a_popup_claimed() {
         matches!(&actions[0], Action::RestartAgent(h) if h.is_empty()),
         "Enter ran the command the user was typing"
     );
-    assert!(!took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
+    assert!(!took_a_key(&mut events), "{CLAIM_NOT_DELIVERED}");
 }
 
 /// What bounds a claim, and why there is nothing to release: the list lives on
@@ -9795,12 +9800,12 @@ fn a_popup_claiming_esc_closes_before_the_streaming_cancel_is_armed() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
-    let (events, cmd_tx) = open_claiming_popup(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    let (mut events, cmd_tx) = open_claiming_popup(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
 
     assert!(actions.is_empty(), "the popup took the Esc");
-    assert!(took_a_key(&events), "{CLAIM_DELIVERED}");
+    assert!(took_a_key(&mut events), "{CLAIM_DELIVERED}");
     assert_eq!(app.status, Status::Streaming);
     assert!(
         app.last_esc.is_none(),
@@ -10824,8 +10829,8 @@ fn open_split_window(app: &mut App, dir: maki_lua::Split) {
         split: dir,
         ..maki_lua::FloatConfig::default()
     };
-    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
-    let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    let (event_tx, _event_rx) = unbounded_channel::<maki_lua::WinEvent>();
+    let (_cmd_tx, cmd_rx) = unbounded_channel::<maki_lua::WinCommand>();
     app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
 }
 
@@ -10837,8 +10842,8 @@ fn attention_float_marks_app_as_awaiting_input_until_close() {
         needs_input: true,
         ..maki_lua::FloatConfig::default()
     };
-    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
-    let (cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    let (event_tx, _event_rx) = unbounded_channel::<maki_lua::WinEvent>();
+    let (cmd_tx, cmd_rx) = unbounded_channel::<maki_lua::WinCommand>();
 
     app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
     assert!(app.awaiting_input());
@@ -10881,8 +10886,8 @@ fn split_question_keeps_transcript_selectable_and_keyboard_focus(dir: Split) {
         needs_input: true,
         ..FloatConfig::default()
     };
-    let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
-    let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+    let (event_tx, mut event_rx) = unbounded_channel::<WinEvent>();
+    let (_cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
     app.float_mgr
         .open(Arc::new(SharedBuf::new()), config, true, event_tx, cmd_rx);
 
@@ -10931,8 +10936,7 @@ fn split_question_keeps_transcript_selectable_and_keyboard_focus(dir: Split) {
 
     app.update(Msg::Key(key(KeyCode::Char('j'))));
     assert!(
-        event_rx
-            .try_iter()
+        iter::from_fn(|| event_rx.try_recv().ok())
             .any(|event| matches!(event, WinEvent::Key { key } if key == plugin_key(KeyCode::Char('j'), KeyModifiers::NONE)))
     );
     assert!(app.input_box.is_empty());
@@ -11100,11 +11104,11 @@ fn stop_in_its_tab(app: &mut App) {
 fn an_ended_task_lets_go_of_its_answer_sender(setup: fn(&mut App), end: fn(&mut App)) {
     let (mut app, sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
     setup(&mut app);
-    assert!(!sub_rx.is_disconnected());
+    assert!(!sub_rx.is_closed());
 
     end(&mut app);
 
-    assert!(sub_rx.is_disconnected());
+    assert!(sub_rx.is_closed());
 }
 
 #[test]
@@ -11628,7 +11632,7 @@ fn loading_a_session_stamps_its_restores_as_a_load_of_that_session() {
         .save(&SessionClaim::acquire(stored.id, &dir).unwrap(), &dir)
         .unwrap();
     let probe = probe_events(&mut app);
-    app.restore_event_tx = Some(maki_agent::EventSender::new(flume::unbounded().0, 0));
+    app.restore_event_tx = Some(maki_agent::EventSender::new(unbounded_channel().0, 0));
 
     load_session(&mut app, stored.id, &test_model());
 
@@ -11648,7 +11652,7 @@ fn reset_session_stamps_the_new_main_chat_with_the_new_session() {
     let mut app = test_app();
     let previous = app.state.session.id;
     let probe = probe_events(&mut app);
-    app.restore_event_tx = Some(maki_agent::EventSender::new(flume::unbounded().0, 0));
+    app.restore_event_tx = Some(maki_agent::EventSender::new(unbounded_channel().0, 0));
     let (_, items) = crate::chat::history_to_display(
         &[
             tool_use_msg(SUB_TOOL_ID),
@@ -13052,7 +13056,7 @@ fn an_adopted_subagents_events_outlive_its_run() {
 /// after the turn ended still gets its answer, and the main agent none.
 #[test]
 fn a_moved_subagent_asking_after_its_turn_ended_gets_its_answer() {
-    let (mut app, sub_rx, main_rx) = app_with_subagent_tx(TASK_ID);
+    let (mut app, mut sub_rx, main_rx) = app_with_subagent_tx(TASK_ID);
     receive_receipt(&mut app);
     end_turn(&mut app);
 
@@ -13078,7 +13082,7 @@ fn a_moved_subagent_asking_after_its_turn_ended_gets_its_answer() {
 /// on one: the prompt takes the keys first, Esc included.
 #[test]
 fn esc_cannot_cancel_the_turn_over_a_moved_subagents_ask() {
-    let (mut app, sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
+    let (mut app, mut sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
     receive_receipt(&mut app);
     moved_subagent_event(
         &mut app,
@@ -13198,7 +13202,7 @@ fn a_task_call_moved_before_its_subagent_spoke_gets_a_full_tab(
     app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
     app.update(agent_msg(moved_done(MOVED_ID)));
     let control = Arc::new(SessionControl::default());
-    let (answer_tx, _answer_rx) = flume::unbounded();
+    let (answer_tx, _answer_rx) = unbounded_channel();
     let mut info = subagent_info_with_tx(MOVED_ID, RESEARCH_NAME, Some(answer_tx));
     info.model = Some(MOVED_MODEL.into());
     info.opts = Some(MOVED_OPTS);
@@ -13569,13 +13573,13 @@ fn clicking_a_moved_row_whose_tab_is_gone_takes_the_rows_own_click() {
 
 /// A `task` call moved off its turn, whose subagent asks the user through a
 /// channel of its own.
-fn app_with_moved_subagent() -> (App, flume::Receiver<String>, flume::Receiver<String>) {
+fn app_with_moved_subagent() -> (App, UnboundedReceiver<String>, UnboundedReceiver<String>) {
     let mut app = streaming_app();
-    let (main_tx, main_rx) = flume::unbounded();
+    let (main_tx, main_rx) = unbounded_channel();
     app.answer_tx = Some(main_tx);
     app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
     app.update(agent_msg(moved_done(MOVED_ID)));
-    let (answer_tx, answer_rx) = flume::unbounded();
+    let (answer_tx, answer_rx) = unbounded_channel();
     speak_after_the_move(
         &mut app,
         subagent_info_with_tx(MOVED_ID, RESEARCH_NAME, Some(answer_tx)),
@@ -13588,7 +13592,7 @@ fn app_with_moved_subagent() -> (App, flume::Receiver<String>, flume::Receiver<S
 #[test_case(false ; "enter")]
 #[test_case(true  ; "esc_then_enter")]
 fn one_enter_retries_every_run_parked_on_auth(esc_first: bool) {
-    let (mut app, sub_rx, main_rx) = app_with_moved_subagent();
+    let (mut app, mut sub_rx, mut main_rx) = app_with_moved_subagent();
     app.update(agent_msg(AgentEvent::AuthRequired));
     moved_subagent_event(&mut app, MOVED_ID, AgentEvent::AuthRequired);
     let tab = app.chat_of_task(MOVED_ID).unwrap();
@@ -13611,7 +13615,7 @@ fn one_enter_retries_every_run_parked_on_auth(esc_first: bool) {
 /// user's, sent as usual on top of the retry.
 #[test]
 fn a_task_awaiting_auth_lets_the_main_chat_go_on() {
-    let (mut app, sub_rx, _main_rx) = app_with_moved_subagent();
+    let (mut app, mut sub_rx, _main_rx) = app_with_moved_subagent();
     end_turn(&mut app);
     moved_subagent_event(&mut app, MOVED_ID, AgentEvent::AuthRequired);
 
@@ -13666,7 +13670,7 @@ fn a_finished_subagent_late_auth_ask_never_parks() {
 #[test]
 fn a_plugin_task_nobody_can_answer_gets_no_auth_retry() {
     let mut app = app_with_plugin_task();
-    let (main_tx, main_rx) = flume::unbounded();
+    let (main_tx, main_rx) = unbounded_channel();
     app.answer_tx = Some(main_tx);
 
     plugin_event(&mut app, AgentEvent::AuthRequired);

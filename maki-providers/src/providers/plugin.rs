@@ -4,8 +4,8 @@ use std::future::Future;
 use std::iter;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use tokio::sync::mpsc::unbounded_channel;
 
-use flume::Sender;
 use maki_config::host_allowed;
 use maki_config::providers::{Protocol, ProvidersConfig, base_url_override, plan_base_url};
 use maki_storage::StateDir;
@@ -14,6 +14,7 @@ use maki_storage::id::SessionRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
@@ -1238,7 +1239,7 @@ impl Provider for PluginProvider {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -1254,7 +1255,7 @@ impl Provider for PluginProvider {
                     // channel that already delivered part of the answer would
                     // duplicate text in the UI and, after a cancel, in the
                     // history.
-                    let (tx, rx) = flume::unbounded();
+                    let (tx, mut rx) = unbounded_channel();
                     let attempt = async {
                         let result = self
                             .inner
@@ -1265,9 +1266,9 @@ impl Provider for PluginProvider {
                     };
                     let forward = async move {
                         let mut forwarded = false;
-                        while let Ok(ev) = rx.recv_async().await {
+                        while let Some(ev) = rx.recv().await {
                             forwarded = true;
-                            if event_tx.send_async(ev).await.is_err() {
+                            if event_tx.send(ev).is_err() {
                                 break;
                             }
                         }
@@ -1642,6 +1643,8 @@ mod tests {
     use std::borrow::Cow;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
+    use tokio::sync::Notify;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use futures::FutureExt;
     use maki_config::providers::base_url_env_var;
@@ -1809,16 +1812,16 @@ mod tests {
     /// Says when it has started, then holds on until released, so a test can
     /// drop the caller while the hook is known to be mid-flight.
     struct ParkedAuth {
-        entered: flume::Sender<()>,
-        released: flume::Receiver<()>,
+        entered: Notify,
+        released: Notify,
         calls: AtomicUsize,
     }
 
     impl Hook<AuthPurpose, PluginAuth> for ParkedAuth {
         fn call(&self, _purpose: AuthPurpose) -> BoxFuture<'_, Result<PluginAuth, AgentError>> {
             Box::pin(async move {
-                let _ = self.entered.send(());
-                let _ = self.released.recv_async().await;
+                self.entered.notify_one();
+                self.released.notified().await;
                 self.calls.fetch_add(1, Ordering::AcqRel);
                 Ok(PluginAuth {
                     base_url: None,
@@ -1854,7 +1857,7 @@ mod tests {
             _messages: &'a [Message],
             _system: &'a str,
             _tools: &'a Value,
-            _event_tx: &'a Sender<ProviderEvent>,
+            _event_tx: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -2332,11 +2335,9 @@ mod tests {
     #[tokio::test]
     async fn a_refresh_outlives_the_caller_that_started_it() {
         const MINT_DROPPED: &str = "what the abandoned refresh minted never landed";
-        let (entered_tx, entered) = flume::bounded(1);
-        let (release, released) = flume::bounded(1);
         let hook = Arc::new(ParkedAuth {
-            entered: entered_tx,
-            released,
+            entered: Notify::new(),
+            released: Notify::new(),
             calls: AtomicUsize::new(0),
         });
         let entry = entry_with(ProviderHooks {
@@ -2346,8 +2347,8 @@ mod tests {
 
         let abandoned = entry.run_auth(AuthPurpose::Refresh).now_or_never();
         assert!(abandoned.is_none());
-        entered.recv_async().await.unwrap();
-        release.send(()).unwrap();
+        hook.entered.notified().await;
+        hook.released.notify_one();
         let _gate = entry.auth.gate.lock.lock().await;
 
         assert_eq!(hook.calls.load(Ordering::Acquire), 1, "{ONE_HOOK_CALL}");
@@ -2393,7 +2394,7 @@ mod tests {
         let provider = create(slug, Timeouts::default()).unwrap();
         let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
         let messages = [Message::user(PROMPT.to_owned())];
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let result = provider
             .stream_message(
                 &model,
@@ -2440,7 +2441,7 @@ mod tests {
 
         let provider = create(slug, Timeouts::default()).unwrap();
         let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let _ = provider
             .stream_message(
                 &model,
@@ -2490,7 +2491,7 @@ mod tests {
         let provider = create(slug, Timeouts::default()).unwrap();
         let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
         let session = SessionRef::generate();
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let _ = provider
             .stream_message(
                 &model,
