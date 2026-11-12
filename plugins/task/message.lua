@@ -25,7 +25,7 @@ maki.api.register_tool({
     },
   },
   header = function(input)
-    return input.id
+    return input.message
   end,
   -- A restore hook that returns nothing would also drop the restored header.
   restore = function()
