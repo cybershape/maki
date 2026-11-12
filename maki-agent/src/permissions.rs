@@ -1390,6 +1390,18 @@ mod tests {
         format!("{}{}", path.display(), "/..".repeat(normal_depth(path)))
     }
 
+    /// A tempdir whose canonical path is itself: on macOS `tempdir()` lands
+    /// under the `/var` -> `/private/var` symlink, and a test that counts `..`
+    /// against the spelled path would climb one level short of the root.
+    #[cfg(unix)]
+    fn canonical_tempdir() -> tempfile::TempDir {
+        let probe = tempfile::tempdir().unwrap();
+        let canonical = probe.path().canonicalize().unwrap();
+        tempfile::Builder::new()
+            .tempdir_in(canonical.parent().unwrap())
+            .unwrap()
+    }
+
     #[test_case("*" ; "star")]
     #[test_case("**" ; "double_star")]
     #[test_case("/*" ; "root_star")]
@@ -1413,7 +1425,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn lexical_root_through_symlink_is_refused_but_grants_only_its_subtree() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         let real = dir.path().join("a/b/c/d");
         std::fs::create_dir_all(&real).unwrap();
         let link = dir.path().join("link");
@@ -1421,8 +1433,21 @@ mod tests {
         let pattern = format!("{}/**", climb_to_lexical_root(&link));
 
         assert!(is_universal_scope(&pattern), "{pattern}");
+        // The climb lands inside the temp root, never at the filesystem root:
+        // that is what makes the allow a subtree grant instead of everything.
+        // Where exactly it lands depends on the temp root's depth, and the
+        // isolated test home may sit inside it, so "outside" is measured
+        // against the landing dir rather than assumed.
+        let landing = normalize_scope_prefix(pattern.strip_suffix("/**").unwrap());
+        assert!(landing.parent().is_some(), "{landing:?}");
+        assert!(dir.path().starts_with(&landing), "{landing:?}");
         for scope in OUTSIDE_SCOPES {
-            assert!(!scope_matches(&pattern, scope), "{pattern} matched {scope}");
+            let outside = !normalize_scope_prefix(scope).starts_with(&landing);
+            assert_eq!(
+                scope_matches(&pattern, scope),
+                !outside,
+                "{pattern} vs {scope}"
+            );
         }
         for (rule, expected) in [
             (allow_rule(&pattern), PROMPTS),
@@ -1442,7 +1467,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn write_rule_through_pnpm_symlink_stays_in_landing_dir() {
-        let project = tempfile::tempdir().unwrap();
+        let project = canonical_tempdir();
         let link = project.path().join("node_modules/react");
         let store = project
             .path()
