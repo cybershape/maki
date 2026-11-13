@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 use super::scrollbar::{self, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
 use super::thinking;
+use maki_agent::tools::BASH_TOOL_NAME;
 use maki_agent::{
     BufWatch, BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND,
     SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
@@ -497,6 +498,83 @@ impl MessagesPanel {
 
     pub fn tool_start(&mut self, event: ToolStartEvent) {
         if self.compact_tools {
+            if tool_group::is_background_bash(&event.tool, event.raw_input.as_ref()) {
+                let mut removed_from_group = None;
+                for msg in self.messages.iter_mut().rev() {
+                    if let DisplayRole::ToolGroup(g) = &mut msg.role
+                        && let Some(pos) = g.entries.iter().position(|e| match e {
+                            GroupEntry::Tool(t) => t.id == event.id,
+                            _ => false,
+                        })
+                    {
+                        g.entries.remove(pos);
+                        removed_from_group = Some(g.id.clone());
+                        break;
+                    }
+                }
+
+                if let Some(DisplayMessage {
+                    role: DisplayRole::ToolGroup(g),
+                    ..
+                }) = self.messages.last()
+                    && !g.sealed
+                    && g.entries.is_empty()
+                {
+                    self.messages.pop();
+                    self.cache.clear();
+                } else if let Some(DisplayMessage {
+                    role: DisplayRole::ToolGroup(g),
+                    ..
+                }) = self.messages.last_mut()
+                    && !g.sealed
+                {
+                    if let Some(GroupEntry::Thinking(th)) = g.entries.last_mut()
+                        && th.active
+                    {
+                        th.active = false;
+                        if th.duration.is_none() {
+                            th.duration = th.started_at.map(|st| st.elapsed());
+                        }
+                    }
+                    g.sealed = true;
+                    let gid = g.id.clone();
+                    self.rebuild_tool_group_segment(&gid);
+                } else if let Some(gid) = removed_from_group {
+                    self.rebuild_tool_group_segment(&gid);
+                }
+
+                if let Some(msg) = self.find_tool_msg_mut(&event.id) {
+                    if let DisplayRole::Tool(t) = &mut msg.role {
+                        t.name = Arc::clone(&event.tool);
+                    }
+                    msg.text = event.summary;
+                    msg.tool_input = event.input.map(Arc::new);
+                    msg.tool_raw_input = event.raw_input.map(Arc::new);
+                    msg.tool_output = event.output.map(Arc::new);
+                    msg.annotation = event.annotation;
+                    msg.render_header = event.render_header;
+                    self.rebuild_tool_segment(&event.id);
+                    return;
+                }
+                self.flush();
+                let mut msg = DisplayMessage::new(
+                    DisplayRole::Tool(Box::new(ToolRole {
+                        id: event.id,
+                        status: ToolStatus::InProgress,
+                        name: Arc::clone(&event.tool),
+                    })),
+                    event.summary,
+                );
+                msg.tool_input = event.input.map(Arc::new);
+                msg.tool_raw_input = event.raw_input.map(Arc::new);
+                msg.tool_output = event.output.map(Arc::new);
+                msg.annotation = event.annotation;
+                msg.render_header = event.render_header;
+                msg.timestamp = Some(format_timestamp_now(self.clock_format));
+                self.messages.push(msg);
+                return;
+            }
+
             let summary = tool_group::format_compact_summary(
                 &event.tool,
                 event.raw_input.as_ref(),
@@ -678,56 +756,101 @@ impl MessagesPanel {
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
         if self.compact_tools {
-            let mut found_group = None;
-            for msg in self.messages.iter_mut().rev() {
-                if let DisplayRole::ToolGroup(g) = &mut msg.role
-                    && let Some(entry) = g.entries.iter_mut().find_map(|e| match e {
-                        GroupEntry::Tool(t) if t.id == event.id => Some(t),
-                        _ => None,
-                    })
-                {
-                    entry.status = if event.is_error {
-                        ToolStatus::Error
-                    } else {
-                        ToolStatus::Success
-                    };
-                    entry.receiving_args = false;
-                    if let Some(detail) = &mut entry.detail {
-                        detail.output = Some(Arc::clone(&event.output));
-                        detail.live_output = None;
-                        if let Some(note) = event
-                            .annotation
-                            .as_deref()
-                            .map(str::to_owned)
-                            .or_else(|| event.output.annotation())
-                        {
-                            append_annotation(&mut detail.annotation, &note);
-                        }
-                    }
-                    let dur = event
-                        .call
-                        .as_ref()
-                        .map(|c| {
-                            c.duration
-                                .max(entry.started_at.map_or(Duration::ZERO, |st| st.elapsed()))
+            if event.backgrounded && event.tool.as_ref() == BASH_TOOL_NAME {
+                let mut removed = false;
+                for msg in self.messages.iter_mut().rev() {
+                    if let DisplayRole::ToolGroup(g) = &mut msg.role
+                        && let Some(pos) = g.entries.iter().position(|e| match e {
+                            GroupEntry::Tool(t) => t.id == event.id,
+                            _ => false,
                         })
-                        .or_else(|| entry.started_at.map(|st| st.elapsed()));
-                    entry.duration = dur;
-                    let all_done = g.entries.iter().all(|e| match e {
-                        GroupEntry::Tool(t) => t.status != ToolStatus::InProgress,
-                        GroupEntry::Thinking(th) => !th.active,
-                    });
-                    if all_done {
-                        g.waiting_since = Some(Instant::now());
+                    {
+                        g.entries.remove(pos);
+                        let gid = g.id.clone();
+                        if g.entries.is_empty() {
+                            removed = true;
+                        } else {
+                            g.sealed = true;
+                            self.rebuild_tool_group_segment(&gid);
+                        }
+                        break;
                     }
-                    found_group = Some(g.id.clone());
-                    break;
                 }
-            }
-            if let Some(gid) = found_group {
-                self.sync_buf(&event.id);
-                self.rebuild_tool_group_segment(&gid);
-                return;
+                if removed
+                    && let Some(DisplayMessage {
+                        role: DisplayRole::ToolGroup(g),
+                        ..
+                    }) = self.messages.last()
+                    && !g.sealed
+                    && g.entries.is_empty()
+                {
+                    self.messages.pop();
+                    self.cache.clear();
+                }
+                if self.find_tool_msg(&event.id).is_none() {
+                    let mut msg = DisplayMessage::new(
+                        DisplayRole::Tool(Box::new(ToolRole {
+                            id: event.id.clone(),
+                            status: ToolStatus::InProgress,
+                            name: Arc::clone(&event.tool),
+                        })),
+                        String::new(),
+                    );
+                    msg.timestamp = Some(format_timestamp_now(self.clock_format));
+                    self.messages.push(msg);
+                }
+            } else {
+                let mut found_group = None;
+                for msg in self.messages.iter_mut().rev() {
+                    if let DisplayRole::ToolGroup(g) = &mut msg.role
+                        && let Some(entry) = g.entries.iter_mut().find_map(|e| match e {
+                            GroupEntry::Tool(t) if t.id == event.id => Some(t),
+                            _ => None,
+                        })
+                    {
+                        entry.status = if event.is_error {
+                            ToolStatus::Error
+                        } else {
+                            ToolStatus::Success
+                        };
+                        entry.receiving_args = false;
+                        if let Some(detail) = &mut entry.detail {
+                            detail.output = Some(Arc::clone(&event.output));
+                            detail.live_output = None;
+                            if let Some(note) = event
+                                .annotation
+                                .as_deref()
+                                .map(str::to_owned)
+                                .or_else(|| event.output.annotation())
+                            {
+                                append_annotation(&mut detail.annotation, &note);
+                            }
+                        }
+                        let dur = event
+                            .call
+                            .as_ref()
+                            .map(|c| {
+                                c.duration
+                                    .max(entry.started_at.map_or(Duration::ZERO, |st| st.elapsed()))
+                            })
+                            .or_else(|| entry.started_at.map(|st| st.elapsed()));
+                        entry.duration = dur;
+                        let all_done = g.entries.iter().all(|e| match e {
+                            GroupEntry::Tool(t) => t.status != ToolStatus::InProgress,
+                            GroupEntry::Thinking(th) => !th.active,
+                        });
+                        if all_done {
+                            g.waiting_since = Some(Instant::now());
+                        }
+                        found_group = Some(g.id.clone());
+                        break;
+                    }
+                }
+                if let Some(gid) = found_group {
+                    self.sync_buf(&event.id);
+                    self.rebuild_tool_group_segment(&gid);
+                    return;
+                }
             }
         }
         if let Some(msg) = self.find_tool_msg_mut(&event.id) {

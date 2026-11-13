@@ -3,6 +3,7 @@ use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use maki_agent::tools::schema::TOOLCALL_REASON_FIELD;
+use maki_agent::tools::BASH_TOOL_NAME;
 use maki_agent::{BufferSnapshot, SpanStyle};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -303,6 +304,17 @@ pub fn format_compact_summary(
         }
         _ => reason.to_string(),
     }
+}
+
+pub fn is_background_bash(tool: &str, raw_input: Option<&Value>) -> bool {
+    if tool != BASH_TOOL_NAME {
+        return false;
+    }
+    raw_input.is_some_and(|input| {
+        input.get("background").is_some_and(|val| {
+            val.as_bool() == Some(true) || val.as_str() == Some("true")
+        })
+    })
 }
 
 pub fn update_batch_compact_summary(current_summary: &str, count: usize) -> String {
@@ -1860,5 +1872,30 @@ mod tests {
             Some("cargo error: unresolved".to_string())
         );
         assert_eq!(extract_batch_child_output(batch_output, 2), None);
+    }
+
+    #[test]
+    fn test_is_background_bash() {
+        assert!(is_background_bash(
+            "bash",
+            Some(&serde_json::json!({"command": "cargo check", "background": true}))
+        ));
+        assert!(is_background_bash(
+            "bash",
+            Some(&serde_json::json!({"command": "cargo check", "background": "true"}))
+        ));
+        assert!(!is_background_bash(
+            "bash",
+            Some(&serde_json::json!({"command": "cargo check", "background": false}))
+        ));
+        assert!(!is_background_bash(
+            "bash",
+            Some(&serde_json::json!({"command": "cargo check"}))
+        ));
+        assert!(!is_background_bash("bash", None));
+        assert!(!is_background_bash(
+            "read",
+            Some(&serde_json::json!({"path": "foo.rs", "background": true}))
+        ));
     }
 }

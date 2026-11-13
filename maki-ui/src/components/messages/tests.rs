@@ -4563,3 +4563,152 @@ fn scrollbar_sits_on_the_theme_window_background() {
         );
     }
 }
+
+#[test]
+fn compact_tools_background_bash_seals_group_and_renders_standalone() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    panel.tool_pending("c1".into(), "read");
+    panel.tool_start(start("c1", "read"));
+    panel.tool_done(done("c1"));
+
+    panel.tool_pending("c2".into(), "bash");
+    let mut ev_bg = start("c2", "bash");
+    ev_bg.raw_input = Some(serde_json::json!({"command": "cargo test", "background": true}));
+    panel.tool_start(ev_bg);
+    panel.tool_done(ToolDoneEvent {
+        backgrounded: true,
+        ..done("c2")
+    });
+
+    panel.tool_pending("c3".into(), "read");
+    panel.tool_start(start("c3", "read"));
+    panel.tool_done(done("c3"));
+
+    assert_eq!(panel.messages.len(), 3);
+
+    let DisplayRole::ToolGroup(g1) = &panel.messages[0].role else {
+        panic!("expected ToolGroup in messages[0]");
+    };
+    assert!(g1.sealed);
+    assert_eq!(g1.entries.len(), 1);
+    assert!(matches!(&g1.entries[0], GroupEntry::Tool(t) if t.id == "c1"));
+
+    let DisplayRole::Tool(t) = &panel.messages[1].role else {
+        panic!("expected Tool in messages[1]");
+    };
+    assert_eq!(t.id, "c2");
+    assert_eq!(t.name.as_ref(), "bash");
+    assert!(panel.messages[1].background.is_some());
+
+    let DisplayRole::ToolGroup(g2) = &panel.messages[2].role else {
+        panic!("expected ToolGroup in messages[2]");
+    };
+    assert!(!g2.sealed);
+    assert_eq!(g2.entries.len(), 1);
+    assert!(matches!(&g2.entries[0], GroupEntry::Tool(t) if t.id == "c3"));
+}
+
+#[test]
+fn compact_tools_background_bash_with_empty_group_drops_empty_group() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    panel.ensure_active_group();
+    panel.tool_pending("c1".into(), "bash");
+    let mut ev = start("c1", "bash");
+    ev.raw_input = Some(serde_json::json!({"command": "sleep 10", "background": true}));
+    panel.tool_start(ev);
+
+    assert_eq!(panel.messages.len(), 1);
+    let DisplayRole::Tool(t) = &panel.messages[0].role else {
+        panic!("expected standalone Tool in messages[0]");
+    };
+    assert_eq!(t.id, "c1");
+    assert_eq!(t.name.as_ref(), "bash");
+}
+
+#[test]
+fn compact_tools_background_bash_preserves_prior_thinking() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    panel.thinking_delta("running task in background");
+    panel.tool_pending("c1".into(), "bash");
+    let mut ev = start("c1", "bash");
+    ev.raw_input = Some(serde_json::json!({"command": "cargo check", "background": true}));
+    panel.tool_start(ev);
+
+    assert_eq!(panel.messages.len(), 2);
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!("expected ToolGroup in messages[0]");
+    };
+    assert!(g.sealed);
+    assert_eq!(g.entries.len(), 1);
+    assert!(matches!(&g.entries[0], GroupEntry::Thinking(th) if !th.active));
+
+    let DisplayRole::Tool(t) = &panel.messages[1].role else {
+        panic!("expected standalone Tool in messages[1]");
+    };
+    assert_eq!(t.id, "c1");
+    assert_eq!(t.name.as_ref(), "bash");
+}
+
+#[test]
+fn compact_tools_consecutive_background_bash_renders_individual_standalone_rows() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    let mut ev1 = start("c1", "bash");
+    ev1.raw_input = Some(serde_json::json!({"command": "cmd1", "background": true}));
+    panel.tool_start(ev1);
+
+    let mut ev2 = start("c2", "bash");
+    ev2.raw_input = Some(serde_json::json!({"command": "cmd2", "background": true}));
+    panel.tool_start(ev2);
+
+    panel.tool_start(start("c3", "read"));
+
+    assert_eq!(panel.messages.len(), 3);
+    assert!(matches!(&panel.messages[0].role, DisplayRole::Tool(t) if t.id == "c1"));
+    assert!(matches!(&panel.messages[1].role, DisplayRole::Tool(t) if t.id == "c2"));
+    let DisplayRole::ToolGroup(g) = &panel.messages[2].role else {
+        panic!("expected ToolGroup in messages[2]");
+    };
+    assert_eq!(g.entries.len(), 1);
+}
+
+#[test]
+fn compact_tools_dynamically_backgrounded_bash_in_tool_done_extracts_standalone() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    panel.tool_start(start("c1", "bash"));
+    panel.tool_done(ToolDoneEvent {
+        backgrounded: true,
+        ..done("c1")
+    });
+
+    assert_eq!(panel.messages.len(), 1);
+    let DisplayRole::Tool(t) = &panel.messages[0].role else {
+        panic!("expected standalone Tool in messages[0]");
+    };
+    assert_eq!(t.id, "c1");
+    assert!(panel.messages[0].background.is_some());
+}

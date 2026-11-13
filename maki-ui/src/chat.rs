@@ -993,7 +993,11 @@ pub fn history_to_display(
                                     reason: maki_lua::RestoreReason::Load,
                                 });
                             }
-                            if compact_tools {
+                            let is_bg_bash = crate::components::tool_group::is_background_bash(
+                                static_name,
+                                Some(input),
+                            );
+                            if compact_tools && !is_bg_bash {
                                 let summary = crate::components::tool_group::format_compact_summary(
                                     static_name,
                                     Some(input),
@@ -1041,6 +1045,9 @@ pub fn history_to_display(
                                     String::new(),
                                 ));
                                 continue;
+                            }
+                            if is_bg_bash {
+                                seal_last_group(&mut display);
                             }
                             display.push(DisplayMessage {
                                 role: DisplayRole::Tool(Box::new(ToolRole {
@@ -2179,6 +2186,104 @@ mod tests {
         assert_eq!(g.total_duration(), std::time::Duration::from_millis(150));
         assert_eq!(display[2].role, DisplayRole::Assistant);
         assert_eq!(display[2].text, "all passed");
+    }
+
+    #[test]
+    fn history_compact_tools_background_bash_renders_standalone_and_splits_groups() {
+        let msgs = vec![
+            Message::user("run build and tests".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "thinking step".into(),
+                        signature: None,
+                        duration_ms: None,
+                    },
+                    ContentBlock::tool_use(
+                        "t1",
+                        "read",
+                        serde_json::json!({"path": "src/lib.rs"}),
+                    ),
+                ],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result("t1", "code", false)],
+                ..Default::default()
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    "t2",
+                    "bash",
+                    serde_json::json!({
+                        "command": "cargo test",
+                        "background": true
+                    }),
+                )],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result(
+                    "t2",
+                    "Running in the background.",
+                    false,
+                )],
+                ..Default::default()
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    "t3",
+                    "read",
+                    serde_json::json!({"path": "Cargo.toml"}),
+                )],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result("t3", "[package]", false)],
+                ..Default::default()
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "all dispatched".into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let outputs = HashMap::new();
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true).0;
+        assert_eq!(display.len(), 5);
+        assert_eq!(display[0].role, DisplayRole::User);
+
+        let DisplayRole::ToolGroup(g1) = &display[1].role else {
+            panic!("expected ToolGroup in display[1]");
+        };
+        assert!(g1.sealed);
+        assert_eq!(g1.entries.len(), 2);
+        assert!(matches!(&g1.entries[0], GroupEntry::Thinking(_)));
+        assert!(matches!(&g1.entries[1], GroupEntry::Tool(t) if t.name.as_ref() == "read"));
+
+        let DisplayRole::Tool(b) = &display[2].role else {
+            panic!("expected Tool in display[2]");
+        };
+        assert_eq!(b.id, "t2");
+        assert_eq!(b.name.as_ref(), "bash");
+
+        let DisplayRole::ToolGroup(g2) = &display[3].role else {
+            panic!("expected ToolGroup in display[3]");
+        };
+        assert!(g2.sealed);
+        assert_eq!(g2.entries.len(), 1);
+        assert!(matches!(&g2.entries[0], GroupEntry::Tool(t) if t.name.as_ref() == "read"));
+
+        assert_eq!(display[4].role, DisplayRole::Assistant);
+        assert_eq!(display[4].text, "all dispatched");
     }
 
     #[test]
