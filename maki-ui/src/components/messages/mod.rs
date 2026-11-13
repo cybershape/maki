@@ -826,6 +826,12 @@ impl MessagesPanel {
                                 append_annotation(&mut detail.annotation, &note);
                             }
                         }
+                        if entry.name.as_ref() == tool_group::QUESTION_TOOL && !event.is_error {
+                            entry.children = tool_group::question_children(
+                                entry.raw_input.as_ref(),
+                                Some(&event.output),
+                            );
+                        }
                         let dur = event
                             .call
                             .as_ref()
@@ -2158,6 +2164,16 @@ impl MessagesPanel {
                     .detail
                     .get_or_insert_with(CompactDetail::default)
                     .render_snapshot = Some(snapshot.clone());
+                if entry.name.as_ref() == tool_group::QUESTION_TOOL
+                    && entry.children.is_empty()
+                    && let Some(detail) = &entry.detail
+                    && let Some(output) = &detail.output
+                {
+                    entry.children = tool_group::question_children(
+                        entry.raw_input.as_ref(),
+                        Some(output),
+                    );
+                }
                 if entry.name.as_ref() != tool_group::BATCH_TOOL {
                     return Some(group.id.clone());
                 }

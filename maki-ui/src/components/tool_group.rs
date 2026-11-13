@@ -1,10 +1,11 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use maki_agent::tools::schema::TOOLCALL_REASON_FIELD;
 use maki_agent::tools::BASH_TOOL_NAME;
-use maki_agent::{BufferSnapshot, SpanStyle};
+use maki_agent::{BufferSnapshot, SpanStyle, ToolOutput};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
@@ -13,7 +14,9 @@ use crate::theme;
 
 use super::code_view::SectionFlags;
 use super::tool_display::ToolLines;
-use super::{GroupEntry, GroupThinkingEntry, GroupToolEntry, ToolGroupRole, ToolStatus};
+use super::{
+    CompactDetail, GroupEntry, GroupThinkingEntry, GroupToolEntry, ToolGroupRole, ToolStatus,
+};
 
 #[cfg(test)]
 pub const DEFAULT_COMPACT_LINES: usize = maki_config::DEFAULT_COMPACT_LINES;
@@ -22,6 +25,9 @@ const RAIL_LAST: &str = "└  ";
 const CHILD_RAIL_CONTINUE: &str = "├  ";
 const CHILD_INDENT: &str = "   ";
 pub(super) const BATCH_TOOL: &str = "batch";
+pub const QUESTION_TOOL: &str = "question";
+const NO_ANSWER: &str = "(no answer)";
+const DISMISSED_OUTPUT: &str = "(question dismissed by user)";
 const CHILD_PREFIX_STYLE: &str = "tool_prefix";
 const CHILD_SUCCESS_STYLE: &str = "tool_success";
 const CHILD_ERROR_STYLE: &str = "tool_error";
@@ -424,6 +430,164 @@ pub(super) fn batch_children(
             })
         })
         .collect()
+}
+
+pub fn question_children(
+    raw_input: Option<&Value>,
+    output: Option<&ToolOutput>,
+) -> Vec<GroupToolEntry> {
+    let Some(output) = output else {
+        return Vec::new();
+    };
+    if output
+        .state()
+        .and_then(|s| s.get("dismissed"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Vec::new();
+    }
+    let display_text = output.as_display_text();
+    if display_text.trim() == DISMISSED_OUTPUT {
+        return Vec::new();
+    }
+
+    let state_answers = output
+        .state()
+        .and_then(|s| s.get("answers"))
+        .and_then(Value::as_array);
+
+    let fallback_lines: Vec<&str> = display_text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    let questions = raw_input
+        .and_then(|v| v.get("questions"))
+        .and_then(Value::as_array);
+
+    if let Some(questions) = questions
+        && !questions.is_empty()
+    {
+        questions
+            .iter()
+            .enumerate()
+            .map(|(idx, q)| {
+                let header = q
+                    .get("header")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let label = match header {
+                    Some(h) => {
+                        if h.ends_with(':') {
+                            h.to_string()
+                        } else {
+                            format!("{h}:")
+                        }
+                    }
+                    None => format!("Q{}:", idx + 1),
+                };
+
+                let answer = if let Some(answers) = state_answers {
+                    match answers.get(idx) {
+                        Some(Value::Array(arr)) => {
+                            let items: Vec<&str> = arr
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            if items.is_empty() {
+                                NO_ANSWER.to_string()
+                            } else {
+                                items.join(", ")
+                            }
+                        }
+                        Some(Value::String(s)) => {
+                            let trimmed = s.trim();
+                            if trimmed.is_empty() {
+                                NO_ANSWER.to_string()
+                            } else {
+                                trimmed.to_string()
+                            }
+                        }
+                        _ => NO_ANSWER.to_string(),
+                    }
+                } else if let Some(line) = fallback_lines.get(idx) {
+                    if let Some((_, ans)) = line.split_once(": ") {
+                        let trimmed = ans.trim();
+                        if trimmed.is_empty() {
+                            NO_ANSWER.to_string()
+                        } else {
+                            trimmed.to_string()
+                        }
+                    } else {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            NO_ANSWER.to_string()
+                        } else {
+                            trimmed.to_string()
+                        }
+                    }
+                } else {
+                    NO_ANSWER.to_string()
+                };
+
+                GroupToolEntry {
+                    id: String::new(),
+                    name: Arc::from(label),
+                    summary: answer.clone(),
+                    raw_input: Some(q.clone()),
+                    children: Vec::new(),
+                    status: ToolStatus::Success,
+                    receiving_args: false,
+                    started_at: None,
+                    duration: None,
+                    detail: Some(CompactDetail {
+                        raw_input: Some(q.clone()),
+                        output: Some(Arc::new(ToolOutput::Plain(answer.into()))),
+                        ..CompactDetail::default()
+                    }),
+                }
+            })
+            .collect()
+    } else {
+        fallback_lines
+            .iter()
+            .filter_map(|line| {
+                let (lbl, ans) = line.split_once(": ")?;
+                let label = if lbl.ends_with(':') {
+                    lbl.to_string()
+                } else {
+                    format!("{lbl}:")
+                };
+                let trimmed = ans.trim();
+                let answer = if trimmed.is_empty() {
+                    NO_ANSWER.to_string()
+                } else {
+                    trimmed.to_string()
+                };
+                Some(GroupToolEntry {
+                    id: String::new(),
+                    name: Arc::from(label),
+                    summary: answer.clone(),
+                    raw_input: None,
+                    children: Vec::new(),
+                    status: ToolStatus::Success,
+                    receiving_args: false,
+                    started_at: None,
+                    duration: None,
+                    detail: Some(CompactDetail {
+                        raw_input: None,
+                        output: Some(Arc::new(ToolOutput::Plain(answer.into()))),
+                        ..CompactDetail::default()
+                    }),
+                })
+            })
+            .collect()
+    }
 }
 
 fn push_tool_rows(
@@ -1897,5 +2061,155 @@ mod tests {
             "read",
             Some(&serde_json::json!({"path": "foo.rs", "background": true}))
         ));
+    }
+
+    #[test]
+    fn question_children_multiple_with_headers_and_state_answers() {
+        let input = serde_json::json!({
+            "questions": [
+                {
+                    "question": "Which breakfast items?",
+                    "header": "Breakfast",
+                    "options": [{ "label": "eggs" }, { "label": "toast" }]
+                },
+                {
+                    "question": "Sweet or savory?",
+                    "header": "Taste",
+                    "options": [{ "label": "savory" }]
+                }
+            ]
+        });
+        let output = ToolOutput::Plain(maki_agent::TextOutput {
+            text: "Breakfast: eggs, toast\nTaste: savory".into(),
+            instructions: None,
+            state: Some(serde_json::json!({
+                "answers": [["eggs", "toast"], ["savory"]]
+            })),
+            loaded_tools: Vec::new(),
+            duration_ms: None,
+        });
+
+        let children = question_children(Some(&input), Some(&output));
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].name.as_ref(), "Breakfast:");
+        assert_eq!(children[0].summary, "eggs, toast");
+        assert_eq!(children[0].status, ToolStatus::Success);
+        assert!(children[0].detail.is_some());
+
+        assert_eq!(children[1].name.as_ref(), "Taste:");
+        assert_eq!(children[1].summary, "savory");
+        assert_eq!(children[1].status, ToolStatus::Success);
+        assert!(children[1].detail.is_some());
+    }
+
+    #[test]
+    fn question_children_omitted_header_falls_back_to_q_index() {
+        let input = serde_json::json!({
+            "questions": [
+                { "question": "First question?" },
+                { "question": "Second question?" }
+            ]
+        });
+        let output = ToolOutput::Plain(maki_agent::TextOutput {
+            text: "Q1: yes\nQ2: no".into(),
+            instructions: None,
+            state: Some(serde_json::json!({
+                "answers": [["yes"], ["no"]]
+            })),
+            loaded_tools: Vec::new(),
+            duration_ms: None,
+        });
+
+        let children = question_children(Some(&input), Some(&output));
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].name.as_ref(), "Q1:");
+        assert_eq!(children[0].summary, "yes");
+        assert_eq!(children[1].name.as_ref(), "Q2:");
+        assert_eq!(children[1].summary, "no");
+    }
+
+    #[test]
+    fn question_children_dismissed_returns_empty() {
+        let input = serde_json::json!({
+            "questions": [{ "question": "Do you agree?", "header": "Confirm" }]
+        });
+        let output_state = ToolOutput::Plain(maki_agent::TextOutput {
+            text: "(question dismissed by user)".into(),
+            instructions: None,
+            state: Some(serde_json::json!({ "dismissed": true })),
+            loaded_tools: Vec::new(),
+            duration_ms: None,
+        });
+        assert!(question_children(Some(&input), Some(&output_state)).is_empty());
+
+        let output_text_only = ToolOutput::Plain(maki_agent::TextOutput {
+            text: "(question dismissed by user)".into(),
+            instructions: None,
+            state: None,
+            loaded_tools: Vec::new(),
+            duration_ms: None,
+        });
+        assert!(question_children(Some(&input), Some(&output_text_only)).is_empty());
+    }
+
+    #[test]
+    fn question_children_no_answers_formats_as_no_answer() {
+        let input = serde_json::json!({
+            "questions": [{ "question": "Skipped question?", "header": "Optional" }]
+        });
+        let output = ToolOutput::Plain(maki_agent::TextOutput {
+            text: "Optional: (no answer)".into(),
+            instructions: None,
+            state: Some(serde_json::json!({ "answers": [[]] })),
+            loaded_tools: Vec::new(),
+            duration_ms: None,
+        });
+
+        let children = question_children(Some(&input), Some(&output));
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name.as_ref(), "Optional:");
+        assert_eq!(children[0].summary, "(no answer)");
+    }
+
+    #[test]
+    fn question_children_fallback_from_display_text_without_state() {
+        let input = serde_json::json!({
+            "questions": [
+                { "question": "Item A?", "header": "A" },
+                { "question": "Item B?", "header": "B" }
+            ]
+        });
+        let output = ToolOutput::Plain(maki_agent::TextOutput {
+            text: "A: alpha\nB: beta".into(),
+            instructions: None,
+            state: None,
+            loaded_tools: Vec::new(),
+            duration_ms: None,
+        });
+
+        let children = question_children(Some(&input), Some(&output));
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].name.as_ref(), "A:");
+        assert_eq!(children[0].summary, "alpha");
+        assert_eq!(children[1].name.as_ref(), "B:");
+        assert_eq!(children[1].summary, "beta");
+    }
+
+    #[test]
+    fn question_children_header_already_ending_with_colon() {
+        let input = serde_json::json!({
+            "questions": [{ "question": "Pick one", "header": "Choice:" }]
+        });
+        let output = ToolOutput::Plain(maki_agent::TextOutput {
+            text: "Choice: x".into(),
+            instructions: None,
+            state: Some(serde_json::json!({ "answers": [["x"]] })),
+            loaded_tools: Vec::new(),
+            duration_ms: None,
+        });
+
+        let children = question_children(Some(&input), Some(&output));
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name.as_ref(), "Choice:");
     }
 }

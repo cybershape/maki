@@ -4712,3 +4712,157 @@ fn compact_tools_dynamically_backgrounded_bash_in_tool_done_extracts_standalone(
     assert_eq!(t.id, "c1");
     assert!(panel.messages[0].background.is_some());
 }
+
+#[test]
+fn compact_tools_question_populates_children_after_done() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    let q_input = serde_json::json!({
+        "questions": [
+            {
+                "question": "Which breakfast items?",
+                "header": "Breakfast",
+                "options": [{ "label": "eggs" }, { "label": "toast" }]
+            },
+            {
+                "question": "Sweet or savory?",
+                "header": "Taste",
+                "options": [{ "label": "savory" }]
+            }
+        ]
+    });
+    let mut start_ev = start("q1", "question");
+    start_ev.raw_input = Some(q_input);
+    panel.tool_start(start_ev);
+
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!("expected ToolGroup");
+    };
+    let GroupEntry::Tool(t) = &g.entries[0] else {
+        panic!("expected Tool entry");
+    };
+    assert!(t.children.is_empty());
+
+    let output = ToolOutput::Plain(maki_agent::TextOutput {
+        text: "Breakfast: eggs, toast\nTaste: savory".into(),
+        instructions: None,
+        state: Some(serde_json::json!({
+            "answers": [["eggs", "toast"], ["savory"]]
+        })),
+        loaded_tools: Vec::new(),
+        duration_ms: None,
+    });
+    panel.tool_done(ToolDoneEvent {
+        id: "q1".into(),
+        tool: "question".into(),
+        output: Arc::new(output),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+        call: None,
+        backgrounded: false,
+    });
+
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!("expected ToolGroup");
+    };
+    let GroupEntry::Tool(t) = &g.entries[0] else {
+        panic!("expected Tool entry");
+    };
+    assert_eq!(t.children.len(), 2);
+    assert_eq!(t.children[0].name.as_ref(), "Breakfast:");
+    assert_eq!(t.children[0].summary, "eggs, toast");
+    assert_eq!(t.children[0].status, ToolStatus::Success);
+    assert_eq!(t.children[1].name.as_ref(), "Taste:");
+    assert_eq!(t.children[1].summary, "savory");
+    assert_eq!(t.children[1].status, ToolStatus::Success);
+}
+
+#[test]
+fn compact_tools_question_dismissed_leaves_children_empty() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    let q_input = serde_json::json!({
+        "questions": [{ "question": "Proceed?", "header": "Confirm" }]
+    });
+    let mut start_ev = start("q1", "question");
+    start_ev.raw_input = Some(q_input);
+    panel.tool_start(start_ev);
+
+    let output = ToolOutput::Plain(maki_agent::TextOutput {
+        text: "(question dismissed by user)".into(),
+        instructions: None,
+        state: Some(serde_json::json!({ "dismissed": true })),
+        loaded_tools: Vec::new(),
+        duration_ms: None,
+    });
+    panel.tool_done(ToolDoneEvent {
+        id: "q1".into(),
+        tool: "question".into(),
+        output: Arc::new(output),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+        call: None,
+        backgrounded: false,
+    });
+
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!("expected ToolGroup");
+    };
+    let GroupEntry::Tool(t) = &g.entries[0] else {
+        panic!("expected Tool entry");
+    };
+    assert!(t.children.is_empty());
+}
+
+#[test]
+fn compact_tools_question_error_leaves_children_empty() {
+    let ui_cfg = UiConfig {
+        compact_tools: true,
+        ..Default::default()
+    };
+    let mut panel = MessagesPanel::new(ui_cfg, EventHandle::disconnected_for_test());
+
+    let q_input = serde_json::json!({
+        "questions": [{ "question": "Proceed?", "header": "Confirm" }]
+    });
+    let mut start_ev = start("q1", "question");
+    start_ev.raw_input = Some(q_input);
+    panel.tool_start(start_ev);
+
+    let output = ToolOutput::Plain(maki_agent::TextOutput {
+        text: "error occurred".into(),
+        instructions: None,
+        state: None,
+        loaded_tools: Vec::new(),
+        duration_ms: None,
+    });
+    panel.tool_done(ToolDoneEvent {
+        id: "q1".into(),
+        tool: "question".into(),
+        output: Arc::new(output),
+        is_error: true,
+        annotation: None,
+        written_path: None,
+        call: None,
+        backgrounded: false,
+    });
+
+    let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
+        panic!("expected ToolGroup");
+    };
+    let GroupEntry::Tool(t) = &g.entries[0] else {
+        panic!("expected Tool entry");
+    };
+    assert_eq!(t.status, ToolStatus::Error);
+    assert!(t.children.is_empty());
+}

@@ -1003,12 +1003,22 @@ pub fn history_to_display(
                                     Some(input),
                                     &summary,
                                 );
+                                let is_question =
+                                    static_name == crate::components::tool_group::QUESTION_TOOL;
+                                let children = if is_question && status != ToolStatus::Error {
+                                    crate::components::tool_group::question_children(
+                                        Some(input),
+                                        stored.map(|o| &**o),
+                                    )
+                                } else {
+                                    Vec::new()
+                                };
                                 let entry = GroupToolEntry {
                                     id: id.clone(),
                                     name: Arc::from(static_name),
                                     summary,
                                     raw_input: Some(input.clone()),
-                                    children: Vec::new(),
+                                    children,
                                     status,
                                     receiving_args: false,
                                     started_at: None,
@@ -2361,6 +2371,63 @@ mod tests {
         };
         assert_eq!(t.summary, "batching tools · 1 tools");
         assert_eq!(t.raw_input.as_ref(), Some(&batch_input));
+    }
+
+    #[test]
+    fn history_compact_tools_preserves_question_children() {
+        let q_input = serde_json::json!({
+            "questions": [
+                {
+                    "question": "Which breakfast items?",
+                    "header": "Breakfast",
+                    "options": [{ "label": "eggs" }, { "label": "toast" }]
+                },
+                {
+                    "question": "Sweet or savory?",
+                    "header": "Taste",
+                    "options": [{ "label": "savory" }]
+                }
+            ],
+            "toolcall_reason": "asking breakfast"
+        });
+        let msgs = vec![
+            Message::user("plan breakfast".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use("q1", "question", q_input.clone())],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result("q1", "done", false)],
+                ..Default::default()
+            },
+        ];
+        let mut outputs = HashMap::new();
+        outputs.insert(
+            "q1".to_string(),
+            Arc::new(ToolOutput::Plain(maki_agent::TextOutput {
+                text: "Breakfast: eggs, toast\nTaste: savory".into(),
+                instructions: None,
+                state: Some(serde_json::json!({
+                    "answers": [["eggs", "toast"], ["savory"]]
+                })),
+                loaded_tools: Vec::new(),
+                duration_ms: None,
+            })),
+        );
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true).0;
+        let DisplayRole::ToolGroup(g) = &display[1].role else {
+            panic!("expected ToolGroup in display[1]");
+        };
+        let GroupEntry::Tool(t) = &g.entries[0] else {
+            panic!("expected GroupEntry::Tool");
+        };
+        assert_eq!(t.children.len(), 2);
+        assert_eq!(t.children[0].name.as_ref(), "Breakfast:");
+        assert_eq!(t.children[0].summary, "eggs, toast");
+        assert_eq!(t.children[1].name.as_ref(), "Taste:");
+        assert_eq!(t.children[1].summary, "savory");
     }
 
     #[test]
