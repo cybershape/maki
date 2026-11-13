@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `b2a2ae193225cbe6e38b1f911d01200b6bdb9a96`
-  - **Commit date**: `Thu Nov 12 00:19:57 2026 +0100`
+  - **Commit SHA**: `684e9bc03702cfaa9e397bc0f4f71b62bfe1c8aa`
+  - **Commit date**: `Thu Nov 12 23:28:08 2026 +0100`
   - **Commit author**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
-  - **Commit message**: `refactor(lua): move the host's request lanes from flume to tokio mpsc`
+  - **Commit message**: `refactor(highlight,providers): hold whole-value registries in ArcSwap`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `b2a2ae19`.
+> `upstream/main` has been successfully merged through commit `684e9bc0`.
 
 ---
 
@@ -185,6 +185,12 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `d31c2f54` | `Merge branch 'upstream/main' into main` | Merge upstream through `01f1ebd4`, including migration of wire channels, event loop channels, worker queues, and MCP manager from flume to tokio/std mpsc channels, sse-stream adoption for provider SSE parsing, compaction progress and completion indicators, user messages plain text rendering, 32-bit ARM build fixes in Lua runtime, and async storage writer drain, while preserving core fork customizations |
 | `be526263` | `docs: update upstream tracking record to 01f1ebd4` | Update the upstream tracking record to `01f1ebd4` |
 | `647b3bba` | `Merge branch 'upstream/main' into main` | Merge upstream through `b2a2ae19`, including migration of channels from flume to tokio mpsc/oneshot across Lua host, provider streaming, agent events, window/UI channels, and headless handles, prompt hint session callbacks, item_match style honoring, and OpenBSD launch fixes, while preserving core fork customizations |
+| `e83e0856` | `docs: update upstream tracking record to b2a2ae19` | Update the upstream tracking record to `b2a2ae19` |
+| `f4b077ca` | `feat(task): show the message text as task_message's header` | Show message text as task_message header instead of task id |
+| `0617fcca` | `fix(task): keep /tasks, Ctrl+X and task_stop when the plugin is disabled` | Keep /tasks, Ctrl+X, and task_stop available even when the task plugin is disabled |
+| `2b2d531c` | `test(permissions): fix symlink scope tests on macOS temp roots` | Fix symlink scope tests on macOS temp roots and landing dir assertions |
+| `b9d4db00` | `feat(ui): render background bash standalone in compact_tools mode` | Render background bash commands as standalone tool rows and split compact groups |
+| `07eff86e` | `Merge branch 'upstream/main' into main` | Merge upstream through `684e9bc0`, including dropping flume across the codebase in favor of tokio and std channels, ArcSwap for whole-value registries in highlight and providers, LazyLock for fixed statics, reading session archived windows one at a time, recording sealed_by on archived windows, async stdout for ACP and SDK, and tokio::process for tmux queries, while preserving core fork customizations |
 
 ---
 
