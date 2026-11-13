@@ -116,7 +116,7 @@ impl AgentLoop {
             return;
         }
 
-        while let Ok(()) = self.queue.recv_notify().await {
+        while let Some(()) = self.queue.recv_notify().await {
             let mut last_run_id = None;
             while let Some(mut run) = self.queue.pop_run() {
                 let Some(run_id) = run.drop_cancelled(self.cancels.min_run_id()) else {
@@ -218,7 +218,7 @@ impl AgentLoop {
         }
         let prompt_slots = Arc::new(
             self.lua_handle
-                .collect_prompt_slots_async(Some(self.seed.session_id.as_str()))
+                .collect_prompt_slots(Some(self.seed.session_id.as_str()))
                 .await,
         );
         let vars = self.vars.clone();

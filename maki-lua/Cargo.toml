@@ -34,7 +34,6 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 strum = { workspace = true }
-flume = { workspace = true }
 futures = { workspace = true }
 pin-project-lite = { workspace = true }
 tree-sitter = { workspace = true }

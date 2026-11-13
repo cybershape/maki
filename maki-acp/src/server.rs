@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -18,7 +17,6 @@ use agent_client_protocol_schema::v1::{
     TextContent,
 };
 use color_eyre::eyre::Context;
-use flume::{Receiver, Sender, WeakSender};
 use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
@@ -41,8 +39,9 @@ use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::{SessionClaim, SessionError, StoredThinking};
 use serde::Serialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender, unbounded_channel};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdout};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, WeakUnboundedSender, unbounded_channel};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tracing::{debug, info, warn};
 
@@ -117,7 +116,7 @@ struct Server {
     session: Option<SessionState>,
     on_session_end: Option<SessionEndHook>,
     should_wait_models: bool,
-    models_rx: Option<Receiver<Vec<String>>>,
+    models_rx: Option<Arc<AsyncMutex<UnboundedReceiver<Vec<String>>>>>,
 }
 
 impl Server {
@@ -135,13 +134,14 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     let (out_tx, mut out_rx) = unbounded_channel::<Value>();
 
     let writer_task = tokio::spawn(async move {
-        let stdout = std::io::stdout();
+        let mut out = stdout();
         while let Some(msg) = out_rx.recv().await {
-            let mut handle = stdout.lock();
-            if serde_json::to_writer(&mut handle, &msg).is_ok() {
-                let _ = handle.write_all(b"\n");
-                let _ = handle.flush();
-            }
+            let Ok(mut line) = serde_json::to_vec(&msg) else {
+                continue;
+            };
+            line.push(b'\n');
+            let _ = out.write_all(&line).await;
+            let _ = out.flush().await;
         }
     });
 
@@ -154,8 +154,9 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         }
     }
 
-    let (lines_tx, lines_rx) = flume::unbounded::<String>();
-    let (models_tx, models_rx) = flume::unbounded::<Vec<String>>();
+    let (lines_tx, mut lines_rx) = unbounded_channel::<String>();
+    let (models_tx, models_rx) = unbounded_channel::<Vec<String>>();
+    let models_rx = Arc::new(AsyncMutex::new(models_rx));
     // Weak, so a discovery still in flight cannot keep the loop alive once stdin closes.
     discover_models(Arc::clone(&params.model_policy), models_tx.downgrade());
     let reader_task = tokio::spawn(read_stdin(lines_tx));
@@ -169,14 +170,15 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         session: None,
         on_session_end: params.on_session_end.clone(),
         should_wait_models: !has_cache,
-        models_rx: Some(models_rx.clone()),
+        models_rx: Some(Arc::clone(&models_rx)),
     };
 
     while !params.stop.is_cancelled() {
         let incoming_fut = async {
+            let mut m_rx = models_rx.lock().await;
             tokio::select! {
-                line = lines_rx.recv_async() => line.ok().map(Incoming::Line),
-                specs = models_rx.recv_async() => specs.ok().map(Incoming::Models),
+                line = lines_rx.recv() => line.map(Incoming::Line),
+                specs = m_rx.recv() => specs.map(Incoming::Models),
             }
         };
         let incoming = match params.stop.race(incoming_fut).await {
@@ -208,14 +210,14 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
 
 /// Lives in its own task because `read_line` is not cancel safe: the main loop
 /// waits on discovery too, and a dropped read would eat half a line.
-async fn read_stdin(tx: Sender<String>) -> std::io::Result<()> {
+async fn read_stdin(tx: UnboundedSender<String>) -> std::io::Result<()> {
     let mut reader = BufReader::new(tokio::io::stdin());
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).await? == 0 {
             return Ok(());
         }
-        if tx.send_async(line).await.is_err() {
+        if tx.send(line).is_err() {
             return Ok(());
         }
     }
@@ -226,7 +228,7 @@ async fn read_stdin(tx: Sender<String>) -> std::io::Result<()> {
 /// in the background. Each batch leaves the moment it lands: the slowest source
 /// is a cold catalog download, and a provider the client could already pick from
 /// should not wait behind it.
-fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Vec<String>>) {
+fn discover_models(policy: Arc<ModelPolicy>, tx: WeakUnboundedSender<Vec<String>>) {
     tokio::spawn(async move {
         fetch_all_models_cached(&policy, |list, _warnings| {
             if let Some(tx) = tx.upgrade() {
@@ -294,7 +296,8 @@ async fn wait_for_models_on_first_run(srv: &mut Server) {
         return;
     };
     let _ = tokio::time::timeout(FIRST_RUN_DISCOVERY_TIMEOUT, async {
-        while let Ok(specs) = models_rx.recv_async().await {
+        let mut rx = models_rx.lock().await;
+        while let Some(specs) = rx.recv().await {
             let before = srv.model_specs.len();
             refresh_models(srv, specs);
             if srv.model_specs.len() > before {
@@ -303,7 +306,8 @@ async fn wait_for_models_on_first_run(srv: &mut Server) {
         }
     })
     .await;
-    while let Ok(specs) = models_rx.try_recv() {
+    let mut rx = models_rx.lock().await;
+    while let Ok(specs) = rx.try_recv() {
         refresh_models(srv, specs);
     }
 }
@@ -1407,6 +1411,7 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 #[cfg(test)]
 mod tests {
     use std::sync::LazyLock;
+    use std::sync::mpsc::sync_channel;
 
     use maki_agent::headless::SessionEnd;
     use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
@@ -1546,7 +1551,7 @@ mod tests {
         let cwd = project.path().to_path_buf();
 
         let held = std::io::stdin().lock();
-        let (done_tx, done_rx) = flume::bounded(1);
+        let (done_tx, done_rx) = sync_channel(1);
         let worker = std::thread::spawn(move || {
             let config =
                 trusted_project_config(&cwd, &storage, TrustMode::Consult, &TrustConfig::default());
@@ -2427,7 +2432,7 @@ mod tests {
     async fn close_session_awaits_the_session_end_hook() {
         let (mut srv, ..) = test_server();
         let ended = srv.session.as_ref().unwrap().handle.session_id.id();
-        let (ended_tx, ended_rx) = flume::bounded(1);
+        let (ended_tx, ended_rx) = sync_channel(1);
         srv.on_session_end = Some(Arc::new(move |id, reason| {
             let ended_tx = ended_tx.clone();
             Box::pin(async move {
@@ -2599,8 +2604,8 @@ mod tests {
         let (mut srv, .., _out_rx) = test_server();
         srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
         srv.should_wait_models = true;
-        let (models_tx, models_rx) = flume::unbounded();
-        srv.models_rx = Some(models_rx);
+        let (models_tx, models_rx) = unbounded_channel();
+        srv.models_rx = Some(Arc::new(AsyncMutex::new(models_rx)));
 
         models_tx.send(vec![DISCOVERED_SPEC.to_owned()]).unwrap();
 
@@ -2614,8 +2619,8 @@ mod tests {
         let (mut srv, .., _out_rx) = test_server();
         srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
         srv.should_wait_models = true;
-        let (_models_tx, models_rx) = flume::unbounded();
-        srv.models_rx = Some(models_rx);
+        let (_models_tx, models_rx) = unbounded_channel();
+        srv.models_rx = Some(Arc::new(AsyncMutex::new(models_rx)));
 
         drop(_models_tx);
         wait_for_models_on_first_run(&mut srv).await;

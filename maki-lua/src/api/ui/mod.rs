@@ -11,6 +11,7 @@ use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::{MakiId, MakiIdParseError};
 use mlua::{Lua, Result as LuaResult, Table};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::api::action::run_plugin_action;
@@ -450,7 +451,7 @@ fn truncate_text(lua: &Lua, text: String, max_width: usize) -> LuaResult<Table> 
 #[lua_fn]
 fn flash(
     _lua: &Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] plugin: Arc<str>,
     msg: String,
 ) -> LuaResult<()> {
@@ -477,7 +478,7 @@ fn flash(
 #[lua_fn]
 fn set_window_title(
     _lua: &Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     title: String,
 ) -> LuaResult<()> {
     let _ = ui_send(tx.as_ref(), UiAction::SetWindowTitle(title));
@@ -507,7 +508,7 @@ fn set_window_title(
 #[lua_fn]
 fn set_program_status(
     _lua: &Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     opts: Table,
 ) -> LuaResult<()> {
     let state: String = opts.get("state")?;
@@ -621,7 +622,7 @@ fn set_mode(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String) -> LuaResult<()> {
 #[lua_fn]
 async fn action(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] plugin: Arc<str>,
     #[ctx] caller: PluginReach,
     name: String,
@@ -645,7 +646,7 @@ async fn action(
 
 async fn input_roundtrip(
     lua: Lua,
-    tx: Option<&flume::Sender<UiAction>>,
+    tx: Option<&UnboundedSender<UiAction>>,
     req: InputRequest,
 ) -> LuaResult<Pair<mlua::Value>> {
     ui_json_roundtrip(&lua, tx, |reply_tx| UiAction::Input { req, reply_tx }).await
@@ -685,7 +686,7 @@ fn input_marks(func: &str, ns: String, marks: Table) -> LuaResult<InputMarks> {
 #[lua_fn(guard = SessionRead)]
 async fn input(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
 ) -> LuaResult<Pair<mlua::Value>> {
     input_roundtrip(lua, tx.as_ref(), InputRequest::Read).await
 }
@@ -780,7 +781,7 @@ fn table_list(list: Table, func: &str, key: &str) -> LuaResult<Vec<Table>> {
 #[lua_fn(guard = [Input, SessionRead])]
 async fn input_edit(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] plugin: Arc<str>,
     #[ctx] caller: PluginReach,
     opts: Table,
@@ -868,7 +869,7 @@ async fn input_edit(
 #[lua_fn]
 async fn input_decorate(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] plugin: Arc<str>,
     opts: Table,
 ) -> LuaResult<Pair<mlua::Value>> {
@@ -947,7 +948,7 @@ async fn input_decorate(
 #[lua_fn]
 async fn input_submit(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] caller: PluginReach,
     opts: Table,
 ) -> LuaResult<Pair<mlua::Value>> {
@@ -1069,7 +1070,7 @@ fn text_edit(edit: &Table) -> LuaResult<TextEdit> {
 #[lua_fn]
 async fn open_editor(
     _lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     path: String,
 ) -> LuaResult<i32> {
     let path = PathBuf::from(path);
@@ -1143,7 +1144,7 @@ fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
 #[lua_fn]
 fn open_win(
     lua: &Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] plugin: Arc<str>,
     buf: mlua::AnyUserData,
     opts: Table,
@@ -1452,7 +1453,7 @@ lua_table! {
 
 pub(crate) fn create_ui_table(
     lua: &Lua,
-    ui_action_tx: Option<flume::Sender<UiAction>>,
+    ui_action_tx: Option<UnboundedSender<UiAction>>,
     plugin: Arc<str>,
     reach: PluginReach,
 ) -> LuaResult<Table> {
@@ -1693,6 +1694,7 @@ mod tests {
     use maki_highlight::StyledSegment;
     use mlua::Lua;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
     use tokio::sync::mpsc::unbounded_channel;
 
     const MISSING_KEY: &str = "missing";
@@ -2464,9 +2466,9 @@ mod tests {
 
     /// [`ui_with_input`] for a plugin whose load is gone.
     fn ui_with_input_of_unloaded(edit: fn(InputEdit) -> UiReply, grants: PluginPermissions) -> Lua {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         std::thread::spawn(move || {
-            while let Ok(UiAction::Input { req, reply_tx }) = rx.recv() {
+            while let Some(UiAction::Input { req, reply_tx }) = rx.blocking_recv() {
                 let reply = match req {
                     InputRequest::Read => Ok(serde_json::json!({
                         "session_id": READ_SESSION_ID,
@@ -2489,11 +2491,14 @@ mod tests {
         lua_with_ui_granted(Some(tx), grants)
     }
 
-    fn lua_with_ui(tx: Option<flume::Sender<UiAction>>) -> Lua {
+    fn lua_with_ui(tx: Option<UnboundedSender<UiAction>>) -> Lua {
         lua_with_ui_granted(tx, PluginPermissions::trusted())
     }
 
-    fn lua_with_ui_granted(tx: Option<flume::Sender<UiAction>>, grants: PluginPermissions) -> Lua {
+    fn lua_with_ui_granted(
+        tx: Option<UnboundedSender<UiAction>>,
+        grants: PluginPermissions,
+    ) -> Lua {
         let lua = Lua::new();
         let reach = PluginReach::new(grants).owned_by(Arc::from(INPUT_PLUGIN));
         let t = create_ui_table(&lua, tx, Arc::from(INPUT_PLUGIN), reach).unwrap();
@@ -2761,9 +2766,9 @@ mod tests {
     #[test_case("file_picker", None ; "file_picker_is_free")]
     #[tokio::test]
     async fn action_charges_what_its_api_would(name: &str, needed: Option<Permission>) {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         std::thread::spawn(move || {
-            while let Ok(action) = rx.recv() {
+            while let Some(action) = rx.blocking_recv() {
                 if let UiAction::Builtin { reply_tx, .. } = action {
                     let _ = reply_tx.send(true);
                 }
@@ -2794,7 +2799,7 @@ mod tests {
 
     #[test]
     fn set_program_status_dispatches_ui_action() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = Lua::new();
         let reach = PluginReach::new(PluginPermissions::trusted());
         let t = create_ui_table(&lua, Some(tx), Arc::from("test"), reach).unwrap();

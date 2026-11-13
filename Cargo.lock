@@ -1725,17 +1725,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flume"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
-dependencies = [
- "futures-core",
- "futures-sink",
- "spin",
-]
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3190,7 +3179,6 @@ version = "0.7.1"
 dependencies = [
  "agent-client-protocol-schema",
  "color-eyre",
- "flume",
  "futures",
  "jiff",
  "maki-agent",
@@ -3215,7 +3203,6 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bitflags 2.13.2",
- "flume",
  "futures",
  "getrandom 0.4.3",
  "grep-regex",
@@ -3302,10 +3289,11 @@ dependencies = [
 name = "maki-highlight"
 version = "0.7.1"
 dependencies = [
- "flume",
+ "arc-swap",
  "serde_json",
  "syntect",
  "test-case",
+ "tokio",
  "tracing",
  "two-face",
 ]
@@ -3334,7 +3322,6 @@ dependencies = [
  "criterion",
  "crossterm",
  "fastrand",
- "flume",
  "futures",
  "htmd",
  "image",
@@ -3472,6 +3459,7 @@ dependencies = [
 name = "maki-providers"
 version = "0.7.1"
 dependencies = [
+ "arc-swap",
  "base64 0.23.1",
  "bytes",
  "fastrand",
@@ -3530,7 +3518,6 @@ dependencies = [
  "criterion",
  "crossterm",
  "fastrand",
- "flume",
  "futures",
  "getrandom 0.4.3",
  "image",
@@ -3566,7 +3553,6 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "unicode-width",
- "wait-timeout",
  "windows-sys 0.61.2",
 ]
 
@@ -7670,15 +7656,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d9b2acfb050df409c972a37d3b8e08cdea3bddb0c09db9d53137e504cfabed0"
 dependencies = [
  "utf8parse",
-]
-
-[[package]]
-name = "wait-timeout"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
-dependencies = [
- "libc",
 ]
 
 [[package]]

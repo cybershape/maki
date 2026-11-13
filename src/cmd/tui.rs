@@ -398,7 +398,8 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
         let prompt_slots = stack
             .plugin_host
             .event_handle()
-            .collect_prompt_slots(Some(resolved.id.as_str()));
+            .collect_prompt_slots(Some(resolved.id.as_str()))
+            .await;
         let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
         let interrupt = crate::sdk_mode::run(crate::sdk_mode::SdkParams {
@@ -521,9 +522,11 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
                 keymap_reader: stack.plugin_host.keymap_reader(),
                 hint_reader: stack.plugin_host.hint_reader(),
                 input_rules_reader: stack.plugin_host.input_rules_reader(),
-                ui_action_rx: stack.plugin_host.ui_action_rx(),
-                ui_wake_rx: stack.plugin_host.ui_wake_rx(),
-                ui_attachment: stack.plugin_host.ui_attachment(),
+                ui_action_rx: stack
+                    .plugin_host
+                    .take_ui_action_rx()
+                    .expect("the UI takes the plugin action queue once"),
+                ui_waker: stack.plugin_host.ui_waker(),
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
                 project_config: trust.project_config.clone(),

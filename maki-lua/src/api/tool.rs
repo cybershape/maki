@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::Path;
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -318,7 +319,7 @@ impl Tool for LuaTool {
                 None => Cow::Borrowed(&self.meta.description),
             };
         }
-        let (reply_tx, reply_rx) = flume::bounded(1);
+        let (reply_tx, reply_rx) = sync_channel(1);
         let sent = self
             .tx
             .send(Request::Describe {
@@ -1151,7 +1152,7 @@ fn register_command(
 #[lua_fn]
 async fn run_command(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] caller: PluginReach,
     cmdline: String,
 ) -> LuaResult<Pair<bool>> {
@@ -1405,7 +1406,7 @@ pub(crate) fn create_api_table(
     reach: PluginReach,
     plugin: Arc<str>,
     opts: PluginOpts,
-    ui_action_tx: Option<flume::Sender<UiAction>>,
+    ui_action_tx: Option<UnboundedSender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
     run_command__register(&t, lua, ui_action_tx, reach.clone())?;

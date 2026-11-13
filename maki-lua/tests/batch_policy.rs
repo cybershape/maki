@@ -6,6 +6,7 @@ mod common;
 use maki_lua::test_support::wait_next;
 use std::iter;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -355,7 +356,7 @@ fn runaway_child_under_cancel_still_terminates() {
 struct RunningBatch {
     trigger: maki_agent::cancel::CancelTrigger,
     body: Arc<SharedBuf>,
-    result: flume::Receiver<Result<String, String>>,
+    result: Receiver<Result<String, String>>,
     /// Kept alive so the handler's later events still have a receiver.
     _events: UnboundedReceiver<Envelope>,
 }
@@ -368,7 +369,7 @@ fn start_batch_with(child_src: String, tool_calls: Value) -> RunningBatch {
     let (event_tx, mut events) = unbounded_channel();
     let event_tx = EventSender::new(event_tx, 0);
     let (trigger, token) = CancelToken::new();
-    let (result_tx, result) = flume::bounded(1);
+    let (result_tx, result) = sync_channel(1);
     thread::spawn(move || {
         let (reg, _host) = load_batch_host_with(&child_src);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(BATCH_ID));
@@ -1527,7 +1528,7 @@ end
 struct MovableBatch {
     reg: Arc<ToolRegistry>,
     host: PluginHost,
-    ui: flume::Receiver<UiAction>,
+    ui: UnboundedReceiver<UiAction>,
     mailbox: SessionMailbox,
     body: Arc<SharedBuf>,
     _seed: Arc<AgentSeed>,
@@ -1545,8 +1546,7 @@ impl MovableBatch {
         permissions: PluginPermissions,
     ) -> (Self, JoinHandle<ToolDoneEvent>) {
         let (reg, host) = load_batch_host_as(MOVABLE_CHILD_SRC, permissions);
-        host.ui_attachment().attach();
-        let ui = host.ui_action_rx();
+        let ui = host.take_ui_action_rx().unwrap();
         let Chat { id, mailbox, seed } = Chat::live();
         let (run, run_token) = CancelToken::new();
         let (ctx, mut events) = call_ctx(&reg, id, &run_token, BATCH_ID);
@@ -1607,8 +1607,8 @@ impl MovableBatch {
     }
 
     /// The final reply of a moved batch, as its task tab gets it.
-    fn task_done(&self) -> ToolDoneEvent {
-        next_task_done(&self.ui)
+    fn task_done(&mut self) -> ToolDoneEvent {
+        next_task_done(&mut self.ui)
     }
 }
 
@@ -1617,7 +1617,7 @@ impl MovableBatch {
 /// result is the whole final reply.
 #[test]
 fn batch_moves_with_finished_results_inline_and_replies_with_the_late_children() {
-    let (batch, call) = MovableBatch::start(json!([
+    let (mut batch, call) = MovableBatch::start(json!([
         { "tool": OK_TOOL, "parameters": { "tag": "a" } },
         { "tool": HOOKED_TOOL, "parameters": { "tag": "early" } },
         { "tool": HOOKED_TOOL, "parameters": { "tag": "late" } },
@@ -1664,7 +1664,7 @@ fn batch_moves_with_finished_results_inline_and_replies_with_the_late_children()
 #[test_case(Some(MARKDOWN_FORMAT), true ; "markdown_last_child")]
 #[test_case(None, false ; "plain_last_child")]
 fn a_moved_batch_reports_each_child_as_it_lands(last_format: Option<&str>, markdown_reply: bool) {
-    let (batch, call) = MovableBatch::start(json!([
+    let (mut batch, call) = MovableBatch::start(json!([
         { "tool": HOOKED_TOOL, "parameters": { "tag": "a", "format": MARKDOWN_FORMAT } },
         { "tool": HOOKED_TOOL, "parameters": { "tag": "b", "format": last_format } },
     ]));
@@ -1715,7 +1715,7 @@ fn a_moved_batch_reports_each_child_as_it_lands(last_format: Option<&str>, markd
 /// the receipt.
 #[test]
 fn batch_declines_while_a_child_without_a_hook_runs_and_moves_once_it_finished() {
-    let (batch, call) = MovableBatch::start(json!([
+    let (mut batch, call) = MovableBatch::start(json!([
         { "tool": HOOKED_TOOL, "parameters": { "tag": "a" } },
         { "tool": EDIT_TOOL, "parameters": { "tag": "b" } },
     ]));
@@ -1751,7 +1751,7 @@ fn batch_declines_while_a_child_without_a_hook_runs_and_moves_once_it_finished()
 /// results, and the ask never reaches the child, which cannot move inside it.
 #[test]
 fn a_background_child_moves_the_batch_once_the_rest_finished() {
-    let (batch, call) = MovableBatch::start(json!([
+    let (mut batch, call) = MovableBatch::start(json!([
         { "tool": HOOKED_TOOL, "parameters": { "tag": "slow", "background": true } },
         { "tool": EDIT_TOOL, "parameters": { "tag": "quick" } },
     ]));

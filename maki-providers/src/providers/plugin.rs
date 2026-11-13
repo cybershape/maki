@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use tokio::sync::mpsc::unbounded_channel;
 
+use arc_swap::ArcSwap;
 use maki_config::host_allowed;
 use maki_config::providers::{Protocol, ProvidersConfig, base_url_override, plan_base_url};
 use maki_storage::StateDir;
@@ -463,16 +464,13 @@ type AuthCell = (Option<Arc<str>>, Arc<AuthState>);
 /// What every read answers. Only ever replaced whole, by [`commit_load`], so
 /// there is no moment at which a reader can see a half-built registry: during
 /// a load the previous generation is still the published one.
-static PROVIDERS: LazyLock<RwLock<Arc<Registry>>> = LazyLock::new(RwLock::default);
+static PROVIDERS: LazyLock<ArcSwap<Registry>> = LazyLock::new(ArcSwap::default);
 /// The load in progress. `Some` between [`begin_load`] and [`commit_load`],
 /// and open at process start so a host that loads plugins without driving the
 /// phases (tests, embedders) still registers.
-static STAGING: LazyLock<Mutex<Option<Registry>>> =
-    LazyLock::new(|| Mutex::new(Some(Registry::new())));
-/// One cell of credentials per slug, for the life of the process: see
-/// [`shared_auth`].
+static STAGING: Mutex<Option<Registry>> = Mutex::new(Some(Registry::new()));
 /// The current owner and auth state of each slug: see [`shared_auth`].
-static AUTH: LazyLock<RwLock<HashMap<Box<str>, AuthCell>>> = LazyLock::new(RwLock::default);
+static AUTH: LazyLock<Mutex<HashMap<Box<str>, AuthCell>>> = LazyLock::new(Mutex::default);
 /// Slugs granted to enabled packages, kept even when their load fails so the
 /// catalog client cannot take over the slug and receive the saved key. Maps
 /// the package name to its granted slugs, so unloading the package releases
@@ -541,7 +539,7 @@ pub fn commit_load() {
     }
     let logins = staged.values().filter_map(|e| e.built.login).collect();
     maki_config::providers::set_registered_providers(logins);
-    *PROVIDERS.write().unwrap() = Arc::new(staged);
+    PROVIDERS.store(Arc::new(staged));
 }
 
 /// Takes back everything `plugin` staged in the load in progress, for a plugin
@@ -738,7 +736,7 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
 /// Reusing stops at the owner, though: a slug another package took over gets
 /// a fresh cell, so a token one of them minted never serves the other.
 fn shared_auth(slug: &str, owner: Option<Arc<str>>) -> Arc<AuthState> {
-    let mut states = AUTH.write().unwrap();
+    let mut states = AUTH.lock().unwrap();
     let (current_owner, state) = states
         .entry(slug.into())
         .or_insert_with(|| (owner.clone(), Arc::new(AuthState::new())));
@@ -750,11 +748,11 @@ fn shared_auth(slug: &str, owner: Option<Arc<str>>) -> Arc<AuthState> {
 }
 
 pub fn clear_auth(slug: &str) {
-    AUTH.write().unwrap().remove(slug);
+    AUTH.lock().unwrap().remove(slug);
 }
 
 fn entries() -> Arc<Registry> {
-    Arc::clone(&PROVIDERS.read().unwrap())
+    PROVIDERS.load_full()
 }
 
 fn entry(slug: &str) -> Option<Arc<PluginEntry>> {
@@ -2122,7 +2120,7 @@ mod tests {
 
         assert!(!is_registered(SLUG), "{RELOAD_DROPS_STALE}");
         assert!(
-            AUTH.read().unwrap().contains_key(SLUG),
+            AUTH.lock().unwrap().contains_key(SLUG),
             "{CREDENTIALS_DROPPED}"
         );
     }
