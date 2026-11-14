@@ -515,6 +515,7 @@ mod tests {
             thinking: text.into(),
             signature: None,
             duration_ms: None,
+            reasoning_id: None,
         }
     }
 

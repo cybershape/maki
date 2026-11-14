@@ -56,6 +56,7 @@ use maki_lua::{
     PlanActionOutcome, PluginHost, PluginPermissions, SessionEndReason, Split, TextEdit, UiAction,
     WinCommand, WinEvent,
 };
+use maki_providers::provider::ProviderStatus;
 use maki_providers::{
     ContentBlock, Effort, FastPricing, FastSupport, Message, Model, ModelTier, RequestOptions,
     Role, THINKING_USAGE, TaskAnswer, TaskSettled, ThinkingSupport, TokenUsage,
@@ -146,9 +147,7 @@ const PLAN_MENU_GENERATION: u64 = 7;
 /// or plainly in the past, without any test having to wait for a clock.
 const WAIT_AHEAD: Duration = Duration::from_secs(60);
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
-const CURSOR_STAYS_HIDDEN: &str = "the hardware cursor must never be shown";
-const CURSOR_ON_SCREEN: &str = "the reported cursor must be on screen";
-const CURSOR_ON_STYLED_CELL: &str = "the focused input box owns a cell painted as the cursor";
+const CURSOR_ON_INPUT: &str = "the focused input box reports its caret for the cursor";
 const OVERLAY_TAKES_THE_CURSOR: &str = "an overlay unfocuses the input box, so no cell is a cursor";
 /// Stands in for a size the provider measured, baseline included.
 const MEASURED_CONTEXT: u32 = 100_000;
@@ -3365,7 +3364,7 @@ fn model_list_arriving_in_the_background_owes_a_frame() {
     assert_owes_one_frame(&mut app, || {
         models.store(Some(Arc::new(ModelList {
             specs: vec![LATE_MODEL_SPEC.into()],
-            live_providers: Vec::new(),
+            providers: HashMap::new(),
             loading: false,
         })));
     });
@@ -3581,39 +3580,29 @@ fn rendered(app: &mut App) -> String {
     buffer_text(&rendered_buffer(app))
 }
 
-/// The event loop parks the terminal cursor on whatever `view` reports, so an
-/// IME anchors its preedit text there. The report has to be the very cell the
-/// input box painted for its software cursor, and the hardware cursor has to
-/// stay hidden: shown, it would invert that cell back to plain text.
+/// The event loop shows the terminal cursor on whatever `view` reports, and
+/// an IME anchors its preedit text there.
 #[test]
-fn view_reports_the_reversed_input_cell_and_hides_the_hardware_cursor() {
+fn view_reports_the_input_caret_until_an_overlay_takes_the_keyboard() {
     let mut app = test_app();
-    let backend = ratatui::backend::TestBackend::new(80, 24);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    let mut draw = |app: &mut App| {
-        let mut cursor = None;
-        terminal.draw(|frame| cursor = app.view(frame)).unwrap();
-        assert!(
-            !terminal.backend().cursor_visible(),
-            "{CURSOR_STAYS_HIDDEN}"
-        );
-        cursor.map(|pos| {
-            let cell = terminal
-                .backend()
-                .buffer()
-                .cell(pos)
-                .expect(CURSOR_ON_SCREEN);
-            (pos, theme::is_caret_cell(cell))
-        })
-    };
-
-    assert!(
-        matches!(draw(&mut app), Some((_, true))),
-        "{CURSOR_ON_STYLED_CELL}"
-    );
+    assert!(draw_to_buffer(&mut app).0.is_some(), "{CURSOR_ON_INPUT}");
 
     app.update(Msg::Key(kb::HELP.to_key_event()));
-    assert_eq!(draw(&mut app), None, "{OVERLAY_TAKES_THE_CURSOR}");
+    assert_eq!(
+        draw_to_buffer(&mut app).0,
+        None,
+        "{OVERLAY_TAKES_THE_CURSOR}"
+    );
+}
+
+/// Only the chat input stopped painting its caret, so the terminal cursor
+/// shows for it and stays parked under anything else that has the keyboard.
+#[test]
+fn only_the_chat_input_shows_the_terminal_cursor() {
+    let mut app = test_app();
+    assert!(app.shows_terminal_cursor());
+    app.update(Msg::Key(kb::HELP.to_key_event()));
+    assert!(!app.shows_terminal_cursor());
 }
 
 const CARET_FLOAT_MARK: &str = "xqcaret";
@@ -4153,29 +4142,17 @@ fn an_owner_without_a_field_over_a_picker_reports_no_caret(owner: KeyboardOwner)
     );
 }
 
-fn caret_cells(buffer: &Buffer) -> usize {
-    buffer
-        .content()
-        .iter()
-        .filter(|cell| theme::is_caret_cell(cell))
-        .count()
-}
-
 /// The focused queue answers the keys, so the input box under it is not
-/// where anyone types: no caret is painted in it and none is reported.
+/// where anyone types: no caret is reported for it.
 #[test]
 fn a_focused_queue_takes_the_caret_from_the_input_box() {
     let mut app = test_app();
     focus_queue(&mut app);
 
-    let (cursor, buffer) = draw_to_buffer(&mut app);
-    assert_eq!(cursor, None, "{IME_KEYS_OWNER}");
-    assert_eq!(caret_cells(&buffer), 0, "{IME_KEYS_OWNER}");
+    assert_eq!(draw_to_buffer(&mut app).0, None, "{IME_KEYS_OWNER}");
 
     app.queue.unfocus();
-    let (cursor, buffer) = draw_to_buffer(&mut app);
-    assert!(cursor.is_some(), "{CARET_EXPECTED}");
-    assert_eq!(caret_cells(&buffer), 1, "{CARET_EXPECTED}");
+    assert!(draw_to_buffer(&mut app).0.is_some(), "{CARET_EXPECTED}");
 }
 
 /// A plugin slices `text` with the Lua string library, which counts bytes, so
@@ -11391,6 +11368,7 @@ fn turn_response_normalizes_text_and_truncates_unicode() {
                 thinking: "ignored".into(),
                 signature: None,
                 duration_ms: None,
+                reasoning_id: None,
             },
             ContentBlock::Text { text: long },
         ],
@@ -12247,6 +12225,22 @@ fn run_builtin_model_picker_opens_and_refreshes() {
     let actions = app.run_builtin(BuiltinAction::ModelPicker);
     assert!(app.model_picker.is_open());
     assert!(matches!(&actions[..], [Action::RefreshModels]));
+}
+
+/// A provider row that cannot serve models hands Enter to its login.
+#[test]
+fn enter_on_a_keyless_provider_row_opens_its_login() {
+    let (mut app, models) = app_with_model_slot();
+    models.store(Some(Arc::new(ModelList {
+        specs: Vec::new(),
+        providers: HashMap::from([("anthropic".into(), ProviderStatus::MissingKey)]),
+        loading: false,
+    })));
+    app.run_builtin(BuiltinAction::ModelPicker);
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(!app.model_picker.is_open());
+    assert!(app.login_picker.is_open());
 }
 
 #[test]

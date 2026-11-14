@@ -384,6 +384,7 @@ mod tests {
             thinking: PROMPT.into(),
             signature: Some(SIGNATURE.into()),
             duration_ms: None,
+            reasoning_id: None,
         }
     }
 

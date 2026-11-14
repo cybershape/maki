@@ -4,12 +4,12 @@ use maki_config::providers::{
     ModelDef, ProviderDef, ProvidersConfig, resolve_api_key_env, resolve_base_url,
 };
 
-use super::ResolvedAuth;
 use super::responses::ResponsesProvider;
+use super::{KeyPool, ResolvedAuth};
 use crate::AgentError;
 use crate::model::{FastPricing, Model, ModelEntry, ModelInfo, ModelPricing, ModelTier};
 use crate::model_registry::{self, DeclaredTiers};
-use crate::provider::Provider;
+use crate::provider::{ModelBatch, Provider, ProviderStatus};
 use crate::providers::Timeouts;
 use crate::spec::{ProviderSpec, RESPONSES_SPEC};
 
@@ -37,7 +37,7 @@ fn resolve_custom_auth(slug: &str) -> Result<(ResolvedAuth, String), AgentError>
     }
 
     let env_var = resolve_api_key_env(slug, def);
-    let pool = super::KeyPool::resolve(slug, &env_var).ok();
+    let pool = KeyPool::resolve(slug, &env_var).ok();
     let key = pool.map(|p| p.current().to_string()).unwrap_or_default();
 
     Ok((
@@ -184,26 +184,13 @@ fn is_builtin_slug(slug: &str) -> bool {
     slug == RESPONSES_SPEC.slug
 }
 
-/// The declared specs, plus the providers whose list they fully describe.
-/// A `discover_models` provider is left out of the second list: its declared
-/// specs show before discovery finishes, but only a successful probe proves
-/// which models it still serves.
-pub fn declared_batch() -> (Vec<String>, Vec<String>) {
-    declared_batch_from(&ProvidersConfig::load())
-}
-
-fn declared_batch_from(config: &ProvidersConfig) -> (Vec<String>, Vec<String>) {
-    let specs = declared_specs_from(config);
-    let mut providers: Vec<String> = config
+fn custom_entries(config: &ProvidersConfig) -> Vec<(&String, &ProviderDef)> {
+    config
         .providers
         .iter()
-        .filter(|(slug, def)| !def.discover_models && !is_builtin_slug(slug))
-        .map(|(slug, _)| (*slug).clone())
-        .collect();
-    providers.sort();
-    (specs, providers)
+        .filter(|(slug, _)| !is_builtin_slug(slug))
+        .collect()
 }
-
 /// Models a custom provider can start on: its own `default_model`, then one
 /// declared model per tier. Never the protocol's default model, because a local
 /// server or proxy rarely serves it. Sorted by slug, since `providers.toml` is a
@@ -276,26 +263,65 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
     TierLookup::NoModelForTier
 }
 
-pub async fn discover_models(timeouts: Timeouts) -> Vec<String> {
-    let config = ProvidersConfig::load();
+pub async fn discover_models(timeouts: Timeouts, mut emit: impl FnMut(ModelBatch)) {
+    let config = tokio::task::spawn_blocking(ProvidersConfig::load)
+        .await
+        .expect("providers config load panicked");
     model_registry::set_declared(declared_tiers_from(&config));
-    let mut slugs: Vec<_> = config.providers.keys().collect();
-    slugs.sort();
-    let mut all_specs = Vec::new();
-    for slug in slugs {
-        if let Ok(provider) = create(slug, timeouts)
-            && let Ok(mut models) = provider.list_models().await
-        {
-            if let Some(def) = config.providers.get(slug) {
-                overlay_declared_tiers(def, &mut models);
+    let mut entries = custom_entries(&config);
+    entries.sort_by_key(|(_, def)| def.discover_models);
+    for (slug, def) in entries {
+        let mut models: Vec<String> = def
+            .models
+            .iter()
+            .map(|m| format!("{slug}/{}", m.id))
+            .collect();
+        let has_key = KeyPool::resolve(slug, &resolve_api_key_env(slug, Some(def))).is_ok();
+        let is_local = def
+            .base_url
+            .as_ref()
+            .is_some_and(|u| u.contains("localhost") || u.contains("127.0.0.1"));
+        let status = if !has_key && !is_local {
+            models.clear();
+            ProviderStatus::MissingKey
+        } else if !def.discover_models {
+            ProviderStatus::Live
+        } else {
+            match probe(slug, def, timeouts).await {
+                Ok(listed) => {
+                    for spec in listed {
+                        if !models.contains(&spec) {
+                            models.push(spec);
+                        }
+                    }
+                    ProviderStatus::Live
+                }
+                Err(e) => {
+                    tracing::warn!(slug, error = %e, "failed to list models for custom provider");
+                    ProviderStatus::Failed(format!("{slug}: {e}"))
+                }
             }
-            model_registry::set_known_models(slug, models.clone());
-            for m in models {
-                all_specs.push(format!("{slug}/{}", m.id));
-            }
-        }
+        };
+        emit(ModelBatch {
+            provider: slug.clone(),
+            models,
+            status,
+        });
     }
-    all_specs
+}
+
+async fn probe(
+    slug: &str,
+    def: &ProviderDef,
+    timeouts: Timeouts,
+) -> Result<Vec<String>, AgentError> {
+    let mut models = create(slug, timeouts)?.list_models().await?;
+    overlay_declared_tiers(def, &mut models);
+    model_registry::set_known_models(slug, models.clone());
+    Ok(models
+        .into_iter()
+        .map(|m| format!("{slug}/{}", m.id))
+        .collect())
 }
 
 fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
@@ -346,46 +372,6 @@ mod tests {
         assert_eq!(model.context_window, 64000);
     }
 
-    fn test_def(model_id: &str) -> ProviderDef {
-        ProviderDef {
-            models: vec![ModelDef {
-                id: model_id.to_string(),
-                name: None,
-                tier: ModelTier::Strong,
-                context_window: None,
-                max_output_tokens: None,
-                supports_tool_examples: None,
-                supports_thinking: None,
-                requires_thinking: None,
-                thinking_fields: None,
-                supports_vision: None,
-                pricing_input: None,
-                pricing_output: None,
-                pricing_cache_write: None,
-                pricing_cache_read: None,
-                pricing_fast_input: None,
-                pricing_fast_output: None,
-            }],
-            ..Default::default()
-        }
-    }
-
-    /// A `discover_models` provider's declared specs still show before its
-    /// probe lands, but the batch must not claim it answered: a failed probe
-    /// would otherwise mark its undiscovered recents retired.
-    #[test]
-    fn declared_batch_leaves_discovering_providers_out() {
-        let mut config = ProvidersConfig::default();
-        config.upsert("declared".to_string(), test_def("small"));
-        let mut discovering = test_def("small");
-        discovering.discover_models = true;
-        config.upsert("discovering".to_string(), discovering);
-
-        let (specs, providers) = declared_batch_from(&config);
-        assert!(specs.contains(&"declared/small".to_string()));
-        assert!(specs.contains(&"discovering/small".to_string()));
-        assert_eq!(providers, ["declared"]);
-    }
     #[test]
     fn declared_tiers_keep_the_first_model_per_tier() {
         let config: ProvidersConfig = toml::from_str(

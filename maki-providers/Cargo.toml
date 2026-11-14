@@ -8,7 +8,6 @@ license.workspace = true
 arc-swap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde-saphyr = { workspace = true, features = ["deserialize"] }
 indexmap = { workspace = true }
 maki-storage = { workspace = true }
 thiserror = { workspace = true }
@@ -27,8 +26,6 @@ maki-config = { workspace = true }
 inventory = { workspace = true }
 jiff = { workspace = true }
 getrandom = { workspace = true }
-open = { workspace = true }
-keyring = { workspace = true }
 url = { workspace = true }
 toml = { workspace = true }
 tempfile = { workspace = true }

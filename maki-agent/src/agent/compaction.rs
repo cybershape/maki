@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use super::frame::{RunContext, fit_frame};
-use super::history::{History, remove_orphaned_tool_results, strip_thinking};
+use super::history::{History, remove_orphaned_tool_results, stamp_new, strip_thinking};
 use super::hook::{AgentHooks, AgentSlot};
 use super::streaming::{
     StreamError, StreamRequest, StreamedResponse, min_output, stream_with_retry,
@@ -299,6 +299,43 @@ pub(super) async fn compact_history(
     }
 }
 
+/// Rebuild the transcript after a compaction: a summary pair, then the tail that
+/// was not summarized. Returns the new list and the length of the summary pair,
+/// so the caller can report how many messages carried over.
+///
+/// The summary pair carries the first kept message's stamp, not "now". The pair
+/// is followed by the carried tail, whose stamps predate the summary call that
+/// just returned; stamping the pair now would run the transcript's clock backwards
+/// at the join, and a timing reader would see a negative gap. The compaction
+/// call's own wall time then falls to the first carried message instead.
+fn rebuild_history(
+    summary: Message,
+    history: &[Message],
+    summarized: usize,
+    post_compaction_instructions: Option<&str>,
+) -> (Vec<Message>, usize) {
+    let carried_at = history.get(summarized).and_then(|m| m.created_at);
+    let stamp = |msg: Message| {
+        stamp_new(Message {
+            created_at: carried_at,
+            ..msg
+        })
+    };
+    let mut new_history = vec![
+        stamp(Message::user("What did we do so far?".into())),
+        stamp(summary),
+    ];
+    // Part of the summary block and not the carried input, so the next
+    // compaction summarizes this copy away instead of carrying a duplicate.
+    new_history.extend(
+        normalize(post_compaction_instructions)
+            .map(|text| stamp(Message::synthetic(text.to_owned()))),
+    );
+    let summary_len = new_history.len();
+    new_history.extend_from_slice(&history[summarized..]);
+    (new_history, summary_len)
+}
+
 fn finish_compact(
     streamed: StreamedResponse,
     history: &mut History,
@@ -333,18 +370,12 @@ fn finish_compact(
         return Err(AgentError::EmptySummary);
     };
 
-    let mut new_history = vec![
-        Message::user("What did we do so far?".into()),
+    let (new_history, summary_len) = rebuild_history(
         response.message,
-    ];
-    // Part of the summary block and not the carried input, so the next
-    // compaction summarizes this copy away instead of carrying a duplicate.
-    new_history.extend(
-        normalize(config.post_compaction_instructions.as_deref())
-            .map(|text| Message::synthetic(text.to_owned())),
+        history.as_slice(),
+        summarized,
+        config.post_compaction_instructions.as_deref(),
     );
-    let summary_len = new_history.len();
-    new_history.extend_from_slice(&history.as_slice()[summarized..]);
     history.restart(new_history);
 
     Ok((summary, history.len() - summary_len))
@@ -679,6 +710,61 @@ mod tests {
     use crate::tools::{RequestTools, ToolRegistry};
     use maki_config::CompactionBuffer;
 
+    #[test]
+    fn rebuild_history_keeps_timestamps_monotonic_at_the_join() {
+        let history = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "summarized".into(),
+                }],
+                created_at: Some(100),
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "first kept".into(),
+                }],
+                created_at: Some(1_000),
+                ..Default::default()
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "kept".into(),
+                }],
+                created_at: Some(2_000),
+                ..Default::default()
+            },
+        ];
+        let summary = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "the summary".into(),
+            }],
+            ..Default::default()
+        };
+
+        let (rebuilt, summary_len) = rebuild_history(summary, &history, 1, None);
+        assert_eq!(
+            summary_len, 2,
+            "a prompt and its summary head the transcript"
+        );
+        assert_eq!(rebuilt.len(), 2 + 2, "pair + the carried tail");
+        // The pair takes the first kept message's stamp (1_000), never "now": the
+        // summary call started after the tail was written, so "now" would postdate
+        // it and run the transcript clock backwards at the join.
+        assert_eq!(rebuilt[0].created_at, Some(1_000));
+        assert_eq!(rebuilt[1].created_at, Some(1_000));
+        let mut prev = 0;
+        for msg in &rebuilt {
+            let at = msg.created_at.expect("every rebuilt message is stamped");
+            assert!(at >= prev, "timestamps must not go backwards: {rebuilt:?}");
+            prev = at;
+        }
+    }
+
     const CONFIG_EXTRA: &str = "Record anything that belongs in plan.md";
     const REQUEST_EXTRA: &str = "Keep the failing test names";
     const POST: &str = "Re-read plan.md and agent.md";
@@ -916,7 +1002,7 @@ mod tests {
 
     #[test_case(vec![] ; "no_content")]
     #[test_case(vec![ContentBlock::Text { text: " \n".into() }] ; "blank_text")]
-    #[test_case(vec![ContentBlock::Thinking { thinking: KEPT_TEXT.into(), signature: None, duration_ms: None }] ; "thinking_only")]
+    #[test_case(vec![ContentBlock::Thinking { thinking: KEPT_TEXT.into(), signature: None, duration_ms: None, reasoning_id: None }] ; "thinking_only")]
     #[tokio::test]
     async fn a_failed_compaction_leaves_the_context_alone(content: Vec<ContentBlock>) {
         let empty = || {
@@ -1463,6 +1549,7 @@ mod tests {
                     thinking: "hmm".into(),
                     signature: Some("sig".into()),
                     duration_ms: None,
+                    reasoning_id: None,
                 },
                 ContentBlock::Text {
                     text: "hello".into(),

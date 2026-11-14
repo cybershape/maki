@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use futures::TryStreamExt;
 use reqwest::Client;
+use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
@@ -40,8 +41,14 @@ fn tool_parameters(tool: &Value) -> Value {
     }
 }
 
-pub fn build_body(model: &Model, messages: &[Message], system: &str, tools: &Value) -> Value {
-    let input = convert_input(messages);
+pub fn build_body(
+    model: &Model,
+    messages: &[Message],
+    system: &str,
+    tools: &Value,
+    replay_reasoning: bool,
+) -> Value {
+    let input = convert_input(messages, replay_reasoning);
     let wire_tools = convert_tools(tools);
 
     let mut body = json!({
@@ -103,7 +110,7 @@ pub fn apply_responses_reasoning(
     }
 }
 
-pub(crate) fn convert_input(messages: &[Message]) -> Value {
+pub(crate) fn convert_input(messages: &[Message], replay_reasoning: bool) -> Value {
     let mut input = Vec::new();
 
     for msg in messages {
@@ -144,11 +151,21 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                 }
             }
             Role::Assistant => {
+                let mut reasoning = String::new();
+                let mut reasoning_id = None;
                 let mut text_parts = Vec::new();
                 let mut tool_calls = Vec::new();
 
                 for block in &msg.content {
                     match block {
+                        ContentBlock::Thinking {
+                            thinking,
+                            reasoning_id: id,
+                            ..
+                        } => {
+                            reasoning.push_str(thinking);
+                            reasoning_id = reasoning_id.or_else(|| id.clone());
+                        }
                         ContentBlock::Text { text } => text_parts.push(text.as_str()),
                         ContentBlock::ToolUse {
                             id, name, input, ..
@@ -157,10 +174,21 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                         }
                         ContentBlock::ToolResult { .. }
                         | ContentBlock::Image { .. }
-                        | ContentBlock::Thinking { .. }
                         | ContentBlock::RedactedThinking { .. }
                         | ContentBlock::Unknown(_) => {}
                     }
+                }
+
+                if replay_reasoning && !reasoning.is_empty() {
+                    let mut item = json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": [{"type": "reasoning_text", "text": reasoning}]
+                    });
+                    if let Some(id) = reasoning_id {
+                        item["id"] = json!(id);
+                    }
+                    input.push(item);
                 }
 
                 if !text_parts.is_empty() {
@@ -230,9 +258,12 @@ fn strip_summary(body: &mut Value) {
     }
 }
 
+/// `headers` are the provider's own for this request: over maki's, under
+/// the credentials.
 pub(crate) async fn do_stream(
     client: &Client,
     model: &crate::model::Model,
+    headers: &HeaderMap,
     body: &Value,
     event_tx: &UnboundedSender<ProviderEvent>,
     auth: &ResolvedAuth,
@@ -245,12 +276,32 @@ pub(crate) async fn do_stream(
     if summary_rejected(base) && has_summary(&body) {
         strip_summary(body.to_mut());
     }
-    let result = post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await;
+    let result = post_responses(
+        client,
+        model,
+        headers,
+        &body,
+        event_tx,
+        auth,
+        base,
+        stream_timeout,
+    )
+    .await;
     match result {
         Err(err) if has_summary(&body) && err.is_unsupported_reasoning_summary() => {
             reject_summary(base);
             strip_summary(body.to_mut());
-            post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await
+            post_responses(
+                client,
+                model,
+                headers,
+                &body,
+                event_tx,
+                auth,
+                base,
+                stream_timeout,
+            )
+            .await
         }
         result => result,
     }
@@ -260,6 +311,7 @@ pub(crate) async fn do_stream(
 async fn post_responses(
     client: &Client,
     model: &crate::model::Model,
+    headers: &HeaderMap,
     body: &Value,
     event_tx: &UnboundedSender<ProviderEvent>,
     auth: &ResolvedAuth,
@@ -268,15 +320,13 @@ async fn post_responses(
 ) -> Result<StreamResponse, AgentError> {
     let json_body = serde_json::to_vec(body)?;
 
-    let request = auth
-        .configure_request(
-            client
-                .post(format!("{base}{RESPONSES_PATH}"))
-                .header("content-type", "application/json")
-                .header("user-agent", super::user_agent()),
-        )
-        .body(json_body)
-        .build()?;
+    let request = auth.finish(
+        client
+            .post(format!("{base}{RESPONSES_PATH}"))
+            .header("content-type", "application/json")
+            .headers(headers.clone())
+            .body(json_body),
+    )?;
 
     debug!(
         model = %model.id,
@@ -299,6 +349,7 @@ pub struct ResponsesProvider {
     client: Client,
     body_hook: Option<Arc<dyn super::codec::BodyHook>>,
     session_id: super::codec::SessionCarrier,
+    pub replay_reasoning: bool,
 }
 
 fn parse_price_value(val: &Value) -> Option<f64> {
@@ -456,7 +507,13 @@ impl ResponsesProvider {
             client: super::http_client(timeouts),
             body_hook: None,
             session_id: super::codec::SessionCarrier::default(),
+            replay_reasoning: false,
         }
+    }
+
+    pub fn with_replay_reasoning(mut self, replay_reasoning: bool) -> Self {
+        self.replay_reasoning = replay_reasoning;
+        self
     }
 
     pub fn with_session_id(mut self, session_id: super::codec::SessionCarrier) -> Self {
@@ -494,12 +551,11 @@ impl ResponsesProvider {
         if let Some(base) = self.resolve_url(auth) {
             let url = format!("{base}/models");
             if let Ok(req) = auth
-                .configure_request(
+                .finish(
                     self.client
                         .get(&url)
                         .header("user-agent", super::user_agent()),
                 )
-                .build()
                 && let Ok(text) = super::ok_text(&self.client, req).await
                 && let Ok(val) = serde_json::from_str::<Value>(&text)
             {
@@ -571,7 +627,7 @@ impl Provider for ResponsesProvider {
                 Some(prefix) => format!("{prefix}\n\n{system}"),
                 None => system.to_string(),
             };
-            let mut body = build_body(model, messages, &effective_system, tools);
+            let mut body = build_body(model, messages, &effective_system, tools, self.replay_reasoning);
             if let Some((fields, fallback)) = model.effective_thinking_fields() {
                 opts.thinking
                     .apply_fields(&mut body, model, fields, fallback);
@@ -581,7 +637,7 @@ impl Provider for ResponsesProvider {
                 apply_responses_reasoning(&mut body, opts.thinking, model, &dialect);
             }
             if let Some(session) = _session_id {
-                self.session_id.apply(session, &mut body, &mut auth);
+                let _ = self.session_id.apply(session, &mut body, &mut auth);
             }
             if let Some(hook) = &self.body_hook {
                 let ctx = super::codec::RequestCtx {
@@ -595,6 +651,7 @@ impl Provider for ResponsesProvider {
             do_stream(
                 &self.client,
                 model,
+                &reqwest::header::HeaderMap::new(),
                 &body,
                 event_tx,
                 &auth,
@@ -623,6 +680,7 @@ pub(crate) async fn parse_sse(
 ) -> Result<StreamResponse, AgentError> {
     let mut text = String::new();
     let mut reasoning_text = String::new();
+    let mut reasoning_id: Option<String> = None;
     let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
@@ -679,26 +737,32 @@ pub(crate) async fn parse_sse(
                 let output_index = parsed["output_index"]
                     .as_u64()
                     .unwrap_or(tool_accumulators.len() as u64);
-                if item["type"].as_str() == Some("function_call") {
-                    let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
-                    let name = item["name"]
-                        .as_str()
-                        .or_else(|| item["function"]["name"].as_str())
-                        .or_else(|| item["function_call"]["name"].as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    if !name.is_empty() {
-                        event_tx.send(ProviderEvent::ToolUseStart {
-                            id: call_id.clone(),
-                            name: name.clone(),
-                        })?;
+                match item["type"].as_str() {
+                    Some("function_call") => {
+                        let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
+                        let name = item["name"]
+                            .as_str()
+                            .or_else(|| item["function"]["name"].as_str())
+                            .or_else(|| item["function_call"]["name"].as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        if !name.is_empty() {
+                            event_tx.send(ProviderEvent::ToolUseStart {
+                                id: call_id.clone(),
+                                name: name.clone(),
+                            })?;
+                        }
+                        tool_accumulators.push(ToolAccumulator {
+                            output_index,
+                            call_id,
+                            name,
+                            arguments: String::new(),
+                        });
                     }
-                    tool_accumulators.push(ToolAccumulator {
-                        output_index,
-                        call_id,
-                        name,
-                        arguments: String::new(),
-                    });
+                    Some("reasoning") => {
+                        reasoning_id = item["id"].as_str().map(str::to_owned);
+                    }
+                    _ => {}
                 }
             }
 
@@ -874,6 +938,7 @@ pub(crate) async fn parse_sse(
             thinking: reasoning_text,
             signature: None,
             duration_ms: None,
+            reasoning_id,
         });
     }
 
@@ -1173,7 +1238,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
             },
         ];
 
-        let input = convert_input(&messages);
+        let input = convert_input(&messages, false);
         let items = input.as_array().unwrap();
 
         assert_eq!(items[0]["type"], "message");
@@ -1196,6 +1261,49 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
     }
 
     #[test]
+    fn convert_input_replays_past_reasoning() {
+        let assistant = |reasoning_id: Option<String>| Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "weighing it".to_string(),
+                    signature: None,
+                    duration_ms: None,
+                    reasoning_id,
+                },
+                ContentBlock::Text {
+                    text: "answer".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let messages = [Message::user("hello".to_string()), assistant(None)];
+
+        let input = convert_input(&messages, true);
+        let items = input.as_array().unwrap();
+
+        assert_eq!(items[1]["type"], "reasoning");
+        assert_eq!(items[1]["summary"], json!([]));
+        assert_eq!(items[1]["content"][0]["type"], "reasoning_text");
+        assert_eq!(items[1]["content"][0]["text"], "weighing it");
+        assert!(items[1].get("id").is_none());
+        assert_eq!(items[2]["type"], "message");
+        assert_eq!(items[2]["role"], "assistant");
+        assert_eq!(items[2]["content"][0]["text"], "answer");
+
+        let dropped = convert_input(&messages, false);
+        assert_eq!(dropped[1]["type"], "message");
+        assert_eq!(dropped[1]["role"], "assistant");
+
+        let with_id = [
+            Message::user("hello".to_string()),
+            assistant(Some("rs_1".to_string())),
+        ];
+        let input = convert_input(&with_id, true);
+        assert_eq!(input[1]["id"], "rs_1");
+    }
+
+    #[test]
     fn convert_input_blank_tool_result_gets_marker() {
         let messages = vec![Message {
             role: Role::User,
@@ -1203,7 +1311,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
             ..Default::default()
         }];
 
-        let input = convert_input(&messages);
+        let input = convert_input(&messages, false);
         assert_eq!(input[0]["type"], "function_call_output");
         assert_eq!(input[0]["output"], crate::types::EMPTY_RESPONSE_MARKER);
     }
@@ -1239,7 +1347,7 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
 
         assert_eq!(resp.message.content.len(), 2);
         assert!(
-            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Let me think about this")
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, reasoning_id, .. } if thinking == "Let me think about this" && reasoning_id.as_deref() == Some("rs_1"))
         );
         assert!(
             matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hello world")

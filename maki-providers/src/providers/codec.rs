@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
+use crate::headers::HeaderError;
 use crate::provider::BoxFuture;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -40,17 +41,26 @@ pub struct SessionCarrier {
 }
 
 impl SessionCarrier {
-    pub(crate) fn apply(&self, session: &SessionRef, body: &mut Value, auth: &mut ResolvedAuth) {
+    pub(crate) fn apply(
+        &self,
+        session: &SessionRef,
+        body: &mut Value,
+        auth: &mut ResolvedAuth,
+    ) -> Result<(), HeaderError> {
         if let (Some(field), Some(object)) = (&self.body_field, body.as_object_mut()) {
             object.insert(field.to_string(), json!(session.as_str()));
         }
-        self.apply_headers(session, auth);
+        self.apply_headers(session, auth)
     }
 
-    pub(crate) fn apply_headers(&self, session: &SessionRef, auth: &mut ResolvedAuth) {
-        for name in self.headers.iter() {
-            auth.set_header(name, session.as_str().to_owned());
-        }
+    pub(crate) fn apply_headers(
+        &self,
+        session: &SessionRef,
+        auth: &mut ResolvedAuth,
+    ) -> Result<(), HeaderError> {
+        self.headers
+            .iter()
+            .try_for_each(|name| auth.set_header(name, session.as_str()))
     }
 }
 
@@ -98,6 +108,7 @@ pub struct CodecOptions {
     pub system_prefix: Option<String>,
     pub openai: OpenAiWire,
     pub session_id: SessionCarrier,
+    pub replay_reasoning: bool,
     pub build_body: Option<Arc<dyn BodyHook>>,
 }
 
@@ -112,6 +123,7 @@ impl CodecOptions {
             system_prefix: None,
             openai: OpenAiWire::default(),
             session_id: SessionCarrier::default(),
+            replay_reasoning: false,
             build_body: None,
         }
     }
@@ -130,6 +142,7 @@ pub fn build(
     let provider = ResponsesProvider::new(options.slug, base_url, auth, timeouts)
         .with_body_hook(options.build_body)
         .with_system_prefix(options.system_prefix)
-        .with_session_id(options.session_id);
+        .with_session_id(options.session_id)
+        .with_replay_reasoning(options.replay_reasoning);
     Box::new(provider)
 }

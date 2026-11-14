@@ -1825,8 +1825,16 @@ impl MessagesPanel {
                 break;
             }
             let highlight = self.highlight_segment == Some(i);
-            let style = if seg.is_user {
+            let style = if seg.is_user
+                || seg.msg_index.is_some_and(|idx| {
+                    self.messages
+                        .get(idx)
+                        .is_some_and(|m| matches!(&m.role, DisplayRole::User))
+                })
+            {
                 Some(theme::current().user_bg)
+            } else if seg.tool_id.is_some() {
+                Some(theme::current().tool_bg)
             } else {
                 None
             };

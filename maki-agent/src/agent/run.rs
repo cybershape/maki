@@ -1615,6 +1615,7 @@ mod tests {
             thinking: "stalled".into(),
             signature: None,
             duration_ms: None,
+            reasoning_id: None,
         }])
     }
 
@@ -1626,6 +1627,7 @@ mod tests {
                 thinking: THOUGHT.into(),
                 signature: Some(THOUGHT_SIGNATURE.into()),
                 duration_ms: None,
+                reasoning_id: None,
             },
         );
         response
@@ -3883,6 +3885,7 @@ mod tests {
                     thinking: "hmm".into(),
                     signature: Some("sig".into()),
                     duration_ms: None,
+                    reasoning_id: None,
                 },
                 ContentBlock::Text {
                     text: "done".into(),
@@ -4733,6 +4736,17 @@ mod tests {
         assert_eq!(completions, [(SUMMARY.into(), expected_gauge.size())]);
     }
 
+    /// Messages are compared by content and order here; the append paths stamp
+    /// `created_at`, and pinning that is compaction.rs and history.rs's job.
+    fn without_clock(msgs: &[Message]) -> Vec<Message> {
+        msgs.iter()
+            .map(|m| Message {
+                created_at: None,
+                ..m.clone()
+            })
+            .collect()
+    }
+
     /// The configured instructions close the summary block, ahead of the
     /// carried input. A truncated answer stays last so it can be continued, and
     /// the next compaction summarizes the old copy instead of carrying it.
@@ -4767,18 +4781,21 @@ mod tests {
 
         let messages = agent.history.as_slice();
         assert_eq!(
-            messages[1..agent.carry_from],
-            [
+            without_clock(&messages[1..agent.carry_from]),
+            without_clock(&[
                 summary_response().message,
-                Message::synthetic(POST_COMPACTION.into())
-            ]
+                Message::synthetic(POST_COMPACTION.into()),
+            ])
         );
         let expected_tail = if carried.is_empty() {
             vec![Message::synthetic(compaction::continue_message(None))]
         } else {
             carried
         };
-        assert_eq!(messages[agent.carry_from..], expected_tail);
+        assert_eq!(
+            without_clock(&messages[agent.carry_from..]),
+            without_clock(&expected_tail)
+        );
     }
 
     /// Lands its command once the stop layer has spent the allowance, keyed on

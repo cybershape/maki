@@ -41,6 +41,7 @@ const BUILD_BODY_OPTION: &str = "build_body hook";
 const SYSTEM_PREFIX_OPTION: &str = "system_prefix";
 const OPENAI_OPTION: &str = "openai";
 const SESSION_ID_OPTION: &str = "session_id";
+const REPLAY_REASONING_OPTION: &str = "replay_reasoning";
 const BASE_URL_OPTION: &str = "base_url";
 const HTTPS_SCHEME: &str = "https";
 const HTTP_SCHEME: &str = "http";
@@ -192,6 +193,11 @@ pub struct ProviderDecl {
     pub openai: Option<OpenAiWire>,
     /// Above the codec tables, because every codec but google carries it.
     pub session_id: Option<SessionCarrier>,
+    /// Send past assistant reasoning back as `reasoning` input items. Only
+    /// `codec = "openai-responses"` reads it, and only some providers take
+    /// plaintext reasoning back.
+    #[serde(default)]
+    pub replay_reasoning: bool,
     /// This and the next three describe a model no row or listing covers.
     /// Each falls back to the native provider behind the codec or base. The
     /// two limits also fill in any row that leaves its own out.
@@ -399,7 +405,7 @@ fn honours_build_body(target: Target) -> bool {
     }
 }
 
-fn honours_openai_wire(target: Target) -> bool {
+fn honours_openai_wire(target: Target, _wire: &OpenAiWire) -> bool {
     match target {
         Target::Codec(_) => true,
         Target::Base(_) => false,
@@ -419,6 +425,15 @@ fn honours_system_prefix(_target: Target) -> bool {
 /// use for one.
 fn honours_session_id(_target: Target) -> bool {
     true
+}
+
+/// Only the responses wire takes a `reasoning` input item, and only some
+/// providers accept one in plaintext.
+fn honours_replay_reasoning(target: Target) -> bool {
+    match target {
+        Target::Codec(_) => true,
+        Target::Base(_) => false,
+    }
 }
 
 /// A base is the native provider whole, and the native only moves for an
@@ -716,11 +731,16 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
     if decl.system_prefix.is_some() && !honours_system_prefix(target) {
         return Err(unsupported(SYSTEM_PREFIX_OPTION));
     }
-    if decl.openai.is_some() && !honours_openai_wire(target) {
+    if let Some(wire) = &decl.openai
+        && !honours_openai_wire(target, wire)
+    {
         return Err(unsupported(OPENAI_OPTION));
     }
     if decl.session_id.is_some() && !honours_session_id(target) {
         return Err(unsupported(SESSION_ID_OPTION));
+    }
+    if decl.replay_reasoning && !honours_replay_reasoning(target) {
+        return Err(unsupported(REPLAY_REASONING_OPTION));
     }
     let states_origin =
         decl.base_url.is_some() || decl.plans.iter().any(|plan| plan.base_url.is_some());
@@ -1415,6 +1435,7 @@ fn codec_options(entry: &PluginEntry, protocol: Protocol) -> CodecOptions {
         system_prefix: decl.system_prefix.clone(),
         openai: decl.openai.clone().unwrap_or_default(),
         session_id: decl.session_id.clone().unwrap_or_default(),
+        replay_reasoning: decl.replay_reasoning,
         build_body: entry
             .hooks
             .build_body
@@ -1902,7 +1923,9 @@ mod tests {
     }
 
     fn token(entry: &PluginEntry) -> String {
-        entry.auth.current.lock().unwrap().headers[0].1.clone()
+        entry.auth.current.lock().unwrap().header_list()[0]
+            .1
+            .clone()
     }
 
     fn base_url(slug: &str) -> Option<String> {
@@ -2222,7 +2245,7 @@ mod tests {
         };
         let entry = entry(SLUG).unwrap();
         let auth = entry.auth.current.lock().unwrap();
-        assert_eq!(auth.headers, [(header.to_string(), value)]);
+        assert_eq!(auth.header_list(), [(header.to_string(), value)]);
     }
 
     /// Tier defaults are looked up through `default`, like in a curated table.
@@ -2753,6 +2776,13 @@ mod tests {
         commit_load();
     }
 
+    #[test]
+    fn replay_reasoning_registers_on_the_responses_codec() {
+        let mut reg = registration("replay-reasoning-plugin");
+        reg.decl.codec = Some(Protocol::OpenaiResponses);
+        reg.decl.replay_reasoning = true;
+        register_loaded(reg).unwrap();
+    }
     fn base_url_off_the_declared_hosts(reg: &mut Registration) {
         reg.decl.base_url = Some(UNDECLARED_BASE_URL.to_string());
     }
@@ -2773,6 +2803,7 @@ mod tests {
     #[test_case(missing_base, |e| matches!(e, RegisterError::UnknownBase { .. }) ; "unknown_base")]
     #[test_case(no_net_hosts, |e| matches!(e, RegisterError::NoNetHosts(_)) ; "net_hosts_empty")]
     #[test_case(outside_a_load, |e| matches!(e, RegisterError::Closed(_)) ; "registration_outside_a_load")]
+
     #[test_case(base_url_off_the_declared_hosts, |e| matches!(e, RegisterError::UndeclaredBaseUrl(_)) ; "base_url_must_be_declared")]
     #[test_case(base_url_over_plain_http, |e| matches!(e, RegisterError::UndeclaredBaseUrl(_)) ; "base_url_must_be_https")]
     #[test_case(plan_off_the_declared_hosts, |e| matches!(e, RegisterError::UndeclaredBaseUrl(_)) ; "plan_base_url_must_be_declared")]

@@ -5,6 +5,7 @@
 
 local TextInput = require("maki.text_input")
 local ListPicker = require("maki.list_picker")
+local ListNav = require("maki.list_nav")
 
 local FILTER_PREFIX = "❯ "
 local RENAME_PREFIX = "Rename: "
@@ -156,7 +157,10 @@ local function dispw(s)
   if not s or s == "" then
     return 0
   end
-  return maki.ui.display_width(s)
+  if maki.ui and maki.ui.display_width then
+    return maki.ui.display_width(s)
+  end
+  return utf8.len(s) or #s
 end
 
 local function render()
@@ -301,19 +305,6 @@ local function set_sel(i)
   render()
 end
 
-local function move_sel(delta, wrap)
-  local n = #board.items
-  if n == 0 then
-    return
-  end
-  local cur = sel_index() or 1
-  if wrap then
-    set_sel((cur - 1 + delta) % n + 1)
-  else
-    set_sel(math.min(math.max(cur + delta, 1), n))
-  end
-end
-
 local function page_size()
   return math.max(board.height - board.reserved - 1, 1)
 end
@@ -432,8 +423,8 @@ local function handle_rename_key(key)
     stop_rename()
   elseif key == "<CR>" then
     commit_rename()
-  elseif key ~= "<Up>" and key ~= "<Down>" then
-    if board.rename.input:handle_key(key) ~= "ignored" then
+  elseif not ListNav.KEYS[key] then
+    if board.rename.input:handle_key(key) ~= TextInput.Result.IGNORED then
       render()
     end
   end
@@ -455,14 +446,6 @@ local function handle_key(key)
     else
       close()
     end
-  elseif key == "<Up>" then
-    move_sel(-1, true)
-  elseif key == "<Down>" then
-    move_sel(1, true)
-  elseif key == "<PageUp>" then
-    move_sel(-page_size())
-  elseif key == "<PageDown>" then
-    move_sel(page_size())
   elseif key == "<CR>" then
     open_selected()
   elseif key == "<C-n>" then
@@ -471,10 +454,10 @@ local function handle_key(key)
     start_rename()
   elseif key == "<C-d>" then
     delete_selected()
-  else
+  elseif not ListNav.handle_key(key, sel_index() or 1, { count = #board.items, page = page_size() }, set_sel) then
     local r = board.input:handle_key(key)
-    if r ~= "ignored" then
-      if r == "changed" then
+    if r ~= TextInput.Result.IGNORED then
+      if r == TextInput.Result.CHANGED then
         filter_changed()
       else
         board.confirm = nil

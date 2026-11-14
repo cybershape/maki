@@ -2051,6 +2051,7 @@ mod tests {
                     thinking: "reasoning".into(),
                     signature: None,
                     duration_ms: None,
+                    reasoning_id: None,
                 },
                 ContentBlock::Text {
                     text: "answer".into(),
@@ -2131,6 +2132,7 @@ mod tests {
                         thinking: "thinking step".into(),
                         signature: None,
                         duration_ms: None,
+                        reasoning_id: None,
                     },
                     ContentBlock::tool_use(
                         "t1",
@@ -2209,6 +2211,7 @@ mod tests {
                         thinking: "thinking step".into(),
                         signature: None,
                         duration_ms: None,
+                        reasoning_id: None,
                     },
                     ContentBlock::tool_use(
                         "t1",
