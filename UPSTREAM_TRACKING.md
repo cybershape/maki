@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `f78edb1624e0efdb3b1bf9d199b67551b852e635`
-  - **Commit date**: `Fri Nov 13 21:37:49 2026 +0200`
-  - **Commit author**: `Sebastian Dröge <sebastian@centricular.com>`
-  - **Commit message**: `feat(providers): replay the reasoning item id on the responses wire`
+  - **Commit SHA**: `2d07edfc476bdff38d0a72c2dff99413a092a0ad`
+  - **Commit date**: `Sat Nov 14 17:21:05 2026 +0200`
+  - **Commit author**: `Tony Solomonik <tony.solomonik@gmail.com>`
+  - **Commit message**: `refactor(ui): simplify the message gutter`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `f78edb16`.
+> `upstream/main` has been successfully merged through commit `2d07edfc`.
 
 ---
 
@@ -192,6 +192,7 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `b9d4db00` | `feat(ui): render background bash standalone in compact_tools mode` | Render background bash commands as standalone tool rows and split compact groups |
 | `07eff86e` | `Merge branch 'upstream/main' into main` | Merge upstream through `684e9bc0`, including dropping flume across the codebase in favor of tokio and std channels, ArcSwap for whole-value registries in highlight and providers, LazyLock for fixed statics, reading session archived windows one at a time, recording sealed_by on archived windows, async stdout for ACP and SDK, and tokio::process for tmux queries, while preserving core fork customizations |
 | `cd74ef20` | `Merge branch 'upstream/main' into main` | Merge upstream through `f78edb16`, including shared tokio stdin reader, 6 recent models, folded model picker rows by default with expanded-providers state, per-message wall clock, maki.list_nav and maki.version Lua API, stepping thinking effort via Alt+,/Alt+., user_bg/user_text styles, past reasoning and reasoning_id replay on Responses wire, and Claude Code subagent lifecycle task messages, while preserving core fork customizations |
+| `1b9a041b` | `Merge branch 'upstream/main' into main` | Merge upstream through `2d07edfc`, including version 0.7.2 bump, chat messages marker gutter column rendering, user message tinting in bundled themes, archiving compaction that keeps message count, preserving user-typed title across rewrites, `agent.compact.before` deferral, subagent task ID notification, nested subagent ask denial, and UI gutter refactoring, while preserving core fork customizations |
 
 ---
 
