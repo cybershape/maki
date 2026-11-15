@@ -268,8 +268,8 @@ impl SessionTrack {
         let history = &mut self.history;
         let store = &mut self.store;
         match store.record_turn(
-            history.messages_with_timestamps(),
-            history.frame(),
+            history.snapshot(),
+            Some(history.messages_with_timestamps()),
             self.gauge.size(),
         ) {
             Ok(()) => history.mark_saved(),
@@ -333,27 +333,6 @@ struct SessionStore {
     header: SharedHeader,
 }
 
-trait IntoTurnMessages {
-    fn into_turn_messages(self) -> Vec<(Message, Option<u64>)>;
-}
-
-impl IntoTurnMessages for Vec<(Message, Option<u64>)> {
-    fn into_turn_messages(self) -> Vec<(Message, Option<u64>)> {
-        self
-    }
-}
-
-impl IntoTurnMessages for &[Message] {
-    fn into_turn_messages(self) -> Vec<(Message, Option<u64>)> {
-        self.iter().cloned().map(|m| (m, None)).collect()
-    }
-}
-
-impl<const N: usize> IntoTurnMessages for &[Message; N] {
-    fn into_turn_messages(self) -> Vec<(Message, Option<u64>)> {
-        self.as_slice().iter().cloned().map(|m| (m, None)).collect()
-    }
-}
 
 impl SessionStore {
     /// Opening touches no file: the driver either read the session already or
@@ -409,25 +388,29 @@ impl SessionStore {
     /// not in the log yet and must survive the appends around them.
     fn record_turn(
         &mut self,
-        messages: impl IntoTurnMessages,
-        frame: Option<&Arc<StoredFrame>>,
+        snapshot: &HistorySnapshot,
+        messages_with_timestamps: Option<Vec<(Message, Option<u64>)>>,
         context_size: u32,
     ) -> Result<(), SessionError> {
-        let messages = messages.into_turn_messages();
-        fn tool_call_ids(m: &Message) -> Vec<String> {
-            m.tool_uses().map(|(id, _, _)| id.to_owned()).collect()
-        }
+        let messages = snapshot.messages.as_slice();
         if messages.is_empty() {
             return Ok(());
         }
-        let bare: Vec<Message> = messages.iter().map(|(m, _)| m.clone()).collect();
-        let dropped = self.session.dropped_tool_ids(&bare, tool_call_ids);
-        self.session.replace_messages_with_timestamps(messages);
+        fn tool_call_ids(m: &Message) -> Vec<String> {
+            m.tool_uses().map(|(id, _, _)| id.to_owned()).collect()
+        }
+        let dropped = self.session.dropped_tool_ids(messages, tool_call_ids);
+        if let Some(timed) = messages_with_timestamps {
+            self.session.replace_messages_with_timestamps(timed);
+        } else {
+            self.session.replace_messages(messages.to_vec());
+        }
         self.session.drop_tool_state_of(&dropped, tool_call_ids);
-        self.session.set_frame(frame.cloned());
+        self.session.set_frame(snapshot.frame.clone());
         self.session.meta.context_size = context_size;
         self.session.meta.pending_background = self.mailbox.unsettled();
-        self.session.update_title_if_default();
+        self.session
+            .update_title_if_default(snapshot.title_source.as_deref());
         self.session.save(&self.claim, &self.dir)
     }
 }
@@ -456,6 +439,7 @@ mod tests {
     const OTHER_SPEC: &str = "other/model";
     const CONTEXT_SIZE: u32 = 42_000;
     const PROMPT: &str = "fix the login bug";
+    const WRAPPED_PROMPT: &str = "Memories: the login uses OAuth.\n\nfix the login bug";
     const OBSERVATION: &str = "build failed";
     const TITLE: &str = "a title the user set";
     const PLAN_PATH: &str = "/plans/plan.md";
@@ -656,6 +640,22 @@ mod tests {
         );
     }
 
+    /// Headless runs save only through `record_turn`, so the typed text has
+    /// to reach the title through it while the log keeps the rewrite.
+    #[test]
+    fn a_wrapped_prompt_saves_the_typed_title() {
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        push_turn(&mut track, MODEL_SPEC, |params| {
+            params.history.offer_title_source(PROMPT, WRAPPED_PROMPT);
+            params.history.push(Message::user(WRAPPED_PROMPT.into()));
+        });
+
+        let loaded = load(&tmp);
+        assert_eq!(loaded.title, PROMPT);
+        assert_eq!(loaded.messages()[0].user_text(), Some(WRAPPED_PROMPT));
+    }
+
     /// `updated_at` counts whole seconds, so a rewrite in the same second as
     /// the seed could leave the bytes as they were. The orphan closes that
     /// gap: the reopened history has already dropped it, so any rewrite at
@@ -707,14 +707,18 @@ mod tests {
 
         track
             .store
-            .record_turn(&[call("gone"), call("kept")], None, CONTEXT_SIZE)
+            .record_turn(
+                &HistorySnapshot::new(vec![call("gone"), call("kept")]),
+                None,
+                CONTEXT_SIZE,
+            )
             .unwrap();
         assert!(load(&tmp).tool_outputs().contains_key("gone"));
 
         track
             .store
             .record_turn(
-                &[Message::user("summary".into()), call("kept")],
+                &HistorySnapshot::new(vec![Message::user("summary".into()), call("kept")]),
                 None,
                 CONTEXT_SIZE,
             )
@@ -738,7 +742,11 @@ mod tests {
 
         track
             .store
-            .record_turn(&[Message::user("next turn".into())], None, CONTEXT_SIZE)
+            .record_turn(
+                &HistorySnapshot::new(vec![Message::user("next turn".into())]),
+                None,
+                CONTEXT_SIZE,
+            )
             .unwrap();
 
         assert!(load(&tmp).tool_outputs().contains_key("live"));

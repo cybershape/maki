@@ -12227,20 +12227,39 @@ fn run_builtin_model_picker_opens_and_refreshes() {
     assert!(matches!(&actions[..], [Action::RefreshModels]));
 }
 
-/// A provider row that cannot serve models hands Enter to its login.
+/// A provider row that cannot serve models hands Enter to its login, and the
+/// keys page goes out as an `Action` so a test never opens a browser.
 #[test]
 fn enter_on_a_keyless_provider_row_opens_its_login() {
+    use maki_config::providers::{BuiltInProvider, Protocol};
+    static TEST_PROVIDER: BuiltInProvider = BuiltInProvider {
+        slug: "test-keyless",
+        display_name: "Test Keyless",
+        protocol: Protocol::OpenaiResponses,
+        default_base_url: "",
+        default_api_key_env: "TEST_KEY",
+        default_model: None,
+        login_url: Some("https://example.com/login"),
+        plans: None,
+        needs_url: false,
+    };
+    maki_config::providers::set_registered_providers(vec![&TEST_PROVIDER]);
     let (mut app, models) = app_with_model_slot();
     models.store(Some(Arc::new(ModelList {
         specs: Vec::new(),
-        providers: HashMap::from([("anthropic".into(), ProviderStatus::MissingKey)]),
+        providers: HashMap::from([("test-keyless".into(), ProviderStatus::MissingKey)]),
         loading: false,
     })));
     app.run_builtin(BuiltinAction::ModelPicker);
 
-    app.update(Msg::Key(key(KeyCode::Enter)));
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(!app.model_picker.is_open());
     assert!(app.login_picker.is_open());
+    let keys_page = maki_config::providers::resolve_login_url("test-keyless", None).unwrap();
+    assert!(
+        matches!(&actions[..], [Action::OpenUrl(url)] if url == &keys_page),
+        "Enter must emit the keys page as an action"
+    );
 }
 
 #[test]

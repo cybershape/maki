@@ -105,10 +105,10 @@ selection    = "#363848"
 
 [ui]
 user               = { fg = "cyan" }
-user_bg            = { bg = "#222430" }
 assistant          = { fg = "foreground" }
 assistant_prefix   = { fg = "pink" }
 thinking           = { fg = "comment", modifiers = ["italic"] }
+user_bg            = { bg = "#2e303d" }
 tool_bg            = { bg = "#222430" }
 tool               = { fg = "foreground" }
 tool_path          = { fg = "orange" }

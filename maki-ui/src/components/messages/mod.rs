@@ -9,7 +9,7 @@ pub use self::scroll::ScrollPos;
 
 use self::render::RenderCursor;
 use self::scroll::Layout;
-use self::segment::{Segment, SegmentCache};
+use self::segment::{Segment, SegmentCache, body_width};
 
 use super::compact_detail::CompactTarget;
 use super::tool_display::{
@@ -66,7 +66,6 @@ const IMAGE_KEEP_MARGIN_SEGMENTS: usize = 8;
 const CLICKABLE: bool = true;
 const NOTICE_COLLAPSED_MARK: &str = " ▸";
 const NOTICE_EXPANDED_MARK: &str = " ▾";
-const NOTICE_DETAIL_INDENT: &str = "  ";
 const NOTICE_DETAIL_DIM: f32 = 0.7;
 
 /// What a click in the transcript asks of the app.
@@ -149,15 +148,15 @@ impl MessagesPanel {
         Self {
             messages: Vec::new(),
             streaming_thinking: StreamingContent::new(
-                thinking.prefix,
+                thinking.label,
                 thinking.text_style,
-                thinking.prefix_style,
+                thinking.label_style(),
                 ms,
             ),
             streaming_text: StreamingContent::new(
-                assistant.prefix,
+                assistant.label,
                 assistant.text_style,
-                assistant.prefix_style,
+                assistant.label_style(),
                 ms,
             ),
             started_at: Instant::now(),
@@ -1042,7 +1041,7 @@ impl MessagesPanel {
             .get(&inst_id)
             .copied()
             .unwrap_or_default();
-        let tl = build_instructions_lines(blocks, self.viewport_width, exp.output);
+        let tl = build_instructions_lines(blocks, body_width(self.viewport_width), exp.output);
 
         // The spacer gets its line only now. Empty means no rows, so a tool
         // that never sends instructions leaves no gap behind.
@@ -1543,7 +1542,7 @@ impl MessagesPanel {
         if let Some(badge) = &msg.background {
             return Some(ClickOutcome::OpenTask(badge.id.clone()));
         }
-        let col = col.checked_sub(area.x)?;
+        let col = col.checked_sub(area.x + seg.gutter_cols(area.width))?;
         (pos.row == 0 && hint_columns(seg.lines().first()?)?.contains(&col))
             .then(|| ClickOutcome::MoveCall(tool_id.to_owned()))
     }
@@ -1773,14 +1772,14 @@ impl MessagesPanel {
             let thinking = thinking_style();
             let assistant = assistant_style();
             self.streaming_thinking.set_style(
-                thinking.prefix,
+                thinking.label,
                 thinking.text_style,
-                thinking.prefix_style,
+                thinking.label_style(),
             );
             self.streaming_text.set_style(
-                assistant.prefix,
+                assistant.label,
                 assistant.text_style,
-                assistant.prefix_style,
+                assistant.label_style(),
             );
         }
         self.rebuild_line_cache();
@@ -1888,6 +1887,7 @@ impl MessagesPanel {
     /// so a [`ScrollPos`] still points at the same text after the flush.
     fn rebuild_live_segments(&mut self, width: u16) {
         self.live_start = self.cache.len();
+        let width = body_width(width);
         if !self.streaming_thinking.is_empty() {
             let collapsed = thinking::collapsed_view(
                 thinking::tail_rows(self.thinking_lines, self.live_thinking_expanded),
@@ -1902,17 +1902,23 @@ impl MessagesPanel {
             let drawn_collapsed = collapsed.is_some();
             let lines =
                 collapsed.unwrap_or_else(|| self.streaming_thinking.render_lines(width).to_vec());
-            self.push_live_segment(lines, drawn_collapsed);
+            self.push_live_segment(lines, drawn_collapsed, thinking_style().gutter());
         }
         if !self.streaming_text.is_empty() {
             let lines = self.streaming_text.render_lines(width).to_vec();
-            self.push_live_segment(lines, false);
+            self.push_live_segment(lines, false, assistant_style().gutter());
         }
     }
 
-    fn push_live_segment(&mut self, lines: Vec<Line<'static>>, collapsed: bool) {
+    fn push_live_segment(
+        &mut self,
+        lines: Vec<Line<'static>>,
+        collapsed: bool,
+        gutter: Span<'static>,
+    ) {
         self.cache.push_spacer_if_needed();
         let mut seg = Segment::with_lines(lines, None);
+        seg.gutter = Some(gutter);
         seg.truncation.output = collapsed;
         self.cache.push(seg);
     }
@@ -2260,7 +2266,7 @@ impl MessagesPanel {
     fn rctx(&self) -> RenderCtx<'_> {
         RenderCtx {
             started_at: self.started_at,
-            width: self.viewport_width,
+            width: body_width(self.viewport_width),
             tool_output_lines: &self.tool_output_lines,
         }
     }
@@ -2523,12 +2529,12 @@ impl MessagesPanel {
                 seg.apply_highlight(tl, &self.hl_worker);
                 self.cache.push(seg);
             } else {
-                let (lines, truncated) =
-                    message_view(msg, self.thinking_lines, self.viewport_width);
+                let view = message_view(msg, self.thinking_lines, self.viewport_width);
                 self.cache.push_spacer_if_needed();
-                let mut seg = Segment::with_lines(lines, Some(i));
+                let mut seg = Segment::with_lines(view.lines, Some(i));
                 seg.is_user = matches!(msg.role, DisplayRole::User);
-                seg.truncation.output = truncated;
+                seg.gutter = view.gutter;
+                seg.truncation.output = view.collapsed;
                 seg.set_images(message_images(msg));
                 self.cache.push(seg);
             }
@@ -2622,12 +2628,13 @@ impl MessagesPanel {
         let Some(msg) = self.messages.get(msg_idx) else {
             return;
         };
-        let (lines, truncated) = message_view(msg, self.thinking_lines, width);
+        let view = message_view(msg, self.thinking_lines, width);
         let Some(seg) = self.cache.get_mut(seg_idx) else {
             return;
         };
-        seg.set_lines(lines);
-        seg.truncation.output = truncated;
+        seg.gutter = view.gutter;
+        seg.set_lines(view.lines);
+        seg.truncation.output = view.collapsed;
     }
 }
 
@@ -2658,52 +2665,81 @@ fn message_style(role: &DisplayRole) -> RoleStyle {
     }
 }
 
-/// A plan message draws its own rule and path instead of the role prefix.
-fn message_prefix(msg: &DisplayMessage, style: &RoleStyle) -> &'static str {
+/// A plan message draws its own rule and path instead of the role label.
+fn message_label(msg: &DisplayMessage, style: &RoleStyle) -> &'static str {
     if msg.plan_path.is_some() {
         ""
     } else {
-        style.prefix
+        style.label
     }
 }
 
-/// Carries the role prefix so a query can hit either the prose or the role
-/// prefix markers the reader sees. Collapsed thinking needs no case of
-/// its own: its indicator is drawn from the same prefix.
-fn message_search_text(msg: &DisplayMessage) -> String {
-    let style = message_style(&msg.role);
-    format!("{}{}", message_prefix(msg, &style), msg.text)
+fn message_gutter(msg: &DisplayMessage, style: &RoleStyle) -> Option<Span<'static>> {
+    if msg.plan_path.is_some() {
+        None
+    } else if let Some(end) = msg.task_end {
+        Some(outcome_glyph(end))
+    } else {
+        Some(style.gutter())
+    }
 }
 
-/// A non-Tool message's lines at `width`, and whether they are thinking drawn
-/// collapsed, which is what makes a click on them expand it.
-fn message_view(
-    msg: &DisplayMessage,
-    mode: ThinkingLines,
-    width: u16,
-) -> (Vec<Line<'static>>, bool) {
+/// Starts with the marker and label the reader sees, so a query for "❯" or
+/// "thinking>" lands on them too. A blank marker trims down to nothing, and
+/// collapsed thinking draws its header from the same label, so neither needs
+/// a case of its own.
+fn message_search_text(msg: &DisplayMessage) -> String {
+    let style = message_style(&msg.role);
+    let marker = if message_gutter(msg, &style).is_some() {
+        style.marker.trim_start()
+    } else {
+        ""
+    };
+    format!("{marker}{}{}", message_label(msg, &style), msg.text)
+}
+
+struct MessageView {
+    lines: Vec<Line<'static>>,
+    gutter: Option<Span<'static>>,
+    /// Thinking drawn collapsed, which is what makes a click on it expand it.
+    collapsed: bool,
+}
+
+/// A non-Tool message's lines at the body width of `width`, with the gutter
+/// they sit behind.
+fn message_view(msg: &DisplayMessage, mode: ThinkingLines, width: u16) -> MessageView {
+    let style = message_style(&msg.role);
+    let gutter = message_gutter(msg, &style);
+    let body = if gutter.is_some() {
+        body_width(width)
+    } else {
+        width
+    };
     if matches!(msg.role, DisplayRole::Thinking)
         && let Some(lines) = thinking::collapsed_view(
             thinking::tail_rows(mode, msg.thinking_expanded),
             thinking::line_count(&msg.text),
             CLICKABLE,
-            |rows| thinking::render_tail(&msg.text, rows, width, thinking_style().text_style, None),
+            |rows| thinking::render_tail(&msg.text, rows, body, style.text_style, None),
         )
     {
-        return (lines, true);
+        return MessageView {
+            lines,
+            gutter,
+            collapsed: true,
+        };
     }
-    let mut lines = build_message_lines(msg, width);
-    if let Some(end) = msg.task_end
-        && let Some(first) = lines.first_mut()
-    {
-        first.spans.insert(0, outcome_glyph(end));
-    }
+    let mut lines = build_message_lines(msg, &style, body, width);
     if matches!(msg.role, DisplayRole::Notice)
         && let Some(detail) = &msg.detail
     {
-        push_notice_detail(&mut lines, detail, msg.detail_expanded, width);
+        push_notice_detail(&mut lines, detail, msg.detail_expanded, body);
     }
-    (lines, false)
+    MessageView {
+        lines,
+        gutter,
+        collapsed: false,
+    }
 }
 
 fn push_notice_detail(
@@ -2731,8 +2767,7 @@ fn push_notice_detail(
 fn notice_detail_lines(detail: &NoticeDetail, width: u16) -> impl Iterator<Item = Line<'static>> {
     let text_style = theme::current().assistant;
     let lines = if detail.markdown {
-        let body_width = width.saturating_sub(NOTICE_DETAIL_INDENT.len() as u16);
-        text_to_lines(&detail.text, "", text_style, text_style, body_width, None)
+        text_to_lines(&detail.text, "", text_style, text_style, width, None)
     } else {
         plain_lines(&detail.text, "", text_style, text_style)
     };
@@ -2740,7 +2775,6 @@ fn notice_detail_lines(detail: &NoticeDetail, width: u16) -> impl Iterator<Item 
         for span in &mut line.spans {
             span.style = theme::dim_style(span.style, NOTICE_DETAIL_DIM);
         }
-        line.spans.insert(0, Span::raw(NOTICE_DETAIL_INDENT));
         line
     })
 }
@@ -2748,10 +2782,14 @@ fn notice_detail_lines(detail: &NoticeDetail, width: u16) -> impl Iterator<Item 
 /// Builds ratatui lines for a non-Tool message shown in full at the given
 /// width. Shared by `rebuild_line_cache` (new messages) and
 /// `reflow_text_segment` (stale-on-resize messages) so both paths produce
-/// identical segments.
-fn build_message_lines(msg: &DisplayMessage, width: u16) -> Vec<Line<'static>> {
-    let style = message_style(&msg.role);
-    let prefix = message_prefix(msg, &style);
+/// identical segments. Plan rules span the full `width`, prose the `body`.
+fn build_message_lines(
+    msg: &DisplayMessage,
+    style: &RoleStyle,
+    body: u16,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let prefix = message_label(msg, style);
     let text = if !msg.images.is_empty() && msg.text == IMAGE_PLACEHOLDER {
         ""
     } else {
@@ -2762,12 +2800,12 @@ fn build_message_lines(msg: &DisplayMessage, width: u16) -> Vec<Line<'static>> {
             text,
             prefix,
             style.text_style,
-            style.prefix_style,
-            width,
+            style.label_style(),
+            body,
             style.max_line_bytes,
         )
     } else {
-        plain_lines(text, prefix, style.text_style, style.prefix_style)
+        plain_lines(text, prefix, style.text_style, style.label_style())
     };
     if let Some(pp) = &msg.plan_path {
         if !msg.text.is_empty() {

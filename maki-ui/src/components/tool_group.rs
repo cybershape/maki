@@ -813,7 +813,8 @@ pub fn build_tool_group_lines(
             highlight: None,
             spinner_lines: Vec::new(),
             snapshot_base: None,
-            content_indent: "",
+            gutter: Span::default(),
+            gutter_spins: false,
             truncation: SectionFlags::default(),
             elapsed: None,
         };
@@ -914,7 +915,8 @@ pub fn build_tool_group_lines(
         highlight: None,
         spinner_lines,
         snapshot_base: None,
-        content_indent: "",
+        gutter: Span::default(),
+        gutter_spins: false,
         truncation: SectionFlags::default(),
         elapsed: None,
     }

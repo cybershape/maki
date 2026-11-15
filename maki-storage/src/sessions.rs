@@ -57,7 +57,7 @@ const LOG_BLOATED: &str = "too many stale meta records";
 /// Every append leaves a whole meta record behind and only the last one is ever
 /// read. Past this many, the log is rewritten and they all go away at once.
 const MAX_APPENDS: usize = 512;
-/// Where a shrink rewrite parks the log it is about to drop, as `archive/<id>/`.
+/// Where a rewrite that drops turns parks the log first, as `archive/<id>/`.
 const ARCHIVE_DIR: &str = "archive";
 /// Beside `<seq>.jsonl`, what sealed that window.
 const ARCHIVE_META_EXT: &str = "meta";
@@ -237,7 +237,7 @@ impl SessionClaim {
     /// claim keeps still describes the file, a full rewrite otherwise.
     pub fn persist<M, U, T>(&self, session: &Session<M, U, T>) -> Result<(), SessionError>
     where
-        M: Serialize,
+        M: Serialize + DeserializeOwned,
         U: Serialize,
         T: Serialize,
     {
@@ -407,6 +407,11 @@ pub struct HistorySnapshot<M> {
     pub frame: Option<Arc<StoredFrame>>,
     /// In memory only: a resumed process rebuilds it from `frame`.
     pub tools: Option<SessionTools>,
+    /// What the user typed for the first message, when a layer's rewrite of
+    /// it still holds it whole. The default title names the session after
+    /// this instead of the context a layer wrapped around it. In memory only:
+    /// the title it produced is what gets saved.
+    pub title_source: Option<Arc<str>>,
 }
 
 /// The `tools` array the messages went out with, so a reader sending its own
@@ -425,6 +430,7 @@ impl<M> HistorySnapshot<M> {
             messages: Arc::new(messages),
             frame: None,
             tools: None,
+            title_source: None,
         }
     }
 }
@@ -500,9 +506,9 @@ pub struct Session<M, U, T> {
     /// erase a locally minted void: cursor validity is the pair.
     #[serde(skip)]
     rewrites: u64,
-    /// Why the next shrink rewrite would park the log. Set by the mutator
-    /// that dropped messages, read when the archive is written, and never
-    /// serialized: a loaded session has no pending shrink.
+    /// Why the next rewrite that drops turns would park the log. Set by the
+    /// mutator that dropped messages, read when the archive is written, and
+    /// never serialized: a loaded session has dropped nothing.
     #[serde(skip)]
     sealed_by: SealedBy,
 }
@@ -749,9 +755,11 @@ pub fn normalize_title(title: &str) -> String {
 }
 
 pub fn generate_title<M: TitleSource>(messages: &[M]) -> String {
-    let first_user_text = messages.iter().find_map(|m| m.first_user_text());
+    title_from(messages.iter().find_map(|m| m.first_user_text()))
+}
 
-    let Some(text) = first_user_text.map(str::trim).filter(|t| !t.is_empty()) else {
+fn title_from(text: Option<&str>) -> String {
+    let Some(text) = text.map(str::trim).filter(|t| !t.is_empty()) else {
         return DEFAULT_TITLE.into();
     };
     let text = normalize_title(text);
@@ -852,16 +860,18 @@ fn sub_msg_snapshot<M>(map: &HashMap<String, Arc<Vec<M>>>) -> HashMap<String, us
     map.iter().map(|(k, v)| (k.clone(), v.len())).collect()
 }
 
-/// Compaction and rewind hand the log a shorter message list, and writing that
-/// out would take the dropped turns with it, so the old file gets a second name
-/// under `archive/<id>/` first, where it stays until the session is deleted:
-/// the log's own history lives forever, so the turns compaction drops are
-/// history too. Its own path is untouched until the rename, so
-/// [`SessionLog::rewrite`] keeps its crash-safety promise.
-fn archive_if_shrinking<M, U, T>(dir: &Path, session: &Session<M, U, T>) {
+/// Compaction and rewind hand the log a message list without some turns it
+/// holds, and writing that out would lose them. So the old file first gets a
+/// second name under `archive/<id>/`, where it stays until the session is
+/// deleted: the turns compaction drops are history too. Its own path is
+/// untouched until the rename, so [`SessionLog::rewrite`] keeps its
+/// crash-safety promise.
+fn archive_if_dropping<M, U, T>(dir: &Path, session: &Session<M, U, T>)
+where
+    M: Serialize + DeserializeOwned,
+{
     let path = jsonl_path(dir, session.id);
-    let new_count = session.messages.len();
-    if !log_msg_count_exceeds(&path, new_count) {
+    if !log_holds_dropped_messages(&path, &session.messages) {
         return;
     }
 
@@ -876,7 +886,7 @@ fn archive_if_shrinking<M, U, T>(dir: &Path, session: &Session<M, U, T>) {
         warn!(
             error = %e,
             session_id = %session.id,
-            "cannot archive session log before shrink rewrite"
+            "cannot archive session log before dropping rewrite"
         );
         return;
     }
@@ -887,22 +897,40 @@ fn archive_if_shrinking<M, U, T>(dir: &Path, session: &Session<M, U, T>) {
     write_archive_meta(&archive_path, session.sealed_by, session.updated_at);
     info!(
         session_id = %session.id,
-        new_msgs = new_count,
+        new_msgs = session.messages.len(),
         sealed_by = session.sealed_by.as_str(),
         archive = %archive_path.display(),
-        "archived session log before shrink rewrite"
+        "archived session log before dropping rewrite"
     );
 }
 
-/// Whether the log holds more than `limit` messages, which is the whole
-/// question a shrink asks, so the scan stops at the first line past it. A
-/// growing log never trips that, so this still walks to EOF once per rewrite:
-/// it reads bytes into one reused buffer rather than allocating and
-/// UTF-8-validating a `String` per line, which is what made the pass show up
-/// next to the write it rides along with. A missing or unreadable file answers
-/// no and the rewrite goes ahead as before: nobody should lose a save because
-/// the old file would not count.
-fn log_msg_count_exceeds(path: &Path, limit: usize) -> bool {
+/// Whether `next` lacks messages `prev` holds: it is shorter, or its head
+/// changed, which is where compaction puts its summary. The summary plus the
+/// kept tail can be as long as the turns it replaced, so the count alone
+/// misses it. Edits further in, like thinking unbound by a new frame, drop
+/// nothing.
+fn drops_messages<M: PartialEq>(prev: &[M], next: &[M]) -> bool {
+    next.len() < prev.len() || prev.first().is_some_and(|head| next.first() != Some(head))
+}
+
+/// The message half of a [`LogRecord::Msg`] line, so reading one needs no
+/// `U` or `T`.
+#[derive(Deserialize)]
+struct MsgLine<M> {
+    d: M,
+}
+
+/// [`drops_messages`] with the log on disk as `prev`, which matters when
+/// writes were coalesced or the file came from another run. A longer log stops
+/// the scan at the first line past `next`. A growing one still walks to EOF
+/// once per rewrite, so it reads into one reused byte buffer instead of a
+/// `String` per line, which used to show up next to the write itself. A
+/// missing or unreadable file answers no: nobody should lose a save because
+/// the old file would not read.
+fn log_holds_dropped_messages<M>(path: &Path, next: &[M]) -> bool
+where
+    M: Serialize + DeserializeOwned,
+{
     let Ok(file) = fs::File::open(path) else {
         return false;
     };
@@ -915,13 +943,29 @@ fn log_msg_count_exceeds(path: &Path, limit: usize) -> bool {
             Ok(0) | Err(_) => return false,
             Ok(_) => {}
         }
-        if line.starts_with(MSG_PREFIX) {
-            count += 1;
-            if count > limit {
-                return true;
-            }
+        if !line.starts_with(MSG_PREFIX) {
+            continue;
+        }
+        count += 1;
+        if count > next.len() || (count == 1 && head_changed(&line, &next[0])) {
+            return true;
         }
     }
+}
+
+/// Headless rewrites the log every turn, so a wrong yes here would copy the
+/// whole log into the archive every turn. That is why the old head is read
+/// and written again the way this build writes it: a head an older build
+/// wrote in another shape is still the same head. A head this build cannot
+/// read gives no verdict and leaves it to the count.
+fn head_changed<M>(line: &[u8], next_head: &M) -> bool
+where
+    M: Serialize + DeserializeOwned,
+{
+    let Ok(MsgLine { d: head }) = serde_json::from_slice::<MsgLine<M>>(line) else {
+        return false;
+    };
+    serde_json::to_vec(&head).ok() != serde_json::to_vec(next_head).ok()
 }
 
 /// The archive is a second name for the log's current inode. The rewrite
@@ -1079,7 +1123,7 @@ impl SessionLog {
         session: &Session<M, U, T>,
     ) -> Result<Self, SessionError>
     where
-        M: Serialize,
+        M: Serialize + DeserializeOwned,
         U: Serialize,
         T: Serialize,
     {
@@ -1095,7 +1139,7 @@ impl SessionLog {
         session: &Session<M, U, T>,
     ) -> Result<Self, SessionError>
     where
-        M: Serialize,
+        M: Serialize + DeserializeOwned,
         U: Serialize,
         T: Serialize,
     {
@@ -1113,7 +1157,7 @@ impl SessionLog {
         session: &Session<M, U, T>,
     ) -> Result<Self, SessionError>
     where
-        M: Serialize,
+        M: Serialize + DeserializeOwned,
         U: Serialize,
         T: Serialize,
     {
@@ -1126,7 +1170,7 @@ impl SessionLog {
         tmp_file.sync_data().map_err(StorageError::from)?;
         // Last thing before the rename: only a write that lands may archive
         // the log it replaces.
-        archive_if_shrinking(dir, session);
+        archive_if_dropping(dir, session);
         fs::rename(&tmp, &path).map_err(StorageError::from)?;
         crate::sync_parent_dir(&path);
 
@@ -1743,7 +1787,7 @@ fn remove_legacy_files(dir: &Path, id: MakiId) -> Result<bool, SessionError> {
 /// session another process owns is left for that process to migrate.
 fn migrate_legacy<M, U, T>(dir: &Path, session: &Session<M, U, T>, held: Option<&SessionClaim>)
 where
-    M: Serialize,
+    M: Serialize + DeserializeOwned,
     U: Serialize,
     T: Serialize,
 {
@@ -2162,20 +2206,30 @@ where
     }
 
     /// Replaces the transcript and stamps every message now.
-    pub fn replace_messages(&mut self, messages: Vec<M>) {
+    pub fn replace_messages(&mut self, messages: Vec<M>)
+    where
+        M: PartialEq,
+    {
+        if drops_messages(&self.messages, &messages) {
+            self.sealed_by = SealedBy::Compaction;
+        }
         self.message_timestamps = vec![Some(now_millis()); messages.len()];
         self.messages = Arc::new(messages);
-        self.sealed_by = SealedBy::Compaction;
         self.rewrite_messages();
     }
 
     /// [`Self::replace_messages`] that keeps a time the caller already has.
     /// `None` stays unset. The log stamps it when the record is written.
-    pub fn replace_messages_with_timestamps(&mut self, messages: Vec<(M, Option<u64>)>) {
-        let (messages, timestamps) = messages.into_iter().unzip();
+    pub fn replace_messages_with_timestamps(&mut self, messages: Vec<(M, Option<u64>)>)
+    where
+        M: PartialEq,
+    {
+        let (messages, timestamps): (Vec<M>, Vec<Option<u64>>) = messages.into_iter().unzip();
+        if drops_messages(&self.messages, &messages) {
+            self.sealed_by = SealedBy::Compaction;
+        }
         self.message_timestamps = timestamps;
         self.messages = Arc::new(messages);
-        self.sealed_by = SealedBy::Compaction;
         self.rewrite_messages();
     }
 
@@ -2191,9 +2245,13 @@ where
 
     /// Adopting a producer's snapshot inherits its run token, so the log's
     /// cursors survive exactly when the snapshot was an append.
-    fn set_history(&mut self, snapshot: &HistorySnapshot<M>) {
-        // Only compaction replaces a producer's history with a shorter one.
-        if snapshot.messages.len() < self.messages.len() {
+    fn set_history(&mut self, snapshot: &HistorySnapshot<M>)
+    where
+        M: PartialEq,
+    {
+        // Only compaction drops turns from a producer's history. A snapshot
+        // from the same run is an append, so it skips the compare.
+        if snapshot.epoch != self.epoch && drops_messages(&self.messages, &snapshot.messages) {
             self.sealed_by = SealedBy::Compaction;
             self.message_timestamps.truncate(snapshot.messages.len());
         }
@@ -2217,7 +2275,7 @@ where
         token_usage: U,
         tool_ids: impl Fn(&M) -> Vec<String>,
     ) where
-        M: Clone,
+        M: Clone + PartialEq,
         U: PartialEq + Clone,
         T: Clone,
     {
@@ -2234,7 +2292,7 @@ where
         let session = Arc::make_mut(this);
         if let Some(snapshot) = history {
             session.set_history(snapshot);
-            // Compaction shrinks the snapshot, so the state its dropped turns
+            // Compaction drops turns from the snapshot, so the state they
             // held goes with them and every later rewrite and archive stays
             // at the session stretch it belongs to. Only those ids are
             // pruned: a run beside the chat is not in the transcript yet and
@@ -2242,7 +2300,7 @@ where
             session.drop_tool_state_of(&dropped, tool_ids);
             // The title comes from the messages, so it goes stale exactly when
             // they move.
-            session.update_title_if_default();
+            session.update_title_if_default(snapshot.title_source.as_deref());
         }
         session.set_meta(meta);
         session.set_token_usage(token_usage);
@@ -2665,9 +2723,14 @@ where
         load_session_at(&path)
     }
 
-    pub fn update_title_if_default(&mut self) {
+    /// `typed` stands in for the first message's text, which may hold a
+    /// layer's rewrite of what the user typed.
+    pub fn update_title_if_default(&mut self, typed: Option<&str>) {
         if self.title == DEFAULT_TITLE {
-            self.set_title(generate_title(&self.messages));
+            let title = title_from(
+                typed.or_else(|| self.messages.iter().find_map(|m| m.first_user_text())),
+            );
+            self.set_title(title);
         }
     }
 
@@ -2762,6 +2825,8 @@ mod tests {
     const FRAME_SYSTEM: &str = "system";
     const NEXT_FRAME_SYSTEM: &str = "system after compaction";
     const LATE_MCP_TOOLS: [&str; 3] = ["github__search", "linear__issue", "sentry__events"];
+    const TYPED_PROMPT: &str = "fix the login bug";
+    const REWRITTEN_PROMPT: &str = "memories: the login uses OAuth. fix the login bug";
 
     impl TitleSource for Value {
         fn first_user_text(&self) -> Option<&str> {
@@ -3378,6 +3443,7 @@ mod tests {
             messages: Arc::new(vec![user_message("hi")]),
             frame: None,
             tools: None,
+            title_source: None,
         };
         let meta = session.meta.clone();
         Session::checkpoint(
@@ -3404,6 +3470,7 @@ mod tests {
             messages: Arc::new(vec![user_message("hi"), assistant_message("reply")]),
             frame: None,
             tools: None,
+            title_source: None,
         };
         Session::checkpoint(
             &mut session,
@@ -3716,6 +3783,57 @@ mod tests {
         session.save_to(&claim_for(dir, &session), dir).unwrap();
 
         session.push_message(user_message("two"));
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        assert!(!archive_dir_for(dir, session.id).exists());
+    }
+
+    /// A summary pair can replace two turns and keep the count. That still
+    /// parks the old log, but only once: a later run with the same head must
+    /// not, even at the same count.
+    #[test]
+    fn compaction_keeping_the_count_archives_once() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
+        let claim = claim_for(dir, &session);
+        let adopt = |session: &mut Arc<TestSession>, messages: Vec<Value>| {
+            let snapshot = HistorySnapshot::new(messages);
+            let meta = session.meta.clone();
+            Session::checkpoint(session, Some(&snapshot), meta, Value::Null, no_tool_ids);
+            claim.persist(&**session).unwrap();
+        };
+        let turns = vec![user_message("one huge prompt"), assistant_message("reply")];
+        let compacted = vec![user_message("so far?"), assistant_message("summary")];
+
+        adopt(&mut session, turns.clone());
+        adopt(&mut session, compacted.clone());
+        adopt(&mut session, compacted);
+
+        let windows = TestSession::archive_windows_in(session.id, dir);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].sealed_by, SealedBy::Compaction);
+        let archived = TestSession::archive_in(session.id, windows[0].seq, dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(archived.messages(), turns.as_slice());
+    }
+
+    /// An older build may have written the same head in other bytes. Headless
+    /// rewrites every turn, so that must not park the log.
+    #[test]
+    fn head_in_other_bytes_does_not_archive() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message(user_message("one"));
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+        let path = jsonl_path(dir, session.id);
+        let log = fs::read_to_string(&path).unwrap();
+        let respelled = log.replacen(r#""one""#, r#""\u006fne""#, 1);
+        assert_ne!(respelled, log);
+        fs::write(&path, respelled).unwrap();
+
         session.save_to(&claim_for(dir, &session), dir).unwrap();
 
         assert!(!archive_dir_for(dir, session.id).exists());
@@ -4209,6 +4327,25 @@ mod tests {
             vec![user_message(input)]
         };
         assert_eq!(generate_title(&messages), expected);
+    }
+
+    /// Forks, rewinds and restores carry no typed text, so they name the
+    /// session after the first message as it stands.
+    #[test_case(Some(TYPED_PROMPT), TYPED_PROMPT ; "typed_text_names_it_over_the_rewrite")]
+    #[test_case(None, REWRITTEN_PROMPT ; "without_typed_text_the_message_names_it")]
+    fn checkpoint_titles_from_the_typed_text_first(typed: Option<&str>, expected: &str) {
+        let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
+        let mut snapshot = HistorySnapshot::new(vec![user_message(REWRITTEN_PROMPT)]);
+        snapshot.title_source = typed.map(Arc::from);
+        let meta = session.meta.clone();
+        Session::checkpoint(
+            &mut session,
+            Some(&snapshot),
+            meta,
+            Value::Null,
+            no_tool_ids,
+        );
+        assert_eq!(session.title, expected);
     }
 
     #[test]
