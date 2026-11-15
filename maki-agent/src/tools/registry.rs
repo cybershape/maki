@@ -647,6 +647,7 @@ mod tests {
             defs[0]["input_schema"]["type"], "object",
             "{EMPTY_SCHEMA_REJECTED}"
         );
+        assert_eq!(defs[0]["input_schema"]["additionalProperties"], true);
         assert!(
             defs[0]["input_schema"]["properties"]
                 .as_object()

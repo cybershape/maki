@@ -8,6 +8,7 @@
 //! it wakes the moment any of them has something and never blocks a worker:
 //! it runs under `block_on` on the main thread.
 
+use std::collections::VecDeque;
 use std::future::{pending, ready};
 use std::mem;
 use std::path::Path;
@@ -60,7 +61,7 @@ use tokio::sync::{Notify, oneshot};
 use tokio::task::coop::unconstrained;
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::timeout;
-use tokio_util::task::AbortOnDropHandle;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tracing::{debug, info, warn};
 
 use crate::agent::{
@@ -603,9 +604,30 @@ pub(crate) struct EventLoop<'t> {
     /// second `/packupdate` would otherwise race the first over the same clones
     /// and locks.
     pack: Option<JoinHandle<PackPreparation>>,
+    /// The stored session a focus is reading. One at a time, with later
+    /// requests in `queued_focus`, so they land in the order they were made,
+    /// as they did when each one read inline.
+    opening: Option<AbortOnDropHandle<Box<OpenedSession>>>,
+    queued_focus: VecDeque<(MakiId, oneshot::Sender<UiReply>)>,
+    /// Writes to sessions no tab has open, which shutdown waits for like it
+    /// waits for the storage writer.
+    stored_writes: TaskTracker,
     _model_fetch_task: AbortOnDropHandle<()>,
     sleep_detector: SleepDetector,
     resize_debounce: Option<ResizeDebounce>,
+}
+
+/// A focus that reads a stored session.
+struct PendingFocus {
+    reply_tx: oneshot::Sender<UiReply>,
+    /// The tab focused when it was asked, the only one it may take over.
+    from: MakiId,
+}
+
+/// A stored session a focus read off the loop, for the loop to bring up.
+struct OpenedSession {
+    focus: PendingFocus,
+    opened: Result<OpenSession, String>,
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -624,6 +646,8 @@ enum Wake {
     Shell(usize, ShellEvent),
     Warn(String),
     Pack(Box<PackPreparation>),
+    /// `None` when the read panicked, which dropped its reply.
+    SessionOpened(Option<Box<OpenedSession>>),
     ModelsDiscovered,
 }
 
@@ -653,6 +677,19 @@ async fn pack_done(pack: &mut Option<JoinHandle<PackPreparation>>) -> PackPrepar
         .unwrap_or_else(|_| PackPreparation::failed(PACK_PANIC_ERR.to_owned()));
     *pack = None;
     preparation
+}
+
+/// The stored session a focus is reading, or never, when none is. Cleared
+/// only once it answered, like [`pack_done`].
+async fn session_opened(
+    opening: &mut Option<AbortOnDropHandle<Box<OpenedSession>>>,
+) -> Option<Box<OpenedSession>> {
+    let Some(task) = opening else {
+        return pending().await;
+    };
+    let answer = task.await.ok();
+    *opening = None;
+    answer
 }
 
 /// The first agent envelope or shell event from any session.
@@ -887,6 +924,9 @@ impl<'t> EventLoop<'t> {
             ui_action_rx,
             ui_waker,
             pack: None,
+            opening: None,
+            queued_focus: VecDeque::new(),
+            stored_writes: TaskTracker::new(),
             _model_fetch_task: bg.task,
             sleep_detector: SleepDetector::new(),
             resize_debounce: None,
@@ -1023,6 +1063,7 @@ impl<'t> EventLoop<'t> {
             () = decor_worker::wakes().woken() => Wake::Decor,
             Some(warning) = self.warn_rx.recv() => Wake::Warn(warning),
             preparation = pack_done(&mut self.pack) => Wake::Pack(Box::new(preparation)),
+            answer = session_opened(&mut self.opening) => Wake::SessionOpened(answer),
             () = self.models_fetched.notified() => Wake::ModelsDiscovered,
             wake = session_wake(&mut self.sessions) => wake,
         }
@@ -1090,6 +1131,10 @@ impl<'t> EventLoop<'t> {
             }
             Wake::Pack(preparation) => {
                 self.finish_pack(*preparation);
+                Dirty::YES
+            }
+            Wake::SessionOpened(answer) => {
+                self.finish_open(answer);
                 Dirty::YES
             }
             Wake::ModelsDiscovered => {
@@ -1696,12 +1741,12 @@ impl<'t> EventLoop<'t> {
                 };
                 let _ = reply_tx.send(idx.and_then(|idx| self.submit_text(idx, text)));
             }
-            SessionRequest::Focus { id } => {
-                let reply = parse_session_id(&id)
-                    .and_then(|id| self.focus_session(id))
-                    .map(|()| json!(true));
-                let _ = reply_tx.send(reply);
-            }
+            SessionRequest::Focus { id } => match parse_session_id(&id) {
+                Ok(id) => self.focus_session(id, reply_tx),
+                Err(e) => {
+                    let _ = reply_tx.send(Err(e));
+                }
+            },
             // Resolved by id like the rest: a plan form row asking for build
             // mode fires for the session whose plan landed, which may be in
             // the background.
@@ -1715,19 +1760,30 @@ impl<'t> EventLoop<'t> {
             }
             SessionRequest::SetTitle { id, title } => {
                 let title = normalize_title(&title);
-                let reply = (|| {
-                    let id = parse_session_id(&id)?;
-                    if let Some(i) = self.position(id) {
-                        self.sessions[i].app.state.session_mut().set_title(title);
-                    } else {
-                        let OpenSession { mut session, claim } =
-                            OpenSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
-                        session.set_title(title);
-                        self.ctx.storage_writer.send(Arc::new(session), claim);
+                let id = match parse_session_id(&id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let _ = reply_tx.send(Err(e));
+                        return;
                     }
-                    Ok(json!(true))
-                })();
-                let _ = reply_tx.send(reply);
+                };
+                if let Some(i) = self.position(id) {
+                    self.sessions[i].app.state.session_mut().set_title(title);
+                    let _ = reply_tx.send(Ok(json!(true)));
+                    return;
+                }
+                // No tab has it, so the claim taken here is the only writer.
+                let storage = self.ctx.storage.clone();
+                self.stored_writes.spawn_blocking(move || {
+                    let reply = OpenSession::load(id, &storage)
+                        .and_then(|OpenSession { mut session, claim }| {
+                            session.set_title(title);
+                            claim.persist(&session)
+                        })
+                        .map(|()| json!(true))
+                        .map_err(|e| e.to_string());
+                    let _ = reply_tx.send(reply);
+                });
             }
         }
     }
@@ -1856,7 +1912,7 @@ impl<'t> EventLoop<'t> {
         };
         if prompt.is_none() && !focus {
             let storage = self.ctx.storage.clone();
-            spawn_blocking(move || {
+            self.stored_writes.spawn_blocking(move || {
                 let reply = open.store(&storage).map(|id| json!(id));
                 let _ = reply_tx.send(reply.map_err(|e| e.to_string()));
             });
@@ -1983,21 +2039,61 @@ impl<'t> EventLoop<'t> {
         self.sessions.len() - 1
     }
 
-    /// Focus a live session, or bring a stored one up: in place when the
-    /// focused session is a blank idle one (nothing worth keeping), otherwise
-    /// as a new runtime so the session you came from stays live.
-    fn focus_session(&mut self, id: MakiId) -> Result<(), String> {
+    /// Focus a live session, or read a stored one off the loop and bring it up
+    /// once [`Wake::SessionOpened`] lands, see [`Self::show_opened`].
+    fn focus_session(&mut self, id: MakiId, reply_tx: oneshot::Sender<UiReply>) {
+        if self.opening.is_some() {
+            self.queued_focus.push_back((id, reply_tx));
+            return;
+        }
         if let Some(i) = self.position(id) {
             self.set_focused(i);
-            return Ok(());
+            let _ = reply_tx.send(Ok(json!(true)));
+            return;
         }
-        // A session another maki owns is refused here, where it costs a flash,
-        // rather than at the first write, after a whole conversation.
-        let open = OpenSession::load(id, &self.ctx.storage)
-            .map_err(|e| format!("Failed to load session: {e}"))?;
+        let focus = PendingFocus {
+            reply_tx,
+            from: self.sessions[self.focused].id(),
+        };
+        let storage = self.ctx.storage.clone();
+        self.opening = Some(AbortOnDropHandle::new(spawn_blocking(move || {
+            // A session another maki owns is refused here, where it costs a
+            // flash, rather than at the first write, after a whole conversation.
+            let opened =
+                OpenSession::load(id, &storage).map_err(|e| format!("Failed to load session: {e}"));
+            Box::new(OpenedSession { focus, opened })
+        })));
+    }
+
+    /// The focus requests that queued behind a read go next, up to the next
+    /// one that has to read too.
+    fn finish_open(&mut self, answer: Option<Box<OpenedSession>>) {
+        if let Some(answer) = answer {
+            let OpenedSession { focus, opened } = *answer;
+            let reply = opened.map(|open| {
+                self.show_opened(open, focus.from);
+                json!(true)
+            });
+            let _ = focus.reply_tx.send(reply);
+        }
+        while self.opening.is_none()
+            && let Some((id, reply_tx)) = self.queued_focus.pop_front()
+        {
+            self.focus_session(id, reply_tx);
+        }
+    }
+
+    /// In place of the tab the focus was asked from, while it is still focused
+    /// and a blank idle one (nothing worth keeping), otherwise as a new runtime
+    /// so the session you came from stays live. Decided now rather than at the
+    /// request, since the read may have taken a while.
+    fn show_opened(&mut self, open: OpenSession, from: MakiId) {
         let (slot, reason) = self.slots.get_or_fallback(&open.session.model);
         let focused = &self.sessions[self.focused];
-        if SessionStatus::of(&focused.app) == SessionStatus::Idle && focused.app.is_blank() {
+        if focused.id() == from
+            && SessionStatus::of(&focused.app) == SessionStatus::Idle
+            && focused.app.is_blank()
+        {
             let idx = self.focused;
             let history = self.sessions[idx]
                 .app
@@ -2011,7 +2107,6 @@ impl<'t> EventLoop<'t> {
         if let Some(reason) = reason {
             self.focused_app().flash(reason);
         }
-        Ok(())
     }
 
     /// Handles one input event plus any leftover produced while coalescing
@@ -2497,6 +2592,13 @@ impl<'t> EventLoop<'t> {
                 Vec::new()
             }
         };
+        self.stored_writes.close();
+        if timeout(AGENT_SHUTDOWN_TIMEOUT, self.stored_writes.wait())
+            .await
+            .is_err()
+        {
+            warn!("stored session writes did not finish within {AGENT_SHUTDOWN_TIMEOUT:?}");
+        }
         let storage_drain_ms = lap();
         info!(
             session_end_ms,
@@ -2884,5 +2986,43 @@ mod tests {
         answer_tx.send(expected.clone()).unwrap();
         assert_eq!(pack_done(&mut pack).await, expected);
         assert!(pack.is_none());
+    }
+
+    const OPEN_ERROR: &str = "no such session";
+
+    #[tokio::test]
+    async fn a_panicked_open_answers_nothing_and_frees_the_slot() {
+        let mut opening = Some(AbortOnDropHandle::new(tokio::spawn(async {
+            panic!("the read broke")
+        })));
+        assert!(session_opened(&mut opening).await.is_none());
+        assert!(opening.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_open_wait_keeps_the_read() {
+        let (go_tx, go_rx) = oneshot::channel::<()>();
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let mut opening = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+            go_rx.await.unwrap();
+            Box::new(OpenedSession {
+                focus: PendingFocus {
+                    reply_tx,
+                    from: MakiId::generate(),
+                },
+                opened: Err(OPEN_ERROR.to_owned()),
+            })
+        })));
+        tokio::select! {
+            biased;
+            _ = session_opened(&mut opening) => panic!("the read has not answered yet"),
+            () = ready(()) => {}
+        }
+        assert!(opening.is_some());
+
+        go_tx.send(()).unwrap();
+        let answer = session_opened(&mut opening).await.unwrap();
+        assert_eq!(answer.opened.err().as_deref(), Some(OPEN_ERROR));
+        assert!(opening.is_none());
     }
 }

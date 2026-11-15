@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use crate::lock::Lock;
 use crate::{StateDir, StorageError, atomic_write_permissions};
 
 const AUTH_DIR: &str = "auth";
@@ -122,9 +123,10 @@ pub fn lock_exclusive(path: &Path) -> Option<File> {
 }
 
 /// Every write replaces the token file, so the lock sits beside it under a name
-/// no loader reads.
-pub fn lock_tokens(dir: &StateDir, provider: &str) -> Option<File> {
-    lock_exclusive(&auth_path(dir, &format!("{provider}{LOCK_SUFFIX}")))
+/// no loader reads. Waits like [`lock_exclusive`], on the timer.
+pub async fn lock_tokens_async(dir: &StateDir, provider: &str) -> Option<Lock> {
+    let path = auth_path(dir, &format!("{provider}{LOCK_SUFFIX}"));
+    Lock::acquire_within(&path, LOCK_WAIT, LOCK_POLL).await.ok()
 }
 
 /// The cross-process half of [`lock_credentials`]: a plugin provider's store,
@@ -205,6 +207,13 @@ fn load_auth<T: DeserializeOwned>(path: &Path) -> Option<T> {
         .and_then(|d| serde_json::from_str(&d).ok())
 }
 
+async fn load_auth_async<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    tokio::fs::read_to_string(path)
+        .await
+        .ok()
+        .and_then(|d| serde_json::from_str(&d).ok())
+}
+
 fn save_auth(path: &Path, data: &impl Serialize) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -227,6 +236,10 @@ pub fn load_tokens(dir: &StateDir, provider: &str) -> Option<OAuthTokens> {
     load_auth(&auth_path(dir, provider))
 }
 
+pub async fn load_tokens_async(dir: &StateDir, provider: &str) -> Option<OAuthTokens> {
+    load_auth_async(&auth_path(dir, provider)).await
+}
+
 pub fn save_tokens(
     dir: &StateDir,
     provider: &str,
@@ -240,17 +253,24 @@ pub fn delete_tokens(dir: &StateDir, provider: &str) -> Result<bool, StorageErro
 }
 
 pub fn load_mcp_auth(dir: &StateDir, server_name: &str, expected_url: &str) -> Option<McpAuthData> {
-    let data: McpAuthData = load_auth(&auth_path(dir, &format!("mcp-{server_name}")))?;
-    if data.server_url != expected_url {
-        return None;
-    }
-    if let Some(expires_at) = data.client_secret_expires_at
-        && expires_at != CLIENT_SECRET_NEVER_EXPIRES
-        && now_millis() / 1000 >= expires_at
-    {
-        return None;
-    }
-    Some(data)
+    load_auth(&mcp_auth_path(dir, server_name)).filter(|data| mcp_auth_usable(data, expected_url))
+}
+
+pub async fn load_mcp_auth_async(
+    dir: &StateDir,
+    server_name: &str,
+    expected_url: &str,
+) -> Option<McpAuthData> {
+    load_auth_async(&mcp_auth_path(dir, server_name))
+        .await
+        .filter(|data| mcp_auth_usable(data, expected_url))
+}
+
+fn mcp_auth_usable(data: &McpAuthData, expected_url: &str) -> bool {
+    data.server_url == expected_url
+        && data.client_secret_expires_at.is_none_or(|expires_at| {
+            expires_at == CLIENT_SECRET_NEVER_EXPIRES || now_millis() / 1000 < expires_at
+        })
 }
 
 pub fn save_mcp_auth(
@@ -258,11 +278,15 @@ pub fn save_mcp_auth(
     server_name: &str,
     data: &McpAuthData,
 ) -> Result<(), StorageError> {
-    save_auth(&auth_path(dir, &format!("mcp-{server_name}")), data)
+    save_auth(&mcp_auth_path(dir, server_name), data)
 }
 
 pub fn delete_mcp_auth(dir: &StateDir, server_name: &str) -> Result<bool, StorageError> {
-    delete_auth(&auth_path(dir, &format!("mcp-{server_name}")))
+    delete_auth(&mcp_auth_path(dir, server_name))
+}
+
+fn mcp_auth_path(dir: &StateDir, server_name: &str) -> PathBuf {
+    auth_path(dir, &format!("mcp-{server_name}"))
 }
 
 pub fn load_provider_credentials(dir: &StateDir, slug: &str) -> Option<ProviderCredentials> {

@@ -38,7 +38,7 @@ fn copilot_usd(copilot_usage: &Value) -> Option<f64> {
 fn tool_parameters(tool: &Value) -> Value {
     match tool.get("input_schema") {
         Some(schema) if schema.is_object() => schema.clone(),
-        _ => json!({ "type": "object", "properties": {} }),
+        _ => json!({"type": "object", "properties": {}, "additionalProperties": true}),
     }
 }
 
@@ -1048,7 +1048,7 @@ mod tests {
         );
         assert_eq!(
             converted[0]["parameters"],
-            json!({"type": "object", "properties": {}})
+            json!({"type": "object", "properties": {}, "additionalProperties": true})
         );
     }
 
