@@ -27,6 +27,7 @@ use maki_storage::id::SessionRef;
 const RESPONSES_PATH: &str = "/responses";
 const FAILED_RESPONSE_STATUS: u16 = 500;
 const NANO_AIU_PER_USD: f64 = 100_000_000_000.0;
+const SERVICE_TIER_FAST: &str = "fast";
 
 fn copilot_usd(copilot_usage: &Value) -> Option<f64> {
     copilot_usage["total_nano_aiu"]
@@ -107,6 +108,16 @@ pub fn apply_responses_reasoning(
             reasoning["summary"] = json!("auto");
         }
         body["reasoning"] = reasoning;
+    }
+}
+
+/// Opts a request into Fast mode (formerly priority processing). `fast` is
+/// already gated by [`RequestOptions::clamped`], so a model without a fast tier
+/// never reaches here with it set. Leaving the field off lets the project's own
+/// default service tier apply.
+pub fn apply_responses_fast(body: &mut Value, fast: bool) {
+    if fast {
+        body["service_tier"] = json!(SERVICE_TIER_FAST);
     }
 }
 
@@ -636,6 +647,7 @@ impl Provider for ResponsesProvider {
                 let dialect = responses_dialect(&model.id, discovered.as_ref());
                 apply_responses_reasoning(&mut body, opts.thinking, model, &dialect);
             }
+            apply_responses_fast(&mut body, opts.fast);
             if let Some(session) = _session_id {
                 let _ = self.session_id.apply(session, &mut body, &mut auth);
             }
@@ -1752,6 +1764,73 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
         apply_responses_reasoning(&mut body, ThinkingConfig::Off, &model, &dialect);
         assert_eq!(body["reasoning"]["effort"], "none");
         assert!(body["reasoning"].get("summary").is_none());
+    }
+
+    #[test]
+    fn responses_fast_sets_service_tier() {
+        let mut body = json!({});
+        apply_responses_fast(&mut body, true);
+        assert_eq!(body["service_tier"], SERVICE_TIER_FAST);
+    }
+
+    #[test]
+    fn responses_fast_off_leaves_tier_to_the_project_default() {
+        let mut body = json!({});
+        apply_responses_fast(&mut body, false);
+        assert!(body.get("service_tier").is_none());
+    }
+
+    #[test_case(true, Some(SERVICE_TIER_FAST) ; "fast_on_sends_the_tier")]
+    #[test_case(false, None ; "fast_off_omits_the_tier")]
+    #[tokio::test]
+    async fn responses_stream_carries_service_tier_only_when_fast(
+        fast: bool,
+        expected: Option<&str>,
+    ) {
+        use crate::test_support::{Canned, serve};
+        use std::sync::{Arc, Mutex};
+
+        const PROMPT: &str = "hi";
+        const MISSING_TIER: &str = "service_tier did not match the fast flag on the wire";
+        const SCRIPT: &[Canned] = &[Canned::json(401, r#"{"error":{"message":"no"}}"#)];
+
+        let (base_url, requests) = serve(SCRIPT);
+        let auth = crate::providers::ResolvedAuth::bearer("responses", "sk-fast")
+            .unwrap()
+            .with_base_url(Some(base_url));
+        let provider = ResponsesProvider::new(
+            "responses".to_string(),
+            None,
+            Arc::new(Mutex::new(auth)),
+            Timeouts::default(),
+        );
+        let model = Model::from_spec("responses/gpt-6.1-sol").unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let opts = RequestOptions {
+            fast,
+            ..Default::default()
+        };
+        let _ = provider
+            .stream_message(
+                &model,
+                &[Message::user(PROMPT.to_owned())],
+                "",
+                &json!([]),
+                &tx,
+                opts,
+                None,
+            )
+            .await;
+
+        let recorded = requests.lock().unwrap();
+        let [request] = recorded.as_slice() else {
+            panic!("{MISSING_TIER}");
+        };
+        assert_eq!(
+            request.json()["service_tier"].as_str(),
+            expected,
+            "{MISSING_TIER}"
+        );
     }
 
     #[test]
