@@ -2196,6 +2196,10 @@ impl<'t> EventLoop<'t> {
                 let (drag, leftover) = self.coalesce_drag(mouse);
                 (Some(Msg::Mouse(drag)), leftover)
             }
+            MouseEventKind::Moved => {
+                let (moved, leftover) = self.coalesce_move(mouse);
+                (Some(Msg::Mouse(moved)), leftover)
+            }
             _ => (Some(Msg::Mouse(mouse)), None),
         }
     }
@@ -2238,6 +2242,24 @@ impl<'t> EventLoop<'t> {
         while let Some(next) = self.input.try_next() {
             match next {
                 Event::Mouse(m) if matches!(m.kind, MouseEventKind::Drag(MouseButton::Left)) => {
+                    latest = m;
+                }
+                other => {
+                    leftover = Some(other);
+                    break;
+                }
+            }
+        }
+        (latest, leftover)
+    }
+
+    /// Keeps only the newest queued mouse move position; the first non-move event
+    /// drained along the way is returned so it isn't lost.
+    fn coalesce_move(&self, mut latest: CtMouseEvent) -> (CtMouseEvent, Option<Event>) {
+        let mut leftover = None;
+        while let Some(next) = self.input.try_next() {
+            match next {
+                Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved) => {
                     latest = m;
                 }
                 other => {

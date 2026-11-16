@@ -3717,7 +3717,7 @@ fn compact_batch_children_follow_snapshots(restored: bool, cancelled: bool) {
         assert_eq!(group.total_duration(), Duration::from_millis(1234));
     }
     let rows =
-        tool_group::build_tool_group_lines(group, VIEW_WIDTH, 0, tool_group::DEFAULT_COMPACT_LINES);
+        tool_group::build_tool_group_lines(group, VIEW_WIDTH, 0, tool_group::DEFAULT_COMPACT_LINES, None);
     assert!(rows.lines[2].to_string().ends_with("(1.23s)"));
     assert_eq!(
         batch.children[0].status,
@@ -3801,7 +3801,7 @@ fn compact_tools_state_text_transitions() {
     let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
         panic!()
     };
-    let tl1 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
+    let tl1 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES, None);
     let h1: String = tl1.lines[0]
         .spans
         .iter()
@@ -3814,7 +3814,7 @@ fn compact_tools_state_text_transitions() {
     let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
         panic!()
     };
-    let tl2 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
+    let tl2 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES, None);
     let h2: String = tl2.lines[0]
         .spans
         .iter()
@@ -3828,7 +3828,7 @@ fn compact_tools_state_text_transitions() {
     let DisplayRole::ToolGroup(g) = &panel.messages[0].role else {
         panic!()
     };
-    let tl3 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
+    let tl3 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES, None);
     assert_eq!(tl3.lines.len(), 2);
     let h3: String = tl3.lines[0]
         .spans
@@ -3872,7 +3872,7 @@ fn compact_tools_state_text_transitions() {
         waiting_since: None,
         expanded: false,
     };
-    let tl4 = tool_group::build_tool_group_lines(&group2, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
+    let tl4 = tool_group::build_tool_group_lines(&group2, 80, 0, tool_group::DEFAULT_COMPACT_LINES, None);
     let h4: String = tl4.lines[0]
         .spans
         .iter()
@@ -3892,7 +3892,7 @@ fn compact_tools_state_text_transitions() {
             duration: None,
         }),
     );
-    let tl5 = tool_group::build_tool_group_lines(&group2, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
+    let tl5 = tool_group::build_tool_group_lines(&group2, 80, 0, tool_group::DEFAULT_COMPACT_LINES, None);
     let h5: String = tl5.lines[0]
         .spans
         .iter()
@@ -3914,7 +3914,7 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         panic!()
     };
     assert!(!g.sealed);
-    let tl = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
+    let tl = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES, None);
     let h: String = tl.lines[0]
         .spans
         .iter()
@@ -3931,7 +3931,7 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         panic!()
     };
     assert!(!g.sealed);
-    let tl2 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
+    let tl2 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES, None);
     let h2: String = tl2.lines[0]
         .spans
         .iter()
@@ -3946,7 +3946,7 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         panic!()
     };
     assert!(!g.sealed);
-    let tl3 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
+    let tl3 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES, None);
     let h3: String = tl3.lines[0]
         .spans
         .iter()
@@ -3963,7 +3963,7 @@ fn compact_tools_waiting_for_response_on_ensure_active_group() {
         panic!()
     };
     assert!(g.sealed);
-    let tl4 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES);
+    let tl4 = tool_group::build_tool_group_lines(g, 80, 0, tool_group::DEFAULT_COMPACT_LINES, None);
     let h4: String = tl4.lines[0]
         .spans
         .iter()
@@ -4490,8 +4490,9 @@ fn compact_row_click_names_the_call_and_skips_the_title() {
         .expect("thinking row");
     assert_eq!(thinking.entry, 1);
     assert_eq!(thinking.child, None);
+    assert_eq!(panel.handle_click(1, 0, view_area()), ClickOutcome::None);
     assert_eq!(
-        panel.handle_click(1, 0, view_area()),
+        panel.handle_click(1, 3, view_area()),
         ClickOutcome::OpenCompact(tool)
     );
 }
@@ -4529,10 +4530,50 @@ fn compact_batch_child_click_names_the_child() {
     let child = panel.compact_target_at(2, view_area()).expect("child row");
     assert_eq!(child.entry, 0);
     assert_eq!(child.child, Some(0));
+    assert_eq!(panel.handle_click(2, 0, view_area()), ClickOutcome::None);
     assert_eq!(
-        panel.handle_click(2, 0, view_area()),
+        panel.handle_click(2, 6, view_area()),
         ClickOutcome::OpenCompact(child)
     );
+}
+
+#[test]
+fn hovering_compact_row_switches_icon_to_open_symbol_and_reverts() {
+    let mut panel = compact_panel();
+    let mut start_ev = start("call-1", BASH_TOOL_NAME);
+    start_ev.raw_input = Some(serde_json::json!({ "command": "ls" }));
+    panel.tool_start(start_ev);
+    panel.tool_done(ToolDoneEvent {
+        output: Arc::new(ToolOutput::Plain(COMPACT_OUTPUT.into())),
+        ..done("call-1")
+    });
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    let target = panel.compact_target_at(1, view_area()).expect("target");
+
+    let seg_idx = panel.cache.find_by_tool_id(&target.group_id).unwrap();
+    let line_before = &panel.cache.get(seg_idx).unwrap().lines()[1];
+    assert_eq!(line_before.spans[1].content, "✓ ");
+
+    let changed = panel.set_hovered_compact(Some(target.clone()));
+    assert!(changed);
+    let line_hovered = &panel.cache.get(seg_idx).unwrap().lines()[1];
+    assert_eq!(line_hovered.spans[1].content, tool_group::COMPACT_OPEN_ICON);
+    assert_eq!(line_hovered.spans[1].style, theme::current().accent);
+
+    assert!(!panel.set_hovered_compact(Some(target.clone())));
+
+    assert_eq!(panel.handle_click(1, 6, view_area()), ClickOutcome::None);
+    assert_eq!(
+        panel.handle_click(1, 3, view_area()),
+        ClickOutcome::OpenCompact(target)
+    );
+
+    let cleared = panel.set_hovered_compact(None);
+    assert!(cleared);
+    let line_after = &panel.cache.get(seg_idx).unwrap().lines()[1];
+    assert_eq!(line_after.spans[1].content, "✓ ");
+    assert_eq!(line_after.spans[1].style, theme::current().tool_success);
 }
 
 #[test]

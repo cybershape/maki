@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +14,7 @@ use serde_json::Value;
 use crate::theme;
 
 use super::code_view::SectionFlags;
+use super::compact_detail::CompactTarget;
 use super::tool_display::ToolLines;
 use super::{
     CompactDetail, GroupEntry, GroupThinkingEntry, GroupToolEntry, ToolGroupRole, ToolStatus,
@@ -20,6 +22,7 @@ use super::{
 
 #[cfg(test)]
 pub const DEFAULT_COMPACT_LINES: usize = maki_config::DEFAULT_COMPACT_LINES;
+pub const COMPACT_OPEN_ICON: &str = "⤢ ";
 const RAIL_CONTINUE: &str = "│  ";
 const RAIL_LAST: &str = "└  ";
 const CHILD_RAIL_CONTINUE: &str = "├  ";
@@ -590,6 +593,21 @@ pub fn question_children(
     }
 }
 
+pub fn compact_icon_columns(line: &Line<'_>) -> Option<Range<u16>> {
+    if line.spans.len() >= 2 {
+        let rail_w = line.spans[0].width() as u16;
+        let icon_w = line.spans[1].width() as u16;
+        Some(rail_w..rail_w + icon_w)
+    } else {
+        line.spans.first().map(|first| 0..first.width() as u16)
+    }
+}
+
+struct ToolHover {
+    parent: bool,
+    child: Option<usize>,
+}
+
 fn push_tool_rows(
     lines: &mut Vec<Line<'static>>,
     spinner_lines: &mut Vec<(usize, usize)>,
@@ -597,6 +615,7 @@ fn push_tool_rows(
     rail: &str,
     frame: (&str, Style),
     width: u16,
+    hover: ToolHover,
 ) {
     lines.push(render_tool_row(
         rail,
@@ -605,6 +624,7 @@ fn push_tool_rows(
         width,
         spinner_lines,
         lines.len(),
+        hover.parent,
     ));
     let parent_rail = match rail {
         RAIL_LAST => CHILD_INDENT,
@@ -617,6 +637,7 @@ fn push_tool_rows(
             CHILD_RAIL_CONTINUE
         };
         let child_rail = format!("{parent_rail}{branch}");
+        let is_child_hovered = hover.child == Some(idx);
         lines.push(render_tool_row(
             &child_rail,
             child,
@@ -624,6 +645,7 @@ fn push_tool_rows(
             width,
             spinner_lines,
             lines.len(),
+            is_child_hovered,
         ));
     }
 }
@@ -635,13 +657,18 @@ fn render_tool_row(
     width: u16,
     spinner_lines: &mut Vec<(usize, usize)>,
     line_idx: usize,
+    is_hovered: bool,
 ) -> Line<'static> {
     let theme = theme::current();
     let is_in_progress = tool.status == ToolStatus::InProgress;
-    let (icon, icon_style) = match tool.status {
-        ToolStatus::InProgress => (format!("{} ", frame.0), frame.1),
-        ToolStatus::Success => ("✓ ".to_string(), theme.tool_success),
-        ToolStatus::Error => ("✗ ".to_string(), theme.tool_error),
+    let (icon, icon_style) = if is_hovered {
+        (COMPACT_OPEN_ICON.to_string(), theme.accent)
+    } else {
+        match tool.status {
+            ToolStatus::InProgress => (format!("{} ", frame.0), frame.1),
+            ToolStatus::Success => ("✓ ".to_string(), theme.tool_success),
+            ToolStatus::Error => ("✗ ".to_string(), theme.tool_error),
+        }
     };
 
     let mut spans = Vec::new();
@@ -652,7 +679,7 @@ fn render_tool_row(
         span_idx += 1;
     }
 
-    if is_in_progress {
+    if is_in_progress && !is_hovered {
         spinner_lines.push((line_idx, span_idx));
     }
     let icon_width = icon.width();
@@ -708,9 +735,12 @@ fn render_thinking_row(
     spinner_millis: u128,
     width: u16,
     _line_idx: usize,
+    is_hovered: bool,
 ) -> Line<'static> {
     let theme = theme::current();
-    let (icon, icon_style) = if thinking.active {
+    let (icon, icon_style) = if is_hovered {
+        (COMPACT_OPEN_ICON.to_string(), theme.accent)
+    } else if thinking.active {
         let (f, s) = busy_spinner_frame(spinner_millis);
         (format!("{f} "), s)
     } else {
@@ -784,6 +814,7 @@ pub fn build_tool_group_lines(
     width: u16,
     spinner_millis: u128,
     max_entries: usize,
+    hovered: Option<&CompactTarget>,
 ) -> ToolLines {
     let mut lines = Vec::new();
     let mut spinner_lines = Vec::new();
@@ -895,17 +926,36 @@ pub fn build_tool_group_lines(
         let is_last = idx == total_visible - 1;
         let rail = if is_last { RAIL_LAST } else { RAIL_CONTINUE };
         let line_idx = lines.len();
+        let entry_idx = visible_start + idx;
+        let is_this_entry_hovered =
+            hovered.is_some_and(|h| h.group_id == group.id && h.entry == entry_idx);
+        let is_parent_hovered = is_this_entry_hovered && hovered.and_then(|h| h.child).is_none();
+        let hovered_child = if is_this_entry_hovered {
+            hovered.and_then(|h| h.child)
+        } else {
+            None
+        };
 
         match entry {
-            GroupEntry::Tool(t) => {
-                push_tool_rows(&mut lines, &mut spinner_lines, t, rail, frame, width)
-            }
+            GroupEntry::Tool(t) => push_tool_rows(
+                &mut lines,
+                &mut spinner_lines,
+                t,
+                rail,
+                frame,
+                width,
+                ToolHover {
+                    parent: is_parent_hovered,
+                    child: hovered_child,
+                },
+            ),
             GroupEntry::Thinking(th) => lines.push(render_thinking_row(
                 rail,
                 th,
                 spinner_millis,
                 width,
                 line_idx,
+                is_parent_hovered,
             )),
         }
     }
@@ -928,6 +978,50 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
     use test_case::test_case;
+
+    #[test]
+    fn hovered_entry_renders_open_icon_with_accent_style() {
+        let child = GroupToolEntry {
+            id: String::new(),
+            name: Arc::from("read"),
+            summary: "src/main.rs".into(),
+            raw_input: None,
+            children: Vec::new(),
+            status: ToolStatus::Success,
+            receiving_args: false,
+            started_at: None,
+            duration: None,
+            detail: None,
+        };
+        let group = ToolGroupRole {
+            id: "group-1".into(),
+            sealed: true,
+            entries: vec![GroupEntry::Tool(Box::new(child))],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
+            expanded: false,
+        };
+
+        let unhovered_tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
+        let unhovered_row = &unhovered_tl.lines[1];
+        assert_eq!(unhovered_row.spans[1].content, "✓ ");
+        assert_eq!(unhovered_row.spans[1].style, theme::current().tool_success);
+
+        let hover_target = CompactTarget {
+            group_id: "group-1".into(),
+            entry: 0,
+            child: None,
+        };
+        let hovered_tl =
+            build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, Some(&hover_target));
+        let hovered_row = &hovered_tl.lines[1];
+        assert_eq!(hovered_row.spans[1].content, COMPACT_OPEN_ICON);
+        assert_eq!(hovered_row.spans[1].style, theme::current().accent);
+
+        let cols = compact_icon_columns(hovered_row).expect("icon columns");
+        assert_eq!(cols, 3..5);
+    }
 
     #[test_case(false, false; "single_batch")]
     #[test_case(true, false; "batch_followed_by_tool")]
@@ -970,7 +1064,7 @@ mod tests {
         if preceded_by_tool {
             group.entries.insert(0, GroupEntry::Tool(Box::new(child)));
         }
-        let rendered = build_tool_group_lines(&group, 60, 0, DEFAULT_COMPACT_LINES);
+        let rendered = build_tool_group_lines(&group, 60, 0, DEFAULT_COMPACT_LINES, None);
         let parent_idx = 1 + usize::from(preceded_by_tool);
         let parent = rendered.lines[parent_idx].to_string();
         assert!(parent.contains("batch 2 tools"), "{parent}");
@@ -1027,7 +1121,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         assert!(tl.lines.is_empty());
     }
 
@@ -1054,7 +1148,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         assert_eq!(tl.lines.len(), 2);
         let header_text: String = tl.lines[0]
             .spans
@@ -1087,7 +1181,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         let header_text: String = tl.lines[0]
             .spans
             .iter()
@@ -1119,7 +1213,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         let header_text: String = tl.lines[0]
             .spans
             .iter()
@@ -1141,7 +1235,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         let header_text: String = tl.lines[0]
             .spans
             .iter()
@@ -1176,7 +1270,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         // Header + 1 tool row
         assert_eq!(tl.lines.len(), 2);
         let header_text: String = tl.lines[0]
@@ -1210,7 +1304,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         let header_text: String = tl.lines[0]
             .spans
             .iter()
@@ -1238,7 +1332,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         let header_text: String = tl.lines[0]
             .spans
             .iter()
@@ -1285,7 +1379,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         assert_eq!(tl.lines.len(), 3);
         let header_text: String = tl.lines[0]
             .spans
@@ -1343,7 +1437,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         assert_eq!(tl.lines.len(), 12);
         let header_text: String = tl.lines[0]
             .spans
@@ -1396,7 +1490,7 @@ mod tests {
             expanded: false,
         };
 
-        let mut tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let mut tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         let done_line: String = tl.lines[1]
             .spans
             .iter()
@@ -1464,7 +1558,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         let title_span = &tl.lines[0].spans[1];
         assert_eq!(title_span.content.as_ref(), "Tool calling...");
         assert_eq!(title_span.style, Style::default());
@@ -1489,7 +1583,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         let preview_span = tl.lines[1]
             .spans
             .iter()
@@ -1552,7 +1646,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         let preview_span = tl.lines[1]
             .spans
             .iter()
@@ -1609,7 +1703,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         assert_eq!(tl.lines.len(), 3);
         let header: String = tl.lines[0]
             .spans
@@ -1646,7 +1740,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         assert_eq!(tl.lines.len(), 12);
         let header: String = tl.lines[0]
             .spans
@@ -1699,7 +1793,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         assert_eq!(tl.lines.len(), 12);
         let header: String = tl.lines[0]
             .spans
@@ -1734,7 +1828,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         assert_eq!(tl.lines.len(), 2);
         assert!(
             tl.lines[1]
@@ -1914,7 +2008,7 @@ mod tests {
             waiting_since: None,
             expanded: false,
         };
-        let tl_collapsed = build_tool_group_lines(&group_collapsed, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl_collapsed = build_tool_group_lines(&group_collapsed, 80, 0, DEFAULT_COMPACT_LINES, None);
         let collapsed_text = tl_collapsed
             .lines
             .iter()
@@ -1932,7 +2026,7 @@ mod tests {
             waiting_since: None,
             expanded: true,
         };
-        let tl_expanded = build_tool_group_lines(&group_expanded, 80, 0, DEFAULT_COMPACT_LINES);
+        let tl_expanded = build_tool_group_lines(&group_expanded, 80, 0, DEFAULT_COMPACT_LINES, None);
         let expanded_text = tl_expanded
             .lines
             .iter()
@@ -1973,7 +2067,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, 0);
+        let tl = build_tool_group_lines(&group, 80, 0, 0, None);
         // Header + hidden line using RAIL_LAST because no entries follow
         assert_eq!(tl.lines.len(), 2);
         let hidden_line: String = tl.lines[1]
@@ -2014,7 +2108,7 @@ mod tests {
             expanded: false,
         };
 
-        let tl = build_tool_group_lines(&group, 80, 0, 2);
+        let tl = build_tool_group_lines(&group, 80, 0, 2, None);
         // Header + 1 hidden line + 2 visible entries = 4 lines
         assert_eq!(tl.lines.len(), 4);
         let hidden_line: String = tl.lines[1]

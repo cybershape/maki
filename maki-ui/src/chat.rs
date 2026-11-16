@@ -9,6 +9,7 @@ use jiff::Timestamp;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::tasks::{TaskClock, TaskOutcome, TaskParent, TaskStatus};
+use crate::components::compact_detail::CompactTarget;
 use crate::components::input::Draft;
 use crate::components::messages::{ClickOutcome, MessagesPanel, PromptProgress, ScrollPos};
 use crate::components::tool_display::append_annotation;
@@ -502,6 +503,24 @@ impl Chat {
 
     pub fn toggle_click(&mut self, row: u16, area: Rect) -> ClickOutcome {
         self.messages_panel.toggle_click(row, area)
+    }
+
+    pub fn compact_target_at(&self, row: u16, area: Rect) -> Option<CompactTarget> {
+        self.messages_panel.compact_target_at(row, area)
+    }
+
+    pub fn set_hovered_compact(&mut self, target: Option<CompactTarget>) -> bool {
+        self.messages_panel.set_hovered_compact(target)
+    }
+
+    #[cfg(test)]
+    pub fn hovered_compact(&self) -> Option<&CompactTarget> {
+        self.messages_panel.hovered_compact()
+    }
+
+    #[cfg(test)]
+    pub fn set_compact_tools(&mut self, compact: bool) {
+        self.messages_panel.compact_tools = compact;
     }
 
     pub fn has_tool(&self, tool_id: &str) -> bool {

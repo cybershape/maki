@@ -13970,6 +13970,66 @@ fn clicking_outside_compact_detail_closes_it() {
     assert!(!app.compact_detail.is_open());
 }
 
+#[test]
+fn mouse_move_updates_hovered_compact_and_click_opens_only_on_icon() {
+    let mut app = test_app();
+    app.run_id = 1;
+    app.ui_config.compact_tools = true;
+    let chat = app.active_chat;
+    app.chats[chat].set_compact_tools(true);
+    app.chats[chat].ensure_active_group();
+    app.update(agent_msg(tool_start("tool-1", "bash")));
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: "tool-1".into(),
+        tool: Arc::from("bash"),
+        call: None,
+        output: Arc::new(ToolOutput::Plain("ok".into())),
+        backgrounded: false,
+        annotation: None,
+        is_error: false,
+        written_path: None,
+    }))));
+
+    let _ = rendered(&mut app);
+
+    assert_eq!(app.active_chat().hovered_compact(), None);
+
+    let msg_area = app.zones.find(SelectionZone::Messages).unwrap().area;
+    let pad_left = u16::from(msg_area.width >= 2);
+    let row = msg_area.y + 1;
+
+    app.update(mouse_event(
+        MouseEventKind::Moved,
+        msg_area.x + pad_left + 10,
+        row,
+    ));
+    assert!(app.active_chat().hovered_compact().is_some());
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        msg_area.x + pad_left + 10,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        msg_area.x + pad_left + 10,
+        row,
+    ));
+    assert!(!app.compact_detail.is_open());
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        msg_area.x + pad_left + 3,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        msg_area.x + pad_left + 3,
+        row,
+    ));
+    assert!(app.compact_detail.is_open());
+}
+
 const OWNER_MISMATCH: &str = "the wrong state holds the keyboard";
 const OWNER_NOT_OPENED: &str = "the later owner has to be open for the earlier one to beat it";
 const OWNER_INPUT_MISMATCH: &str = "the chat input is focused only when the chat owns the keyboard";

@@ -140,6 +140,7 @@ pub struct MessagesPanel {
     live_start: usize,
     pub compact_tools: bool,
     pub compact_lines: usize,
+    hovered_compact: Option<CompactTarget>,
 }
 
 impl MessagesPanel {
@@ -192,6 +193,7 @@ impl MessagesPanel {
             live_start: 0,
             compact_tools: ui_config.compact_tools,
             compact_lines: ui_config.compact_lines,
+            hovered_compact: None,
         }
     }
 
@@ -1423,7 +1425,7 @@ impl MessagesPanel {
         if self.try_expand_compact_group(row, area) {
             return ClickOutcome::Handled;
         }
-        if let Some(target) = self.compact_target_at(row, area) {
+        if let Some(target) = self.compact_icon_at(row, col, area) {
             return ClickOutcome::OpenCompact(target);
         }
         self.tool_target_at(row, col, area)
@@ -1518,6 +1520,47 @@ impl MessagesPanel {
             cursor += rows;
         }
         None
+    }
+
+    /// The compact target if the click column lands on that row's status icon.
+    pub fn compact_icon_at(&self, row: u16, col: u16, area: Rect) -> Option<CompactTarget> {
+        let target = self.compact_target_at(row, area)?;
+        let pos = self
+            .layout()
+            .advance(self.scroll, u32::from(row.saturating_sub(area.y)));
+        let seg = self.cache.get(pos.seg)?;
+        let line_idx = seg.source_line_at(pos.row, self.viewport_width)?;
+        let line = seg.lines().get(line_idx)?;
+        let icon_cols = tool_group::compact_icon_columns(line)?;
+        let col_in_line = col.checked_sub(area.x + seg.gutter_cols(area.width))?;
+        if icon_cols.contains(&col_in_line) {
+            Some(target)
+        } else {
+            None
+        }
+    }
+
+    pub fn set_hovered_compact(&mut self, target: Option<CompactTarget>) -> bool {
+        if self.hovered_compact == target {
+            return false;
+        }
+        let old_group = self.hovered_compact.as_ref().map(|t| t.group_id.clone());
+        let new_group = target.as_ref().map(|t| t.group_id.clone());
+        self.hovered_compact = target;
+        if let Some(ref gid) = old_group {
+            self.rebuild_tool_group_segment(gid);
+        }
+        if let Some(ref gid) = new_group
+            && old_group.as_ref() != Some(gid)
+        {
+            self.rebuild_tool_group_segment(gid);
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub fn hovered_compact(&self) -> Option<&CompactTarget> {
+        self.hovered_compact.as_ref()
     }
 
     /// The click a row takes when it targets no task, for a moved row whose
@@ -2527,11 +2570,16 @@ impl MessagesPanel {
         let Some(seg_idx) = self.cache.find_by_tool_id(group_id) else {
             return;
         };
+        let hovered = self
+            .hovered_compact
+            .as_ref()
+            .filter(|t| t.group_id == group_id);
         let tl = tool_group::build_tool_group_lines(
             g,
             self.viewport_width,
             self.started_at.elapsed().as_millis(),
             self.compact_lines,
+            hovered,
         );
         let seg = self.cache.get_mut(seg_idx).unwrap();
         seg.update_with_reuse(tl, &self.hl_worker);
@@ -2564,11 +2612,16 @@ impl MessagesPanel {
                     self.upsert_instruction_segment(&id, &blocks);
                 }
             } else if let DisplayRole::ToolGroup(g) = &msg.role {
+                let hovered = self
+                    .hovered_compact
+                    .as_ref()
+                    .filter(|t| t.group_id == g.id);
                 let tl = tool_group::build_tool_group_lines(
                     g,
                     self.viewport_width,
                     self.started_at.elapsed().as_millis(),
                     self.compact_lines,
+                    hovered,
                 );
                 let id = g.id.clone();
                 self.cache.push_spacer_if_needed();

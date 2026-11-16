@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use unicode_width::UnicodeWidthStr;
 
 use super::keybindings::key;
 use super::modal::Modal;
@@ -20,9 +21,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 const TITLE_PAD: &str = " ";
 const SECTION_GAP: &str = "";
-const INPUT_LABEL: &str = "Input";
-const OUTPUT_LABEL: &str = "Output";
-const ERROR_LABEL: &str = "Error";
+const DIVIDER_LABEL: &str = " ▲ input / output ▼";
 const EMPTY: &str = "(empty)";
 const RECEIVING: &str = "Receiving arguments…";
 const RUNNING: &str = "Running…";
@@ -157,10 +156,6 @@ impl CompactDetailModal {
             self.rendered_area = None;
             return Rect::default();
         };
-        let lines = match shown {
-            Shown::Tool(entry) => tool_lines(entry),
-            Shown::Thinking(entry) => thinking_lines(entry),
-        };
         let title = match shown {
             Shown::Tool(entry) => {
                 if self.items.len() > 1 {
@@ -200,6 +195,10 @@ impl CompactDetailModal {
         let padded_width = modal
             .width(area.width)
             .saturating_sub(super::modal::BORDER + H_PAD * 2);
+        let lines = match shown {
+            Shown::Tool(entry) => tool_lines(entry, padded_width),
+            Shown::Thinking(entry) => thinking_lines(entry),
+        };
         let wrapped = Paragraph::new(lines).wrap(Wrap { trim: false });
         let total = wrapped.line_count(padded_width) as u16;
 
@@ -244,7 +243,7 @@ impl Overlay for CompactDetailModal {
     }
 }
 
-fn tool_lines(entry: &GroupToolEntry) -> Vec<Line<'static>> {
+fn tool_lines(entry: &GroupToolEntry, width: u16) -> Vec<Line<'static>> {
     let theme = theme::current();
     let mut lines = Vec::new();
     let detail = entry.detail.as_ref();
@@ -254,7 +253,6 @@ fn tool_lines(entry: &GroupToolEntry) -> Vec<Line<'static>> {
         lines.push(Line::from(SECTION_GAP));
     }
 
-    lines.push(section_label(INPUT_LABEL));
     if entry.name.as_ref() == "code_execution" {
         if let Some(code) = extract_code_execution_code(entry, detail) {
             push_highlighted_code(&mut lines, "python", code);
@@ -280,14 +278,19 @@ fn tool_lines(entry: &GroupToolEntry) -> Vec<Line<'static>> {
         }
     }
 
-    lines.push(Line::from(SECTION_GAP));
-    lines.push(section_label(if entry.status == ToolStatus::Error {
-        ERROR_LABEL
-    } else {
-        OUTPUT_LABEL
-    }));
+    lines.push(divider_line(width));
     push_output(&mut lines, entry, detail);
     lines
+}
+
+fn divider_line(width: u16) -> Line<'static> {
+    let theme = theme::current();
+    let label_w = UnicodeWidthStr::width(DIVIDER_LABEL);
+    let rule_w = (width as usize).saturating_sub(label_w);
+    Line::from(vec![
+        Span::styled("─".repeat(rule_w), theme.horizontal_rule),
+        Span::styled(DIVIDER_LABEL, theme.status_dim),
+    ])
 }
 
 fn thinking_lines(entry: &GroupThinkingEntry) -> Vec<Line<'static>> {
@@ -431,10 +434,6 @@ fn push_highlighted_code(lines: &mut Vec<Line<'static>>, lang: &str, code: &str)
     }
 }
 
-fn section_label(label: &str) -> Line<'static> {
-    Line::from(Span::styled(label.to_owned(), theme::current().panel_title))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,7 +526,7 @@ mod tests {
             modal.scroll.scroll(-1);
         }
         let scrolled = draw(&mut modal, 16);
-        assert!(scrolled.contains("row 2"), "{scrolled}");
+        assert!(scrolled.contains("row 4"), "{scrolled}");
         assert!(!scrolled.contains("row 0"), "{scrolled}");
     }
 
@@ -646,11 +645,11 @@ mod tests {
         // Find a line that has borders
         let border_line = text
             .lines()
-            .find(|l| l.contains("Input"))
-            .expect("Input line");
-        // With H_PAD = 1, inside border there is a space before "Input"
+            .find(|l| l.contains("cargo check"))
+            .expect("cargo check line");
+        // With H_PAD = 1, inside border there is padding space before the content
         assert!(
-            border_line.contains("│ Input") || border_line.contains("│  Input"),
+            border_line.starts_with("       │   \"command\"") || border_line.contains("│   \"command\""),
             "{border_line}"
         );
     }
@@ -765,7 +764,7 @@ mod tests {
         });
         entry.name = Arc::from("code_execution");
 
-        let lines = tool_lines(&entry);
+        let lines = tool_lines(&entry, SCREEN);
         let full_text = lines
             .iter()
             .map(|l| {
@@ -779,6 +778,7 @@ mod tests {
 
         assert!(full_text.contains("def solve():"), "{full_text}");
         assert!(full_text.contains("return 42"), "{full_text}");
+        assert!(full_text.contains(DIVIDER_LABEL), "{full_text}");
         assert!(!full_text.contains("toolcall_reason"), "{full_text}");
         assert!(!full_text.contains("{\"code\":"), "{full_text}");
 
@@ -794,7 +794,7 @@ mod tests {
     fn code_execution_input_empty_and_receiving() {
         let mut empty_entry = tool(CompactDetail::default());
         empty_entry.name = Arc::from("code_execution");
-        let empty_lines = tool_lines(&empty_entry);
+        let empty_lines = tool_lines(&empty_entry, SCREEN);
         let empty_text = empty_lines
             .iter()
             .map(|l| {
@@ -806,11 +806,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(empty_text.contains(EMPTY), "{empty_text}");
+        assert!(empty_text.contains(DIVIDER_LABEL), "{empty_text}");
 
         let mut receiving_entry = tool(CompactDetail::default());
         receiving_entry.name = Arc::from("code_execution");
         receiving_entry.receiving_args = true;
-        let receiving_lines = tool_lines(&receiving_entry);
+        let receiving_lines = tool_lines(&receiving_entry, SCREEN);
         let receiving_text = receiving_lines
             .iter()
             .map(|l| {
@@ -822,6 +823,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(receiving_text.contains(RECEIVING), "{receiving_text}");
+        assert!(receiving_text.contains(DIVIDER_LABEL), "{receiving_text}");
     }
 
     #[test]

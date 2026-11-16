@@ -71,7 +71,23 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                self.chats[self.active_chat].set_hovered_compact(None);
                 self.handle_drag(event.row, event.column);
+            }
+            MouseEventKind::Moved => {
+                if self.compact_detail.is_open() || self.has_modal_overlay() {
+                    self.chats[self.active_chat].set_hovered_compact(None);
+                    return;
+                }
+                if let Some(zone) = self.zone_at(event.row, event.column)
+                    && zone.zone == SelectionZone::Messages
+                {
+                    let area = self.msg_area();
+                    let target = self.chats[self.active_chat].compact_target_at(event.row, area);
+                    self.chats[self.active_chat].set_hovered_compact(target);
+                } else {
+                    self.chats[self.active_chat].set_hovered_compact(None);
+                }
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if let Some(SelectionState::Dragging { sel, .. }) = self.selection_state {
@@ -186,6 +202,7 @@ impl App {
         }
 
         if !items.is_empty() {
+            self.chats[self.active_chat].set_hovered_compact(None);
             self.compact_detail.open_group(items, selected_idx);
         }
     }
