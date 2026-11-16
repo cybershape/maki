@@ -679,10 +679,9 @@ fn parse_inline_impl(text: &str, base: Emphasis, mode: ParseMode) -> Vec<InlineS
                 let content = &text[pos + 1..close];
                 if !content.is_empty() {
                     flush_plain(&mut spans, &text[plain_start..pos], base, mode);
-                    spans.push(InlineSpan::math(
-                        crate::math::linearize_latex(content),
-                        base,
-                    ));
+                    let converted = crate::math::latex_to_unicode_inline(content)
+                        .unwrap_or_else(|| content.to_owned());
+                    spans.push(InlineSpan::math(converted, base));
                     pos = close + 1;
                     plain_start = pos;
                     continue;
@@ -1445,7 +1444,7 @@ mod tests {
         assert_eq!(spans.len(), 3);
         assert_eq!(spans[0].text, "formula ");
         assert_eq!(spans[1].kind, SpanKind::Math);
-        assert_eq!(spans[1].text, "E = mc^2");
+        assert_eq!(spans[1].text, "E = mc²");
         assert_eq!(spans[2].text, " in text");
     }
 }

@@ -1489,4 +1489,11 @@ mod tests {
         assert_eq!(math_lines[0].spans[0].style, StyleToken::MathBar);
         assert_eq!(math_lines[0].spans[1].style, StyleToken::Math);
     }
+
+    #[test]
+    fn render_unclosed_streaming_math_block_never_panics() {
+        let text = "$$\\Delta \\text{Rate} = \\beta_0 + \\beta_";
+        let lines = render(text, 120);
+        assert!(lines.iter().any(|l| l.kind == LineKind::Math));
+    }
 }

@@ -251,6 +251,14 @@ Pay particular attention to the following potential conflicts and integration re
 - **Key changes**:
   - Persist and restore the last used model and thinking level per model per project under `<state>/projects/<project-id>/`.
 
+### 3.8. Math Rendering Ported from grok build (replaces vendored `txm`)
+
+- **Affected files**: `maki-markdown/src/math/`, `maki-markdown/src/lib.rs`, `Cargo.toml`
+- **Key changes**:
+  - The initial fix for streaming-math panics vendored `txm` 0.1.6 with EOF/argument guards. That vendor was later **removed**: both grok build and codex CLI render math with self-contained, bounded, never-panicking LaTeX→Unicode converters, which fit terminal streaming better than a typesetting engine (and handle CJK `\text{...}` for free).
+  - `maki-markdown/src/math/` now ports grok build's `xai-grok-markdown/src/latex` module (Apache-2.0, xai-org/grok-build): inline (`latex_to_unicode_inline`, single line) and display (`latex_to_unicode_display`, multi-line) entry points, 4 KiB input cap, depth cap 32, unknown commands degrade to bare names. Local extension: display-mode `\frac` stacks numerator/bar/denominator via `MathBox::push_fraction`; inline keeps linear/vulgar forms.
+  - **Merge note**: upstream maki still depends on crates.io `txm`; merges touching `maki-markdown` math or the `txm` dependency must keep this port instead of re-adding `txm`.
+
 ---
 
 ## 4. Upstream Tracking and Synchronization Guide
