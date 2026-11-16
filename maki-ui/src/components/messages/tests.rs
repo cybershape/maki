@@ -5122,3 +5122,42 @@ fn tool_output_wraps_behind_the_gutter_and_copies_without_it() {
         "copy kept the gutter: {copied:?}"
     );
 }
+
+#[test]
+fn scroll_to_bottom_indicator_shows_when_scrolled_up_and_clicking_resets() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.streaming_text.set_buffer(&"line\n".repeat(30));
+    let width = 80;
+    let height = 10;
+    let terminal = render(&mut panel, width, height);
+    assert!(panel.auto_scroll);
+    let center_col = width / 2;
+    let bottom_row = height - 1;
+    let cell_at_bottom = &terminal.backend().buffer()[(center_col, bottom_row)];
+    assert_ne!(cell_at_bottom.symbol(), super::SCROLL_TO_BOTTOM_CHAR);
+
+    panel.scroll(5);
+    let terminal = render(&mut panel, width, height);
+    assert!(!panel.auto_scroll);
+    let cell_at_bottom = &terminal.backend().buffer()[(center_col, bottom_row)];
+    assert_eq!(cell_at_bottom.symbol(), super::SCROLL_TO_BOTTOM_CHAR);
+
+    let area = Rect::new(0, 0, width, height);
+    assert!(panel.is_scroll_to_bottom_hit(bottom_row, center_col, area));
+    assert!(panel.is_scroll_to_bottom_hit(bottom_row, center_col - 1, area));
+    assert!(panel.is_scroll_to_bottom_hit(bottom_row, center_col + 1, area));
+    assert!(!panel.is_scroll_to_bottom_hit(bottom_row, center_col + 2, area));
+    assert!(!panel.is_scroll_to_bottom_hit(bottom_row - 1, center_col, area));
+
+    let outcome = panel.handle_click(bottom_row, 0, area);
+    assert_ne!(outcome, ClickOutcome::Handled);
+    assert!(!panel.auto_scroll);
+
+    let outcome = panel.handle_click(bottom_row, center_col, area);
+    assert_eq!(outcome, ClickOutcome::Handled);
+    assert!(panel.auto_scroll);
+
+    let terminal = render(&mut panel, width, height);
+    let cell_at_bottom = &terminal.backend().buffer()[(center_col, bottom_row)];
+    assert_ne!(cell_at_bottom.symbol(), super::SCROLL_TO_BOTTOM_CHAR);
+}

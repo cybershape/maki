@@ -48,6 +48,15 @@ impl App {
                     if self.has_modal_overlay() && zone.zone != SelectionZone::Overlay {
                         return;
                     }
+                    if zone.zone == SelectionZone::Messages
+                        && !self.active_chat().auto_scroll()
+                        && self
+                            .active_chat()
+                            .is_scroll_to_bottom_hit(event.row, event.column, zone.area)
+                    {
+                        self.active_chat().enable_auto_scroll();
+                        return;
+                    }
                     // Move the cursor to the click position in the input area.
                     if zone.zone == SelectionZone::Input {
                         self.input_box

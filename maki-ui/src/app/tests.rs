@@ -3182,6 +3182,26 @@ fn scroll_shortcuts_toggle_auto_scroll() {
     assert!(app.chats[0].auto_scroll());
 }
 
+#[test]
+fn clicking_scroll_to_bottom_indicator_re_enables_auto_scroll() {
+    let mut app = test_app();
+    let area = Rect::new(0, 0, 80, 20);
+    set_zone(&mut app, SelectionZone::Messages, area);
+    app.active_chat().scroll(5);
+    assert!(!app.chats[0].auto_scroll());
+
+    let center_col = area.width / 2;
+    let bottom_row = area.bottom() - 1;
+
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 0, bottom_row));
+    assert!(!app.chats[0].auto_scroll());
+    app.selection_state = None;
+
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), center_col, bottom_row));
+    assert!(app.chats[0].auto_scroll());
+    assert!(app.selection_state.is_none());
+}
+
 /// A selection names a place in the transcript, so the transcript has to
 /// exist before a drag can land anywhere.
 fn app_with_transcript(zone: Rect) -> App {

@@ -68,6 +68,7 @@ const CLICKABLE: bool = true;
 const NOTICE_COLLAPSED_MARK: &str = " ▸";
 const NOTICE_EXPANDED_MARK: &str = " ▾";
 const NOTICE_DETAIL_DIM: f32 = 0.7;
+pub(crate) const SCROLL_TO_BOTTOM_CHAR: &str = "▼";
 
 /// What a click in the transcript asks of the app.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1415,6 +1416,10 @@ impl MessagesPanel {
 
     /// {col} is the screen column, for the right-aligned move hint.
     pub fn handle_click(&mut self, row: u16, col: u16, area: Rect) -> ClickOutcome {
+        if !self.auto_scroll && self.is_scroll_to_bottom_hit(row, col, area) {
+            self.enable_auto_scroll();
+            return ClickOutcome::Handled;
+        }
         if self.try_expand_compact_group(row, area) {
             return ClickOutcome::Handled;
         }
@@ -1882,6 +1887,33 @@ impl MessagesPanel {
                 render_vertical_scrollbar(frame, area, total_rows, layout.doc_row(self.scroll));
             }
         }
+
+        if !self.auto_scroll {
+            self.render_scroll_to_bottom(frame, area);
+        }
+    }
+
+    pub fn is_scroll_to_bottom_hit(&self, row: u16, col: u16, area: Rect) -> bool {
+        if area.height == 0 || area.width == 0 {
+            return false;
+        }
+        let target_row = area.bottom().saturating_sub(1);
+        let center_col = area.x + area.width / 2;
+        row == target_row && col >= center_col.saturating_sub(1) && col <= center_col.saturating_add(1)
+    }
+
+    fn render_scroll_to_bottom(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+        let target_row = area.bottom().saturating_sub(1);
+        let center_col = area.x + area.width / 2;
+        let style = Style::new()
+            .fg(crate::theme::current().foreground)
+            .bg(crate::theme::current().background);
+        frame
+            .buffer_mut()
+            .set_string(center_col, target_row, SCROLL_TO_BOTTOM_CHAR, style);
     }
 
     /// Same order and spacers as `rebuild_line_cache` builds once they flush,

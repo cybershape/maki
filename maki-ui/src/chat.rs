@@ -496,6 +496,10 @@ impl Chat {
         self.messages_panel.handle_click(row, col, area)
     }
 
+    pub fn is_scroll_to_bottom_hit(&self, row: u16, col: u16, area: Rect) -> bool {
+        self.messages_panel.is_scroll_to_bottom_hit(row, col, area)
+    }
+
     pub fn toggle_click(&mut self, row: u16, area: Rect) -> ClickOutcome {
         self.messages_panel.toggle_click(row, area)
     }
