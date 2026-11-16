@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `6c85344b257fdb7991b35864f36ff185e5c505ad`
-  - **Commit date**: `Sun Nov 15 23:32:03 2026 +0100`
-  - **Commit author**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
-  - **Commit message**: `refactor(storage): wait for file locks on the tokio timer`
+  - **Commit SHA**: `6c3c4463fda1e86d19e089dfd1d748327f8b184a`
+  - **Commit date**: `Mon Nov 16 20:59:33 2026 +0200`
+  - **Commit author**: `Sebastian Dröge <sebastian@centricular.com>`
+  - **Commit message**: `perf(events): build a TurnComplete reply only for its readers`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `6c85344b`.
+> `upstream/main` has been successfully merged through commit `6c3c4463`.
 
 ---
 
@@ -196,6 +196,19 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `b9f0ae6b` | `docs: update upstream tracking record to 2d07edfc` | Update the upstream tracking record to `2d07edfc` |
 | `c47561f1` | `feat(providers): send service_tier=fast on Responses requests` | Send `service_tier: "fast"` on Responses provider requests |
 | `c7e98f3d` | `Merge branch 'upstream/main' into main` | Merge upstream through `6c85344b`, including marking free-form tool schemas with additionalProperties=true, reading write diffs on tokio::fs in ACP, non-blocking OAuth token reads, reading and renaming stored sessions off the UI event loop, and waiting for storage file locks on the tokio timer, while preserving core fork customizations |
+| `71863cc6` | `docs: update upstream tracking record to 6c85344b` | Update upstream tracking record to `6c85344b` |
+| `68eb4815` | `feat(ui): display right-aligned timestamp for user messages` | Display right-aligned timestamp for user messages |
+| `8a500399` | `fix(markdown): replace txm with grok-build latex-to-unicode port` | Replace txm with grok-build LaTeX-to-Unicode port |
+| `31d8fb8e` | `feat(ui): brighten user_bg across themes and set ANSI 236 for system theme` | Brighten user_bg across themes and set ANSI 236 for system theme |
+| `df8f43f2` | `feat(ui): display scroll-to-bottom indicator when scrolled up` | Display scroll-to-bottom indicator when scrolled up |
+| `0cc11ab5` | `feat(ui): display right-aligned completion timestamp for turn stats line` | Display right-aligned completion timestamp for turn stats line |
+| `64a4fee8` | `fix(ui): dedicate full row and stabilize style for scroll-to-bottom indicator` | Dedicate full row and stabilize style for scroll-to-bottom indicator |
+| `e575827b` | `feat(ui): add disable_bold and disable_italic options` | Add disable_bold and disable_italic options |
+| `63077f0d` | `feat(ui): display real-time execution elapsed timer in status bar` | Display real-time execution elapsed timer in status bar |
+| `97c2ead5` | `feat(ui): open compact tool details via hover icon and add modal divider` | Open compact tool details via hover icon and add modal divider |
+| `e9696eb8` | `feat(ui): allow clicking tool name on hover to open compact details` | Allow clicking tool name on hover to open compact details |
+| `25fdaa52` | `feat(ui): refuse /workflow when task or code_execution is disabled by config` | Refuse /workflow when task or code_execution is disabled by config |
+| `55703657` | `Merge branch 'upstream/main' into main` | Merge upstream through `6c3c4463`, including model requested compaction (`maki.session.request_compact`), agent slot layer prompt-like pricing, blocking pool panic re-raising helper (`maki_storage::blocking`/`joined`), OAuth token refresh file lock protection, and `TurnComplete` host event message payload and deferred reply building, while preserving core fork customizations |
 
 ---
 
