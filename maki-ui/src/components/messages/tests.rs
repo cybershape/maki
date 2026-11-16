@@ -5187,6 +5187,14 @@ fn scroll_to_bottom_indicator_shows_when_scrolled_up_and_clicking_resets() {
     assert!(!panel.auto_scroll);
     let cell_at_bottom = &terminal.backend().buffer()[(center_col, bottom_row)];
     assert_eq!(cell_at_bottom.symbol(), super::SCROLL_TO_BOTTOM_CHAR);
+    assert_eq!(cell_at_bottom.fg, theme::current().foreground);
+    assert_eq!(cell_at_bottom.bg, theme::current().background);
+    assert_eq!(cell_at_bottom.modifier, ratatui::style::Modifier::empty());
+
+    let cell_at_left = &terminal.backend().buffer()[(0, bottom_row)];
+    assert_eq!(cell_at_left.symbol(), " ");
+    let cell_at_right = &terminal.backend().buffer()[(width - 2, bottom_row)];
+    assert_eq!(cell_at_right.symbol(), " ");
 
     let area = Rect::new(0, 0, width, height);
     assert!(panel.is_scroll_to_bottom_hit(bottom_row, center_col, area));

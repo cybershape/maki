@@ -1815,7 +1815,12 @@ impl MessagesPanel {
         self.reflow_viewport(width);
         self.resolve_scroll(has_selection);
 
-        let viewport = Rect::new(area.x + pad_left, area.y, width, area.height);
+        let msg_height = if !self.auto_scroll {
+            area.height.saturating_sub(1)
+        } else {
+            area.height
+        };
+        let viewport = Rect::new(area.x + pad_left, area.y, width, msg_height);
         let mut cursor = RenderCursor::new(self.scroll.row, viewport);
 
         let mut last_drawn = self.scroll.seg;
@@ -1850,6 +1855,10 @@ impl MessagesPanel {
             last_drawn = i;
         }
         self.release_images_outside(last_drawn);
+
+        if !self.auto_scroll {
+            self.render_scroll_to_bottom(frame, area);
+        }
 
         if let Some(pp) = self.prompt_progress
             && pp.total > 0
@@ -1887,10 +1896,6 @@ impl MessagesPanel {
                 render_vertical_scrollbar(frame, area, total_rows, layout.doc_row(self.scroll));
             }
         }
-
-        if !self.auto_scroll {
-            self.render_scroll_to_bottom(frame, area);
-        }
     }
 
     pub fn is_scroll_to_bottom_hit(&self, row: u16, col: u16, area: Rect) -> bool {
@@ -1908,12 +1913,22 @@ impl MessagesPanel {
         }
         let target_row = area.bottom().saturating_sub(1);
         let center_col = area.x + area.width / 2;
-        let style = Style::new()
+        let style = Style::reset()
             .fg(crate::theme::current().foreground)
             .bg(crate::theme::current().background);
-        frame
-            .buffer_mut()
-            .set_string(center_col, target_row, SCROLL_TO_BOTTOM_CHAR, style);
+        let buf = frame.buffer_mut();
+        for col in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut((col, target_row)) {
+                cell.reset();
+                cell.set_char(' ');
+                cell.set_style(style);
+            }
+        }
+        if let Some(cell) = buf.cell_mut((center_col, target_row)) {
+            cell.reset();
+            cell.set_symbol(SCROLL_TO_BOTTOM_CHAR);
+            cell.set_style(style);
+        }
     }
 
     /// Same order and spacers as `rebuild_line_cache` builds once they flush,
