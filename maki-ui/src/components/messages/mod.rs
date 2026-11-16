@@ -2859,8 +2859,8 @@ fn split_for_timestamp(text: &str, available_width: usize) -> (&str, &str) {
     }
 }
 
-/// Builds lines for a user message, right-aligning the timestamp on the first line.
-fn build_user_message_lines(
+/// Builds lines for a message, right-aligning the timestamp on the first line.
+fn build_timestamped_message_lines(
     text: &str,
     timestamp: Option<&str>,
     body: u16,
@@ -2942,6 +2942,10 @@ fn build_message_lines(
     } else {
         &msg.text
     };
+    let ts_str = msg.timestamp.clone().or_else(|| {
+        msg.created_at
+            .map(|ms| crate::clock::format_message_timestamp(ms, clock_format))
+    });
     let mut lines = if style.use_markdown {
         text_to_lines(
             text,
@@ -2951,12 +2955,8 @@ fn build_message_lines(
             body,
             style.max_line_bytes,
         )
-    } else if matches!(msg.role, DisplayRole::User) {
-        let ts_str = msg.timestamp.clone().or_else(|| {
-            msg.created_at
-                .map(|ms| crate::clock::format_message_timestamp(ms, clock_format))
-        });
-        build_user_message_lines(
+    } else if ts_str.is_some() {
+        build_timestamped_message_lines(
             text,
             ts_str.as_deref(),
             body,

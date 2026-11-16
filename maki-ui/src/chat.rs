@@ -538,8 +538,9 @@ impl Chat {
             timing.thinking_ms = compact_ms.max(timing.thinking_ms);
         }
         if let Some(line) = turn_stats_line(usage, timing) {
-            self.messages_panel
-                .push(DisplayMessage::new(DisplayRole::Notice, line));
+            let mut msg = DisplayMessage::new(DisplayRole::Notice, line);
+            msg.created_at = Some(Timestamp::now().as_millisecond() as u64);
+            self.messages_panel.push(msg);
         }
         self.reset_turn_stats();
     }
@@ -1409,6 +1410,8 @@ mod tests {
             notices[0],
             "◷ 9.0s / 0.2s · ↑300 ↓125 · » 14 t/s · t₁ 1.0s · ⛁ 0%"
         );
+        let last_msg = chat.message_at(chat.message_count() - 1).unwrap();
+        assert!(last_msg.created_at.is_some());
     }
 
     #[test]

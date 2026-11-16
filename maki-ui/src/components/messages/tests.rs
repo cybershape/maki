@@ -1017,6 +1017,52 @@ fn user_message_multiline_text_puts_timestamp_on_first_line() {
 }
 
 #[test]
+fn turn_stats_notice_renders_right_aligned_timestamp_for_today() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let now_ms = jiff::Timestamp::now().as_millisecond() as u64;
+    let mut msg = DisplayMessage::new(
+        DisplayRole::Notice,
+        "◷ 1m15s / 0s · ↑1.1m ↓634 · » 8 t/s · t₁ 11s · ⛁ 97%".into(),
+    );
+    msg.created_at = Some(now_ms);
+    panel.push(msg);
+    let terminal = render(&mut panel, 80, 24);
+    let buf = terminal.backend().buffer();
+
+    let expected_ts = crate::clock::format_message_timestamp(now_ms, panel.clock_format);
+    let row0: String = (0..buf.area.width)
+        .filter_map(|x| buf.cell((x, 0)).map(|c| c.symbol()))
+        .collect();
+
+    assert!(row0.contains("◷ 1m15s / 0s · ↑1.1m ↓634 · » 8 t/s · t₁ 11s · ⛁ 97%"));
+    assert!(row0.trim_end().ends_with(&expected_ts));
+}
+
+#[test]
+fn turn_stats_notice_renders_date_and_time_for_past_date() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let past_ms = (jiff::Timestamp::now().as_millisecond() as u64).saturating_sub(2 * 86_400 * 1000);
+    let mut msg = DisplayMessage::new(
+        DisplayRole::Notice,
+        "◷ 9.0s / 0.2s · ↑300 ↓125 · » 14 t/s · t₁ 1.0s · ⛁ 0%".into(),
+    );
+    msg.created_at = Some(past_ms);
+    panel.push(msg);
+    let terminal = render(&mut panel, 90, 24);
+    let buf = terminal.backend().buffer();
+
+    let expected_ts = crate::clock::format_message_timestamp(past_ms, panel.clock_format);
+    assert!(expected_ts.contains('-'), "past date timestamp must contain year-month-day");
+
+    let row0: String = (0..buf.area.width)
+        .filter_map(|x| buf.cell((x, 0)).map(|c| c.symbol()))
+        .collect();
+
+    assert!(row0.contains("◷ 9.0s / 0.2s · ↑300 ↓125 · » 14 t/s · t₁ 1.0s · ⛁ 0%"));
+    assert!(row0.trim_end().ends_with(&expected_ts));
+}
+
+#[test]
 fn annotate_tool_sets_annotation() {
     let mut panel = panel_with_tools(&[("t1", "task"), ("t2", "bash")]);
     rebuild(&mut panel);
