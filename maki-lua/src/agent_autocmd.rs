@@ -7,7 +7,7 @@
 use std::fmt::Display;
 
 use maki_agent::{AgentEvent, DoneReason, Envelope};
-use maki_providers::TokenUsage;
+use maki_providers::{Message, TokenUsage};
 use serde::Serialize;
 use serde_json::Value;
 use strum::{EnumDiscriminants, EnumString, IntoStaticStr, VariantArray};
@@ -15,6 +15,10 @@ use strum::{EnumDiscriminants, EnumString, IntoStaticStr, VariantArray};
 use crate::EventHandle;
 
 const SESSION_ID: &str = "session_id";
+
+/// Where a `TurnComplete` reply lands, in the payload and in
+/// [`HostEventKind::fields`] alike.
+pub(crate) const MESSAGE_KEY: &str = "message";
 
 /// Every event the host fires, one variant each, and [`EventHandle::fire`]
 /// takes nothing else. Each field lands in the payload, so
@@ -42,6 +46,10 @@ pub enum HostEvent<'a> {
         duration_ms: Option<u64>,
     },
     TurnComplete {
+        /// Beside the payload JSON, which would drop its nulls and inline
+        /// base64 for every image. The Lua thread builds the table plugins know.
+        #[serde(skip)]
+        message: &'a Message,
         /// Absent when the host does not know the gauge.
         #[serde(skip_serializing_if = "Option::is_none")]
         context_size: Option<u32>,
@@ -154,6 +162,15 @@ impl HostEvent<'_> {
         }
         data
     }
+
+    /// The reply the Lua thread sets under [`MESSAGE_KEY`]. No other event
+    /// carries one.
+    pub(crate) fn lua_message(&self) -> Option<&Message> {
+        match self {
+            Self::TurnComplete { message, .. } => Some(message),
+            _ => None,
+        }
+    }
 }
 
 /// The keys of one host event's payload, sorted by whether they are
@@ -182,7 +199,7 @@ impl HostEventKind {
                 &["tool_id", "tool", "is_error", "bytes", "duration_ms"],
             ),
             Self::AutoCompacting => (&[], &["context_size", "context_window"]),
-            Self::TurnComplete => (&[], &["context_size", "context_window", "id"]),
+            Self::TurnComplete => (&[MESSAGE_KEY], &["context_size", "context_window", "id"]),
             Self::CompactionDone => (
                 &["summary"],
                 &[
@@ -273,6 +290,7 @@ pub fn host_event_for<'a>(
             duration_ms: e.call.as_ref().map(|call| call.duration.as_millis() as u64),
         }),
         AgentEvent::TurnComplete(e) => Some(HostEvent::TurnComplete {
+            message: &e.message,
             context_size: e.context_size,
             context_window: e.context_window,
             id: task_id,
@@ -333,14 +351,14 @@ fn turn_end_reason(reason: DoneReason) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, LazyLock};
 
     use std::time::Duration;
 
     use maki_agent::{
         CallRecord, RunTotals, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
     };
-    use maki_providers::Message;
+    use maki_providers::{ContentBlock, Message, Role};
     use serde_json::json;
     use test_case::test_case;
 
@@ -371,9 +389,9 @@ mod tests {
         }
     }
 
-    fn turn_complete(context_size: Option<u32>) -> AgentEvent {
+    fn turn_complete(message: Message, context_size: Option<u32>) -> AgentEvent {
         AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
-            message: Message::default(),
+            message,
             usage: TokenUsage::default(),
             model: "m".into(),
             cost: None,
@@ -422,7 +440,7 @@ mod tests {
                 output: None,
             })),
             tool_done(),
-            turn_complete(Some(150_000)),
+            turn_complete(no_reply(), Some(150_000)),
             AgentEvent::AutoCompacting {
                 context_size: 1,
                 context_window: 2,
@@ -480,6 +498,23 @@ mod tests {
 
     const SAMPLE_TEXT: &str = "some text";
 
+    /// A message the model could actually return, so a fixture never pins a
+    /// payload the agent cannot produce.
+    fn no_reply() -> Message {
+        Message {
+            role: Role::Assistant,
+            ..Default::default()
+        }
+    }
+
+    static SAMPLE_MESSAGE: LazyLock<Message> = LazyLock::new(|| Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: SAMPLE_TEXT.into(),
+        }],
+        ..Default::default()
+    });
+
     /// One of each event with every optional field set, so the payload shows
     /// every key the event can carry. The match is exhaustive, so a new event
     /// does not compile until it is sampled here.
@@ -504,6 +539,7 @@ mod tests {
                 context_window: 0,
             },
             HostEventKind::TurnComplete => HostEvent::TurnComplete {
+                message: &SAMPLE_MESSAGE,
                 context_size: Some(0),
                 context_window: 0,
                 id: Some(SAMPLE_TEXT),
@@ -605,7 +641,7 @@ mod tests {
 
     #[test]
     fn turn_complete_carries_the_run_gauge() {
-        let data = fired(&turn_complete(Some(150_000)))
+        let data = fired(&turn_complete(no_reply(), Some(150_000)))
             .expect("TurnComplete fires")
             .1;
         assert_eq!(data["context_size"], 150_000);
@@ -616,9 +652,24 @@ mod tests {
         );
     }
 
+    /// The reply is not JSON: only the Lua thread can build the table a
+    /// plugin expects, so it travels beside the payload.
+    #[test]
+    fn turn_complete_sends_its_reply_beside_the_payload() {
+        let event = turn_complete(SAMPLE_MESSAGE.clone(), Some(150_000));
+        let fired = host_event_for(&event, None).expect("TurnComplete fires");
+        assert_eq!(fired.lua_message(), Some(&*SAMPLE_MESSAGE));
+        assert!(
+            fired.payload(Some(&SESSION)).get(MESSAGE_KEY).is_none(),
+            "a serialized reply would drop nulls and inline base64"
+        );
+    }
+
     #[test]
     fn turn_complete_omits_an_unknown_gauge() {
-        let data = fired(&turn_complete(None)).expect("TurnComplete fires").1;
+        let data = fired(&turn_complete(no_reply(), None))
+            .expect("TurnComplete fires")
+            .1;
         assert!(
             data.get("context_size").is_none(),
             "an unknown gauge is absent, not zero"
@@ -637,10 +688,10 @@ mod tests {
     }
 
     #[test]
-    fn subagent_turn_complete_carries_the_task_id() {
-        let data = host_event_for(&turn_complete(Some(150_000)), Some("toolu_sub"))
-            .expect("TurnComplete fires")
-            .payload(Some(&SESSION));
-        assert_eq!(data["id"], "toolu_sub");
+    fn subagent_turn_complete_carries_its_reply() {
+        let event = turn_complete(SAMPLE_MESSAGE.clone(), Some(150_000));
+        let fired = host_event_for(&event, Some("toolu_sub")).expect("TurnComplete fires");
+        assert_eq!(fired.payload(Some(&SESSION))["id"], "toolu_sub");
+        assert_eq!(fired.lua_message(), Some(&*SAMPLE_MESSAGE));
     }
 }

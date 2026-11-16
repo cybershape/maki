@@ -382,7 +382,7 @@ print(maki.json.encode(copy)) -- {"files":[],"mode":"strict"}
 maki.NIL
 ```
 
-`maki.NIL` is a value that stands for JSON null, like `vim.NIL`. `maki.json.decode` returns it for every null unless `luanil` says otherwise. Every conversion to JSON turns it back into null. So a decode, change, encode pass loses no key. It is truthy and not equal to nil, so test `x == maki.NIL` for null. Tool handler arguments and event payloads use nil for null instead, never `maki.NIL`.
+`maki.NIL` is a value that stands for JSON null, like `vim.NIL`. `maki.json.decode` returns it for every null unless `luanil` says otherwise. Every conversion to JSON turns it back into null. So a decode, change, encode pass loses no key. It is truthy and not equal to nil, so test `x == maki.NIL` for null. Tool handler arguments use nil for null instead, and so does an event payload, except for the message of `TurnComplete`, which is a session table.
 
 **Example:**
 
@@ -941,17 +941,27 @@ name the session now running or focused. What each event adds:
   turn took). `list_cost` is the un-subsidised list price and `cost` is
   the real bill, so a budget plugin charges against whichever one it
   wants.
-- `"TurnComplete"`: `data.context_size` and `data.context_window` after
-  each model response, before its tool calls run. Use it to act mid-turn,
-  before `"AutoCompacting"`. `data.context_size` is absent when unknown.
-  A subagent's response carries its own sizes plus `data.id`, its task id,
-  which `maki.session.notify` takes as `task` to reach that subagent. To
-  watch only the main context, skip events that have an `id`.
+- `"TurnComplete"`: `data.message`, the model's message, with
+  `data.context_window` and `data.context_size` when the host knows it.
+  Fires after each response, before that response's tool calls run.
+  `data.message` needs `session_read` and is the same table a
+  `maki.session.messages()` entry is, so a null arrives as `maki.NIL` and
+  an image block carries an image handle instead of base64. The keys and
+  blocks are [listed here](#maki-session-messages). Each block is tagged
+  by `type`, and each type carries its own fields. A
+  subagent's response carries its own message and sizes with `data.id`,
+  the task id `maki.session.notify` takes as `task`. Skip events with an
+  `id` to watch only the main context. No payload carries a cost, and
+  `"TurnEnd"` holds the bill.
 - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
   trigger time.
 - `"CompactionDone"`: `data.context_size_before`,
   `data.context_size_after`, `data.context_window`, and `data.summary`,
-  the text that replaced the history.
+  the text that replaced the history. A compaction asks the model for
+  that summary first, so its `"TurnComplete"` arrives before this event,
+  carrying the summary as `data.message`. The payload does not say it is
+  a summary there, and a compaction whose summary fails fires that
+  `"TurnComplete"` without ever reaching this event.
 - `"PlanReady"`: `data.path`, the absolute path of the plan file the
   agent just wrote. Fires once per draft. Plan state is per session, so
   pass `data.session_id` to `maki.plan.read`.
@@ -1279,8 +1289,9 @@ the [Hooks price table](/docs/hooks/#rules).
 
 The agent loop fires `agent.user_message`, `agent.stop`,
 `agent.compact.before`, and `agent.compact.prepare`, with the same
-contract. Wrapping one costs every permission. See
-[Hooks](/docs/hooks/).
+contract. Wrapping one costs `agent`, `session_read` and `session_write`,
+since every slot can hand a layer text the user or the model wrote, and a
+layer steers what happens next. See [Hooks](/docs/hooks/).
 
 `permission.prompt` fires where the permission prompt would show, with
 the prompt as its default. A layer takes `function(prev, req, ctx)` and
@@ -5876,6 +5887,44 @@ Requires the `session_settings` [plugin permission](#plugin-permissions).
 ```lua
 maki.session.set_mode("build", { session = opts.session })
 maki.session.prompt("Implement the plan at `" .. opts.path .. "`.", { session = opts.session })
+```
+
+---
+
+### `maki.session.request_compact()` {#maki-session-request_compact}
+
+```lua
+maki.session.request_compact({opts?})
+```
+
+Queues a compaction of a live session, the API behind `/compact`.
+
+Answers once the request is queued, not when the summary lands: a
+running agent compacts before its next request, an idle one when it
+next runs. While one sits unclaimed, a repeat request fails.
+`agent.compact.before` still steers or skips it, and sees it with
+reason `requested`.
+
+Requires the `agent` and `session_write` [plugin permissions](#plugin-permissions).
+
+**Parameters:**
+
+- `{opts?}` (`table`) Options:
+  - `session` (`string`) id of a live session.
+  - `task` (`string?`) id of a live subagent of `session`, as `TurnComplete`
+    reports it; that subagent's own conversation compacts.
+  - `instructions` (`string?`) guidance for this one summary, like
+    `/compact <text>`.
+
+**Returns:** (`boolean|nil`, `string|nil`) true once queued, or nil and an error.
+
+**Example:**
+
+```lua
+maki.session.request_compact({
+  session = ctx:session_id(),
+  instructions = "keep the failing test names",
+})
 ```
 
 ---

@@ -13,7 +13,7 @@ use maki_agent::permissions::{LayerAnswer, LayerVerdict};
 use maki_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{CallOrigin, ToolOutputMode, ToolRegistry};
-use maki_lua::agent_autocmd::host_event_fields;
+use maki_lua::agent_autocmd::{HostEvent, host_event_fields};
 use maki_lua::test_support::{
     content_omitted_message, fire_autocmd, layer_skipped_message, runtime, wait_reply,
 };
@@ -21,6 +21,7 @@ use maki_lua::{
     Permission, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRowAction, PluginHost,
     PluginPermissions, SessionEndReason, UiAction,
 };
+use maki_providers::{ContentBlock, ImageMediaType, ImageSource, Message, Role};
 use maki_storage::id::MakiId;
 use test_case::test_case;
 use tokio::join;
@@ -133,6 +134,7 @@ fn flashes_until_sentinel(ui: &mut UnboundedReceiver<UiAction>) -> Vec<String> {
 
 /// A plugin without `session_read` still hears the event, minus the content,
 /// and is told so once rather than on every event.
+#[test_case("TurnComplete" ; "turn_complete")]
 #[test_case("TurnStart" ; "turn_start")]
 #[test_case("ToolDone" ; "tool_done")]
 #[test_case("CompactionDone" ; "compaction_done")]
@@ -182,6 +184,113 @@ fn without_session_read() -> PluginPermissions {
     let mut blind = PluginPermissions::trusted();
     blind.set(Permission::SessionRead, false);
     blind
+}
+
+/// The reply arrives as the table `maki.session.messages` builds rather than as
+/// JSON: a null inside a tool call survives, and an image stays a handle. The host
+/// adds it on the Lua thread, so a plugin without `session_read` loses it there too.
+#[test]
+fn turn_complete_message_arrives_as_a_session_table() {
+    const READER: &str = "reply_reader";
+    const BLIND: &str = "reply_blind";
+    let fields = host_event_fields("TurnComplete").expect("TurnComplete is classified");
+    let (_reg, host) = host();
+    let mut ui = host.take_ui_action_rx().unwrap();
+    load(&host, READER, &reply_reporter(READER));
+    load_granted(&host, BLIND, &reply_reporter(BLIND), without_session_read());
+    fire_reply(&host, &reply_with_null_and_image());
+    assert_eq!(
+        [
+            next_flash(&mut ui),
+            next_flash(&mut ui),
+            next_flash(&mut ui)
+        ],
+        [
+            format!("{READER}:seen=true,null=true,image=userdata"),
+            content_omitted_message(BLIND, "TurnComplete", fields.content),
+            format!("{BLIND}:seen=false,null=nil,image=nil"),
+        ],
+    );
+}
+
+/// No listener holds `session_read`, so the reply is never built. The event
+/// still arrives without it, and the plugin is still told it was left out.
+#[test]
+fn an_unbuilt_reply_is_still_reported_as_left_out() {
+    let fields = host_event_fields("TurnComplete").expect("TurnComplete is classified");
+    let (_reg, host) = host();
+    let mut ui = host.take_ui_action_rx().unwrap();
+    load_granted(
+        &host,
+        CONTENT_BLIND,
+        &reply_reporter(CONTENT_BLIND),
+        without_session_read(),
+    );
+    fire_reply(&host, &reply_with_null_and_image());
+    assert_eq!(
+        [next_flash(&mut ui), next_flash(&mut ui)],
+        [
+            content_omitted_message(CONTENT_BLIND, "TurnComplete", fields.content),
+            format!("{CONTENT_BLIND}:seen=false,null=nil,image=nil"),
+        ],
+    );
+}
+
+/// A reply holding the two values JSON would mangle: a null in a tool call and
+/// an image.
+fn reply_with_null_and_image() -> Message {
+    const IMAGE_BASE64: &str = "aW1hZ2U=";
+    Message {
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::tool_use("t1", "read", serde_json::json!({ "path": null })),
+            ContentBlock::Image {
+                source: ImageSource::new(ImageMediaType::Png, IMAGE_BASE64.into()),
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+fn fire_reply(host: &PluginHost, reply: &Message) {
+    host.event_handle().fire(
+        None,
+        HostEvent::TurnComplete {
+            message: reply,
+            context_size: None,
+            context_window: 0,
+            id: None,
+        },
+    );
+}
+
+/// Flashes what a reply looks like, without indexing one a plugin may not get.
+fn reply_reporter(plugin: &str) -> String {
+    format!(
+        r#"
+maki.api.create_autocmd("TurnComplete", {{
+    callback = function(ev)
+        local msg = ev.data.message
+        local content = msg and msg.content or {{}}
+        maki.ui.flash(("%s:seen=%s,null=%s,image=%s"):format(
+            "{plugin}",
+            tostring(msg ~= nil),
+            tostring(content[1] and content[1].input.path == maki.NIL),
+            type(content[2] and content[2].source)))
+    end,
+}})
+"#
+    )
+}
+
+fn next_flash(ui: &mut UnboundedReceiver<UiAction>) -> String {
+    loop {
+        match wait_next(ui, DISPATCH_TIMEOUT) {
+            Some(UiAction::Flash(msg)) => return msg,
+            Some(_) => {}
+            None => panic!("no flash arrived"),
+        }
+    }
 }
 
 const UNCLASSIFIED_KEY: &str = "unclassified";
@@ -839,8 +948,29 @@ fn all_but_run() -> PluginPermissions {
 }
 
 fn all_but_agent() -> PluginPermissions {
+    all_but(Permission::Agent)
+}
+
+fn all_but_session_write() -> PluginPermissions {
+    all_but(Permission::SessionWrite)
+}
+
+fn all_but_session_read() -> PluginPermissions {
+    all_but(Permission::SessionRead)
+}
+
+fn all_but(perm: Permission) -> PluginPermissions {
     let mut permissions = PluginPermissions::trusted();
-    permissions.set(Permission::Agent, false);
+    permissions.set(perm, false);
+    permissions
+}
+
+/// The whole price of an agent slot layer.
+fn agent_read_and_write() -> PluginPermissions {
+    let mut permissions = PluginPermissions::denied();
+    permissions.set(Permission::Agent, true);
+    permissions.set(Permission::SessionRead, true);
+    permissions.set(Permission::SessionWrite, true);
     permissions
 }
 
@@ -2087,29 +2217,43 @@ const AGENT_MODEL: &str = "anthropic/claude-sonnet-4";
 const KEEP_GOING: &str = "keep going";
 const CONTINUE_FIELD: &str = "continue";
 
-fn stop_layer() -> String {
+fn agent_layer(slot: &str) -> String {
     format!(
-        r#"maki.api.set_slot("agent.stop", function(prev, value, ctx)
+        r#"maki.api.set_slot("{slot}", function(prev, value, ctx)
     assert(ctx.model == "{AGENT_MODEL}", ctx.model)
     return {{ {CONTINUE_FIELD} = "{KEEP_GOING}" }}
 end)"#
     )
 }
 
-/// Steering the agent can start turns, so unlike a tool with no declared reach
-/// it costs `agent` too and only a fully trusted plugin's layer runs.
-#[test_case(PluginPermissions::trusted, true  ; "trusted_layer_runs")]
-#[test_case(all_but_run,                false ; "denied_run_is_skipped")]
-#[test_case(all_but_agent,              false ; "denied_agent_is_skipped")]
-fn agent_slot_layers_need_full_trust(granted: fn() -> PluginPermissions, runs: bool) {
+/// A layer on an agent slot pays `agent`, `session_read` and
+/// `session_write`: every slot can hand it text the user or the model wrote,
+/// and steering is what sending a prompt costs.
+#[test_case(AgentSlot::Stop, PluginPermissions::trusted, true  ; "trusted_layer_runs")]
+#[test_case(AgentSlot::Stop, all_but_run,                true  ; "steering_does_not_charge_run")]
+#[test_case(AgentSlot::Stop, all_but_agent,              false ; "denied_agent_is_skipped")]
+#[test_case(AgentSlot::Stop, all_but_session_write,      false ; "denied_session_write_is_skipped")]
+#[test_case(AgentSlot::UserMessage, all_but_session_read, false ; "denied_session_read_is_skipped")]
+#[test_case(AgentSlot::CompactBefore, all_but_session_read, false ; "compact_before_pays_session_read")]
+#[test_case(AgentSlot::CompactPrepare, agent_read_and_write, true  ; "only_the_price_needs_holding")]
+fn agent_slot_layers_pay_the_prompt_price(
+    slot: AgentSlot,
+    granted: fn() -> PluginPermissions,
+    runs: bool,
+) {
     let (reg, host) = host();
     let hook = reg
         .agent_hook()
         .expect("the plugin host installs one at boot");
-    assert!(!hook.wraps(AgentSlot::Stop));
-    load_granted(&host, LAYER_PLUGIN, &stop_layer(), granted());
-    assert!(hook.wraps(AgentSlot::Stop));
-    assert!(!hook.wraps(AgentSlot::UserMessage));
+    let slots = [
+        AgentSlot::UserMessage,
+        AgentSlot::Stop,
+        AgentSlot::CompactBefore,
+        AgentSlot::CompactPrepare,
+    ];
+    assert!(slots.iter().all(|&s| !hook.wraps(s)));
+    load_granted(&host, LAYER_PLUGIN, &agent_layer(slot.name()), granted());
+    assert!(slots.iter().all(|&s| hook.wraps(s) == (s == slot)));
 
     let cancel = CancelToken::none();
     let call = AgentCall {
@@ -2121,7 +2265,7 @@ fn agent_slot_layers_need_full_trust(granted: fn() -> PluginPermissions, runs: b
         cancel: &cancel,
         deadline: Instant::now() + DISPATCH_TIMEOUT,
     };
-    let verdict = within(hook.run(AgentSlot::Stop, serde_json::json!({}), &call));
+    let verdict = within(hook.run(slot, serde_json::json!({}), &call));
     let kept_going = serde_json::json!({ CONTINUE_FIELD: KEEP_GOING });
     assert_eq!(
         matches!(verdict, Verdict::Replaced(value) if value == kept_going),

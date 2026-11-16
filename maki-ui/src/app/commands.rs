@@ -58,7 +58,7 @@ impl App {
                     self.queue_compact(instructions);
                     return vec![];
                 }
-                self.status = Status::Streaming;
+                self.mark_compacting();
                 self.turn_started_at = Some(Instant::now());
                 vec![Action::Compact(instructions)]
             }

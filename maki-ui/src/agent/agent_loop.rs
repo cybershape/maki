@@ -277,6 +277,7 @@ impl AgentLoop {
             &self.seed.config,
             compaction.instructions.as_deref(),
             self.seed.timeouts.retry,
+            compaction.reason,
         )
         .await
     }

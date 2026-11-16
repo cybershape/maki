@@ -92,6 +92,7 @@ const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_OUTPUT_CAP: u32 = 8192;
 const ALL_LANDED: &str = "a drain that wrote everything reports nothing unsaved";
 const TASK_ID: &str = "task1";
+const COMPACT_INSTRUCTIONS: &str = "keep tests";
 pub(crate) const STARTED_AT_KEY: &str = "started_at";
 const ENDED_AT_KEY: &str = "ended_at";
 const COST_KEY: &str = "cost";
@@ -14353,4 +14354,29 @@ fn status_bar_timer_shows_in_plan_mode() {
         bottom.contains("[PLAN] 00:"),
         "expected [PLAN] 00: in bottom row, got: {bottom}"
     );
+}
+
+#[test_case(Status::Idle, true ; "quiescence_claims")]
+#[test_case(Status::Streaming, false ; "a_live_run_claims_first")]
+fn a_requested_compaction_wins_its_single_taker(status: Status, claimed: bool) {
+    let mut app = test_app();
+    app.status = status;
+    let mailbox = hold_mailbox(&mut app);
+    SessionMailbox::request_compact(app.state.session.id, Some(COMPACT_INSTRUCTIONS.into()))
+        .unwrap();
+
+    let claim = app.take_requested_compact();
+
+    assert_eq!(claim.is_some(), claimed);
+    if claimed {
+        assert_eq!(
+            claim.unwrap().instructions.as_deref(),
+            Some(COMPACT_INSTRUCTIONS)
+        );
+    } else {
+        assert_eq!(
+            mailbox.take_compact().unwrap().instructions.as_deref(),
+            Some(COMPACT_INSTRUCTIONS)
+        );
+    }
 }

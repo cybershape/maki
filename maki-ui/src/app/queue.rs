@@ -5,7 +5,9 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::time::Instant;
 
-use maki_agent::{AgentInput, AgentMode, Delivery, ImageSource, InputSource, SessionMailbox};
+use maki_agent::{
+    AgentInput, AgentMode, CompactReason, Delivery, ImageSource, InputSource, SessionMailbox,
+};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_storage::model::{persist_project_model, persist_project_model_thinking};
 
@@ -339,6 +341,11 @@ impl App {
         }
     }
 
+    /// A queued compaction looks like running work to Esc and the status bar.
+    pub(crate) fn mark_compacting(&mut self) {
+        self.status = Status::Streaming;
+    }
+
     pub(super) fn queue_compact(&mut self, instructions: Option<String>) {
         let Some(ref shared) = self.queue.shared else {
             return;
@@ -346,6 +353,7 @@ impl App {
         shared.push(QueueItem::Compact(Compaction {
             run_id: self.run_id,
             instructions,
+            reason: CompactReason::Manual,
             workflow: self.state.workflow,
         }));
     }

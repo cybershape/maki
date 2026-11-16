@@ -52,18 +52,23 @@ const PREPARE_TEXT_MAX: usize = 4 * 1024;
 const MAX_SUMMARY_ATTEMPTS: u32 = 3;
 
 pub(super) const FIELD_SKIP: &str = "skip";
+const FIELD_REASON: &str = "reason";
 const FIELD_INSTRUCTIONS: &str = "instructions";
 pub(super) const FIELD_CONTINUE: &str = "continue";
 pub(super) const FIELD_DEFER: &str = "defer";
 const FIELD_COLLAPSE: &str = "collapse";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum CompactReason {
+pub enum CompactReason {
     Auto,
     /// The provider already refused the prompt as too long. Compaction is the
     /// only way out, so a layer cannot skip this one.
     Overflow,
     Manual,
+    /// A plugin asked through `maki.session.request_compact`. Hooks get it as
+    /// its own reason so a layer honoring user intent can tell it from a
+    /// typed `/compact`.
+    Requested,
 }
 
 impl CompactReason {
@@ -72,6 +77,7 @@ impl CompactReason {
             Self::Auto => "auto",
             Self::Overflow => "overflow",
             Self::Manual => "manual",
+            Self::Requested => "requested",
         }
     }
 }
@@ -122,7 +128,7 @@ pub(super) async fn steer_compaction(
     let verdict = hooks
         .fire(AgentSlot::CompactBefore, || {
             json!({
-                "reason": reason.as_str(),
+                FIELD_REASON: reason.as_str(),
                 "context_size": hooks.context_size,
                 "usable": usable(hooks.model, config),
                 "request_instructions": request,
@@ -423,6 +429,7 @@ pub async fn compact(
     config: &AgentConfig,
     instructions: Option<&str>,
     retry: RetryPolicy,
+    reason: CompactReason,
 ) -> Result<DoneReason, AgentError> {
     let size_before = gauge.size();
     let ledger = RunLedger::default();
@@ -441,7 +448,7 @@ pub async fn compact(
         }
     };
     let CompactionPlan::Proceed(steer) =
-        steer_compaction(hooks, config, CompactReason::Manual, instructions, false).await
+        steer_compaction(hooks, config, reason, instructions, false).await
     else {
         event_tx.send(finished(size_before))?;
         return Ok(DoneReason::Compact);
@@ -715,7 +722,7 @@ pub(super) fn auto_compact_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use std::iter;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
@@ -925,6 +932,7 @@ mod tests {
             config,
             instructions,
             RetryPolicy::default(),
+            CompactReason::Manual,
         )
         .await
     }
@@ -1068,6 +1076,7 @@ mod tests {
             &AgentConfig::default(),
             None,
             RetryPolicy::default(),
+            CompactReason::Manual,
         )
         .await;
 
@@ -1152,6 +1161,7 @@ mod tests {
             &AgentConfig::default(),
             None,
             RetryPolicy::default(),
+            CompactReason::Manual,
         )
         .await;
 
@@ -1273,12 +1283,13 @@ mod tests {
         }
     }
 
-    /// Runs the `/compact` path with a gauge at [`SUMMARISED_PROMPT`] and
-    /// hands back every event it sent.
+    /// Runs a compaction with a gauge at [`SUMMARISED_PROMPT`] and hands
+    /// back every event it sent.
     async fn summarize_steered(
         provider: &MockProvider,
         history: &mut History,
         instructions: Option<&str>,
+        reason: CompactReason,
         answer: impl Fn(AgentSlot, &Value) -> Verdict + Send + Sync + 'static,
     ) -> (Result<DoneReason, AgentError>, Vec<AgentEvent>) {
         let (raw_tx, mut rx) = unbounded_channel();
@@ -1298,6 +1309,7 @@ mod tests {
             &AgentConfig::default(),
             instructions,
             RetryPolicy::default(),
+            reason,
         )
         .await;
         (
@@ -1318,6 +1330,7 @@ mod tests {
             &provider,
             &mut history,
             None,
+            CompactReason::Manual,
             before_answers(json!({ FIELD_SKIP: true })),
         )
         .await;
@@ -1362,6 +1375,7 @@ mod tests {
             &provider,
             &mut history,
             Some(REQUEST_EXTRA),
+            CompactReason::Manual,
             before_answers(json!({ FIELD_INSTRUCTIONS: LAYER_EXTRA })),
         )
         .await;
@@ -1372,6 +1386,36 @@ mod tests {
         let request_at = prompt.find(REQUEST_EXTRA).expect(prompt);
         let layer_at = prompt.find(LAYER_EXTRA).expect(prompt);
         assert!(request_at < layer_at, "{prompt}");
+    }
+
+    #[test_case(CompactReason::Manual, "manual" ; "manual")]
+    #[test_case(CompactReason::Requested, "requested" ; "requested")]
+    #[tokio::test]
+    async fn compact_tells_the_layer_why(reason: CompactReason, expected: &str) {
+        let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+        let mut history = History::new(vec![Message::user("work".into())]);
+        let seen = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&seen);
+
+        let (result, _) = summarize_steered(
+            &provider,
+            &mut history,
+            None,
+            reason,
+            move |slot, payload| {
+                if matches!(slot, AgentSlot::CompactBefore) {
+                    *captured.lock().unwrap() = payload
+                        .get(FIELD_REASON)
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                Verdict::Unchanged
+            },
+        )
+        .await;
+
+        result.unwrap();
+        assert_eq!(seen.lock().unwrap().as_deref(), Some(expected));
     }
 
     const KEEP_GOING: &str = "keep going after the summary";
@@ -1385,6 +1429,7 @@ mod tests {
             &provider,
             &mut history,
             None,
+            CompactReason::Manual,
             before_answers(json!({ FIELD_CONTINUE: KEEP_GOING })),
         )
         .await;
@@ -1423,8 +1468,14 @@ mod tests {
         })]);
         let mut history = History::new(vec![Message::user("work".into())]);
 
-        let (result, events) =
-            summarize_steered(&provider, &mut history, None, |_, _| Verdict::Unchanged).await;
+        let (result, events) = summarize_steered(
+            &provider,
+            &mut history,
+            None,
+            CompactReason::Manual,
+            |_, _| Verdict::Unchanged,
+        )
+        .await;
         assert_eq!(result.unwrap(), DoneReason::Compact);
 
         let [

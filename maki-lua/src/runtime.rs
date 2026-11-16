@@ -46,6 +46,7 @@ use tokio_util::task::task_tracker::TaskTrackerToken;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use maki_config::{CompatibilityConfig, RawConfig};
+use maki_providers::Message;
 use maki_providers::plugin::DeclAuthority;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::now_epoch;
@@ -598,6 +599,8 @@ pub enum Request {
     FireAutocmd {
         event: String,
         data: Value,
+        /// A `TurnComplete` reply, which only the Lua thread can shape.
+        message: Option<Message>,
     },
     EndSession(EndSession),
     ClickTool {
@@ -639,7 +642,11 @@ pub enum Request {
 /// from serving anything else, including the priority lane. One consumer
 /// keeps them in the order the host fired them.
 enum HostHook {
-    Autocmd { event: String, data: Value },
+    Autocmd {
+        event: String,
+        data: Value,
+        message: Option<Message>,
+    },
     EndSession(EndSession),
 }
 
@@ -2542,10 +2549,14 @@ fn collect_turn_garbage(lua: &Lua) {
 
 async fn run_host_hook(lua: &Lua, hook: HostHook) {
     match hook {
-        HostHook::Autocmd { event, data } => {
+        HostHook::Autocmd {
+            event,
+            data,
+            message,
+        } => {
             let data = json_to_lua(lua, &data).unwrap_or(LuaValue::Nil);
             let is_turn_end = event == TURN_END_EVENT;
-            crate::api::autocmd::dispatch(lua.clone(), event, None, data).await;
+            crate::api::autocmd::dispatch(lua.clone(), event, None, data, message).await;
             if is_turn_end {
                 collect_turn_garbage(lua);
             }
@@ -2566,7 +2577,8 @@ async fn run_host_hook(lua: &Lua, hook: HostHook) {
             };
             let data =
                 json_to_lua(lua, &event.payload(Some(&end.session))).unwrap_or(LuaValue::Nil);
-            crate::api::autocmd::dispatch(lua.clone(), event.name().to_owned(), None, data).await;
+            crate::api::autocmd::dispatch(lua.clone(), event.name().to_owned(), None, data, None)
+                .await;
             with_jobs(lua, |store| store.kill_session(lua, end.session));
             BackgroundTasks::of(lua).end_session(end.session);
             // Nothing can pick from this session's plan form again.
@@ -6282,8 +6294,16 @@ pub fn spawn(
                             row,
                             fallback,
                         } => rt.click_tool(&gate, &restores, tool_use_id, row, fallback),
-                        Request::FireAutocmd { event, data } => {
-                            let _ = hook_tx.send(HostHook::Autocmd { event, data });
+                        Request::FireAutocmd {
+                            event,
+                            data,
+                            message,
+                        } => {
+                            let _ = hook_tx.send(HostHook::Autocmd {
+                                event,
+                                data,
+                                message,
+                            });
                         }
                         Request::EndSession(end) => {
                             let _ = hook_tx.send(HostHook::EndSession(end));

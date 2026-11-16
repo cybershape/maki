@@ -11,7 +11,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use maki_agent::{
-    AgentInput, AgentMode, EarlierInput, ExtractedCommand, ImageSource, InterruptSource,
+    AgentInput, AgentMode, CompactReason, EarlierInput, ExtractedCommand, ImageSource,
+    InterruptSource,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
@@ -79,6 +80,7 @@ impl QueuedInput {
 pub(crate) struct Compaction {
     pub(crate) run_id: u64,
     pub(crate) instructions: Option<String>,
+    pub(crate) reason: CompactReason,
     /// The session's workflow mode when it was asked for: the frame left
     /// behind must carry the tools the next run sends.
     pub(crate) workflow: bool,
@@ -331,7 +333,10 @@ impl InterruptSource for QueueReceiver {
             let QueueItem::Compact(compaction) = items.remove(compact_idx).unwrap() else {
                 unreachable!()
             };
-            return Some(ExtractedCommand::Compact(compaction.instructions));
+            return Some(ExtractedCommand::Compact {
+                instructions: compaction.instructions,
+                reason: compaction.reason,
+            });
         }
         let steer_idx = items
             .iter()
@@ -442,6 +447,7 @@ mod tests {
         QueueItem::Compact(Compaction {
             run_id: 0,
             instructions: instructions.map(str::to_string),
+            reason: CompactReason::Manual,
             workflow: false,
         })
     }
@@ -591,7 +597,7 @@ mod tests {
         tx.push(compact(Some(GUIDANCE)));
 
         assert!(
-            matches!(rx.poll(), Some(ExtractedCommand::Compact(Some(extra))) if extra == GUIDANCE)
+            matches!(rx.poll(), Some(ExtractedCommand::Compact { instructions: Some(extra), .. }) if extra == GUIDANCE)
         );
     }
 

@@ -273,8 +273,10 @@ They follow the tool slot contract. `ctx` carries `session_id`, `task_id` (set
 inside a subagent), `model`, `context_size`, `context_window`, and
 `deadline_ms`.
 
-A layer on any of them needs every permission, because it steers what the agent
-does next. The chain gets 30 seconds, then the loop carries on without it.
+A layer on any of them costs `agent`, `session_read` and `session_write`. Each
+slot can hand it text the user or the model wrote, which `session_read` guards,
+and steering what happens next costs what sending a prompt costs. The chain
+gets 30 seconds, then the loop carries on without it.
 
 Every layer shares the same `defer`, `continue`, and `instructions` strings, so
 assigning one erases what another layer wrote. Append instead, and allow for
@@ -311,6 +313,33 @@ maki.api.set_slot("agent.user_message", function(prev, msg, ctx)
 end)
 ```
 
+A model's output arrives at `TurnComplete` as `data.message`, once per
+response. A notification cannot change what was said, so redirect a message
+with `agent.user_message` or a tool result with a `tool.*` layer instead.
+
+```lua
+maki.api.create_autocmd("TurnComplete", {
+  callback = function(ev)
+    local msg = ev.data.message
+    if not msg or ev.data.id then return end
+    for i, block in ipairs(msg.content) do
+      local text = block.text or block.thinking
+      if text and text:find("AKIA[A-Z][A-Z][A-Z][A-Z]") then
+        maki.log.warn(("block %d held a secret"):format(i))
+      end
+    end
+  end,
+})
+```
+
+`TurnComplete` fires once per model response, before that response's tool
+calls run. `data.message` is the same table a `maki.session.messages()` entry
+is, so a null arrives as `maki.NIL` and an image block carries an image handle.
+It includes the `tool_use` blocks. A response that calls tools starts another
+turn. It also fires for a compaction's summary request, where `data.message`
+holds the summary, and nothing in the payload says so. `data.id` marks a
+subagent's response.
+
 ### agent.stop
 
 `reason` is `"finished"` or `"max_tokens"`, and `last_message` is the text of
@@ -334,9 +363,10 @@ A run continues at most 3 times in a row, so a layer that always answers
 ### agent.compact.before
 
 `reason` is `"auto"` (the context crossed its threshold), `"overflow"` (the
-provider rejected the prompt as too long), or `"manual"` (`/compact`). `usable`
-is the token budget `context_size` is measured against. `request_instructions`
-is what the user typed after `/compact`.
+provider rejected the prompt as too long), `"manual"` (`/compact`), or
+`"requested"` (a plugin called `maki.session.request_compact`). `usable` is
+the token budget `context_size` is measured against. `request_instructions`
+is what the user typed after `/compact`, or the plugin's `instructions`.
 
 Return a table with any of:
 
@@ -347,7 +377,8 @@ Return a table with any of:
   A defer buys one turn, so the next automatic compaction goes ahead even
   when the save turn ended the run. The host refuses a defer when the window
   has no room for the save turn. It works in subagent runs too. It does
-  nothing for `"manual"` and `"overflow"`, and it wins over `skip`.
+  nothing for `"manual"`, `"overflow"` and `"requested"`, and it wins over
+  `skip`.
 - `instructions`: appended to the summary prompt, after the configured and
   requested ones.
 - `continue`: text appended to the message the agent resumes with.

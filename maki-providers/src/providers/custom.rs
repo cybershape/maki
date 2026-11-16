@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use maki_config::providers::{
     ModelDef, ProviderDef, ProvidersConfig, resolve_api_key_env, resolve_base_url,
 };
+use maki_storage::blocking;
 
 use super::responses::ResponsesProvider;
 use super::{KeyPool, ResolvedAuth};
@@ -264,9 +265,7 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
 }
 
 pub async fn discover_models(timeouts: Timeouts, mut emit: impl FnMut(ModelBatch)) {
-    let config = tokio::task::spawn_blocking(ProvidersConfig::load)
-        .await
-        .expect("providers config load panicked");
+    let config = blocking(ProvidersConfig::load).await;
     model_registry::set_declared(declared_tiers_from(&config));
     let mut entries = custom_entries(&config);
     entries.sort_by_key(|(_, def)| def.discover_models);
