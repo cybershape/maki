@@ -3592,6 +3592,55 @@ fn a_markdown_preview_plugin_draws_the_prompt_once_parsed() {
     assert_ne!(style_of(&screen, "fn main").fg, style_of(&screen, "say").fg);
 }
 
+#[test]
+fn ui_config_disable_bold_and_italic_strip_modifiers_from_rendered_view() {
+    crate::highlight::warmup();
+    decor_worker::manual();
+    let host = new_host();
+    host.load_source(PREVIEW_PLUGIN_NAME, PREVIEW_PLUGIN)
+        .unwrap();
+
+    let render_with = |disable_bold: bool, disable_italic: bool| {
+        let mut app = test_app();
+        app.ui_config.disable_bold = disable_bold;
+        app.ui_config.disable_italic = disable_italic;
+        app.input_rules_reader = host.input_rules_reader();
+        let _ = app.tick();
+        while decor_worker::run_queued() > 0 {
+            let _ = app.tick();
+        }
+        app.update(Msg::Paste(PREVIEW_PROMPT.into()));
+        let _ = app.tick();
+        let _ = decor_worker::run_queued();
+        let _ = app.tick();
+        rendered_buffer(&mut app)
+    };
+
+    let screen_default = render_with(false, false);
+    let mod_default = |needle| style_of(&screen_default, needle).add_modifier;
+    assert!(mod_default("hi to").contains(Modifier::BOLD));
+    assert!(mod_default("you and").contains(Modifier::ITALIC));
+    assert!(mod_default("Title").contains(Modifier::UNDERLINED));
+
+    let screen_no_bold = render_with(true, false);
+    let mod_no_bold = |needle| style_of(&screen_no_bold, needle).add_modifier;
+    assert!(!mod_no_bold("hi to").contains(Modifier::BOLD));
+    assert!(mod_no_bold("you and").contains(Modifier::ITALIC));
+    assert!(mod_no_bold("Title").contains(Modifier::UNDERLINED));
+
+    let screen_no_italic = render_with(false, true);
+    let mod_no_italic = |needle| style_of(&screen_no_italic, needle).add_modifier;
+    assert!(mod_no_italic("hi to").contains(Modifier::BOLD));
+    assert!(!mod_no_italic("you and").contains(Modifier::ITALIC));
+    assert!(mod_no_italic("Title").contains(Modifier::UNDERLINED));
+
+    let screen_neither = render_with(true, true);
+    let mod_neither = |needle| style_of(&screen_neither, needle).add_modifier;
+    assert!(!mod_neither("hi to").contains(Modifier::BOLD));
+    assert!(!mod_neither("you and").contains(Modifier::ITALIC));
+    assert!(mod_neither("Title").contains(Modifier::UNDERLINED));
+}
+
 fn rendered_buffer(app: &mut App) -> Buffer {
     draw_sized(app, RENDERED_WIDTH, RENDERED_HEIGHT).1
 }

@@ -11,7 +11,9 @@ use maki_config::MaxWidth;
 use maki_lua::{CursorStyle, Split};
 use maki_providers::RequestOptions;
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
@@ -38,6 +40,22 @@ pub fn center_rect(area: Rect, max_width: Option<MaxWidth>) -> Rect {
             }
         }
         None => area,
+    }
+}
+
+pub(crate) fn strip_modifiers(buf: &mut Buffer, disable_bold: bool, disable_italic: bool) {
+    let mut remove = Modifier::empty();
+    if disable_bold {
+        remove |= Modifier::BOLD;
+    }
+    if disable_italic {
+        remove |= Modifier::ITALIC;
+    }
+    if remove.is_empty() {
+        return;
+    }
+    for cell in &mut buf.content {
+        cell.modifier.remove(remove);
     }
 }
 
@@ -142,6 +160,11 @@ impl App {
         });
         self.register_zones(&layout, overlay_rect);
         self.apply_selection(frame, render_chat, &thumbs);
+        strip_modifiers(
+            frame.buffer_mut(),
+            self.ui_config.disable_bold,
+            self.ui_config.disable_italic,
+        );
         self.keyboard_caret(owner, caret, prompt_caret, picker_caret)
     }
 
@@ -608,5 +631,56 @@ impl App {
             .map(|(text, style_name)| Span::styled(text.clone(), theme::style_by_name(style_name)))
             .collect();
         (!spans.is_empty()).then(|| Line::from(spans))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::style::Modifier;
+
+    #[test]
+    fn strip_modifiers_removes_bold_when_configured() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 2, 1));
+        buf[(0, 0)].modifier = Modifier::BOLD | Modifier::UNDERLINED;
+        buf[(1, 0)].modifier = Modifier::ITALIC;
+
+        strip_modifiers(&mut buf, true, false);
+
+        assert_eq!(buf[(0, 0)].modifier, Modifier::UNDERLINED);
+        assert_eq!(buf[(1, 0)].modifier, Modifier::ITALIC);
+    }
+
+    #[test]
+    fn strip_modifiers_removes_italic_when_configured() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 2, 1));
+        buf[(0, 0)].modifier = Modifier::BOLD;
+        buf[(1, 0)].modifier = Modifier::ITALIC | Modifier::UNDERLINED;
+
+        strip_modifiers(&mut buf, false, true);
+
+        assert_eq!(buf[(0, 0)].modifier, Modifier::BOLD);
+        assert_eq!(buf[(1, 0)].modifier, Modifier::UNDERLINED);
+    }
+
+    #[test]
+    fn strip_modifiers_removes_both_when_both_configured() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
+        buf[(0, 0)].modifier = Modifier::BOLD | Modifier::ITALIC | Modifier::DIM;
+
+        strip_modifiers(&mut buf, true, true);
+
+        assert_eq!(buf[(0, 0)].modifier, Modifier::DIM);
+    }
+
+    #[test]
+    fn strip_modifiers_leaves_modifiers_intact_when_disabled() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let initial = Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED;
+        buf[(0, 0)].modifier = initial;
+
+        strip_modifiers(&mut buf, false, false);
+
+        assert_eq!(buf[(0, 0)].modifier, initial);
     }
 }

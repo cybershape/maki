@@ -88,6 +88,8 @@ All fields are optional. Typos in field names cause an error right away.
 | `compact_tools` | bool | `false` | - | Render tool calls and reasoning in a compact tree view |
 | `compact_lines` | usize | `10` | 0 | Maximum visible entries under a compact tool group before folding (0 hides all entries) |
 | `max_width` | integer \| float | `none` | - | Maximum width of the UI: column count (e.g. 120), fraction of viewport (e.g. 0.8), or negative offset from viewport (e.g. -10), centered horizontally when terminal is wider |
+| `disable_bold` | bool | `false` | - | Disable bold text formatting throughout the UI |
+| `disable_italic` | bool | `false` | - | Disable italic text formatting throughout the UI |
 
 ### `ui.theme`
 

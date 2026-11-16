@@ -725,6 +725,8 @@ pub struct UiFileConfig {
     pub compact_tools: Option<bool>,
     pub compact_lines: Option<usize>,
     pub max_width: Option<MaxWidth>,
+    pub disable_bold: Option<bool>,
+    pub disable_italic: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1507,6 +1509,18 @@ pub struct UiConfig {
         desc = "Maximum width of the UI: column count (e.g. 120), fraction of viewport (e.g. 0.8), or negative offset from viewport (e.g. -10), centered horizontally when terminal is wider"
     )]
     pub max_width: Option<MaxWidth>,
+
+    #[config(
+        default = false,
+        desc = "Disable bold text formatting throughout the UI"
+    )]
+    pub disable_bold: bool,
+
+    #[config(
+        default = false,
+        desc = "Disable italic text formatting throughout the UI"
+    )]
+    pub disable_italic: bool,
 }
 
 impl UiConfig {
@@ -1538,6 +1552,8 @@ impl UiConfig {
             compact_tools: f.compact_tools.unwrap_or(false),
             compact_lines: f.compact_lines.unwrap_or(DEFAULT_COMPACT_LINES),
             max_width: f.max_width,
+            disable_bold: f.disable_bold.unwrap_or(false),
+            disable_italic: f.disable_italic.unwrap_or(false),
         }
     }
 }
@@ -5367,6 +5383,36 @@ mod tests {
         assert!(toml::from_str::<RawConfig>("[ui]\nmax_width = -0.5\n").is_err());
         assert!(toml::from_str::<RawConfig>("[ui]\nmax_width = \"invalid\"\n").is_err());
         assert!(toml::from_str::<RawConfig>("[ui]\nmax_width = \"120%\"\n").is_err());
+    }
+
+    #[test]
+    fn disable_bold_defaults_to_false_and_can_be_enabled() {
+        let default_cfg = UiConfig::from_file(UiFileConfig::default());
+        assert!(!default_cfg.disable_bold);
+
+        let parsed: RawConfig = toml::from_str("[ui]\ndisable_bold = true\n").unwrap();
+        let cfg = UiConfig::from_file(parsed.ui);
+        assert!(cfg.disable_bold);
+
+        let mut base: UiFileConfig = toml::from_str("disable_bold = false\n").unwrap();
+        let overlay: UiFileConfig = toml::from_str("disable_bold = true\n").unwrap();
+        base.merge(overlay);
+        assert_eq!(base.disable_bold, Some(true));
+    }
+
+    #[test]
+    fn disable_italic_defaults_to_false_and_can_be_enabled() {
+        let default_cfg = UiConfig::from_file(UiFileConfig::default());
+        assert!(!default_cfg.disable_italic);
+
+        let parsed: RawConfig = toml::from_str("[ui]\ndisable_italic = true\n").unwrap();
+        let cfg = UiConfig::from_file(parsed.ui);
+        assert!(cfg.disable_italic);
+
+        let mut base: UiFileConfig = toml::from_str("disable_italic = false\n").unwrap();
+        let overlay: UiFileConfig = toml::from_str("disable_italic = true\n").unwrap();
+        base.merge(overlay);
+        assert_eq!(base.disable_italic, Some(true));
     }
 
     #[test]

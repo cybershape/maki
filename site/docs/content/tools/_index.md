@@ -36,7 +36,7 @@ Execute a command through Windows PowerShell. Do not use `&&` or `||`. Windows P
 - Use `tail` to return only the last N output lines.
 - Provide a short `toolcall_reason` (3-5 words).
 
-[Plugin permission](/docs/lua-api/#plugin-permissions): `run`
+**Permission:** `run`
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -202,7 +202,7 @@ Execute Python in a sandbox where every tool is an async function.
 
 Retrieve the Python function signature, parameter types, and docstring documentation for an external library function before calling it in code_execution.
 
-[Plugin permission](/docs/lua-api/#plugin-permissions): not declared (every permission except `agent` and `input`)
+**Permission:** undeclared
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
