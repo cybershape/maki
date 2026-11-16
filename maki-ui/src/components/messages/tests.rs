@@ -4563,10 +4563,13 @@ fn hovering_compact_row_switches_icon_to_open_symbol_and_reverts() {
 
     assert!(!panel.set_hovered_compact(Some(target.clone())));
 
-    assert_eq!(panel.handle_click(1, 6, view_area()), ClickOutcome::None);
+    assert_eq!(
+        panel.handle_click(1, 6, view_area()),
+        ClickOutcome::OpenCompact(target.clone())
+    );
     assert_eq!(
         panel.handle_click(1, 3, view_area()),
-        ClickOutcome::OpenCompact(target)
+        ClickOutcome::OpenCompact(target.clone())
     );
 
     let cleared = panel.set_hovered_compact(None);
@@ -4574,6 +4577,12 @@ fn hovering_compact_row_switches_icon_to_open_symbol_and_reverts() {
     let line_after = &panel.cache.get(seg_idx).unwrap().lines()[1];
     assert_eq!(line_after.spans[1].content, "✓ ");
     assert_eq!(line_after.spans[1].style, theme::current().tool_success);
+
+    assert_eq!(panel.handle_click(1, 6, view_area()), ClickOutcome::None);
+    assert_eq!(
+        panel.handle_click(1, 3, view_area()),
+        ClickOutcome::OpenCompact(target)
+    );
 }
 
 #[test]

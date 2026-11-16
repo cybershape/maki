@@ -603,6 +603,17 @@ pub fn compact_icon_columns(line: &Line<'_>) -> Option<Range<u16>> {
     }
 }
 
+pub fn compact_interactive_columns(line: &Line<'_>) -> Option<Range<u16>> {
+    if line.spans.len() >= 3 {
+        let rail_w = line.spans[0].width() as u16;
+        let icon_w = line.spans[1].width() as u16;
+        let name_w = line.spans[2].width() as u16;
+        Some(rail_w..rail_w + icon_w + name_w)
+    } else {
+        compact_icon_columns(line)
+    }
+}
+
 struct ToolHover {
     parent: bool,
     child: Option<usize>,
@@ -1021,6 +1032,9 @@ mod tests {
 
         let cols = compact_icon_columns(hovered_row).expect("icon columns");
         assert_eq!(cols, 3..5);
+        let interactive_cols =
+            compact_interactive_columns(hovered_row).expect("interactive columns");
+        assert_eq!(interactive_cols, 3..9);
     }
 
     #[test_case(false, false; "single_batch")]

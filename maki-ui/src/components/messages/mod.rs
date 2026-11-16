@@ -1522,7 +1522,8 @@ impl MessagesPanel {
         None
     }
 
-    /// The compact target if the click column lands on that row's status icon.
+    /// The compact target if the click column lands on that row's status icon,
+    /// or on the tool name when the row is hovered.
     pub fn compact_icon_at(&self, row: u16, col: u16, area: Rect) -> Option<CompactTarget> {
         let target = self.compact_target_at(row, area)?;
         let pos = self
@@ -1531,9 +1532,14 @@ impl MessagesPanel {
         let seg = self.cache.get(pos.seg)?;
         let line_idx = seg.source_line_at(pos.row, self.viewport_width)?;
         let line = seg.lines().get(line_idx)?;
-        let icon_cols = tool_group::compact_icon_columns(line)?;
         let col_in_line = col.checked_sub(area.x + seg.gutter_cols(area.width))?;
-        if icon_cols.contains(&col_in_line) {
+        let is_hovered = self.hovered_compact.as_ref() == Some(&target);
+        let click_cols = if is_hovered {
+            tool_group::compact_interactive_columns(line)?
+        } else {
+            tool_group::compact_icon_columns(line)?
+        };
+        if click_cols.contains(&col_in_line) {
             Some(target)
         } else {
             None

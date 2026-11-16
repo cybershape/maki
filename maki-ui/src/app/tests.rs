@@ -13971,7 +13971,7 @@ fn clicking_outside_compact_detail_closes_it() {
 }
 
 #[test]
-fn mouse_move_updates_hovered_compact_and_click_opens_only_on_icon() {
+fn mouse_move_updates_hovered_compact_and_click_opens_on_icon_or_name() {
     let mut app = test_app();
     app.run_id = 1;
     app.ui_config.compact_tools = true;
@@ -13999,6 +13999,18 @@ fn mouse_move_updates_hovered_compact_and_click_opens_only_on_icon() {
     let row = msg_area.y + 1;
 
     app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        msg_area.x + pad_left + 6,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        msg_area.x + pad_left + 6,
+        row,
+    ));
+    assert!(!app.compact_detail.is_open());
+
+    app.update(mouse_event(
         MouseEventKind::Moved,
         msg_area.x + pad_left + 10,
         row,
@@ -14016,6 +14028,20 @@ fn mouse_move_updates_hovered_compact_and_click_opens_only_on_icon() {
         row,
     ));
     assert!(!app.compact_detail.is_open());
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        msg_area.x + pad_left + 6,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        msg_area.x + pad_left + 6,
+        row,
+    ));
+    assert!(app.compact_detail.is_open());
+
+    app.compact_detail.close();
 
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
