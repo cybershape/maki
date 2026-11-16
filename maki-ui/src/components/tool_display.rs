@@ -1117,6 +1117,7 @@ mod tests {
             detail: None,
             detail_expanded: false,
             task_end: None,
+            created_at: None,
         }
     }
 
@@ -1332,6 +1333,7 @@ mod tests {
             detail: None,
             detail_expanded: false,
             task_end: None,
+            created_at: None,
         }
     }
 
@@ -1433,6 +1435,7 @@ mod tests {
             detail: None,
             detail_expanded: false,
             task_end: None,
+            created_at: None,
         }
     }
 
@@ -1479,6 +1482,7 @@ mod tests {
             detail: None,
             detail_expanded: false,
             task_end: None,
+            created_at: None,
         }
     }
 
@@ -1806,6 +1810,7 @@ mod tests {
             detail: None,
             detail_expanded: false,
             task_end: None,
+            created_at: None,
         }
     }
 
@@ -1913,6 +1918,7 @@ mod tests {
             detail: None,
             detail_expanded: false,
             task_end: None,
+            created_at: None,
         }
     }
 
@@ -2029,6 +2035,7 @@ mod tests {
             detail: None,
             detail_expanded: false,
             task_end: None,
+            created_at: None,
         };
         assert!(
             search_text_for(&msg).contains("llm_output_here"),
@@ -2068,6 +2075,7 @@ mod tests {
             detail: None,
             detail_expanded: false,
             task_end: None,
+            created_at: None,
         };
         assert!(
             search_text_for(&msg).contains("body_fallback"),
@@ -2104,6 +2112,7 @@ mod tests {
             detail: None,
             detail_expanded: false,
             task_end: None,
+            created_at: None,
         };
         assert!(
             search_text_for(&msg).contains(LIVE_TEXT),

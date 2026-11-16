@@ -437,6 +437,8 @@ pub struct DisplayMessage {
     pub detail_expanded: bool,
     /// On a notice that answers a background task: how the task ended.
     pub task_end: Option<BackgroundOutcome>,
+    /// Wall clock (epoch ms) when the message was created.
+    pub created_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -511,6 +513,7 @@ impl DisplayMessage {
             detail: None,
             detail_expanded: false,
             task_end: None,
+            created_at: None,
         }
     }
 
@@ -549,6 +552,7 @@ impl DisplayMessage {
             detail: None,
             detail_expanded: false,
             task_end: None,
+            created_at: None,
         }
     }
 

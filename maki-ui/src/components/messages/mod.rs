@@ -39,6 +39,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::scrollbar::{self, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
@@ -2529,7 +2530,12 @@ impl MessagesPanel {
                 seg.apply_highlight(tl, &self.hl_worker);
                 self.cache.push(seg);
             } else {
-                let view = message_view(msg, self.thinking_lines, self.viewport_width);
+                let view = message_view(
+                    msg,
+                    self.thinking_lines,
+                    self.clock_format,
+                    self.viewport_width,
+                );
                 self.cache.push_spacer_if_needed();
                 let mut seg = Segment::with_lines(view.lines, Some(i));
                 seg.is_user = matches!(msg.role, DisplayRole::User);
@@ -2628,7 +2634,7 @@ impl MessagesPanel {
         let Some(msg) = self.messages.get(msg_idx) else {
             return;
         };
-        let view = message_view(msg, self.thinking_lines, width);
+        let view = message_view(msg, self.thinking_lines, self.clock_format, width);
         let Some(seg) = self.cache.get_mut(seg_idx) else {
             return;
         };
@@ -2707,7 +2713,12 @@ struct MessageView {
 
 /// A non-Tool message's lines at the body width of `width`, with the gutter
 /// they sit behind.
-fn message_view(msg: &DisplayMessage, mode: ThinkingLines, width: u16) -> MessageView {
+fn message_view(
+    msg: &DisplayMessage,
+    mode: ThinkingLines,
+    clock_format: ClockFormat,
+    width: u16,
+) -> MessageView {
     let style = message_style(&msg.role);
     let gutter = message_gutter(msg, &style);
     let body = if gutter.is_some() {
@@ -2729,7 +2740,7 @@ fn message_view(msg: &DisplayMessage, mode: ThinkingLines, width: u16) -> Messag
             collapsed: true,
         };
     }
-    let mut lines = build_message_lines(msg, &style, body, width);
+    let mut lines = build_message_lines(msg, &style, clock_format, body, width);
     if matches!(msg.role, DisplayRole::Notice)
         && let Some(detail) = &msg.detail
     {
@@ -2779,6 +2790,109 @@ fn notice_detail_lines(detail: &NoticeDetail, width: u16) -> impl Iterator<Item 
     })
 }
 
+/// Splits {text} so that its first part fits within {available_width} terminal cells.
+/// Prefer splitting on a whitespace boundary; otherwise split at character boundary.
+fn split_for_timestamp(text: &str, available_width: usize) -> (&str, &str) {
+    if UnicodeWidthStr::width(text) <= available_width {
+        return (text, "");
+    }
+    let mut last_char_idx = 0;
+    let mut current_width = 0;
+    let mut last_space_idx = None;
+
+    for (idx, ch) in text.char_indices() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width + ch_width > available_width {
+            break;
+        }
+        current_width += ch_width;
+        last_char_idx = idx + ch.len_utf8();
+        if ch == ' ' {
+            last_space_idx = Some(idx);
+        }
+    }
+
+    if let Some(space_idx) = last_space_idx
+        && space_idx > 0
+    {
+        let head = &text[..space_idx];
+        let tail = text[space_idx + 1..].trim_start();
+        (head, tail)
+    } else if last_char_idx > 0 {
+        let head = &text[..last_char_idx];
+        let tail = &text[last_char_idx..];
+        (head, tail)
+    } else {
+        ("", text)
+    }
+}
+
+/// Builds lines for a user message, right-aligning the timestamp on the first line.
+fn build_user_message_lines(
+    text: &str,
+    timestamp: Option<&str>,
+    body: u16,
+    text_style: ratatui::style::Style,
+    label_style: ratatui::style::Style,
+) -> Vec<Line<'static>> {
+    let text = text.trim_start_matches('\n').trim_end();
+    let Some(ts) = timestamp.filter(|t| !t.is_empty()) else {
+        return plain_lines(text, "", text_style, label_style);
+    };
+
+    let ts_width = UnicodeWidthStr::width(ts);
+    let body_usize = body as usize;
+    if body_usize <= ts_width + 2 {
+        return plain_lines(text, "", text_style, label_style);
+    }
+
+    let timestamp_style = theme::current().timestamp;
+    if text.is_empty() {
+        let pad = " ".repeat(body_usize - ts_width);
+        return vec![Line::from(vec![
+            Span::raw(pad),
+            Span::styled(ts.to_owned(), timestamp_style),
+        ])];
+    }
+
+    let mut lines = Vec::new();
+    let available_head = body_usize.saturating_sub(ts_width + 1);
+    let mut raw_lines: VecDeque<&str> = text
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+
+    if let Some(first) = raw_lines.pop_front() {
+        let first_width = UnicodeWidthStr::width(first);
+        if first_width <= available_head {
+            let pad = " ".repeat(body_usize - first_width - ts_width);
+            lines.push(Line::from(vec![
+                Span::styled(first.to_owned(), text_style),
+                Span::raw(pad),
+                Span::styled(ts.to_owned(), timestamp_style),
+            ]));
+        } else {
+            let (head, tail) = split_for_timestamp(first, available_head);
+            let head_width = UnicodeWidthStr::width(head);
+            let pad = " ".repeat(body_usize - head_width - ts_width);
+            lines.push(Line::from(vec![
+                Span::styled(head.to_owned(), text_style),
+                Span::raw(pad),
+                Span::styled(ts.to_owned(), timestamp_style),
+            ]));
+            if !tail.is_empty() {
+                raw_lines.push_front(tail);
+            }
+        }
+    }
+
+    for line in raw_lines {
+        lines.push(Line::from(vec![Span::styled(line.to_owned(), text_style)]));
+    }
+
+    lines
+}
+
 /// Builds ratatui lines for a non-Tool message shown in full at the given
 /// width. Shared by `rebuild_line_cache` (new messages) and
 /// `reflow_text_segment` (stale-on-resize messages) so both paths produce
@@ -2786,6 +2900,7 @@ fn notice_detail_lines(detail: &NoticeDetail, width: u16) -> impl Iterator<Item 
 fn build_message_lines(
     msg: &DisplayMessage,
     style: &RoleStyle,
+    clock_format: ClockFormat,
     body: u16,
     width: u16,
 ) -> Vec<Line<'static>> {
@@ -2803,6 +2918,18 @@ fn build_message_lines(
             style.label_style(),
             body,
             style.max_line_bytes,
+        )
+    } else if matches!(msg.role, DisplayRole::User) {
+        let ts_str = msg.timestamp.clone().or_else(|| {
+            msg.created_at
+                .map(|ms| crate::clock::format_message_timestamp(ms, clock_format))
+        });
+        build_user_message_lines(
+            text,
+            ts_str.as_deref(),
+            body,
+            style.text_style,
+            style.label_style(),
         )
     } else {
         plain_lines(text, prefix, style.text_style, style.label_style())

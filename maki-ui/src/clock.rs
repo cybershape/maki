@@ -1,5 +1,7 @@
 use std::sync::LazyLock;
 
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use maki_config::ClockFormat;
 
 pub fn hm(format: ClockFormat) -> &'static str {
@@ -11,6 +13,30 @@ pub fn hms(format: ClockFormat) -> &'static str {
         "%-I:%M:%S %p"
     } else {
         "%H:%M:%S"
+    }
+}
+
+pub fn format_message_timestamp(epoch_ms: u64, format: ClockFormat) -> String {
+    let tz = TimeZone::system();
+    let now = Timestamp::now().to_zoned(tz.clone());
+    format_message_timestamp_with_now(epoch_ms, format, &now, &tz)
+}
+
+pub(crate) fn format_message_timestamp_with_now(
+    epoch_ms: u64,
+    format: ClockFormat,
+    now: &jiff::Zoned,
+    tz: &TimeZone,
+) -> String {
+    let Ok(ts) = Timestamp::from_millisecond(epoch_ms as i64) else {
+        return String::new();
+    };
+    let zoned = ts.to_zoned(tz.clone());
+    let time_fmt = hm(format);
+    if zoned.date() == now.date() {
+        zoned.strftime(time_fmt).to_string()
+    } else {
+        zoned.strftime(&format!("%Y-%m-%d {time_fmt}")).to_string()
     }
 }
 
@@ -115,5 +141,32 @@ mod tests {
     #[test_case(b"", false ; "empty_defaults_to_24h")]
     fn posix_fmt(fmt: &[u8], expected: bool) {
         assert_eq!(posix_fmt_is_12h(fmt), expected);
+    }
+
+    #[test]
+    fn format_message_timestamp_for_today_and_past() {
+        use jiff::Timestamp;
+        use jiff::tz::TimeZone;
+        use maki_config::ClockFormat;
+
+        let tz = TimeZone::UTC;
+        // 2026-11-16 14:30:00 UTC
+        let now = Timestamp::from_second(1794839400)
+            .unwrap()
+            .to_zoned(tz.clone());
+
+        // Same day: 2026-11-16 10:15:00 UTC
+        let today_ts = 1_794_824_100_000_u64;
+        let today_24 = super::format_message_timestamp_with_now(today_ts, ClockFormat::Hour24, &now, &tz);
+        assert_eq!(today_24, "10:15");
+        let today_12 = super::format_message_timestamp_with_now(today_ts, ClockFormat::Hour12, &now, &tz);
+        assert_eq!(today_12, "10:15 AM");
+
+        // Past day: 2026-11-15 16:45:00 UTC
+        let past_ts = 1_794_761_100_000_u64;
+        let past_24 = super::format_message_timestamp_with_now(past_ts, ClockFormat::Hour24, &now, &tz);
+        assert_eq!(past_24, "2026-11-15 16:45");
+        let past_12 = super::format_message_timestamp_with_now(past_ts, ClockFormat::Hour12, &now, &tz);
+        assert_eq!(past_12, "2026-11-15 4:45 PM");
     }
 }

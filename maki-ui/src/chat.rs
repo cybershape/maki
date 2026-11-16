@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use jiff::Timestamp;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::tasks::{TaskClock, TaskOutcome, TaskParent, TaskStatus};
@@ -724,19 +725,22 @@ impl Chat {
     }
 
     pub fn push_user_message(&mut self, text: impl Into<String>) {
-        self.messages_panel
-            .push(DisplayMessage::new(DisplayRole::User, text.into()));
+        let mut msg = DisplayMessage::new(DisplayRole::User, text.into());
+        msg.created_at = Some(Timestamp::now().as_millisecond() as u64);
+        self.messages_panel.push(msg);
     }
 
     /// Flush, push, and re-pin scroll in one shot to avoid
     /// the one-frame hop where the bubble briefly lands in the wrong row.
     pub fn show_user_message(&mut self, text: impl Into<String>, images: Vec<ImageSource>) {
         self.flush();
-        self.messages_panel.push(DisplayMessage::with_images(
+        let mut msg = DisplayMessage::with_images(
             DisplayRole::User,
             text.into(),
             images,
-        ));
+        );
+        msg.created_at = Some(Timestamp::now().as_millisecond() as u64);
+        self.messages_panel.push(msg);
         self.messages_panel.ensure_active_group();
         self.enable_auto_scroll();
     }
@@ -860,11 +864,13 @@ pub fn history_to_display(
                 let text = msg.user_text();
                 if text.is_some() || !images.is_empty() {
                     seal_last_group(&mut display);
-                    display.push(DisplayMessage::with_images(
+                    let mut dmsg = DisplayMessage::with_images(
                         DisplayRole::User,
                         text.unwrap_or_default().to_owned(),
                         images,
-                    ));
+                    );
+                    dmsg.created_at = msg.created_at;
+                    display.push(dmsg);
                 }
             }
             Role::Assistant => {
@@ -1090,6 +1096,7 @@ pub fn history_to_display(
                                 detail: None,
                                 detail_expanded: false,
                                 task_end: None,
+                                created_at: None,
                             });
                         }
                         _ => {}

@@ -866,7 +866,13 @@ fn search_text_instruction_segment_indexes_its_own_blocks() {
 #[test_case("    indented\n# not a heading" ; "indentation_and_hash")]
 fn user_message_shows_as_typed(text: &str) {
     let message = DisplayMessage::new(DisplayRole::User, text.into());
-    let rows: Vec<String> = build_message_lines(&message, &user_style(), VIEW_WIDTH, VIEW_WIDTH)
+    let rows: Vec<String> = build_message_lines(
+        &message,
+        &user_style(),
+        maki_config::ClockFormat::Hour24,
+        VIEW_WIDTH,
+        VIEW_WIDTH,
+    )
         .iter()
         .map(|row| row.to_string())
         .collect();
@@ -917,6 +923,97 @@ fn user_message_renders_with_user_bg_and_chevron() {
 
     let assistant_cell = buf.cell((1, 2)).unwrap();
     assert_ne!(assistant_cell.style().bg, user_bg);
+}
+
+#[test]
+fn user_message_renders_timestamp_for_today() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let now_ms = jiff::Timestamp::now().as_millisecond() as u64;
+    let mut msg = DisplayMessage::new(DisplayRole::User, "my query".into());
+    msg.created_at = Some(now_ms);
+    panel.push(msg);
+    let terminal = render(&mut panel, 80, 24);
+    let buf = terminal.backend().buffer();
+
+    let expected_ts = crate::clock::format_message_timestamp(now_ms, panel.clock_format);
+    let row0: String = (0..buf.area.width)
+        .filter_map(|x| buf.cell((x, 0)).map(|c| c.symbol()))
+        .collect();
+
+    assert!(row0.contains("❯ my query"));
+    assert!(row0.trim_end().ends_with(&expected_ts));
+
+    let user_bg = crate::theme::current().user_bg.bg;
+    let ts_col = row0.find(&expected_ts).unwrap() as u16;
+    let ts_cell = buf.cell((ts_col, 0)).unwrap();
+    assert_eq!(ts_cell.style().bg, user_bg);
+}
+
+#[test]
+fn user_message_renders_date_and_time_for_past_date() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let past_ms = (jiff::Timestamp::now().as_millisecond() as u64).saturating_sub(2 * 86_400 * 1000);
+    let mut msg = DisplayMessage::new(DisplayRole::User, "old message".into());
+    msg.created_at = Some(past_ms);
+    panel.push(msg);
+    let terminal = render(&mut panel, 80, 24);
+    let buf = terminal.backend().buffer();
+
+    let expected_ts = crate::clock::format_message_timestamp(past_ms, panel.clock_format);
+    assert!(expected_ts.contains('-'), "past date timestamp must contain year-month-day");
+
+    let row0: String = (0..buf.area.width)
+        .filter_map(|x| buf.cell((x, 0)).map(|c| c.symbol()))
+        .collect();
+
+    assert!(row0.contains("❯ old message"));
+    assert!(row0.trim_end().ends_with(&expected_ts));
+}
+
+#[test]
+fn user_message_long_text_wraps_with_timestamp_on_row_0() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let mut msg = DisplayMessage::new(
+        DisplayRole::User,
+        "this is a very long user prompt that exceeds the available width of the first line".into(),
+    );
+    msg.timestamp = Some("17:06".into());
+    panel.push(msg);
+    let terminal = render(&mut panel, 60, 24);
+    let buf = terminal.backend().buffer();
+
+    let row0: String = (0..buf.area.width)
+        .filter_map(|x| buf.cell((x, 0)).map(|c| c.symbol()))
+        .collect();
+    let row1: String = (0..buf.area.width)
+        .filter_map(|x| buf.cell((x, 1)).map(|c| c.symbol()))
+        .collect();
+
+    assert!(row0.contains("❯ this is a very long"));
+    assert!(row0.trim_end().ends_with("17:06"));
+    assert!(row1.contains("first line"));
+}
+
+#[test]
+fn user_message_multiline_text_puts_timestamp_on_first_line() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let mut msg = DisplayMessage::new(DisplayRole::User, "line one\nline two".into());
+    msg.timestamp = Some("12:34".into());
+    panel.push(msg);
+    let terminal = render(&mut panel, 80, 24);
+    let buf = terminal.backend().buffer();
+
+    let row0: String = (0..buf.area.width)
+        .filter_map(|x| buf.cell((x, 0)).map(|c| c.symbol()))
+        .collect();
+    let row1: String = (0..buf.area.width)
+        .filter_map(|x| buf.cell((x, 1)).map(|c| c.symbol()))
+        .collect();
+
+    assert!(row0.contains("❯ line one"));
+    assert!(row0.trim_end().ends_with("12:34"));
+    assert!(row1.contains("line two"));
+    assert!(!row1.contains("12:34"));
 }
 
 #[test]
