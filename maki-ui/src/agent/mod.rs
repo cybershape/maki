@@ -187,6 +187,7 @@ impl AgentHandles {
         // thing that makes the old loop's in-flight envelopes stale. It lives
         // here so no caller can respawn without it.
         app.run_id += 1;
+        app.refresh_workflow_gaps(&config);
         let resumed = Resumed {
             id: SessionRef::from(app.state.session.id),
             history,

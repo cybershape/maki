@@ -183,7 +183,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`."
+        "- **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Refuses to turn on while `task` or `code_execution` is disabled in config, and names what is missing. Config: `always_workflow = true`."
     )
     .unwrap();
     writeln!(

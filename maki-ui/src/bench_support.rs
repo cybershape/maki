@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use maki_agent::permissions::PermissionManager;
-use maki_agent::{McpConfigErrors, McpSnapshotReader, SnapshotSpan, SpanStyle};
+use maki_agent::{AgentConfig, McpConfigErrors, McpSnapshotReader, SnapshotSpan, SpanStyle};
 use maki_config::{ModelPolicy, PermissionsConfig, ProjectConfig, UiConfig};
 use maki_lua::{
     EventHandle, HintReader, InputEdit, InputRule, InputRulesReader, KeymapReader,
@@ -79,6 +79,7 @@ pub fn app(storage: StateDir) -> App {
         InputRulesReader::empty(),
         writer,
         UiConfig::default(),
+        &AgentConfig::default(),
         INPUT_HISTORY_SIZE,
         permissions,
         Arc::from([]),

@@ -13,7 +13,7 @@ use maki_storage::paths;
 use super::{
     AGENT_BUSY_MSG, App, BTW_USAGE_MSG, COMMAND_DEPTH_MSG, EXIT_COMMAND, FAST_OFF_MSG, FAST_ON_MSG,
     FAST_PENDING_MSG, MAX_COMMAND_DEPTH, QueuedMessage, UNKNOWN_COMMAND_PREFIX, WORKFLOW_OFF_MSG,
-    WORKFLOW_ON_MSG, YOLO_OFF_MSG, YOLO_ON_MSG,
+    WORKFLOW_ON_MSG, WORKFLOW_UNAVAILABLE_MSG, YOLO_OFF_MSG, YOLO_ON_MSG,
 };
 use crate::components::command::ParsedCommand;
 use crate::components::{Action, ExitRequest, Status};
@@ -123,15 +123,22 @@ impl App {
                 vec![]
             }
             "/workflow" => {
-                self.state.workflow = !self.state.workflow;
-                self.flash(
-                    if self.state.workflow {
-                        WORKFLOW_ON_MSG
-                    } else {
-                        WORKFLOW_OFF_MSG
-                    }
-                    .into(),
-                );
+                if !self.state.workflow && !self.workflow_gaps.is_empty() {
+                    self.flash(format!(
+                        "{WORKFLOW_UNAVAILABLE_MSG}{}",
+                        self.workflow_gaps.join(", ")
+                    ));
+                } else {
+                    self.state.workflow = !self.state.workflow;
+                    self.flash(
+                        if self.state.workflow {
+                            WORKFLOW_ON_MSG
+                        } else {
+                            WORKFLOW_OFF_MSG
+                        }
+                        .into(),
+                    );
+                }
                 vec![]
             }
             EXIT_COMMAND => self.quit(),

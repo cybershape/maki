@@ -554,6 +554,7 @@ impl SpawnCtx {
             self.input_rules_reader.clone(),
             Arc::clone(&self.storage_writer),
             self.ui_config.clone(),
+            &self.config,
             self.input_history_size,
             permissions,
             Arc::clone(&self.custom_commands),

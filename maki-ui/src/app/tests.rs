@@ -32,7 +32,7 @@ use maki_agent::agent::TranscriptError;
 use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, PermissionManager};
 use maki_agent::session::NOTHING_TO_STORE;
-use maki_agent::tools::ToolRegistry;
+use maki_agent::tools::{CODE_EXECUTION_TOOL_NAME, TASK_TOOL_NAME, ToolRegistry};
 use maki_agent::{
     AgentMode, BackgroundNotice, BufferSnapshot, CallRecord, Cutter, DoneReason, EndReason,
     HistorySnapshot, ImageMediaType, ImageSource, McpConfigErrors, McpPromptArg, McpPromptInfo,
@@ -257,6 +257,7 @@ fn build_app_with_session(
         InputRulesReader::empty(),
         writer,
         UiConfig::default(),
+        &maki_agent::AgentConfig::default(),
         100,
         permissions,
         Arc::from([]),
@@ -10077,6 +10078,38 @@ fn workflow_toggle_flows_into_agent_input() {
 
     app.execute_command(cmd("/workflow"), 0);
     assert!(!app.build_agent_input(&msg).workflow);
+    assert_eq!(app.status_bar.flash_text(), Some(WORKFLOW_OFF_MSG));
+}
+
+#[test_case(&[TASK_TOOL_NAME], &[TASK_TOOL_NAME] ; "task_disabled")]
+#[test_case(&[CODE_EXECUTION_TOOL_NAME], &[CODE_EXECUTION_TOOL_NAME] ; "code_execution_disabled")]
+#[test_case(&[TASK_TOOL_NAME, CODE_EXECUTION_TOOL_NAME], &[TASK_TOOL_NAME, CODE_EXECUTION_TOOL_NAME] ; "both_disabled")]
+fn workflow_refused_when_its_tools_are_disabled(disabled: &[&str], gaps: &[&str]) {
+    let mut app = test_app();
+    app.refresh_workflow_gaps(&maki_agent::AgentConfig {
+        disabled_tools: disabled.iter().map(|s| (*s).to_owned()).collect(),
+        ..Default::default()
+    });
+
+    app.execute_command(cmd("/workflow"), 0);
+    assert!(!app.state.workflow);
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(format!("{WORKFLOW_UNAVAILABLE_MSG}{}", gaps.join(", "))).as_deref()
+    );
+}
+
+#[test]
+fn workflow_turns_off_even_when_its_tools_are_disabled() {
+    let mut app = test_app();
+    app.state.workflow = true;
+    app.refresh_workflow_gaps(&maki_agent::AgentConfig {
+        disabled_tools: vec![TASK_TOOL_NAME.into()],
+        ..Default::default()
+    });
+
+    app.execute_command(cmd("/workflow"), 0);
+    assert!(!app.state.workflow);
     assert_eq!(app.status_bar.flash_text(), Some(WORKFLOW_OFF_MSG));
 }
 

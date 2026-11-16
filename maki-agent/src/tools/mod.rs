@@ -340,6 +340,16 @@ pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
 pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
 pub const WRITE_TOOL_NAME: &str = "write";
 
+/// The workflow-mode tools the config filter holds back. Empty means
+/// `/workflow` may turn on; a name in the list is what its refusal reports.
+pub fn workflow_tool_gaps(config: &AgentConfig, model: &Model) -> Vec<&'static str> {
+    let filter = ToolFilter::from_config(config, model, &[]);
+    [TASK_TOOL_NAME, CODE_EXECUTION_TOOL_NAME]
+        .into_iter()
+        .filter(|name| !filter.matches(name))
+        .collect()
+}
+
 pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
 /// Whole seconds as `1h1m1s`. Hours are the largest unit, so a day reads `24h`.
 pub fn compact_duration(secs: u64) -> String {
@@ -995,6 +1005,22 @@ mod tests {
             filter.matches(READ_TOOL_NAME),
             "unrelated tools stay enabled"
         );
+    }
+
+    #[test_case(&[] as &[&str], &[] as &[&str], &[] as &[&str] ; "default_config_has_no_gaps")]
+    #[test_case(&["task"], &[], &["task"] ; "disabled_task")]
+    #[test_case(&["code_execution"], &[], &["code_execution"] ; "disabled_code_execution")]
+    #[test_case(&["task", "code_execution"], &[], &["task", "code_execution"] ; "both_disabled")]
+    #[test_case(&[], &["read"], &["task", "code_execution"] ; "allowlist_without_workflow_tools")]
+    #[test_case(&[], &["task", "code_execution"], &[] as &[&str] ; "allowlist_with_workflow_tools")]
+    fn workflow_tool_gaps_cases(disabled: &[&str], allowed: &[&str], gaps: &[&str]) {
+        let config = AgentConfig {
+            disabled_tools: disabled.iter().map(|s| (*s).to_owned()).collect(),
+            allowed_tools: allowed.iter().map(|s| (*s).to_owned()).collect(),
+            ..AgentConfig::default()
+        };
+        let model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
+        assert_eq!(workflow_tool_gaps(&config, &model), gaps);
     }
 
     #[test_case(30,  "30s timeout"   ; "seconds_only")]

@@ -65,9 +65,10 @@ use crate::text_buffer::{RuleSet, TextBuffer, Writers, normalize_line_endings, s
 use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
+use maki_agent::tools::workflow_tool_gaps;
 use maki_agent::{
-    AgentEvent, Envelope, McpConfigErrors, McpSnapshotReader, SessionMailbox, SharedBuf,
-    SharedMessages, ToolPart,
+    AgentConfig, AgentEvent, Envelope, McpConfigErrors, McpSnapshotReader, SessionMailbox,
+    SharedBuf, SharedMessages, ToolPart,
 };
 use maki_config::project::{self, GatedFile, TrustState};
 use maki_config::{ModelPolicy, UiConfig};
@@ -161,6 +162,7 @@ const FAST_PENDING_MSG: &str = "Fast mode: pending model discovery";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
+const WORKFLOW_UNAVAILABLE_MSG: &str = "Workflow unavailable, disabled by config: ";
 const YOLO_ON_MSG: &str = "YOLO mode enabled";
 const YOLO_OFF_MSG: &str = "YOLO mode disabled";
 const BTW_USAGE_MSG: &str = "Usage: /btw <question>";
@@ -666,6 +668,9 @@ pub struct App {
     last_sent: Option<Sent>,
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
+    /// Workflow-mode tools the config filter holds back, recomputed on every
+    /// respawn. Nonempty means `/workflow` refuses to turn on.
+    pub(crate) workflow_gaps: Vec<&'static str>,
     pub(crate) permissions: Arc<PermissionManager>,
     pub(crate) model_policy: Arc<ModelPolicy>,
     pub(crate) lua_event_handle: EventHandle,
@@ -717,6 +722,7 @@ impl App {
         input_rules_reader: InputRulesReader,
         storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
+        config: &AgentConfig,
         input_history_size: usize,
         permissions: Arc<PermissionManager>,
         custom_commands: Arc<[maki_agent::command::CustomCommand]>,
@@ -806,6 +812,7 @@ impl App {
             storage_writer,
             last_sent: None,
             shell: shell::ShellState::default(),
+            workflow_gaps: workflow_tool_gaps(config, model),
             ui_config,
             permissions,
             model_policy: Arc::clone(&model_policy),
@@ -1073,6 +1080,10 @@ impl App {
         }
         self.state.set_fast(fast);
         Ok(())
+    }
+
+    pub(crate) fn refresh_workflow_gaps(&mut self, config: &AgentConfig) {
+        self.workflow_gaps = workflow_tool_gaps(config, &self.state.model);
     }
 
     /// What `maki.model.get` hands to Lua.
