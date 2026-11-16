@@ -92,6 +92,7 @@ mode_bash  = "green"
 
 [ui]
 user                = { fg = "cyan" }
+user_bg             = { bg = "236" }
 assistant           = { fg = "foreground" }
 assistant_prefix    = { fg = "magenta" }
 thinking            = { fg = "light-gray", modifiers = ["italic"] }

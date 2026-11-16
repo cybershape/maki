@@ -1102,6 +1102,7 @@ mod tests {
         assert_eq!(t.background, Color::Reset);
         assert_eq!(t.foreground, Color::Reset);
         assert_eq!(t.user.fg, Some(Color::Cyan));
+        assert_eq!(t.user_bg.bg, Some(Color::Indexed(236)));
         assert_eq!(
             t.syntax.settings.background,
             Some(SegmentColor::Default.to_syntect())
