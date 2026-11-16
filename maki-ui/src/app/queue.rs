@@ -3,6 +3,7 @@
 
 use std::borrow::Cow;
 use std::path::Path;
+use std::time::Instant;
 
 use maki_agent::{AgentInput, AgentMode, Delivery, ImageSource, InputSource, SessionMailbox};
 use maki_lua::agent_autocmd::HostEvent;
@@ -355,6 +356,7 @@ impl App {
     /// so no dedup needed.
     pub(super) fn on_queue_item_consumed(&mut self, text: String, images: Vec<ImageSource>) {
         self.status = Status::Streaming;
+        self.turn_started_at = Some(Instant::now());
         self.main_chat().show_user_message(text, images);
     }
 
@@ -400,6 +402,7 @@ impl App {
         // New work supersedes text held for recovery after an agent error.
         self.recoverable_queue.clear();
         self.status = Status::Streaming;
+        self.turn_started_at = Some(Instant::now());
         self.fire_session_event(HostEvent::TurnStart { text: &display });
         let cwd = Path::new(&self.state.session.cwd);
         persist_project_model(&self.storage, cwd, &self.state.model.spec());

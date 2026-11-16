@@ -78,6 +78,19 @@ pub struct StatusBarContext<'a> {
     /// with no `.maki` at all.
     pub restricted: bool,
     pub yolo: bool,
+    pub elapsed_time: Option<Duration>,
+}
+
+pub(crate) fn format_elapsed_time(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
 }
 
 pub struct StatusBar {
@@ -199,6 +212,13 @@ impl StatusBar {
         }
 
         left_spans.push(Span::styled(format!(" {}", ctx.mode_label), ctx.mode_style));
+
+        if let Some(duration) = ctx.elapsed_time {
+            left_spans.push(Span::styled(
+                format!(" {}", format_elapsed_time(duration)),
+                theme::current().status_dim,
+            ));
+        }
 
         if let Some(name) = ctx.chat_name {
             left_spans.push(Span::styled(
@@ -565,6 +585,7 @@ mod tests {
             workflow: false,
             restricted: false,
             yolo,
+            elapsed_time: None,
         }
     }
 
@@ -914,5 +935,36 @@ mod tests {
         assert!(has_bracket);
         assert!(has_percentage_dim);
         assert!(has_cost_fg);
+    }
+
+    #[test_case(Duration::from_secs(0), "00:00" ; "zero")]
+    #[test_case(Duration::from_secs(5), "00:05" ; "single_digit_seconds")]
+    #[test_case(Duration::from_secs(59), "00:59" ; "sub_minute_boundary")]
+    #[test_case(Duration::from_secs(60), "01:00" ; "one_minute")]
+    #[test_case(Duration::from_secs(125), "02:05" ; "minutes_and_seconds")]
+    #[test_case(Duration::from_secs(3599), "59:59" ; "sub_hour_boundary")]
+    #[test_case(Duration::from_secs(3600), "01:00:00" ; "one_hour")]
+    #[test_case(Duration::from_secs(3723), "01:02:03" ; "hours_minutes_seconds")]
+    #[test_case(Duration::from_secs(36610), "10:10:10" ; "multi_digit_hours")]
+    fn format_elapsed_time_cases(duration: Duration, expected: &str) {
+        assert_eq!(format_elapsed_time(duration), expected);
+    }
+
+    #[test]
+    fn status_bar_renders_elapsed_time_when_present() {
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.mode_label = "BUILD".into();
+        ctx.elapsed_time = Some(Duration::from_secs(65));
+        let text = draw(&ctx);
+        assert!(text.contains("BUILD 01:05"), "{text}");
+    }
+
+    #[test]
+    fn status_bar_omits_elapsed_time_when_none() {
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.mode_label = "BUILD".into();
+        ctx.elapsed_time = None;
+        let text = draw(&ctx);
+        assert!(!text.contains("00:"), "{text}");
     }
 }

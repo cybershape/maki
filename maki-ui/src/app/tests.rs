@@ -14152,3 +14152,86 @@ fn the_escape_that_closes_the_palette_stays_out_of_the_chat() {
     assert!(!palette_open(&mut app));
     assert_eq!(app.status_bar.flash_text(), None, "{PALETTE_ESC_LEAKED}");
 }
+
+fn bottom_row_text(buffer: &Buffer) -> String {
+    let y = buffer.area.height - 1;
+    (0..buffer.area.width)
+        .filter_map(|x| buffer.cell(Position::new(x, y)))
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>()
+}
+
+#[test]
+fn status_bar_shows_elapsed_timer_during_streaming() {
+    let mut app = test_app();
+    assert_eq!(app.status, Status::Idle);
+    let (_, buf) = draw_to_buffer(&mut app);
+    let bottom = bottom_row_text(&buf);
+    assert!(!bottom.contains("00:"));
+
+    type_and_submit(&mut app, "hello");
+    assert_eq!(app.status, Status::Streaming);
+    assert!(app.turn_started_at.is_some());
+
+    let (_, buf) = draw_to_buffer(&mut app);
+    let bottom = bottom_row_text(&buf);
+    assert!(
+        bottom.contains("[BUILD] 00:"),
+        "expected [BUILD] 00: in bottom row, got: {bottom}"
+    );
+
+    app.update(agent_msg(done()));
+    assert_eq!(app.status, Status::Idle);
+    assert!(app.turn_started_at.is_none());
+
+    let (_, buf) = draw_to_buffer(&mut app);
+    let bottom = bottom_row_text(&buf);
+    assert!(
+        !bottom.contains("[BUILD] 00:"),
+        "expected no timer in bottom row, got: {bottom}"
+    );
+}
+
+#[test]
+fn status_bar_timer_cleared_on_cancel() {
+    let mut app = test_app();
+    type_and_submit(&mut app, "hello");
+    assert!(app.turn_started_at.is_some());
+
+    cancel_app(&mut app);
+    assert!(app.turn_started_at.is_none());
+
+    let (_, buf) = draw_to_buffer(&mut app);
+    let bottom = bottom_row_text(&buf);
+    assert!(
+        !bottom.contains("[BUILD] 00:"),
+        "expected no timer in bottom row, got: {bottom}"
+    );
+}
+
+#[test]
+fn status_bar_timer_cleared_on_error() {
+    let mut app = test_app();
+    type_and_submit(&mut app, "hello");
+    assert!(app.turn_started_at.is_some());
+
+    error_app(&mut app);
+    assert!(app.turn_started_at.is_none());
+}
+
+#[test]
+fn status_bar_timer_shows_in_plan_mode() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
+    type_and_submit(&mut app, "make a plan");
+    assert_eq!(app.status, Status::Streaming);
+    assert!(app.turn_started_at.is_some());
+
+    let (_, buf) = draw_to_buffer(&mut app);
+    let bottom = bottom_row_text(&buf);
+    assert!(
+        bottom.contains("[PLAN] 00:"),
+        "expected [PLAN] 00: in bottom row, got: {bottom}"
+    );
+}

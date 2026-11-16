@@ -7,7 +7,7 @@
 
 use std::mem;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use maki_agent::tools::{MAIN_TASK_ID, ToolRegistry};
 use maki_agent::{AgentEvent, PartStatus, SessionMailbox, ToolDoneEvent, ToolPart};
@@ -133,6 +133,7 @@ impl From<TaskOutcome> for TaskStatus {
 pub(crate) struct TaskClock {
     started: SystemTime,
     ended: Option<SystemTime>,
+    started_instant: Option<Instant>,
 }
 
 impl TaskClock {
@@ -145,6 +146,7 @@ impl TaskClock {
         Some(Self {
             started: at(started_at?),
             ended: ended_at.map(at),
+            started_instant: None,
         })
     }
 
@@ -156,6 +158,15 @@ impl TaskClock {
         self.ended.and_then(unix_secs)
     }
 
+    pub(crate) fn elapsed(&self) -> Option<Duration> {
+        if self.ended.is_some() {
+            return None;
+        }
+        self.started_instant
+            .map(|i| i.elapsed())
+            .or_else(|| self.started.elapsed().ok())
+    }
+
     /// A moved call's task counts from the call's start, as the call's own
     /// marks do, so `/tasks` and a stop's "after 40s" agree.
     pub(crate) fn started_ago(ran: Duration) -> Self {
@@ -163,6 +174,7 @@ impl TaskClock {
         Self {
             started: now.checked_sub(ran).unwrap_or(now),
             ended: None,
+            started_instant: Instant::now().checked_sub(ran),
         }
     }
 
@@ -578,6 +590,7 @@ impl App {
         chat.clock = started.map(|started| TaskClock {
             started,
             ended: None,
+            started_instant: None,
         });
         chat.push(DisplayMessage::new(
             DisplayRole::Tool(Box::new(ToolRole {
@@ -1900,5 +1913,26 @@ mod tests {
             vec![(OTHER_ID.to_owned(), TaskStatus::Working)]
         );
         assert_eq!(watched(&watch), vec![(two, TaskStatus::Working)]);
+    }
+
+    #[test]
+    fn task_clock_elapsed_tracks_duration_and_stops() {
+        let mut clock = TaskClock::start();
+        assert!(clock.elapsed().is_some());
+
+        let ago = TaskClock::started_ago(Duration::from_secs(42));
+        assert!(ago.elapsed().unwrap() >= Duration::from_secs(42));
+
+        clock.stop();
+        assert!(clock.elapsed().is_none());
+
+        clock.resume();
+        assert!(clock.elapsed().is_some());
+
+        let unix_active = TaskClock::from_unix(Some(100), None).unwrap();
+        assert!(unix_active.elapsed().is_some());
+
+        let unix_ended = TaskClock::from_unix(Some(100), Some(200)).unwrap();
+        assert!(unix_ended.elapsed().is_none());
     }
 }

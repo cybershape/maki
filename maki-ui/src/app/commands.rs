@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use maki_agent::{McpPromptInfo, McpPromptRef};
 use maki_lua::agent_autocmd::HostEvent;
@@ -58,6 +59,7 @@ impl App {
                     return vec![];
                 }
                 self.status = Status::Streaming;
+                self.turn_started_at = Some(Instant::now());
                 vec![Action::Compact(instructions)]
             }
             "/help" => self.run_builtin(BuiltinAction::Help),

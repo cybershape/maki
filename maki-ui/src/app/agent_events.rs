@@ -477,6 +477,7 @@ impl App {
                 self.terminalize_turn(MISSING_TOOL_COMPLETION);
                 self.chat_index.clear();
                 self.status = Status::Idle;
+                self.turn_started_at = None;
                 if self.state.mode == Mode::Plan && self.plan_answers.pending_offer {
                     self.plan_answers.pending_offer = false;
                     let path = self.state.plan.path().map(|p| p.display().to_string());
@@ -495,6 +496,7 @@ impl App {
             ChatEventResult::Error(message) => {
                 self.plan_answers.abandon();
                 self.status = Status::error(message.clone());
+                self.turn_started_at = None;
                 self.status_bar.clear_flash();
                 self.main_chat().push(DisplayMessage::new(
                     DisplayRole::Error,

@@ -1,3 +1,6 @@
+use std::time::Duration;
+
+use crate::app::tasks::TaskStatus;
 use crate::components::Overlay;
 use crate::components::input::BORDER_ROWS;
 use crate::components::queue_panel;
@@ -17,7 +20,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
-use super::{App, KeyboardOwner, Mode};
+use super::{App, KeyboardOwner, MAIN_CHAT, Mode, Status};
 
 /// A tab without an input box, a finished task's or a moved call's, has
 /// only this hint to say how to get out and where to stop it.
@@ -502,6 +505,20 @@ impl App {
                 .unwrap_or(&self.state.session.model)
                 .to_string()
         };
+        let elapsed_time = if render_chat == MAIN_CHAT {
+            if self.status == Status::Streaming {
+                Some(self.turn_started_at.map_or(Duration::ZERO, |t| t.elapsed()))
+            } else {
+                None
+            }
+        } else {
+            let chat = &self.chats[render_chat];
+            if chat.task_status() == TaskStatus::Working {
+                chat.clock.as_ref().and_then(|c| c.elapsed())
+            } else {
+                None
+            }
+        };
         let ctx = StatusBarContext {
             status: &self.status,
             motion: self.status_motion(),
@@ -528,6 +545,7 @@ impl App {
             workflow: self.state.workflow,
             restricted: self.trust.question().is_some(),
             yolo: self.permissions.is_yolo(),
+            elapsed_time,
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

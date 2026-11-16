@@ -309,6 +309,7 @@ impl App {
         self.chat_index.clear();
         self.deleted_tasks.clear();
         self.status = Status::Idle;
+        self.turn_started_at = None;
         self.clear_exit_request();
         self.queue.clear();
         self.recoverable_queue.clear();

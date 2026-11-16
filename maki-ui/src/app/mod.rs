@@ -618,6 +618,7 @@ pub struct App {
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
     pub status: Status,
+    pub(crate) turn_started_at: Option<Instant>,
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
     exit_on_done: Option<ExitOnDone>,
@@ -775,6 +776,7 @@ impl App {
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(flash),
             status: Status::Idle,
+            turn_started_at: None,
             state,
             exit_request: ExitRequest::None,
             exit_on_done: None,
@@ -1356,6 +1358,7 @@ impl App {
             return Dirty::NO;
         }
         self.status = Status::Idle;
+        self.turn_started_at = None;
         Dirty::YES
     }
 
@@ -2654,6 +2657,7 @@ impl App {
         self.queue.clear();
         self.recoverable_queue.clear();
         self.status = Status::Idle;
+        self.turn_started_at = None;
         vec![Action::CancelAgent {
             run_id: cancelled_run,
         }]
