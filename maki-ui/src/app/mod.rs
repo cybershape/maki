@@ -155,7 +155,8 @@ const PLAN_FORM_ANSWER_WAIT: Duration =
 /// still beats it.
 const PLAN_ACTION_ANSWER_WAIT: Duration =
     Duration::from_secs(PLAN_ROW_HANDLER_DEADLINE.as_secs() + PLAN_FORM_QUEUE_SLACK_SECS);
-const FAST_UNSUPPORTED_MSG: &str = "Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
+const FAST_UNSUPPORTED_MSG: &str =
+    "Fast mode needs a model with a fast service tier (discovered service_tiers or configured pricing_fast_*)";
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_PENDING_MSG: &str = "Fast mode: pending model discovery";

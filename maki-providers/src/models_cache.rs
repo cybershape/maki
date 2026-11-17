@@ -318,6 +318,7 @@ pub async fn fetch_all_models_cached(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use test_case::test_case;
 
     use super::*;
@@ -491,5 +492,38 @@ mod tests {
             model_registry::resolve_model_name(slug, model_id).as_deref(),
             Some("Cached Model Name")
         );
+    }
+
+    #[test]
+    fn replay_keeps_the_discovered_fast_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CACHE_FILE);
+        let slug = "fast-cached-provider";
+        let model_id = "fast-cached-model";
+        let mut models = HashMap::new();
+        models.insert(
+            slug.to_string(),
+            vec![ModelInfo {
+                supports_fast: Some(true),
+                extra: Some(json!({"service_tiers": [{"id": "priority"}]})),
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+        store_at(
+            &path,
+            &ModelsCache {
+                fingerprint: FINGERPRINT.to_string(),
+                written_at: NOW,
+                specs: vec![format!("{slug}/{model_id}")],
+                models,
+            },
+        );
+
+        let policy = ModelPolicy::default();
+        replay(&path, &policy, FINGERPRINT, NOW);
+
+        let info = model_registry::discovered(slug, model_id).expect("replayed row");
+        assert_eq!(info.supports_fast, Some(true));
+        assert!(info.extra.is_none(), "extra stays out of the cache");
     }
 }

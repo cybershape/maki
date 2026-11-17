@@ -83,21 +83,25 @@ impl From<&ModelDef> for ModelEntry {
             supports_deferred_tools: None,
             max_output_tokens: def.max_output_tokens,
             context_window: def.context_window,
-            pricing: def.has_pricing().then(|| ModelPricing {
+            pricing: (def.has_pricing() || def.has_fast_pricing()).then(|| ModelPricing {
                 input: def.pricing_input.unwrap_or(0.0),
                 output: def.pricing_output.unwrap_or(0.0),
                 cache_write: def.pricing_cache_write.unwrap_or(0.0),
                 cache_read: def.pricing_cache_read.unwrap_or(0.0),
-                fast: def.has_fast_pricing().then(|| FastPricing {
-                    input: def.pricing_fast_input.unwrap_or(0.0),
-                    output: def.pricing_fast_output.unwrap_or(0.0),
-                }),
+                fast: fast_pricing(def),
             }),
             thinking_fields: def.thinking_fields.clone(),
             family: None,
             default: false,
         }
     }
+}
+
+fn fast_pricing(def: &ModelDef) -> Option<FastPricing> {
+    def.has_fast_pricing().then(|| FastPricing {
+        input: def.pricing_fast_input.unwrap_or(0.0),
+        output: def.pricing_fast_output.unwrap_or(0.0),
+    })
 }
 
 fn model_from_def(
@@ -132,11 +136,16 @@ fn model_from_def(
         .or_else(|| discovered.and_then(|d| d.supports_vision))
         .or(Some(true));
 
-    let pricing = row
+    let mut pricing = row
         .pricing
         .take()
         .or_else(|| discovered.and_then(|d| d.pricing.clone()))
         .unwrap_or_default();
+    // Discovered pricing never carries a fast tier, so a replayed listing
+    // must not drop the one the config states.
+    if pricing.fast.is_none() {
+        pricing.fast = def_model.and_then(fast_pricing);
+    }
     row.pricing = Some(pricing);
     let mut model = row.to_model(slug, base, model_id.to_string());
     model.subsidised_by = subsidy_source.map(Arc::from);
@@ -144,15 +153,8 @@ fn model_from_def(
         if d.pricing.as_ref().is_some_and(ModelPricing::is_zero) {
             model.discovered_free = true;
         }
-        if let Some(extra) = &d.extra
-            && extra
-                .get("service_tiers")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|tiers| {
-                    tiers
-                        .iter()
-                        .any(|t| t["id"] == "priority" || t["id"] == "fast")
-                })
+        if d.supports_fast == Some(true)
+            || d.extra.as_ref().is_some_and(ModelInfo::fast_tier_declared)
         {
             model.supports_fast_override = Some(crate::model::FastSupport::Supported);
         }
@@ -337,6 +339,97 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn fast_pricing_alone_makes_the_model_fast_capable() {
+        let slug = "fast-only-gw";
+        let mut config = ProvidersConfig::default();
+        config.providers.insert(
+            slug.to_string(),
+            serde_json::from_str(
+                r#"{"models":[{"id":"m","tier":"strong","pricing_fast_input":6.0,"pricing_fast_output":30.0}]}"#,
+            )
+            .unwrap(),
+        );
+        let _guard = maki_config::providers::set_override(config);
+        let model = lookup_model(slug, "m").unwrap();
+        assert!(
+            model.supports_fast(),
+            "pricing_fast_* alone must enable fast mode"
+        );
+    }
+
+    #[test]
+    fn cached_discovery_does_not_mask_configured_fast_pricing() {
+        let slug = "fast-cached-gw";
+        let model_id = "m-cached";
+        // A live answer from an earlier run, replayed from disk: pricing
+        // survives serialization, `extra` does not.
+        model_registry::set_known_models(
+            slug,
+            vec![ModelInfo {
+                pricing: Some(ModelPricing::per_million(3.0, 15.0, 3.75, 0.3)),
+                extra: Some(
+                    serde_json::json!({"service_tiers": [{"id": "priority", "name": "Fast"}]}),
+                ),
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+        let cached = model_registry::all_known_models();
+        let json = serde_json::to_string(&cached).unwrap();
+        let mut restored: std::collections::HashMap<String, Vec<ModelInfo>> =
+            serde_json::from_str(&json).unwrap();
+        let rows = restored.remove(slug).unwrap();
+        let replay_slug = format!("{slug}-replay");
+        restored.insert(replay_slug.clone(), rows);
+        model_registry::restore_cached_models(restored);
+
+        let mut config = ProvidersConfig::default();
+        config.providers.insert(
+            replay_slug.clone(),
+            serde_json::from_str(&format!(
+                r#"{{"models":[{{"id":"{model_id}","tier":"strong","pricing_fast_input":6.0,"pricing_fast_output":30.0}}]}}"#
+            ))
+            .unwrap(),
+        );
+        let _guard = maki_config::providers::set_override(config);
+        let model = lookup_model(&replay_slug, model_id).unwrap();
+        assert!(
+            model.supports_fast(),
+            "configured fast pricing must hold even when replayed discovery carries standard pricing"
+        );
+    }
+
+    #[test]
+    fn discovered_fast_tier_survives_a_cache_roundtrip() {
+        let slug = "fast-cache-gw";
+        let replay_slug = "fast-cache-gw-replay";
+        let model_id = "m-fast";
+        let extra = serde_json::json!({"service_tiers": [{"id": "priority", "name": "Fast"}]});
+        model_registry::set_known_models(
+            slug,
+            vec![ModelInfo {
+                supports_fast: Some(true),
+                extra: Some(extra.clone()),
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+        let cached = model_registry::all_known_models();
+        let json = serde_json::to_string(&cached).unwrap();
+        let mut restored: std::collections::HashMap<String, Vec<ModelInfo>> =
+            serde_json::from_str(&json).unwrap();
+        // Replay lands on a registry that never saw the live answer, under a
+        // slug of its own so `or_insert` cannot mask the loss.
+        let rows = restored.remove(slug).unwrap();
+        restored.insert(replay_slug.to_string(), rows);
+        model_registry::restore_cached_models(restored);
+        let def = ProviderDef::default();
+        let model = model_from_def(&def, &RESPONSES_SPEC, replay_slug, model_id);
+        assert!(
+            model.supports_fast(),
+            "a discovered fast tier must survive the on-disk cache roundtrip"
+        );
+    }
+
+    #[test]
     fn custom_lookup_returns_model_when_configured() {
         let mut config = ProvidersConfig::default();
         config.providers.insert(
@@ -435,6 +528,7 @@ mod tests {
                     ],
                     send_off: Some(false),
                 }),
+                supports_fast: None,
             }],
         );
 

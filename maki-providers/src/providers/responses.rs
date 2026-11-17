@@ -499,6 +499,7 @@ fn parse_model_info(m: &Value) -> Option<ModelInfo> {
         provider_info: None,
         extra: Some(m.clone()),
         effort,
+        supports_fast: ModelInfo::fast_tier_declared(m).then_some(true),
     })
 }
 
@@ -609,6 +610,7 @@ impl ResponsesProvider {
                         provider_info: None,
                         extra: None,
                         effort,
+                        supports_fast: m.has_fast_pricing().then_some(true),
                     }
                 })
                 .collect();
@@ -1909,6 +1911,7 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
         let info = parse_model_info(&composer).expect("parses composer");
         assert_eq!(info.supports_thinking, Some(false));
         assert!(info.effort.is_none());
+        assert_eq!(info.supports_fast, None);
 
         let codex = json!({
             "id": "codex/gpt-6.1-sol",
@@ -1931,6 +1934,16 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
         assert_eq!(pricing.cache_read, 0.1);
         assert_eq!(pricing.cache_write, 2.5);
         assert!(info.extra.is_some());
+        assert_eq!(info.supports_fast, Some(true));
+    }
+
+    #[test_case(r#"{"id":"m","service_tiers":[{"id":"fast"}]}"#, Some(true) ; "fast_tier")]
+    #[test_case(r#"{"id":"m","service_tiers":[{"id":"priority"}]}"#, Some(true) ; "priority_tier")]
+    #[test_case(r#"{"id":"m","service_tiers":[{"id":"default"}]}"#, None ; "other_tiers_only")]
+    #[test_case(r#"{"id":"m"}"#, None ; "no_tiers")]
+    fn parse_model_info_derives_fast_support(row: &str, expected: Option<bool>) {
+        let info = parse_model_info(&serde_json::from_str(row).unwrap()).expect("parses row");
+        assert_eq!(info.supports_fast, expected);
     }
 
     #[test]

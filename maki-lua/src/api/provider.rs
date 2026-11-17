@@ -788,13 +788,14 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///            catalogue only known at runtime. Without it, the provider
 ///            lists what its codec or base lists. Rows carry `id`,
 ///            `context_window`, `max_output_tokens`, `pricing`,
-///            `supports_thinking`, `supports_vision` and `tier`, plus two
+///            `supports_thinking`, `supports_vision` and `tier`, plus three
 ///            optional fields. `extra` is any JSON value, handed back to
 ///            `build_body` as `opts.model_info`. `effort` replaces the
 ///            `openai.thinking` levels and off switch for this model:
 ///            `supported` lists the effort names the provider accepts, and
 ///            `send_off` is `true` to send `"none"` for off or `false` to send
-///            nothing.
+///            nothing. `supports_fast = true` declares a fast service tier,
+///            enabling `/fast` for the model.
 ///   `build_body` (function) `function(ctx, body, model, opts)` returning
 ///            the body to send. `opts.thinking` is the rendered effort level,
 ///            nil when thinking is off. `openai` codecs only.

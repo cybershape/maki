@@ -26,7 +26,7 @@ Type `/` in the input box to open the command palette.
 | `/cd` | Change working directory |
 | `/btw` | Ask a quick question (no tools, no history pollution) |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |
-| `/fast` | Toggle fast mode (Anthropic Opus or Codex subscription models) |
+| `/fast` | Toggle fast mode (models with a fast service tier) |
 | `/workflow` | Toggle workflow mode (task callable inside code_execution) |
 | `/exit` | Exit the application |
 | `/reload` | Reload plugins and config (! stops background tasks) |
@@ -47,7 +47,7 @@ Sessions run concurrently. `Ctrl+N` in `/sessions` starts a fresh session while 
 
 - **`/yolo`**: skip permission prompts for this session (deny rules still apply). The toggle survives a resume, and `--yolo` only sets the starting value. Config: `always_yolo = true`.
 - **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker that shows what each level costs in tokens. With an argument it sets the level directly: `off`, `adaptive`, `minimal` to `max`, or a token budget. A model whose API has no adaptive mode does not offer `adaptive`. A session set to it shows and sends the level the provider uses instead. New sessions start at the last level you set, in `-p`, SDK and ACP too. Config: `always_thinking` pins a level.
-- **`/fast`**: faster responses on Anthropic Opus, and on eligible Codex models when you sign in with a ChatGPT subscription. OpenAI API keys and every other model ignore it. Config: `always_fast = true`.
+- **`/fast`**: faster responses on models with a fast service tier, discovered from `service_tiers` or configured with `pricing_fast_*`. Sends `service_tier: "fast"` on the Responses request. Models without a fast tier ignore it. Config: `always_fast = true`.
 - **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Refuses to turn on while `task` or `code_execution` is disabled in config, and names what is missing. Config: `always_workflow = true`.
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only).
 - **`/reload`**: rebuild plugins and config without leaving the app.

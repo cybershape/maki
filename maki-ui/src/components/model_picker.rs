@@ -28,6 +28,7 @@ const NO_KEY_LABEL: &str = "no key";
 const OFFLINE_LABEL: &str = "offline";
 const FALLBACK_LABEL: &str = "fallback";
 const CURRENT_MARK: &str = "● ";
+const FAST_MARK: &str = "⚡";
 const FOOTER: &[(&str, &str)] = &[
     ("Enter", "select"),
     ("!", "strong"),
@@ -293,6 +294,15 @@ impl ModelPicker {
                 continue;
             }
             if let Some(mut e) = parse_model_entry(spec, self.prefer_model_name, self.show_cost) {
+                // The provider name takes the suffix slot here, so a fast
+                // mark moves into the detail column instead of vanishing.
+                if e.suffix.as_deref() == Some(FAST_MARK) {
+                    e.detail = if e.detail.is_empty() {
+                        FAST_MARK.to_string()
+                    } else {
+                        format!("{FAST_MARK}{PRICE_SEPARATOR}{}", e.detail)
+                    };
+                }
                 e.suffix = Some(std::mem::take(&mut e.provider_display));
                 e.provider_display = RECENT_SECTION.to_string();
                 entries.push(e);
@@ -514,13 +524,14 @@ fn parse_model_entry(spec: &str, prefer_model_name: bool, show_cost: bool) -> Op
     let provider_display = provider_display(provider_str)?;
 
     let override_tiers = model_registry::override_tiers(spec);
-    let (tier, free, price) = match Model::from_spec(spec) {
+    let (tier, free, price, fast) = match Model::from_spec(spec) {
         Ok(m) => (
             m.tier.to_string(),
             m.is_free(),
             show_cost.then(|| format_pricing(&m)).flatten(),
+            m.supports_fast(),
         ),
-        Err(_) => (String::new(), false, None),
+        Err(_) => (String::new(), false, None, false),
     };
     let tier = if override_tiers.is_empty() {
         tier
@@ -549,7 +560,7 @@ fn parse_model_entry(spec: &str, prefer_model_name: bool, show_cost: bool) -> Op
         name,
         provider: provider_str.to_string(),
         provider_display,
-        suffix: None,
+        suffix: fast.then(|| FAST_MARK.to_string()),
         detail,
         override_tiers,
         free,
@@ -1285,6 +1296,47 @@ mod tests {
             !entry.detail.contains('$'),
             "paid discovery must not show price when show_cost is false"
         );
+    }
+
+    const FAST_ID: &str = "vendor/fast-model";
+
+    fn register_fast_model(supports_fast: Option<bool>) {
+        model_registry::set_known_models(
+            "responses",
+            vec![ModelInfo {
+                supports_fast,
+                ..discovered(FAST_ID, PAID_PRICING)
+            }],
+        );
+    }
+
+    #[test_case(Some(true), Some(FAST_MARK) ; "fast_model_carries_the_mark")]
+    #[test_case(None, None ; "plain_model_has_no_mark")]
+    #[test_case(Some(false), None ; "explicit_no_has_no_mark")]
+    fn fast_discovery_marks_the_entry(supports_fast: Option<bool>, expected: Option<&str>) {
+        register_fast_model(supports_fast);
+        let entry = parse_model_entry(&format!("responses/{FAST_ID}"), true, true).unwrap();
+        assert_eq!(entry.suffix.as_deref(), expected);
+    }
+
+    #[test]
+    fn recent_fast_model_keeps_the_mark_in_detail() {
+        register_fast_model(Some(true));
+        let spec = format!("responses/{FAST_ID}");
+        let models = Arc::new(ArcSwapOption::empty());
+        models.store(Some(loaded(vec![spec.clone()])));
+        let mut p = unfolded(models);
+        p.set_recents(vec![spec]);
+        p.open("");
+
+        p.picker.select(0);
+        let entry = p.picker.selected_item().expect("recent entry");
+        assert_eq!(entry.section(), Some(RECENT_SECTION));
+        assert!(
+            entry.detail.starts_with(FAST_MARK),
+            "the fast mark must survive the provider name taking the suffix"
+        );
+        assert_ne!(entry.suffix.as_deref(), Some(FAST_MARK));
     }
 
     #[test]

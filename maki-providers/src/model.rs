@@ -102,6 +102,11 @@ pub struct ModelInfo {
     /// [`Self::extra`] is not.
     #[serde(default, skip_serializing)]
     pub effort: Option<ModelEffort>,
+    /// Whether the listing declared a fast service tier. Derived from
+    /// `extra.service_tiers` at parse time, but unlike `extra` it serializes,
+    /// so a cache replay keeps the capability the live answer published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_fast: Option<bool>,
 }
 
 /// Effort levels and off switch, declared under `openai.thinking` or listed by
@@ -170,6 +175,18 @@ impl ModelInfo {
             id,
             ..Self::default()
         }
+    }
+
+    /// Reads a fast service tier off a raw `/models` row. `priority` is the
+    /// tier's former name, which gateways still publish.
+    pub fn fast_tier_declared(row: &Value) -> bool {
+        row.get("service_tiers")
+            .and_then(Value::as_array)
+            .is_some_and(|tiers| {
+                tiers
+                    .iter()
+                    .any(|t| t["id"] == "priority" || t["id"] == "fast")
+            })
     }
 }
 
@@ -607,7 +624,12 @@ impl Model {
             supports_tool_examples_override: entry.and_then(|e| e.supports_tool_examples),
             thinking_override,
             supports_vision_override: None,
-            supports_fast_override: None,
+            supports_fast_override: discovered
+                .is_some_and(|info| {
+                    info.supports_fast == Some(true)
+                        || info.extra.as_ref().is_some_and(ModelInfo::fast_tier_declared)
+                })
+                .then_some(FastSupport::Supported),
             supports_deferred_tools_override: None,
             pricing,
             subsidised_by: None,

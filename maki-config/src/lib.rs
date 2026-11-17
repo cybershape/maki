@@ -371,7 +371,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Bool(false),
         min: None,
         env: None,
-        description: "Start every session with fast mode (Anthropic Opus or eligible Codex subscription models, ignored elsewhere)",
+        description: "Start every session with fast mode (models with a fast service tier, ignored elsewhere)",
     },
     ConfigField {
         name: "always_workflow",

@@ -2655,6 +2655,7 @@ mod tests {
                     supported: vec![maki_providers::Effort::Low, maki_providers::Effort::High],
                     send_off: Some(false),
                 }),
+                supports_fast: None,
             }],
         );
 

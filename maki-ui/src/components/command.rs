@@ -165,7 +165,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/fast",
-        description: "Toggle fast mode (Anthropic Opus or Codex subscription models)",
+        description: "Toggle fast mode (models with a fast service tier)",
         max_args: 0,
         bang: false,
         plugin_access: CHANGES_SETTINGS,

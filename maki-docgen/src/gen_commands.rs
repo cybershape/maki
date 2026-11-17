@@ -178,7 +178,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/fast`**: faster responses on Anthropic Opus, and on eligible Codex models when you sign in with a ChatGPT subscription. OpenAI API keys and every other model ignore it. Config: `always_fast = true`."
+        "- **`/fast`**: faster responses on models with a fast service tier, discovered from `service_tiers` or configured with `pricing_fast_*`. Sends `service_tier: \"fast\"` on the Responses request. Models without a fast tier ignore it. Config: `always_fast = true`."
     )
     .unwrap();
     writeln!(
