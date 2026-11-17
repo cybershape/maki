@@ -10,7 +10,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::unbounded_channel;
 
 use maki_agent::AgentMode;
-use maki_agent::mcp::test_support::stub_session;
+use maki_agent::mcp::test_support::{echo_session, stub_session};
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{
     DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry, local_tool,
@@ -669,6 +669,50 @@ fn library_help_returns_docstring_for_function() {
     .expect("library_help should succeed");
     assert!(out.contains("async def create_issue("), "got: {out}");
     assert!(out.contains("Parameters:"), "got: {out}");
+}
+
+#[test_case::test_case(serde_json::json!({"type": ["string", "null"]}), "str | None" ; "nullable_string")]
+#[test_case::test_case(serde_json::json!({"type": ["integer", "number"]}), "int | float" ; "numeric_union")]
+#[test_case::test_case(serde_json::json!({"type": ["array", "null"], "items": {"type": "string"}}), "list[str] | None" ; "nullable_array")]
+#[test_case::test_case(serde_json::json!({"type": "array", "items": {"type": ["string", "null"]}}), "list[str | None]" ; "nullable_array_items")]
+#[test_case::test_case(serde_json::json!({"type": "array", "items": {"type": "array", "items": {"type": "integer"}}}), "list[list[int]]" ; "nested_array")]
+#[test_case::test_case(serde_json::json!({"anyOf": [{"type": "string"}, {"type": "null"}]}), "str | None" ; "any_of")]
+#[test_case::test_case(serde_json::json!({"oneOf": [{"type": "boolean"}, {"type": "integer"}]}), "bool | int" ; "one_of")]
+#[test_case::test_case(serde_json::json!({}), "any" ; "unknown_type")]
+fn library_help_formats_schema_types(property: serde_json::Value, expected_type: &str) {
+    let (reg, _host) = setup_global();
+    for required in [false, true] {
+        let ctx = shaped_ctx(&reg, |ctx| {
+            ctx.mcp = Some(echo_session(&[(
+                "browse.execute",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"code": property},
+                    "required": if required { vec!["code"] } else { vec![] },
+                }),
+            )]));
+        });
+        let out = run_tool(
+            &reg,
+            &ctx,
+            "library_help",
+            serde_json::json!({
+                "library_name": "browse",
+                "function_name": "execute",
+            }),
+        )
+        .expect("library_help should format schema types");
+        let default = if required { "" } else { " = None" };
+        let requirement = if required { "required" } else { "optional" };
+        assert!(
+            out.contains(&format!("    code: {expected_type}{default},")),
+            "got: {out}"
+        );
+        assert!(
+            out.contains(&format!("- code ({expected_type}, {requirement})")),
+            "got: {out}"
+        );
+    }
 }
 
 #[test]

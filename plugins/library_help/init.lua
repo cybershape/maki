@@ -17,6 +17,7 @@ local PY_TYPES = {
   boolean = "bool",
   object = "dict",
   array = "list",
+  null = "None",
 }
 
 local function py_type(prop)
@@ -24,14 +25,27 @@ local function py_type(prop)
     return "any"
   end
   local t = prop.type
+  local variants = prop.anyOf or prop.oneOf
+  if type(t) == "table" then
+    variants = {}
+    for _, kind in ipairs(t) do
+      table.insert(variants, { type = kind, items = prop.items })
+    end
+  end
+  if type(variants) == "table" and #variants > 0 then
+    local types = {}
+    for _, variant in ipairs(variants) do
+      table.insert(types, py_type(variant))
+    end
+    return table.concat(types, " | ")
+  end
   if t == "array" then
-    if prop.items and type(prop.items) == "table" and prop.items.type then
-      local inner = PY_TYPES[prop.items.type] or "any"
-      return "list[" .. inner .. "]"
+    if type(prop.items) == "table" then
+      return "list[" .. py_type(prop.items) .. "]"
     end
     return "list"
   end
-  return PY_TYPES[t] or (t or "any")
+  return PY_TYPES[t] or "any"
 end
 
 local function format_python_docstring(name, desc, schema)
