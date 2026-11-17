@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `6c3c4463fda1e86d19e089dfd1d748327f8b184a`
-  - **Commit date**: `Mon Nov 16 20:59:33 2026 +0200`
-  - **Commit author**: `Sebastian Dröge <sebastian@centricular.com>`
-  - **Commit message**: `perf(events): build a TurnComplete reply only for its readers`
+  - **Commit SHA**: `a52b443e2051cf0b3aa11d3fa37d9a1e0de192b2`
+  - **Commit date**: `Mon Nov 16 01:46:19 2026 +0100`
+  - **Commit author**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
+  - **Commit message**: `refactor(xai): serve cached model metadata from memory`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `6c3c4463`.
+> `upstream/main` has been successfully merged through commit `a52b443e`.
 
 ---
 
@@ -209,6 +209,13 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `e9696eb8` | `feat(ui): allow clicking tool name on hover to open compact details` | Allow clicking tool name on hover to open compact details |
 | `25fdaa52` | `feat(ui): refuse /workflow when task or code_execution is disabled by config` | Refuse /workflow when task or code_execution is disabled by config |
 | `55703657` | `Merge branch 'upstream/main' into main` | Merge upstream through `6c3c4463`, including model requested compaction (`maki.session.request_compact`), agent slot layer prompt-like pricing, blocking pool panic re-raising helper (`maki_storage::blocking`/`joined`), OAuth token refresh file lock protection, and `TurnComplete` host event message payload and deferred reply building, while preserving core fork customizations |
+| `fc3d982a` | `docs: update upstream tracking record to 6c3c4463` | Update the upstream tracking record to `6c3c4463` |
+| `c7b3e68b` | `fix(providers): keep fast capability across cache replay and config-only pricing` | Keep fast capability across cache replay and config-only pricing |
+| `f230c081` | `feat(build): gate telemetry behind off-by-default otel feature` | Gate OTel telemetry export behind an off-by-default `otel` Cargo feature |
+| `b2512aef` | `fix(task): measure picker rows in terminal cells so CJK names align` | Measure picker row width in terminal cells so CJK task names align properly |
+| `dd975567` | `feat(ui): hide task cost when show_cost is false` | Hide task cost in task picker and status when `show_cost` is false |
+| `a775e775` | `fix(library_help): render MCP union schema types` | Render MCP union / oneOf / anyOf schema types in `library_help` |
+| `22c44740` | `Merge branch 'upstream/main' into main` | Merge upstream through `a52b443e`, including dynamic cwd resolution for relative tool paths, async headless interactive session spawning with blocking instruction load, updated todo_write status summary, and tokio::process async jobs with non-IO line cutting in Lua runtime, while preserving core fork customizations |
 
 ---
 
