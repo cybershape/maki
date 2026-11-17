@@ -414,7 +414,8 @@ async fn new_session(
         0,
         None,
         current_thinking,
-    );
+    )
+    .await;
     #[cfg(feature = "otel")]
     maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(session_ref.as_str()));
     let options =
@@ -516,7 +517,8 @@ async fn load_session(
         used,
         restored_cost,
         current_thinking,
-    );
+    )
+    .await;
     #[cfg(feature = "otel")]
     maki_otel::emit::session_started(maki_otel::emit::START_RESUME, Some(started.as_str()));
     let options =
@@ -580,7 +582,7 @@ fn iso_from_epoch(secs: u64) -> Option<String> {
 /// alone is not a useful state: the event stream has exactly one reader, so it
 /// must be handed to the pump here rather than travel any further.
 #[allow(clippy::too_many_arguments)]
-fn start_session(
+async fn start_session(
     srv: &mut Server,
     params: &AcpParams,
     cwd: PathBuf,
@@ -637,7 +639,8 @@ fn start_session(
         },
         // `close_session` ends it, on a stop as on end of input.
         stop: CancelToken::none(),
-    });
+    })
+    .await;
     let session_ref = handle.session_id.clone();
     let usage = Arc::new(Mutex::new(SessionUsage {
         used: initial_used,

@@ -6521,6 +6521,7 @@ mod tests {
 
     #[test]
     fn task_scope_clears_only_its_jobs_on_drop() {
+        let _runtime = HOST_RUNTIME.enter();
         let lua = Lua::new();
         let scope = TaskScope::new(&lua, task_cell(None));
         let task_owner = JobOwner::Task(lock_cell(scope.handle()).id);
@@ -6580,6 +6581,7 @@ mod tests {
     #[test_case(LuaOwned::PendingLoad ; "pending_load")]
     #[test_case(LuaOwned::Waiting ; "waiting")]
     fn dropped_by_collector_releases_its_hold(owned: LuaOwned) {
+        let _runtime = HOST_RUNTIME.enter();
         let lua = Lua::new();
         match owned {
             LuaOwned::WaitLease => {
@@ -8210,6 +8212,7 @@ mod tests {
     ) -> (Result<String, String>, Duration) {
         let (tx, rx) = sync_channel(1);
         thread::spawn(move || {
+            let _runtime = HOST_RUNTIME.enter();
             let lua = Lua::new();
             let scope = TaskScope::new(&lua, cell);
             let owner = JobOwner::Task(lock_cell(scope.handle()).id);
@@ -8306,6 +8309,7 @@ mod tests {
     fn dispatch_async_wakes_from_its_park(wake: ParkedWake, expected: Result<String, String>) {
         let (tx, rx) = sync_channel(1);
         thread::spawn(move || {
+            let _runtime = HOST_RUNTIME.enter();
             let (trigger, token) = CancelToken::new();
             let mut cell = TaskCell::new(token, None, None);
             cell.deadline_secs = Some(DISPATCH_TEST_DEADLINE_SECS);
