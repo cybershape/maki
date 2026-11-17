@@ -1492,7 +1492,7 @@ pub struct UiConfig {
 
     #[config(
         default = true,
-        desc = "Show cost and pricing amounts in the UI (status bar, messages, usage modal, and model picker)"
+        desc = "Show cost and pricing amounts in the UI (status bar, messages, usage modal, model picker, and task list)"
     )]
     pub show_cost: bool,
 

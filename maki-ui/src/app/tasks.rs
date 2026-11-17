@@ -717,7 +717,11 @@ impl App {
                 focused: idx == self.active_chat,
                 started_at: chat.clock.as_ref().and_then(TaskClock::started_at),
                 ended_at: chat.clock.as_ref().and_then(TaskClock::ended_at),
-                cost: chat.task_id().and(chat.cost),
+                cost: self
+                    .ui_config
+                    .show_cost
+                    .then(|| chat.task_id().and(chat.cost))
+                    .flatten(),
             })
             .collect()
     }

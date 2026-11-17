@@ -6045,8 +6045,8 @@ tool spawned has its tool call's id, one a plugin opened with
   call that `/tasks` replaces with the tasks under it, so it gets no row and does
   not count as running. `started_at` and `ended_at` are Unix seconds: when the
   task started or moved, and when it finished. Tasks saved before they were
-  recorded lack them. `cost` is what a subagent billed so far, in dollars. The
-  main chat has none of the three.
+  recorded lack them. `cost` is what a subagent billed so far, in dollars,
+  absent when `ui.show_cost` is false. The main chat has none of the three.
 
 **Example:**
 

@@ -84,7 +84,7 @@ Other moved calls cannot prompt. A tool they call after the move is denied unles
 
 ### `/tasks`
 
-`/tasks` or `Ctrl+X` lists moved calls and subagents, with their running time and, for subagents, their cost. A moved `batch` lists each of its calls as a task of its own:
+`/tasks` or `Ctrl+X` lists moved calls and subagents, with their running time and, for subagents, their cost. Set [`ui.show_cost = false`](/docs/configuration/) to hide the cost. A moved `batch` lists each of its calls as a task of its own:
 
 ```
   Running

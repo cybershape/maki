@@ -2698,6 +2698,19 @@ fn plugin_task_restores_with_its_owner_and_cost() {
     assert!(app.chat_index.is_empty());
 }
 
+/// `show_cost = false` hides money everywhere, the task list included, while
+/// the clock stays.
+#[test]
+fn tasks_omit_cost_when_show_cost_is_false() {
+    let mut app = app_with_plugin_task();
+    plugin_event(&mut app, monitor_turn());
+    app.ui_config.show_cost = false;
+
+    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    assert_eq!(tasks[1].get(COST_KEY), None);
+    assert!(tasks[1][STARTED_AT_KEY].is_u64());
+}
+
 /// The picker's clock and price tag. The main chat reports none of them, and
 /// a reload keeps all of them, the clock as the checkpoint last saw it.
 #[test]
