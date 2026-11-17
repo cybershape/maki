@@ -11,6 +11,19 @@ Maki can export OpenTelemetry metrics and events to a collector you run. It is
 off by default, and once enabled it only ever sends data to the endpoint you
 configure.
 
+Telemetry is a compile-time feature. Release binaries are built without it, so
+the OpenTelemetry SDK is not part of the default binary. To use telemetry,
+build with the `otel` feature:
+
+```sh
+cargo build --release --features otel
+# or
+cargo install --locked --path . --features otel
+```
+
+A build without the feature logs a warning when `telemetry.enabled` is set and
+exports nothing.
+
 The format matches Claude Code's telemetry, down to the environment variable
 names, so a dashboard you already built mostly works.
 

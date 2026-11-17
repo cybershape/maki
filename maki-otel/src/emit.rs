@@ -12,9 +12,7 @@ use crate::logs::{
 };
 use crate::{handle, saturating_i64, shared};
 
-pub const START_FRESH: &str = "fresh";
-pub const START_RESUME: &str = "resume";
-pub const START_CONTINUE: &str = "continue";
+pub use maki_config::{START_CONTINUE, START_FRESH, START_RESUME};
 
 pub const TOKEN_INPUT: &str = "input";
 pub const TOKEN_OUTPUT: &str = "output";

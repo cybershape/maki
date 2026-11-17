@@ -7,6 +7,7 @@ use std::str::FromStr;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use maki_agent::session::{Resumed, StoredSession};
+use maki_config::{START_CONTINUE, START_FRESH, START_RESUME};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::{SessionClaim, SessionError};
@@ -51,7 +52,7 @@ impl Resolved {
         let claim = SessionClaim::fresh(storage);
         Self {
             id: SessionRef::from(claim.id()),
-            start_type: maki_otel::emit::START_FRESH,
+            start_type: START_FRESH,
             claim,
             session: None,
         }
@@ -120,8 +121,8 @@ impl Source {
 
     fn start_type(&self) -> &'static str {
         match self {
-            Self::Named(_) => maki_otel::emit::START_RESUME,
-            Self::Latest(_) => maki_otel::emit::START_CONTINUE,
+            Self::Named(_) => START_RESUME,
+            Self::Latest(_) => START_CONTINUE,
         }
     }
 
@@ -146,7 +147,7 @@ impl Source {
 /// the one stored transcript it may write over. A fork answers no by
 /// construction, and so does a `--session-id` naming anything but the session
 /// being resumed, which is why both land on a transcript of their own, report
-/// [`START_FRESH`](maki_otel::emit::START_FRESH), and find the original as off
+/// [`START_FRESH`], and find the original as off
 /// limits as any other session's.
 ///
 /// A run claims only the id it writes. The source of a copy is read without a
@@ -192,7 +193,7 @@ pub fn resolve(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<Resolved> {
     };
     Ok(Resolved {
         id,
-        start_type: maki_otel::emit::START_FRESH,
+        start_type: START_FRESH,
         claim,
         session,
     })
@@ -212,7 +213,7 @@ fn unwritten(id: SessionRef, forking: bool, storage: &StateDir) -> Result<Resolv
     let claim = claim_unused(&id, forking, storage)?;
     Ok(Resolved {
         id,
-        start_type: maki_otel::emit::START_FRESH,
+        start_type: START_FRESH,
         claim,
         session: None,
     })
@@ -389,9 +390,9 @@ mod tests {
             .len()
     }
 
-    #[test_case(&[], maki_otel::emit::START_FRESH, false ; "no flags is a fresh session")]
-    #[test_case(&["-r", ID_PLACEHOLDER], maki_otel::emit::START_RESUME, true ; "an explicit id resumes")]
-    #[test_case(&["-c"], maki_otel::emit::START_CONTINUE, true ; "continue takes the latest session")]
+    #[test_case(&[], START_FRESH, false ; "no flags is a fresh session")]
+    #[test_case(&["-r", ID_PLACEHOLDER], START_RESUME, true ; "an explicit id resumes")]
+    #[test_case(&["-c"], START_CONTINUE, true ; "continue takes the latest session")]
     fn flags_pick_a_session_and_a_start_type(
         args: &[&str],
         expected_start: &str,
@@ -457,7 +458,7 @@ mod tests {
         let resolved = resolve(&cli(&["-c"], MakiId::generate()), &cwd, &storage)
             .expect("missing history must not be an error");
 
-        assert_eq!(resolved.start_type, maki_otel::emit::START_FRESH);
+        assert_eq!(resolved.start_type, START_FRESH);
         assert!(resolved.session.is_none());
     }
 
@@ -473,7 +474,7 @@ mod tests {
         )
         .expect("fork resolves");
 
-        assert_eq!(resolved.start_type, maki_otel::emit::START_FRESH);
+        assert_eq!(resolved.start_type, START_FRESH);
         assert_ne!(resolved.id.id(), stored);
         assert_eq!(user_texts(&resolved), vec![STORED_MESSAGE]);
         assert_eq!(
@@ -558,7 +559,7 @@ mod tests {
         )
         .expect("a redirected write target resolves");
 
-        assert_eq!(resolved.start_type, maki_otel::emit::START_FRESH);
+        assert_eq!(resolved.start_type, START_FRESH);
         assert_eq!(resolved.id.id(), target);
         assert_eq!(user_texts(&resolved), vec![STORED_MESSAGE]);
         assert_eq!(

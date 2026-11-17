@@ -2,6 +2,7 @@ use std::mem;
 use std::path::Path;
 use std::slice::from_ref;
 use std::sync::Arc;
+#[cfg(feature = "otel")]
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
@@ -373,6 +374,7 @@ impl<'h> Agent<'h> {
             message_len = message.len(),
             "agent run started"
         );
+        #[cfg(feature = "otel")]
         if self.top_level() {
             // Tabs and frontends share one process, so attribution follows
             // whichever session actually runs a turn, not whoever last
@@ -435,8 +437,10 @@ impl<'h> Agent<'h> {
 
         // Every frontend enters here, so busy time is measured here; a turn
         // that failed was still busy.
+        #[cfg(feature = "otel")]
         let busy_since = Instant::now();
         let result = self.run_loop().await;
+        #[cfg(feature = "otel")]
         if self.top_level() {
             maki_otel::emit::active_time(busy_since.elapsed());
         }
@@ -445,6 +449,7 @@ impl<'h> Agent<'h> {
 
     /// Subagents are prompted by the machine inside the parent's window, so
     /// counting them would inflate prompts and busy time.
+    #[cfg(feature = "otel")]
     fn top_level(&self) -> bool {
         self.audience.contains(ToolAudience::MAIN)
     }

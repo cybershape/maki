@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
-maki-otel = { workspace = true }
+maki-otel = { workspace = true, optional = true }
 maki-highlight = { workspace = true }
 maki-markdown = { workspace = true }
 maki-providers = { workspace = true }
@@ -78,6 +78,9 @@ harness = false
 [[bench]]
 name = "streaming"
 harness = false
+
+[features]
+otel = ["dep:maki-otel"]
 
 [lints]
 workspace = true

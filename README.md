@@ -41,7 +41,7 @@
 - **Storage & history:** Timestamps recorded on session log records (`MessageRecord`, `ContentBlockRecord`); duration tracking for individual thinking blocks; per-project model memory (`<state>/projects/<project-id>/model`) and model thinking memory (`model_thinking.json`) that save and restore the last-used model (and its thinking level) for each project.
 - **Instructions:** Per-agent and global switches for which third-party instruction files (e.g. `CLAUDE.md`, `.cursorrules`) are loaded.
 - **Standby & sleep resilience:** Detects system sleep/wake transitions via cross-platform clock drift heuristics; automatically compensates tool deadlines by the sleep duration so background/foreground commands are not mistakenly killed on wake; enables TCP keepalive on HTTP connections; immediately aborts stale SSE streams on wake instead of waiting for a 30s timeout; applies a wake-up grace period so initial connection attempts during Wi-Fi re-association do not deplete the 5-retry limit; and triggers automatic HTTP MCP transport reconnection upon wake.
-- **CI & build:** Release builds run only on git tags for Windows, Linux, and macOS arm64 (no NetBSD and similar upstream targets); LTO disabled for non-release builds.
+- **CI & build:** Release builds run only on git tags for Windows, Linux, and macOS arm64 (no NetBSD and similar upstream targets); LTO disabled for non-release builds. Telemetry (`maki-otel` and the OpenTelemetry SDK) is behind an off-by-default `otel` cargo feature, so release binaries exclude it; build with `--features otel` to export telemetry, and a build without it warns when `telemetry.enabled` is set.
 
 <img src="./banner.png">
 

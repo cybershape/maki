@@ -23,7 +23,7 @@ maki-config = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
 maki-lua = { workspace = true }
-maki-otel = { workspace = true }
+maki-otel = { workspace = true, optional = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 serde = { workspace = true }
@@ -45,6 +45,14 @@ rustix = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }
+
+[features]
+otel = [
+  "dep:maki-otel",
+  "maki-agent/otel",
+  "maki-acp/otel",
+  "maki-ui/otel",
+]
 
 [workspace]
 members = [

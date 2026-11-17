@@ -415,6 +415,7 @@ async fn new_session(
         None,
         current_thinking,
     );
+    #[cfg(feature = "otel")]
     maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(session_ref.as_str()));
     let options =
         methods::session_config_options(&params.model, &srv.model_specs, current_thinking);
@@ -503,6 +504,7 @@ async fn load_session(
         .thinking
         .map(ThinkingConfig::from)
         .unwrap_or_else(|| ThinkingConfig::from(params.defaults.thinking));
+    #[cfg_attr(not(feature = "otel"), allow(unused_variables))]
     let started = start_session(
         srv,
         params,
@@ -515,6 +517,7 @@ async fn load_session(
         restored_cost,
         current_thinking,
     );
+    #[cfg(feature = "otel")]
     maki_otel::emit::session_started(maki_otel::emit::START_RESUME, Some(started.as_str()));
     let options =
         methods::session_config_options(&params.model, &srv.model_specs, current_thinking);

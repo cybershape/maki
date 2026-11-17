@@ -57,6 +57,7 @@ impl Interrupt {
     /// have, and returns when none was caught.
     pub fn exit_if_caught(&self) {
         if let Some(&signal) = self.caught.get() {
+            #[cfg(feature = "otel")]
             maki_otel::shutdown(crate::TELEMETRY_SHUTDOWN_TIMEOUT);
             process::exit(exit_code(signal));
         }

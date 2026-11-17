@@ -828,11 +828,17 @@ impl PermissionManager {
                     reason: String,
                     guidance: Option<String>,
                     plugin: Option<Arc<str>>| {
+            #[cfg(feature = "otel")]
             maki_otel::emit::tool_decision(&tool_string, maki_otel::emit::DECISION_REJECT, source);
+            #[cfg(not(feature = "otel"))]
+            let _ = source;
             PermissionError::denied(&tool_string, &scope_display(), reason, guidance, plugin)
         };
         let allowed = |source: &'static str| {
+            #[cfg(feature = "otel")]
             maki_otel::emit::tool_decision(&tool_string, maki_otel::emit::DECISION_ACCEPT, source);
+            #[cfg(not(feature = "otel"))]
+            let _ = source;
             Ok(None)
         };
         let by_rule = || {

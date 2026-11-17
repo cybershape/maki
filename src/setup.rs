@@ -224,16 +224,29 @@ pub fn install_panic_log_hook() {
 /// setting is a warning in the log, not an error to the user. Call this after
 /// `init_logging` or the warning has nowhere to go.
 pub fn init_telemetry(config: &maki_config::TelemetryConfig) {
+    #[cfg(feature = "otel")]
     if let Err(error) = maki_otel::init(config) {
         tracing::warn!(%error, "telemetry disabled");
+    }
+    #[cfg(not(feature = "otel"))]
+    if config.enabled == Some(true) {
+        tracing::warn!(
+            cargo_feature = "otel",
+            "telemetry is configured but this build was compiled without it"
+        );
     }
 }
 
 /// Headless runs without a session id still count, they just stay
 /// unattributed.
 pub fn report_session_start(start_type: &'static str, session_id: Option<impl Display>) {
-    let id = session_id.map(|id| id.to_string());
-    maki_otel::emit::session_started(start_type, id.as_deref());
+    #[cfg(feature = "otel")]
+    {
+        let id = session_id.map(|id| id.to_string());
+        maki_otel::emit::session_started(start_type, id.as_deref());
+    }
+    #[cfg(not(feature = "otel"))]
+    let _ = (start_type, session_id);
 }
 
 /// The writer every event goes through.

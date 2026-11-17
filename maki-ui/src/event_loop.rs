@@ -1945,6 +1945,7 @@ impl<'t> EventLoop<'t> {
         };
         let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
         let id = self.sessions[idx].id();
+        #[cfg(feature = "otel")]
         maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(&id.to_string()));
         if let Some(reason) = fallback {
             self.sessions[idx].app.flash(reason);
@@ -2354,7 +2355,9 @@ impl<'t> EventLoop<'t> {
         let slot = self.sessions[idx].slot.load_full();
         let fork = self.push_runtime(self.ctx.spawn_runtime(open, slot));
         self.set_focused(fork);
+        #[cfg(feature = "otel")]
         let id = self.sessions[self.focused].id();
+        #[cfg(feature = "otel")]
         maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(&id.to_string()));
         self.focused_app()
             .flash(FORKED_MSG.replace("{key}", key::SESSIONS.label));

@@ -49,21 +49,32 @@ const MCP_SUMMARY_PREFIX: &str = "mcp: ";
 const SOURCE_NATIVE: &str = "native";
 const SOURCE_LOCAL: &str = "local";
 const SOURCE_MCP: &str = "mcp";
+#[cfg(any(feature = "otel", test))]
 const SOURCE_UNKNOWN: &str = "unknown";
-const BASH_TOOL: &str = "bash";
-const BASH_COMMAND_FIELD: &str = "command";
-const GIT_COMMIT: &str = "git commit";
-const GH_PR_CREATE: &str = "gh pr create";
-
 const ERROR_CANCELLED: &str = "cancelled";
+
+#[cfg(feature = "otel")]
+const BASH_TOOL: &str = "bash";
+#[cfg(feature = "otel")]
+const BASH_COMMAND_FIELD: &str = "command";
+#[cfg(feature = "otel")]
+const GIT_COMMIT: &str = "git commit";
+#[cfg(feature = "otel")]
+const GH_PR_CREATE: &str = "gh pr create";
+#[cfg(any(feature = "otel", test))]
 const ERROR_TIMEOUT: &str = "timeout";
+#[cfg(any(feature = "otel", test))]
 const ERROR_DENIED: &str = "permission_denied";
+#[cfg(any(feature = "otel", test))]
 const ERROR_NOT_FOUND: &str = "not_found";
+#[cfg(any(feature = "otel", test))]
 const ERROR_INVALID_INPUT: &str = "invalid_input";
+#[cfg(any(feature = "otel", test))]
 const ERROR_OTHER: &str = "error";
 
 /// A telemetry counter is not worth an unbounded diff; past this,
 /// `similar` returns a coarser but still valid one.
+#[cfg(any(feature = "otel", test))]
 const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// The longest window a chain gets. An input chain ends sooner when its call
@@ -187,7 +198,10 @@ pub async fn run(
         }
     };
 
+    #[cfg(feature = "otel")]
     let source = maki_otel::enabled().then(|| resolved.route.source());
+    #[cfg(not(feature = "otel"))]
+    let source = None;
     let started = Instant::now();
     let Ran { mut done, moved } = run_inner(
         resolved,
@@ -204,6 +218,7 @@ pub async fn run(
         hook,
         ctx,
         origin,
+        #[cfg(feature = "otel")]
         tool: name,
         source,
     };
@@ -271,6 +286,7 @@ struct OutputPipeline<'a> {
     hook: Option<Hook<'a>>,
     ctx: &'a ToolContext,
     origin: CallOrigin,
+    #[cfg(feature = "otel")]
     tool: &'a str,
     source: Option<Cow<'static, str>>,
 }
@@ -281,6 +297,7 @@ enum Filtered {
     /// carry the call's own output, like the last lines of a command.
     Receipt,
     /// What the call ended with, the only one telemetry reports.
+    #[cfg_attr(not(feature = "otel"), allow(dead_code))]
     Final(Duration),
 }
 
@@ -293,9 +310,12 @@ impl OutputPipeline<'_> {
         if self.origin.is_model() {
             attach_call_instructions(self.ctx, done);
         }
+        #[cfg(feature = "otel")]
         if let (Some(source), Filtered::Final(took)) = (&self.source, filtered) {
             report(done, self.tool, source, input, took);
         }
+        #[cfg(not(feature = "otel"))]
+        let _ = filtered;
     }
 
     /// The call's own cancel belongs to its turn: a stop fires it before the
@@ -342,6 +362,7 @@ impl MovedPipeline {
                 .map(|layer| layer.bind(&self.ctx, &self.tool)),
             ctx: &self.ctx,
             origin: self.origin,
+            #[cfg(feature = "otel")]
             tool: &self.tool,
             source: self.source.clone(),
         }
@@ -655,6 +676,7 @@ enum Route<'a> {
 impl Route<'_> {
     /// Registry tools report the plugin behind them, because "native" alone
     /// tells whoever reads the metric nothing.
+    #[cfg(any(feature = "otel", test))]
     fn source(&self) -> Cow<'static, str> {
         match self {
             Self::Native(entry) => entry.source.as_log_field(),
@@ -1413,6 +1435,7 @@ pub(super) async fn process_tool_calls(
 
 /// Low-cardinality buckets, because a raw error message would give the
 /// collector a new attribute value on every call.
+#[cfg(any(feature = "otel", test))]
 fn classify_error(text: &str) -> &'static str {
     let text = text.to_ascii_lowercase();
     if text.contains("cancel") {
@@ -1430,6 +1453,7 @@ fn classify_error(text: &str) -> &'static str {
     }
 }
 
+#[cfg(any(feature = "otel", test))]
 fn changed_lines(before: &str, after: &str) -> (u64, u64) {
     let mut added = 0;
     let mut removed = 0;
@@ -1448,6 +1472,7 @@ fn changed_lines(before: &str, after: &str) -> (u64, u64) {
 
 /// The same heuristic Claude Code uses: look at what the shell was asked to
 /// do, not at what it printed.
+#[cfg(feature = "otel")]
 fn git_activity(name: &str, input: &Value) {
     if name != BASH_TOOL {
         return;
@@ -1463,6 +1488,7 @@ fn git_activity(name: &str, input: &Value) {
     }
 }
 
+#[cfg(feature = "otel")]
 fn report(done: &ToolDoneEvent, name: &str, source: &str, input: &Value, took: Duration) {
     let error_text = done.is_error.then(|| done.output.as_text());
     let tool_input = maki_otel::logs_tool_details().then(|| input.to_string());

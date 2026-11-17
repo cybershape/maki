@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
-maki-otel = { workspace = true }
+maki-otel = { workspace = true, optional = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
 agent-client-protocol-schema = { workspace = true }
@@ -23,6 +23,9 @@ color-eyre = { workspace = true }
 [dev-dependencies]
 test-case = { workspace = true }
 tempfile = { workspace = true }
+
+[features]
+otel = ["dep:maki-otel"]
 
 [lints]
 workspace = true

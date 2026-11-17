@@ -342,6 +342,7 @@ pub(crate) async fn stream_with_retry(
         match result {
             Ok(mut r) => {
                 canonicalize_tool_names(&mut r.message);
+                #[cfg(feature = "otel")]
                 emit_api_request(model, &r, opts, started.elapsed());
                 if let Some(gauge) = gauge.as_deref_mut() {
                     gauge.record(r.usage.total_input().min(u32::MAX as u64) as u32);
@@ -363,6 +364,7 @@ pub(crate) async fn stream_with_retry(
             }
             Err(e) => {
                 attempt += 1;
+                #[cfg(feature = "otel")]
                 emit_api_error(model, &e, attempt, started.elapsed());
                 if let AgentError::SystemSleep(_) = &e {
                     retry.note_wake(crate::sleep::WAKE_GRACE_DURATION);
@@ -447,6 +449,7 @@ pub(crate) async fn stream_with_retry(
     }
 }
 
+#[cfg(feature = "otel")]
 fn emit_api_request(model: &Model, r: &StreamResponse, opts: RequestOptions, took: Duration) {
     if !maki_otel::enabled() {
         return;
@@ -465,6 +468,7 @@ fn emit_api_request(model: &Model, r: &StreamResponse, opts: RequestOptions, too
     });
 }
 
+#[cfg(feature = "otel")]
 fn emit_api_error(model: &Model, error: &AgentError, attempt: u32, took: Duration) {
     if !maki_otel::enabled() {
         return;
@@ -485,6 +489,7 @@ fn emit_api_error(model: &Model, error: &AgentError, attempt: u32, took: Duratio
 /// A provider's error body is often echoed request content (quoted message
 /// text, masked keys, whatever a gateway returns), so only the status is
 /// reported. Every other variant is generated locally.
+#[cfg(any(feature = "otel", test))]
 fn error_description(error: &AgentError) -> String {
     match error {
         AgentError::Api { status, .. } => format!("API error ({status})"),
@@ -506,6 +511,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(test)]
     const SECRET_BODY: &str = "messages.0.content: \"my private prompt\", key sk-abc";
     const FIRST_SPAN_MS: u64 = 1500;
     const SECOND_SPAN_MS: u64 = 250;
@@ -744,6 +750,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(test)]
     fn a_reported_api_error_leaves_the_provider_body_behind() {
         let error = AgentError::api(400, SECRET_BODY);
         let reported = error_description(&error);

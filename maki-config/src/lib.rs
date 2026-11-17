@@ -17,6 +17,13 @@ use strum::{EnumString, VariantArray};
 use thiserror::Error;
 use tracing::warn;
 
+/// Session start types reported to telemetry. They live here so a build
+/// without the `otel` feature still resolves them; `maki_otel::emit`
+/// re-exports them.
+pub const START_FRESH: &str = "fresh";
+pub const START_RESUME: &str = "resume";
+pub const START_CONTINUE: &str = "continue";
+
 const PROJECT_DIR: &str = ".maki";
 const PERMISSIONS_FILE: &str = "permissions.toml";
 const ENV_FILE: &str = ".env";

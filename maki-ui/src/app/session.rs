@@ -615,6 +615,7 @@ impl App {
         self.state.session = Arc::new(session);
         self.state.claim = claim;
         self.reset_ui_chrome();
+        #[cfg(feature = "otel")]
         maki_otel::emit::session_started(
             maki_otel::emit::START_FRESH,
             Some(&self.state.session.id.to_string()),

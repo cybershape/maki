@@ -559,6 +559,7 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
                     "plugin host and teardown joined"
                 );
                 if code != 0 {
+                    #[cfg(feature = "otel")]
                     maki_otel::shutdown(crate::TELEMETRY_SHUTDOWN_TIMEOUT);
                     std::process::exit(code);
                 }
