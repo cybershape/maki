@@ -42,6 +42,9 @@ local MAIN = { MAIN_ICON, "accent" }
 local board = nil
 
 local function dispw(s)
+  if maki.ui and maki.ui.display_width then
+    return maki.ui.display_width(s)
+  end
   return utf8.len(s) or #s
 end
 
@@ -106,7 +109,7 @@ local function render()
   local words = ListPicker.split_words(board.input:value())
   -- Over every task, not the filtered rows, so columns hold still while a
   -- query is typed.
-  local columns = Rows.columns(board.tasks, board.drawn_at, maki.ui.humantime)
+  local columns = Rows.columns(board.tasks, board.drawn_at, maki.ui.humantime, dispw)
   for _, row in ipairs(board.rows) do
     if row.section then
       lines[#lines + 1] = { { "  " .. row.section, "keybind_section" } }
@@ -129,7 +132,7 @@ local function render()
     -- columns. The name gives way first, so the owner on the right stays in
     -- view.
     local fixed = 2 + dispw(icon) + dispw(hint)
-    local owner = Rows.trailer(task, board.drawn_at, 0, maki.ui.humantime, columns)
+    local owner = Rows.trailer(task, board.drawn_at, 0, maki.ui.humantime, columns, dispw)
     local match_style = selected and "match_selected" or "match"
     local spans = ListPicker.highlight_spans(task.name, words, base, match_style)
     local name_width = 0
@@ -143,7 +146,7 @@ local function render()
     -- Rows with nothing on the right would otherwise end short of the border
     -- and read as padding on one side only, so the bar runs the full width.
     local room = board.width - fixed - name_width
-    local trailer = Rows.trailer(task, board.drawn_at, room, maki.ui.humantime, columns)
+    local trailer = Rows.trailer(task, board.drawn_at, room, maki.ui.humantime, columns, dispw)
     local trail = room - dispw(trailer)
     if trail > 0 then
       line[#line + 1] = { string.rep(" ", trail), base }

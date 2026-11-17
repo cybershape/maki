@@ -1,7 +1,8 @@
 //! Drives a Lua picker plugin against a fake `maki`, pressing scripted keys,
 //! so its key handling is tested without a terminal.
 
-use mlua::{Function, Lua};
+use mlua::{Function, Lua, Table};
+use unicode_width::UnicodeWidthStr;
 
 pub(crate) const DOWN: &str = "<Down>";
 pub(crate) const UP: &str = "<Up>";
@@ -41,6 +42,19 @@ const PICKER_PRELUDE: &str = "
         return win
     end
 ";
+
+/// Installs the real `maki.ui.display_width` into the fake `maki.ui` after
+/// {fake_maki} ran, so picker layout tests measure CJK the way the terminal
+/// does instead of counting bytes.
+pub(crate) fn real_display_width(lua: &Lua) {
+    let maki: Table = lua.globals().get("maki").unwrap();
+    let ui: Table = maki.get("ui").unwrap();
+    ui.set(
+        "display_width",
+        lua.create_function(|_, text: String| Ok(text.width())).unwrap(),
+    )
+    .unwrap();
+}
 
 /// Installs the shared picker libraries and {modules} behind a fake
 /// `require`, runs {fake_maki} to define the `maki` global, then loads

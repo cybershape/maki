@@ -88,10 +88,6 @@ function M.stopped_parent(task, tasks)
   return parent and alive(parent.status) and parent or nil
 end
 
-local function dispw(s)
-  return utf8.len(s) or #s
-end
-
 -- How long the task has run (its total once finished), what it cost, and who
 -- runs it: the tool behind its call, or else the plugin that opened it.
 -- {humantime} formats seconds, passed in so this file stays free of host
@@ -107,8 +103,9 @@ local function cells(task, now, humantime)
 end
 
 -- The widest cell of each kind over {tasks}, so every trailer lays out in the
--- same columns and the eye can run down each.
-function M.columns(tasks, now, humantime)
+-- same columns and the eye can run down each. {dispw} measures terminal cells,
+-- passed in so this file stays free of host calls.
+function M.columns(tasks, now, humantime, dispw)
   local widths = { time = 0, cost = 0, owner = 0 }
   for _, task in ipairs(tasks) do
     local cell = cells(task, now, humantime)
@@ -119,11 +116,11 @@ function M.columns(tasks, now, humantime)
   return widths
 end
 
-local function pad_left(s, width)
+local function pad_left(s, width, dispw)
   return string.rep(" ", width - dispw(s)) .. s
 end
 
-local function pad_right(s, width)
+local function pad_right(s, width, dispw)
   return s .. string.rep(" ", width - dispw(s))
 end
 
@@ -133,20 +130,20 @@ local COLUMNS = { { "time", pad_left }, { "cost", pad_left }, { "owner", pad_rig
 
 -- The dim text at a row's right edge, in {columns} from M.columns(). A row
 -- with less than {room} columns to spare keeps only the owner.
-function M.trailer(task, now, room, humantime, columns)
+function M.trailer(task, now, room, humantime, columns, dispw)
   local cell = cells(task, now, humantime)
   local parts = {}
   for _, column in ipairs(COLUMNS) do
     local kind, pad = column[1], column[2]
     if columns[kind] > 0 then
-      parts[#parts + 1] = pad(cell[kind], columns[kind])
+      parts[#parts + 1] = pad(cell[kind], columns[kind], dispw)
     end
   end
   local full = #parts > 0 and table.concat(parts, COL_GAP) .. " " or ""
   if dispw(full) < room then
     return full
   end
-  return columns.owner > 0 and pad_right(cell.owner, columns.owner) .. " " or ""
+  return columns.owner > 0 and pad_right(cell.owner, columns.owner, dispw) .. " " or ""
 end
 
 -- Whether a row's running time still ticks.

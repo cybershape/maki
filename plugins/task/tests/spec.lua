@@ -180,8 +180,22 @@ local function secs(n)
   return n .. "s"
 end
 
-local function trailer(task, room, tasks)
-  return Rows.trailer(task, NOW, room, secs, Rows.columns(tasks or { task }, NOW, secs))
+local function codepoints(s)
+  return utf8.len(s) or #s
+end
+
+-- Two cells per CJK char, like the host's display_width.
+local function cells_wide(s)
+  local w = 0
+  for _, cp in utf8.codes(s) do
+    w = w + (cp >= 0x4E00 and cp <= 0x9FFF and 2 or 1)
+  end
+  return w
+end
+
+local function trailer(task, room, tasks, dispw)
+  dispw = dispw or codepoints
+  return Rows.trailer(task, NOW, room, secs, Rows.columns(tasks or { task }, NOW, secs, dispw), dispw)
 end
 
 case("a_running_task_shows_its_running_time_and_cost", function()
@@ -220,6 +234,19 @@ case("trailers_line_up_in_columns_over_every_task", function()
   eq(trailer(loaded, WIDE, tasks), "       $12.500  task ")
   eq(trailer(MAIN, WIDE, tasks), "                     ", "the main chat keeps the columns blank")
   eq(trailer(loaded, 8, tasks), "task ", "a narrow row keeps only the owner")
+end)
+
+-- A CJK owner takes two cells per char, so its column pads by cells, not by
+-- codepoints, and every trailer still ends on the same edge.
+case("cjk_owners_pad_by_terminal_cells", function()
+  local wide = { id = "toolu_12", name = "审查", status = "done", cost = 0.25, tool = "审查工具" }
+  local plain = { id = "toolu_13", name = "lint", status = "done", cost = 1, tool = "ci" }
+  local tasks = { wide, plain }
+  local wide_trailer = trailer(wide, WIDE, tasks, cells_wide)
+  local plain_trailer = trailer(plain, WIDE, tasks, cells_wide)
+  eq(cells_wide(wide_trailer), cells_wide(plain_trailer), "both trailers occupy the same cells")
+  eq(wide_trailer, "$0.250  审查工具 ")
+  eq(plain_trailer, "$1.000  ci       ")
 end)
 
 case("only_a_live_task_with_a_start_keeps_the_clock_ticking", function()

@@ -278,7 +278,7 @@ lua_table! {
 mod tests {
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, UiReply};
-    use crate::api::util::fake_picker::{DOWN, ESC, PAGE_DOWN, UP, load_picker};
+    use crate::api::util::fake_picker::{DOWN, ESC, PAGE_DOWN, UP, load_picker, real_display_width};
     use mlua::Table;
     use serde_json::json;
     use std::thread::JoinHandle;
@@ -537,6 +537,49 @@ mod tests {
         assert_eq!(lua.globals().get::<String>("stopped_id").unwrap(), selected);
     }
 
+    const CJK_NAME: &str = "审查队列合并约束";
+    const FAKE_WIN_WIDTH: usize = 80;
+    const ROW_WIDTH_SCRIPT: &str = "
+        local widths = {}
+        for _, line in ipairs(drawn) do
+            local first = line[1] and line[1][1] or ''
+            if first == '  ' and #line > 1 then
+                local w = 0
+                for _, span in ipairs(line) do
+                    w = w + maki.ui.display_width(span[1])
+                end
+                widths[#widths + 1] = w
+            end
+        end
+        return widths
+    ";
+
+    /// A CJK name costs two cells per char. Counting codepoints instead pads
+    /// the row past the border by one cell per char, so the trailers drift
+    /// right row by row. Every task row must fill the window exactly.
+    #[test]
+    fn tasks_picker_rows_fill_the_window_with_cjk_names() {
+        let lua = picker_lua(None, &[ESC], &[TASK_ID]);
+        lua.load(format!(
+            "tasks[2].name = '{CJK_NAME}'
+             tasks[2].started_at = os.time() - 17
+             tasks[2].cost = 0.03
+             tasks[3] = {{id = '{DONE_ID}', session = chat_session, name = 'lint',
+                         status = 'done', started_at = os.time() - 40,
+                         ended_at = os.time() - 10, cost = 0.25}}
+             open_tasks()"
+        ))
+        .exec()
+        .unwrap();
+
+        let widths: Vec<usize> = lua.load(ROW_WIDTH_SCRIPT).eval().unwrap();
+        assert_eq!(widths.len(), 3, "expected one width per task row");
+        assert!(
+            widths.iter().all(|&w| w == FAKE_WIN_WIDTH),
+            "every task row must fill the window, got {widths:?}"
+        );
+    }
+
     /// Runs `plugins/task/picker.lua` against a fake `maki` that lists the main
     /// chat and then {task_ids} in spawn order, all working, and presses {keys}.
     fn picker_lua(stop_error: Option<&str>, keys: &[&str], task_ids: &[&str]) -> Lua {
@@ -555,7 +598,7 @@ mod tests {
             &lua,
             keys,
             r#"
-            local tasks = {{id = 'main', session = chat_session, name = 'chat', focused = true}}
+            tasks = {{id = 'main', session = chat_session, name = 'chat', focused = true}}
             for _, id in ipairs(task_ids) do
                 tasks[#tasks + 1] = {id = id, session = chat_session, name = task_name, status = 'working'}
             end
@@ -571,9 +614,9 @@ mod tests {
                     end,
                 },
                 ui = {
-                    buf = function() return {set_lines = function() end} end,
+                    buf = function() return {set_lines = function(_, lines) drawn = lines end} end,
                     open_win = function() return fake_win(picker_keys) end,
-                    display_width = function(s) return #s end,
+                    humantime = function(n) return n .. 's' end,
                     flash = function(s) flashed = s end,
                 },
                 api = {
@@ -589,6 +632,7 @@ mod tests {
             )],
             include_str!("../../../plugins/task/picker.lua"),
         );
+        real_display_width(&lua);
         lua
     }
 }
