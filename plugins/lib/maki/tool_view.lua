@@ -16,6 +16,7 @@ ToolView.__index = ToolView
 local BODY_CHROME_COLS = 5
 local MIN_MD_WIDTH = 20
 local SEPARATOR = { { "──────", "dim" } }
+local HEADER_HIDDEN = "... (%d more lines) (click to expand)"
 
 local function format_line_nr(fmt, idx)
   return { string.format(fmt, idx), "line_nr" }
@@ -104,8 +105,10 @@ end
 
 -- opts: max_lines (default 80) shown while collapsed, keep "head"|"tail"
 -- (default "tail"), max_expand_lines (default 2000) kept for expansion,
--- max_line_bytes (optional) per-line byte cap. Lines are stored already cut,
--- so a run of huge lines costs no more than short ones while kept for expansion.
+-- max_line_bytes (optional) per-line byte cap, max_header_lines (optional)
+-- header line cap while collapsed; a click expands the header too. Lines are
+-- stored already cut, so a run of huge lines costs no more than short ones
+-- while kept for expansion.
 -- With max_lines 0 only the set_header lines show until a click expands the
 -- view. The UI puts the line count in the tool header, so the row still says
 -- how much is hidden.
@@ -116,6 +119,7 @@ function ToolView.new(buf, opts)
   self.keep = (opts and opts.keep) or "tail"
   self.max_expand_lines = (opts and opts.max_expand_lines) or 2000
   self.max_line_bytes = (opts and opts.max_line_bytes) or nil
+  self.max_header_lines = (opts and opts.max_header_lines) or nil
   self.header = {}
   self.ring = {}
   self.ring_start = 1
@@ -239,8 +243,15 @@ end
 function ToolView:flush()
   local lines = {}
 
-  for _, h in ipairs(self.header) do
-    lines[#lines + 1] = truncate_line(h, self.max_line_bytes)
+  local shown = #self.header
+  if not self.expanded and self.max_header_lines and shown > self.max_header_lines then
+    shown = self.max_header_lines
+  end
+  for i = 1, shown do
+    lines[#lines + 1] = truncate_line(self.header[i], self.max_line_bytes)
+  end
+  if shown < #self.header then
+    lines[#lines + 1] = { { HEADER_HIDDEN:format(#self.header - shown), "dim" } }
   end
   if #self.header > 0 and (self.expanded or self.max > 0) then
     lines[#lines + 1] = SEPARATOR
@@ -277,7 +288,7 @@ function ToolView:flush()
 
   -- The header says what runs, so a row that moved to the background keeps
   -- it. The separator stays out: with the output gone it divides nothing.
-  self.buf:set_lines(lines, { head = #self.header })
+  self.buf:set_lines(lines, { head = shown })
 end
 
 function ToolView:update_line(all_idx, line)

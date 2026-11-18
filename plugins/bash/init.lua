@@ -37,6 +37,7 @@ local EARLIER_DROPPED = "[%d earlier lines dropped]"
 local FULL_OUTPUT_PATTERN = "^(.*)\nFull output: ([^\n]+)$"
 local FULL_OUTPUT_LINE = "Full output: %s"
 local EXPIRE_BACKGROUND = { expire = "background" }
+local HEADER_LINES = 1
 
 local rtk_available
 local fallback_log_seq = 0
@@ -231,6 +232,7 @@ local function create_bash_view(command, ctx)
     max_lines = (tol and tol.bash) or 3,
     keep = "tail",
     max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
+    max_header_lines = HEADER_LINES,
   })
   view:set_header(maki.split(command, "\n"))
   maki.async.run(function()

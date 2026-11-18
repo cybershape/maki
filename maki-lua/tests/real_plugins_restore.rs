@@ -249,6 +249,35 @@ fn bash_title_leaves_out_the_session_directory() {
     assert_eq!(r.header, "print hi");
 }
 
+const MULTILINE_COMMAND: &str = "echo one\necho two\necho three";
+const HEADER_NOTICE: &str = "... (2 more lines) (click to expand)";
+
+/// A heredoc-sized command shows one line plus a notice; a click on the
+/// command row expands the full script.
+#[test]
+fn bash_multiline_command_collapses_to_one_header_line() {
+    let host = load_host();
+    let input = json!({ "command": MULTILINE_COMMAND });
+    let collapsed = restore(
+        &host,
+        "bash",
+        input.clone(),
+        "one\ntwo\nthree",
+        None,
+        Vec::new(),
+    );
+    let text = &collapsed.body;
+    assert!(text.lines().next().unwrap().contains("echo one"), "{text}");
+    assert!(text.contains(HEADER_NOTICE), "{text}");
+    assert!(!text.contains("echo two"), "{text}");
+
+    let clicked = restore(&host, "bash", input, "one\ntwo\nthree", None, vec![1]);
+    let text = &clicked.body;
+    assert!(text.contains("echo two"), "{text}");
+    assert!(text.contains("echo three"), "{text}");
+    assert!(!text.contains(HEADER_NOTICE), "{text}");
+}
+
 /// Phase 1: children render through their own real views (grep gutter,
 /// bash command header), not the raw-llm fallback. Phase 2: a replayed
 /// click inside grep's range reaches its real toggle and expands only it.
