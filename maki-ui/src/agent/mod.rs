@@ -218,7 +218,7 @@ impl AgentHandles {
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
-        // the last old `QueueSender` alive and the old loop parks in `recv_notify` forever.
+        // the last old `QueueSender` alive and the old loop parks on its notify receiver forever.
         self.apply_to_app(app);
         // The first restored prompt can start a run at once, and that run
         // has to drain the lost notices with it.
@@ -268,7 +268,7 @@ fn spawn_agent_internal(
     reload_auth: bool,
 ) -> AgentHandles {
     let (answer_tx, answer_rx) = unbounded_channel::<String>();
-    let (queue_tx, queue_rx) = shared_queue::queue();
+    let (queue_tx, queue_rx, notify_rx) = shared_queue::queue();
     // Seeded empty because `AgentLoop::new` below publishes the real snapshot
     // synchronously, before any handle escapes.
     let shared_history: SharedMessages =
@@ -288,6 +288,7 @@ fn spawn_agent_internal(
             agent_tx: agent_tx.clone(),
             answer_rx,
             queue: Arc::new(queue_rx),
+            notify_rx,
             cancels: Arc::clone(&cancels),
             mailbox: mailbox.clone(),
             subagent_cancels: Arc::clone(&subagent_cancels),

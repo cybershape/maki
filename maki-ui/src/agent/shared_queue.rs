@@ -1,7 +1,7 @@
 //! Queue of work handed from the UI to the agent loop.
 //!
 //! Shutdown rides on `Drop`: when the last [`QueueSender`] goes away, the
-//! notify channel closes, so the receiver's `recv_notify` wakes with `None`
+//! notify channel closes, so the loop's notify receiver wakes with `None`
 //! and the agent loop falls out of its main loop on its own. That way
 //! nobody needs a separate "please stop" flag, and callers can't forget to
 //! set it.
@@ -14,7 +14,6 @@ use maki_agent::{
     AgentInput, AgentMode, CompactReason, EarlierInput, ExtractedCommand, ImageSource,
     InterruptSource,
 };
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::components::input::Submission;
@@ -195,10 +194,9 @@ pub(crate) struct QueueSender {
 
 pub(crate) struct QueueReceiver {
     items: Items,
-    notify_rx: AsyncMutex<Receiver<()>>,
 }
 
-pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
+pub(crate) fn queue() -> (QueueSender, QueueReceiver, Receiver<()>) {
     let (notify_tx, notify_rx) = channel(1);
     let items: Items = Arc::new(Mutex::new(VecDeque::new()));
     (
@@ -206,10 +204,8 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
             items: Arc::clone(&items),
             notify_tx,
         },
-        QueueReceiver {
-            items,
-            notify_rx: AsyncMutex::new(notify_rx),
-        },
+        QueueReceiver { items },
+        notify_rx,
     )
 }
 
@@ -316,10 +312,6 @@ impl QueueReceiver {
         if items.is_empty() {
             publish();
         }
-    }
-
-    pub(crate) async fn recv_notify(&self) -> Option<()> {
-        self.notify_rx.lock().await.recv().await
     }
 }
 
@@ -471,7 +463,7 @@ mod tests {
     #[test_case(QueueItem::Message(QueuedInput { displayed: true, ..queued(FIRST, 0) }), false ; "displayed_message_hidden")]
     #[test_case(compact(None), true  ; "compact_visible")]
     fn panel_visibility(item: QueueItem, visible: bool) {
-        let (tx, _rx) = queue();
+        let (tx, _rx, _notify_rx) = queue();
         tx.push(item);
         let expected = usize::from(visible);
         assert_eq!(tx.panel_len(), expected);
@@ -480,7 +472,7 @@ mod tests {
 
     #[test]
     fn nonempty_queue_does_not_publish_drain() {
-        let (tx, rx) = queue();
+        let (tx, rx, _notify_rx) = queue();
         tx.push(message(FIRST));
         let called = Cell::new(false);
 
@@ -490,7 +482,7 @@ mod tests {
 
     #[test]
     fn drain_publication_is_serialized_with_push() {
-        let (tx, rx) = queue();
+        let (tx, rx, _notify_rx) = queue();
         let barrier = Arc::new(Barrier::new(2));
         let order = Arc::new(Mutex::new(Vec::new()));
         let worker_barrier = Arc::clone(&barrier);
@@ -518,7 +510,7 @@ mod tests {
     #[test_case(vec![plan_message(FIRST), message(SECOND)], vec![vec![FIRST], vec![SECOND]] ; "mode_change_splits_the_drain")]
     #[test_case(vec![message(FIRST), workflow_message(SECOND), message(THIRD)], vec![vec![FIRST], vec![SECOND], vec![THIRD]] ; "workflow_change_splits_the_drain")]
     fn pop_run_groups_the_queue_into_turns(items: Vec<QueueItem>, expected: Vec<Vec<&str>>) {
-        let (tx, rx) = queue();
+        let (tx, rx, _notify_rx) = queue();
         for item in items {
             tx.push(item);
         }
@@ -538,7 +530,7 @@ mod tests {
 
     #[test]
     fn poll_only_consumes_steer_and_compact_not_queued_messages() {
-        let (tx, rx) = queue();
+        let (tx, rx, _notify_rx) = queue();
         tx.push(message(FIRST));
         assert!(
             rx.poll().is_none(),
@@ -559,7 +551,7 @@ mod tests {
 
     #[test]
     fn convert_between_steer_and_queue() {
-        let (tx, rx) = queue();
+        let (tx, rx, _notify_rx) = queue();
         tx.push(message(FIRST));
         assert!(rx.poll().is_none());
 
@@ -577,7 +569,7 @@ mod tests {
 
     #[test]
     fn poll_hands_the_whole_steer_run_to_one_turn() {
-        let (tx, rx) = queue();
+        let (tx, rx, _notify_rx) = queue();
         for text in [FIRST, SECOND, THIRD] {
             tx.push(steer(text));
         }
@@ -593,7 +585,7 @@ mod tests {
 
     #[test]
     fn poll_carries_compact_guidance() {
-        let (tx, rx) = queue();
+        let (tx, rx, _notify_rx) = queue();
         tx.push(compact(Some(GUIDANCE)));
 
         assert!(

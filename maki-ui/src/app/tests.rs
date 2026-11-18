@@ -291,7 +291,7 @@ pub(crate) fn test_app() -> App {
         tab,
         test_permissions(false),
     );
-    let (shared_queue, _rx) = shared_queue::queue();
+    let (shared_queue, _rx, _notify_rx) = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
 }
@@ -303,7 +303,7 @@ fn spawned_app(tab: OpenSession, permissions: Arc<PermissionManager>) -> App {
     let dir = tmp_state();
     let writer = Arc::new(test_writer(dir.clone()));
     let mut app = build_app_with_session(dir, writer, LuaCommandReader::empty(), tab, permissions);
-    let (shared_queue, _rx) = shared_queue::queue();
+    let (shared_queue, _rx, _notify_rx) = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
 }
@@ -4907,7 +4907,7 @@ fn ctrl_e_when_queue_empty_moves_end() {
 #[test]
 fn ctrl_enter_steers_while_streaming() {
     let mut app = test_app();
-    let (tx, _rx) = shared_queue::queue();
+    let (tx, _rx, _notify_rx) = shared_queue::queue();
     app.queue.set_shared(tx);
     app.status = Status::Streaming;
 
@@ -4940,7 +4940,7 @@ fn ctrl_enter_empty_input_converts_queue_to_steer() {
 #[test]
 fn ctrl_q_converts_steer_to_queue() {
     let mut app = test_app();
-    let (tx, _rx) = shared_queue::queue();
+    let (tx, _rx, _notify_rx) = shared_queue::queue();
     app.queue.set_shared(tx);
     app.status = Status::Streaming;
 
@@ -4955,7 +4955,7 @@ fn ctrl_q_converts_steer_to_queue() {
 #[test]
 fn enter_while_streaming_queues_message() {
     let mut app = test_app();
-    let (tx, _rx) = shared_queue::queue();
+    let (tx, _rx, _notify_rx) = shared_queue::queue();
     app.queue.set_shared(tx);
     app.status = Status::Streaming;
 
