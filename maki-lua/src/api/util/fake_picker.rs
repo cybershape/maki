@@ -51,7 +51,8 @@ pub(crate) fn real_display_width(lua: &Lua) {
     let ui: Table = maki.get("ui").unwrap();
     ui.set(
         "display_width",
-        lua.create_function(|_, text: String| Ok(text.width())).unwrap(),
+        lua.create_function(|_, text: String| Ok(text.width()))
+            .unwrap(),
     )
     .unwrap();
 }

@@ -50,9 +50,11 @@ impl App {
                     }
                     if zone.zone == SelectionZone::Messages
                         && !self.active_chat().auto_scroll()
-                        && self
-                            .active_chat()
-                            .is_scroll_to_bottom_hit(event.row, event.column, zone.area)
+                        && self.active_chat().is_scroll_to_bottom_hit(
+                            event.row,
+                            event.column,
+                            zone.area,
+                        )
                     {
                         self.active_chat().enable_auto_scroll();
                         return;

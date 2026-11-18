@@ -3208,11 +3208,19 @@ fn clicking_scroll_to_bottom_indicator_re_enables_auto_scroll() {
     let center_col = area.width / 2;
     let bottom_row = area.bottom() - 1;
 
-    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 0, bottom_row));
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        0,
+        bottom_row,
+    ));
     assert!(!app.chats[0].auto_scroll());
     app.selection_state = None;
 
-    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), center_col, bottom_row));
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        center_col,
+        bottom_row,
+    ));
     assert!(app.chats[0].auto_scroll());
     assert!(app.selection_state.is_none());
 }

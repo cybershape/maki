@@ -14,7 +14,8 @@ local OPEN_READ_CHECK_LINES = 1
 local READ_INPUT_SLOTS = { "tool.read.input", "tool.*.input" }
 local LIST_INPUT_SLOTS = { "tool.list_dir.input", "tool.*.input" }
 local OPEN_READ_HOOKED_ERR = "open() cannot read while a plugin hooks the read tool, call read() instead"
-local INSPECT_HOOKED_ERR = "os and pathlib cannot look at files while a plugin hooks the list_dir tool, call list_dir() instead"
+local INSPECT_HOOKED_ERR =
+  "os and pathlib cannot look at files while a plugin hooks the list_dir tool, call list_dir() instead"
 local MKDIR_BASH_HINT = ", create the directory with the bash tool instead"
 local MKDIR_POWERSHELL_HINT = ", create the directory with the powershell tool instead"
 local REMOVAL_BASH = "use the bash tool"
@@ -134,8 +135,7 @@ local function build_body(ctx, code)
 end
 
 local function build_description(batch_disabled)
-  local use_prefix = batch_disabled
-      and "Use for parallel/batch calls (the batch tool is disabled; use gather), "
+  local use_prefix = batch_disabled and "Use for parallel/batch calls (the batch tool is disabled; use gather), "
     or "Use for "
   local concurrency = batch_disabled
       and "- Concurrency / Batch execution: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`. The batch tool is disabled; use code_execution with `await gather(...)` to run multiple independent tool calls concurrently (replacing batch)."

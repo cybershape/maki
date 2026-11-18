@@ -1,11 +1,11 @@
 //! Rebuilds display messages from stored sessions. Tool outputs get syntax
 //! highlighted, missing outputs fall back to plain text from `ToolResult`.
 
+use jiff::Timestamp;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use jiff::Timestamp;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::tasks::{TaskClock, TaskOutcome, TaskParent, TaskStatus};
@@ -758,11 +758,7 @@ impl Chat {
     /// the one-frame hop where the bubble briefly lands in the wrong row.
     pub fn show_user_message(&mut self, text: impl Into<String>, images: Vec<ImageSource>) {
         self.flush();
-        let mut msg = DisplayMessage::with_images(
-            DisplayRole::User,
-            text.into(),
-            images,
-        );
+        let mut msg = DisplayMessage::with_images(DisplayRole::User, text.into(), images);
         msg.created_at = Some(Timestamp::now().as_millisecond() as u64);
         self.messages_panel.push(msg);
         self.messages_panel.ensure_active_group();
@@ -2251,11 +2247,7 @@ mod tests {
                         duration_ms: None,
                         reasoning_id: None,
                     },
-                    ContentBlock::tool_use(
-                        "t1",
-                        "read",
-                        serde_json::json!({"path": "src/lib.rs"}),
-                    ),
+                    ContentBlock::tool_use("t1", "read", serde_json::json!({"path": "src/lib.rs"})),
                 ],
                 ..Default::default()
             },

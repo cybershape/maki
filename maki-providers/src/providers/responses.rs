@@ -562,13 +562,11 @@ impl ResponsesProvider {
     async fn do_list_models(&self, auth: &ResolvedAuth) -> Result<Vec<ModelInfo>, AgentError> {
         if let Some(base) = self.resolve_url(auth) {
             let url = format!("{base}/models");
-            if let Ok(req) = auth
-                .finish(
-                    self.client
-                        .get(&url)
-                        .header("user-agent", super::user_agent()),
-                )
-                && let Ok(text) = super::ok_text(&self.client, req).await
+            if let Ok(req) = auth.finish(
+                self.client
+                    .get(&url)
+                    .header("user-agent", super::user_agent()),
+            ) && let Ok(text) = super::ok_text(&self.client, req).await
                 && let Ok(val) = serde_json::from_str::<Value>(&text)
             {
                 let raw_items = val["data"].as_array().or_else(|| val["models"].as_array());
@@ -640,7 +638,13 @@ impl Provider for ResponsesProvider {
                 Some(prefix) => format!("{prefix}\n\n{system}"),
                 None => system.to_string(),
             };
-            let mut body = build_body(model, messages, &effective_system, tools, self.replay_reasoning);
+            let mut body = build_body(
+                model,
+                messages,
+                &effective_system,
+                tools,
+                self.replay_reasoning,
+            );
             if let Some((fields, fallback)) = model.effective_thinking_fields() {
                 opts.thinking
                     .apply_fields(&mut body, model, fields, fallback);

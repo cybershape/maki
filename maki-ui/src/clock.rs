@@ -157,16 +157,20 @@ mod tests {
 
         // Same day: 2026-11-16 10:15:00 UTC
         let today_ts = 1_794_824_100_000_u64;
-        let today_24 = super::format_message_timestamp_with_now(today_ts, ClockFormat::Hour24, &now, &tz);
+        let today_24 =
+            super::format_message_timestamp_with_now(today_ts, ClockFormat::Hour24, &now, &tz);
         assert_eq!(today_24, "10:15");
-        let today_12 = super::format_message_timestamp_with_now(today_ts, ClockFormat::Hour12, &now, &tz);
+        let today_12 =
+            super::format_message_timestamp_with_now(today_ts, ClockFormat::Hour12, &now, &tz);
         assert_eq!(today_12, "10:15 AM");
 
         // Past day: 2026-11-15 16:45:00 UTC
         let past_ts = 1_794_761_100_000_u64;
-        let past_24 = super::format_message_timestamp_with_now(past_ts, ClockFormat::Hour24, &now, &tz);
+        let past_24 =
+            super::format_message_timestamp_with_now(past_ts, ClockFormat::Hour24, &now, &tz);
         assert_eq!(past_24, "2026-11-15 16:45");
-        let past_12 = super::format_message_timestamp_with_now(past_ts, ClockFormat::Hour12, &now, &tz);
+        let past_12 =
+            super::format_message_timestamp_with_now(past_ts, ClockFormat::Hour12, &now, &tz);
         assert_eq!(past_12, "2026-11-15 4:45 PM");
     }
 }

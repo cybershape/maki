@@ -132,13 +132,8 @@ impl RenderCursor {
             frame.render_widget(Paragraph::new(marker).style(base), gutter_area);
         }
         let body_width = self.viewport.width - gutter_cols;
-        let p = Paragraph::new(wrap::visible_lines(
-            lines,
-            body_width,
-            self.skip,
-            visible_h,
-        ))
-        .style(base);
+        let p = Paragraph::new(wrap::visible_lines(lines, body_width, self.skip, visible_h))
+            .style(base);
         self.skip = 0;
         frame.render_widget(p, seg_area);
         self.y += visible_h;

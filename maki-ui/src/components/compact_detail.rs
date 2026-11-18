@@ -649,7 +649,8 @@ mod tests {
             .expect("cargo check line");
         // With H_PAD = 1, inside border there is padding space before the content
         assert!(
-            border_line.starts_with("       │   \"command\"") || border_line.contains("│   \"command\""),
+            border_line.starts_with("       │   \"command\"")
+                || border_line.contains("│   \"command\""),
             "{border_line}"
         );
     }

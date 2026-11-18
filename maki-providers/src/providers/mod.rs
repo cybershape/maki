@@ -21,11 +21,11 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 #[allow(unused_imports)]
-use maki_storage::{StateDir, blocking};
-#[allow(unused_imports)]
 use maki_storage::auth::{
     OAuthTokens, delete_tokens, load_tokens_async, lock_tokens_async, save_tokens,
 };
+#[allow(unused_imports)]
+use maki_storage::{StateDir, blocking};
 
 use crate::AgentError;
 use crate::headers::{

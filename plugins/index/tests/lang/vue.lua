@@ -48,7 +48,7 @@ function handleLogout() {
   has(out, {
     "blocks:",
     "<template>",
-    "<script setup lang=\"ts\">",
+    '<script setup lang="ts">',
     "<style scoped>",
     "template:",
     "<div#profile.user-card>",
@@ -117,7 +117,7 @@ export default defineComponent({
   has(out, {
     "blocks:",
     "<template>",
-    "<script lang=\"ts\">",
+    '<script lang="ts">',
     "template:",
     "<div.counter>",
     "imports:",
@@ -183,7 +183,7 @@ export function reset() {
   local out = idx(src, "vue")
   has(out, {
     "blocks:",
-    "<script setup lang=\"ts\">",
+    '<script setup lang="ts">',
     "imports:",
     "{ ref } from 'vue'",
     "types:",
@@ -225,8 +225,8 @@ function toggle() {
   local out = idx(src, "vue")
   has(out, {
     "blocks:",
-    "<script lang=\"ts\">",
-    "<script setup lang=\"ts\">",
+    '<script lang="ts">',
+    '<script setup lang="ts">',
     "<template>",
     "template:",
     "<div.toggle-box>",
@@ -257,7 +257,7 @@ function run() {}
 ]==]
 
   local text, meta = idx_with_meta(src, "vue")
-  helpers.assert_ranged_meta(text, meta, { "<template>", "<script setup lang=\"ts\">", "val =", "run()" })
+  helpers.assert_ranged_meta(text, meta, { "<template>", '<script setup lang="ts">', "val =", "run()" })
 end)
 
 case("vue_standalone_macros_and_slots", function()
@@ -290,7 +290,7 @@ defineOptions({
   has(out, {
     "blocks:",
     "<template>",
-    "<script setup lang=\"ts\">",
+    '<script setup lang="ts">',
     "template:",
     "<div.wrapper>",
     "<slot>",

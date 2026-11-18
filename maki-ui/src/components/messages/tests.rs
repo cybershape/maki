@@ -873,9 +873,9 @@ fn user_message_shows_as_typed(text: &str) {
         VIEW_WIDTH,
         VIEW_WIDTH,
     )
-        .iter()
-        .map(|row| row.to_string())
-        .collect();
+    .iter()
+    .map(|row| row.to_string())
+    .collect();
     assert_eq!(rows.join("\n"), text);
 }
 
@@ -952,7 +952,8 @@ fn user_message_renders_timestamp_for_today() {
 #[test]
 fn user_message_renders_date_and_time_for_past_date() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    let past_ms = (jiff::Timestamp::now().as_millisecond() as u64).saturating_sub(2 * 86_400 * 1000);
+    let past_ms =
+        (jiff::Timestamp::now().as_millisecond() as u64).saturating_sub(2 * 86_400 * 1000);
     let mut msg = DisplayMessage::new(DisplayRole::User, "old message".into());
     msg.created_at = Some(past_ms);
     panel.push(msg);
@@ -960,7 +961,10 @@ fn user_message_renders_date_and_time_for_past_date() {
     let buf = terminal.backend().buffer();
 
     let expected_ts = crate::clock::format_message_timestamp(past_ms, panel.clock_format);
-    assert!(expected_ts.contains('-'), "past date timestamp must contain year-month-day");
+    assert!(
+        expected_ts.contains('-'),
+        "past date timestamp must contain year-month-day"
+    );
 
     let row0: String = (0..buf.area.width)
         .filter_map(|x| buf.cell((x, 0)).map(|c| c.symbol()))
@@ -1041,7 +1045,8 @@ fn turn_stats_notice_renders_right_aligned_timestamp_for_today() {
 #[test]
 fn turn_stats_notice_renders_date_and_time_for_past_date() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    let past_ms = (jiff::Timestamp::now().as_millisecond() as u64).saturating_sub(2 * 86_400 * 1000);
+    let past_ms =
+        (jiff::Timestamp::now().as_millisecond() as u64).saturating_sub(2 * 86_400 * 1000);
     let mut msg = DisplayMessage::new(
         DisplayRole::Notice,
         "◷ 9.0s / 0.2s · ↑300 ↓125 · » 14 t/s · t₁ 1.0s · ⛁ 0%".into(),
@@ -1052,7 +1057,10 @@ fn turn_stats_notice_renders_date_and_time_for_past_date() {
     let buf = terminal.backend().buffer();
 
     let expected_ts = crate::clock::format_message_timestamp(past_ms, panel.clock_format);
-    assert!(expected_ts.contains('-'), "past date timestamp must contain year-month-day");
+    assert!(
+        expected_ts.contains('-'),
+        "past date timestamp must contain year-month-day"
+    );
 
     let row0: String = (0..buf.area.width)
         .filter_map(|x| buf.cell((x, 0)).map(|c| c.symbol()))
@@ -1269,7 +1277,6 @@ fn stream_reset_clears_streaming_and_fails_tools() {
     assert_eq!(panel.in_progress_count(), 0);
     assert_eq!(msg_status(&panel, "t1"), ToolStatus::Error);
 }
-
 
 /// Selections live per segment, so the tests that think in document rows
 /// convert through the same walker the panel uses.
@@ -3716,8 +3723,13 @@ fn compact_batch_children_follow_snapshots(restored: bool, cancelled: bool) {
         assert_eq!(batch.duration, Some(Duration::from_millis(1234)));
         assert_eq!(group.total_duration(), Duration::from_millis(1234));
     }
-    let rows =
-        tool_group::build_tool_group_lines(group, VIEW_WIDTH, 0, tool_group::DEFAULT_COMPACT_LINES, None);
+    let rows = tool_group::build_tool_group_lines(
+        group,
+        VIEW_WIDTH,
+        0,
+        tool_group::DEFAULT_COMPACT_LINES,
+        None,
+    );
     assert!(rows.lines[2].to_string().ends_with("(1.23s)"));
     assert_eq!(
         batch.children[0].status,
@@ -3872,7 +3884,8 @@ fn compact_tools_state_text_transitions() {
         waiting_since: None,
         expanded: false,
     };
-    let tl4 = tool_group::build_tool_group_lines(&group2, 80, 0, tool_group::DEFAULT_COMPACT_LINES, None);
+    let tl4 =
+        tool_group::build_tool_group_lines(&group2, 80, 0, tool_group::DEFAULT_COMPACT_LINES, None);
     let h4: String = tl4.lines[0]
         .spans
         .iter()
@@ -3892,7 +3905,8 @@ fn compact_tools_state_text_transitions() {
             duration: None,
         }),
     );
-    let tl5 = tool_group::build_tool_group_lines(&group2, 80, 0, tool_group::DEFAULT_COMPACT_LINES, None);
+    let tl5 =
+        tool_group::build_tool_group_lines(&group2, 80, 0, tool_group::DEFAULT_COMPACT_LINES, None);
     let h5: String = tl5.lines[0]
         .spans
         .iter()
@@ -5199,10 +5213,7 @@ fn tool_output_wraps_behind_the_gutter_and_copies_without_it() {
     let output_rows: Vec<&String> = rows.iter().filter(|r| r.contains(TOKEN)).collect();
     assert!(output_rows.len() > 1, "output should wrap: {rows:?}");
     for row in output_rows {
-        assert!(
-            row.starts_with(GUTTER_INDENT),
-            "{row:?}"
-        );
+        assert!(row.starts_with(GUTTER_INDENT), "{row:?}");
     }
 
     let area = Rect::new(0, 0, GUTTER_TEST_WIDTH, GUTTER_TEST_HEIGHT);

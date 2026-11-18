@@ -1889,8 +1889,7 @@ impl MessagesPanel {
                     self.messages
                         .get(idx)
                         .is_some_and(|m| matches!(&m.role, DisplayRole::User))
-                })
-            {
+                }) {
                 Some(theme::current().user_bg)
             } else if seg.tool_id.is_some() {
                 Some(theme::current().tool_bg)
@@ -1953,7 +1952,9 @@ impl MessagesPanel {
         }
         let target_row = area.bottom().saturating_sub(1);
         let center_col = area.x + area.width / 2;
-        row == target_row && col >= center_col.saturating_sub(1) && col <= center_col.saturating_add(1)
+        row == target_row
+            && col >= center_col.saturating_sub(1)
+            && col <= center_col.saturating_add(1)
     }
 
     fn render_scroll_to_bottom(&self, frame: &mut Frame, area: Rect) {
@@ -2280,10 +2281,8 @@ impl MessagesPanel {
                     && let Some(detail) = &entry.detail
                     && let Some(output) = &detail.output
                 {
-                    entry.children = tool_group::question_children(
-                        entry.raw_input.as_ref(),
-                        Some(output),
-                    );
+                    entry.children =
+                        tool_group::question_children(entry.raw_input.as_ref(), Some(output));
                 }
                 if entry.name.as_ref() != tool_group::BATCH_TOOL {
                     return Some(group.id.clone());
@@ -2618,10 +2617,7 @@ impl MessagesPanel {
                     self.upsert_instruction_segment(&id, &blocks);
                 }
             } else if let DisplayRole::ToolGroup(g) = &msg.role {
-                let hovered = self
-                    .hovered_compact
-                    .as_ref()
-                    .filter(|t| t.group_id == g.id);
+                let hovered = self.hovered_compact.as_ref().filter(|t| t.group_id == g.id);
                 let tl = tool_group::build_tool_group_lines(
                     g,
                     self.viewport_width,

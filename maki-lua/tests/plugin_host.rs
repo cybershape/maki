@@ -5745,7 +5745,10 @@ fn disabling_task_hides_its_tools_but_keeps_the_tasks_ui() {
 
     let commands = host.command_reader().load();
     assert!(
-        commands.commands.iter().any(|c| c.name.as_ref() == TASKS_COMMAND),
+        commands
+            .commands
+            .iter()
+            .any(|c| c.name.as_ref() == TASKS_COMMAND),
         "{TASKS_COMMAND} must survive the disable"
     );
     let keymaps = host.keymap_reader().load();
@@ -5766,7 +5769,10 @@ fn enabled_task_offers_its_tools() {
     let (reg, _host) = builtins_host_with(&config.plugins);
     let names = request_tool_names(&reg, &config.agent);
     for tool in [TASK_TOOL, TASK_MESSAGE_TOOL, TASK_STOP_TOOL] {
-        assert!(names.iter().any(|n| n == tool), "{tool} must reach the model");
+        assert!(
+            names.iter().any(|n| n == tool),
+            "{tool} must reach the model"
+        );
     }
 }
 

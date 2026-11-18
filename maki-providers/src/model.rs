@@ -627,7 +627,10 @@ impl Model {
             supports_fast_override: discovered
                 .is_some_and(|info| {
                     info.supports_fast == Some(true)
-                        || info.extra.as_ref().is_some_and(ModelInfo::fast_tier_declared)
+                        || info
+                            .extra
+                            .as_ref()
+                            .is_some_and(ModelInfo::fast_tier_declared)
                 })
                 .then_some(FastSupport::Supported),
             supports_deferred_tools_override: None,

@@ -200,7 +200,9 @@ async fn login_custom(storage: &StateDir) -> Result<()> {
         bail!("provider name cannot be empty");
     }
 
-    let base_url = stdin::prompt("  Base URL (Responses API endpoint, e.g. https://api.openai.com/v1): ").await?;
+    let base_url =
+        stdin::prompt("  Base URL (Responses API endpoint, e.g. https://api.openai.com/v1): ")
+            .await?;
     if base_url.is_empty() {
         bail!("base URL cannot be empty");
     }

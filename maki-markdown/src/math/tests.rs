@@ -372,18 +372,12 @@ fn escaped_literals() {
 
 #[test]
 fn display_fraction_stacks_with_bar() {
-    assert_eq!(
-        display(r"\frac{a}{b}"),
-        vec!["a", "─", "b"]
-    );
+    assert_eq!(display(r"\frac{a}{b}"), vec!["a", "─", "b"]);
 }
 
 #[test]
 fn display_fraction_centers_wide_sides() {
-    assert_eq!(
-        display(r"\frac{a+b}{c}"),
-        vec!["a+b", "───", " c"]
-    );
+    assert_eq!(display(r"\frac{a+b}{c}"), vec!["a+b", "───", " c"]);
 }
 
 #[test]
@@ -413,6 +407,10 @@ fn session_regression_formulas_convert() {
         }
         let lines = display(formula);
         assert!(!lines.is_empty());
-        assert!(lines.iter().any(|l| l.contains("千条") || l.contains("FinalRenewalRate")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("千条") || l.contains("FinalRenewalRate"))
+        );
     }
 }

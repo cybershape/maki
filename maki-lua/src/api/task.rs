@@ -278,7 +278,9 @@ lua_table! {
 mod tests {
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, UiReply};
-    use crate::api::util::fake_picker::{DOWN, ESC, PAGE_DOWN, UP, load_picker, real_display_width};
+    use crate::api::util::fake_picker::{
+        DOWN, ESC, PAGE_DOWN, UP, load_picker, real_display_width,
+    };
     use mlua::Table;
     use serde_json::json;
     use std::thread::JoinHandle;

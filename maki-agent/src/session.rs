@@ -333,7 +333,6 @@ struct SessionStore {
     header: SharedHeader,
 }
 
-
 impl SessionStore {
     /// Opening touches no file: the driver either read the session already or
     /// there is nothing under the id to read. A session nothing was written for

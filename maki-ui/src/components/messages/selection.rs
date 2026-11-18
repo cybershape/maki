@@ -78,8 +78,7 @@ pub(super) fn extract_selection_text(
             // segment rows across every chunk.
             let area = Rect::new(0, chunk.start, body, chunk.end - chunk.start);
             let mut tmp = Buffer::empty(area);
-            Paragraph::new(wrap::visible_lines(lines, body, 0, area.height))
-                .render(area, &mut tmp);
+            Paragraph::new(wrap::visible_lines(lines, body, 0, area.height)).render(area, &mut tmp);
 
             // The chunk runs to a line boundary, so it can reach past the
             // selection on either side. `append_rows` clips to the rows this

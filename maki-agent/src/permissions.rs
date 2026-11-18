@@ -1445,7 +1445,10 @@ mod tests {
         // isolated test home may sit inside it, so "outside" is measured
         // against the landing dir rather than assumed.
         let landing = normalize_scope_prefix(pattern.strip_suffix("/**").unwrap());
-        assert!(landing.parent().is_some() && landing != Path::new("/"), "{landing:?}");
+        assert!(
+            landing.parent().is_some() && landing != Path::new("/"),
+            "{landing:?}"
+        );
         assert!(
             dir.path().starts_with(&landing) || landing.starts_with(dir.path()),
             "{landing:?} vs {:?}",

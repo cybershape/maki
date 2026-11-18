@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use maki_agent::tools::schema::TOOLCALL_REASON_FIELD;
 use maki_agent::tools::BASH_TOOL_NAME;
+use maki_agent::tools::schema::TOOLCALL_REASON_FIELD;
 use maki_agent::{BufferSnapshot, SpanStyle, ToolOutput};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -320,9 +320,9 @@ pub fn is_background_bash(tool: &str, raw_input: Option<&Value>) -> bool {
         return false;
     }
     raw_input.is_some_and(|input| {
-        input.get("background").is_some_and(|val| {
-            val.as_bool() == Some(true) || val.as_str() == Some("true")
-        })
+        input
+            .get("background")
+            .is_some_and(|val| val.as_bool() == Some(true) || val.as_str() == Some("true"))
     })
 }
 
@@ -2022,7 +2022,8 @@ mod tests {
             waiting_since: None,
             expanded: false,
         };
-        let tl_collapsed = build_tool_group_lines(&group_collapsed, 80, 0, DEFAULT_COMPACT_LINES, None);
+        let tl_collapsed =
+            build_tool_group_lines(&group_collapsed, 80, 0, DEFAULT_COMPACT_LINES, None);
         let collapsed_text = tl_collapsed
             .lines
             .iter()
@@ -2040,7 +2041,8 @@ mod tests {
             waiting_since: None,
             expanded: true,
         };
-        let tl_expanded = build_tool_group_lines(&group_expanded, 80, 0, DEFAULT_COMPACT_LINES, None);
+        let tl_expanded =
+            build_tool_group_lines(&group_expanded, 80, 0, DEFAULT_COMPACT_LINES, None);
         let expanded_text = tl_expanded
             .lines
             .iter()

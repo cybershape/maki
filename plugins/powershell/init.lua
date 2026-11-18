@@ -5,7 +5,8 @@ local BASE = [[
 - Use `tail` to return only the last N output lines.
 - Provide a short `toolcall_reason` (3-5 words).]]
 
-local V5_NOTE = "Do not use `&&` or `||`. Windows PowerShell 5.1 rejects them. Run one statement per call, or separate statements with `;`."
+local V5_NOTE =
+  "Do not use `&&` or `||`. Windows PowerShell 5.1 rejects them. Run one statement per call, or separate statements with `;`."
 
 local V7_NOTE = [[PowerShell 7 or newer. `&&` and `||` work (`$?` is the previous statement, not the previous pipeline).
 - `&&` and `||` have lower precedence than `|`. Parenthesize a chain used as pipeline input: `(@(1) && @(2)) | Measure-Object`.

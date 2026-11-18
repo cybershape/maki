@@ -94,15 +94,8 @@ impl MathBox {
             return;
         }
         let box_anchor = (rows.len() - 1) / 2;
-        let attach_col = self
-            .lines
-            .get(self.anchor)
-            .map_or(0, |s| s.width());
-        let box_width = rows
-            .iter()
-            .map(|r| r.width())
-            .max()
-            .unwrap_or(0);
+        let attach_col = self.lines.get(self.anchor).map_or(0, |s| s.width());
+        let box_width = rows.iter().map(|r| r.width()).max().unwrap_or(0);
 
         // Ensure enough rows above the anchor within the current visual line.
         let have_above = self.anchor - self.floor;

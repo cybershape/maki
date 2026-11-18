@@ -42,7 +42,9 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncWriteExt, stdout};
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, WeakUnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{
+    UnboundedReceiver, UnboundedSender, WeakUnboundedSender, unbounded_channel,
+};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tracing::{debug, info, warn};
 

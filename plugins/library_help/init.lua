@@ -68,8 +68,12 @@ local function format_python_docstring(name, desc, schema)
     end
   end
 
-  table.sort(req_args, function(a, b) return a.name < b.name end)
-  table.sort(opt_args, function(a, b) return a.name < b.name end)
+  table.sort(req_args, function(a, b)
+    return a.name < b.name
+  end)
+  table.sort(opt_args, function(a, b)
+    return a.name < b.name
+  end)
 
   local sig_lines = {}
   for _, a in ipairs(req_args) do
@@ -136,12 +140,12 @@ maki.api.register_tool({
     properties = {
       library_name = {
         type = "string",
-        description = "The external library name (e.g. \"github\").",
+        description = 'The external library name (e.g. "github").',
         required = true,
       },
       function_name = {
         type = "string",
-        description = "The function name to inspect (e.g. \"create_issue\").",
+        description = 'The function name to inspect (e.g. "create_issue").',
         required = true,
       },
     },
@@ -195,7 +199,10 @@ maki.api.register_tool({
     if not matched_lib then
       if #available_libs == 0 then
         return {
-          llm_output = string.format("Library '%s' not found. No external libraries are currently available.", library_name),
+          llm_output = string.format(
+            "Library '%s' not found. No external libraries are currently available.",
+            library_name
+          ),
           is_error = true,
         }
       end
@@ -238,11 +245,7 @@ maki.api.register_tool({
       }
     end
 
-    local doc = format_python_docstring(
-      matched_fn_name or matched_fn.name,
-      matched_fn.description,
-      matched_fn.schema
-    )
+    local doc = format_python_docstring(matched_fn_name or matched_fn.name, matched_fn.description, matched_fn.schema)
     return { llm_output = doc }
   end,
 })
