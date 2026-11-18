@@ -22,7 +22,7 @@ use super::{
 
 #[cfg(test)]
 pub const DEFAULT_COMPACT_LINES: usize = maki_config::DEFAULT_COMPACT_LINES;
-pub const COMPACT_OPEN_ICON: &str = "⤢ ";
+pub const COMPACT_OPEN_ICON: &str = "↗ ";
 const RAIL_CONTINUE: &str = "│  ";
 const RAIL_LAST: &str = "└  ";
 const CHILD_RAIL_CONTINUE: &str = "├  ";
@@ -673,7 +673,12 @@ fn render_tool_row(
     let theme = theme::current();
     let is_in_progress = tool.status == ToolStatus::InProgress;
     let (icon, icon_style) = if is_hovered {
-        (COMPACT_OPEN_ICON.to_string(), theme.accent)
+        let style = if tool.status == ToolStatus::Error {
+            theme.tool_error
+        } else {
+            theme.accent
+        };
+        (COMPACT_OPEN_ICON.to_string(), style)
     } else {
         match tool.status {
             ToolStatus::InProgress => (format!("{} ", frame.0), frame.1),
@@ -696,7 +701,10 @@ fn render_tool_row(
     let icon_width = icon.width();
     spans.push(Span::styled(icon, icon_style));
 
-    let name_style = theme.tool.add_modifier(Modifier::BOLD);
+    let mut name_style = theme.tool.add_modifier(Modifier::BOLD);
+    if is_hovered {
+        name_style = name_style.add_modifier(Modifier::UNDERLINED);
+    }
     spans.push(Span::styled(tool.name.to_string(), name_style));
 
     let duration_str = tool
@@ -778,7 +786,10 @@ fn render_thinking_row(
         "thinking"
     };
 
-    let label_style = theme.tool.add_modifier(Modifier::BOLD);
+    let mut label_style = theme.tool.add_modifier(Modifier::BOLD);
+    if is_hovered {
+        label_style = label_style.add_modifier(Modifier::UNDERLINED);
+    }
     spans.push(Span::styled(label.to_string(), label_style));
 
     let duration_str = thinking
@@ -990,15 +1001,17 @@ mod tests {
     use std::time::Instant;
     use test_case::test_case;
 
-    #[test]
-    fn hovered_entry_renders_open_icon_with_accent_style() {
+    #[test_case(ToolStatus::Success; "success_uses_accent")]
+    #[test_case(ToolStatus::Error; "error_uses_tool_error")]
+    #[test_case(ToolStatus::InProgress; "in_progress_uses_accent")]
+    fn hovered_entry_open_icon_style_follows_status(status: ToolStatus) {
         let child = GroupToolEntry {
             id: String::new(),
             name: Arc::from("read"),
             summary: "src/main.rs".into(),
             raw_input: None,
             children: Vec::new(),
-            status: ToolStatus::Success,
+            status,
             receiving_args: false,
             started_at: None,
             duration: None,
@@ -1014,11 +1027,6 @@ mod tests {
             expanded: false,
         };
 
-        let unhovered_tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
-        let unhovered_row = &unhovered_tl.lines[1];
-        assert_eq!(unhovered_row.spans[1].content, "✓ ");
-        assert_eq!(unhovered_row.spans[1].style, theme::current().tool_success);
-
         let hover_target = CompactTarget {
             group_id: "group-1".into(),
             entry: 0,
@@ -1028,13 +1036,34 @@ mod tests {
             build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, Some(&hover_target));
         let hovered_row = &hovered_tl.lines[1];
         assert_eq!(hovered_row.spans[1].content, COMPACT_OPEN_ICON);
-        assert_eq!(hovered_row.spans[1].style, theme::current().accent);
+        let expected_style = match status {
+            ToolStatus::Error => theme::current().tool_error,
+            _ => theme::current().accent,
+        };
+        assert_eq!(hovered_row.spans[1].style, expected_style);
 
         let cols = compact_icon_columns(hovered_row).expect("icon columns");
         assert_eq!(cols, 3..5);
         let interactive_cols =
             compact_interactive_columns(hovered_row).expect("interactive columns");
         assert_eq!(interactive_cols, 3..9);
+
+        assert!(
+            hovered_row.spans[2]
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
+
+        let unhovered_tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
+        let unhovered_row = &unhovered_tl.lines[1];
+        assert_ne!(unhovered_row.spans[1].content, COMPACT_OPEN_ICON);
+        assert!(
+            !unhovered_row.spans[2]
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
     }
 
     #[test_case(false, false; "single_batch")]
