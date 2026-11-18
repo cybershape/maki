@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `a52b443e2051cf0b3aa11d3fa37d9a1e0de192b2`
-  - **Commit date**: `Mon Nov 16 01:46:19 2026 +0100`
+  - **Commit SHA**: `cc85b51b4f8955b54f1c0e96b9bde0b44abd06c2`
+  - **Commit date**: `Mon Nov 16 02:13:11 2026 +0100`
   - **Commit author**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
-  - **Commit message**: `refactor(xai): serve cached model metadata from memory`
+  - **Commit message**: `fix(providers): re-vet plugin base urls when a reload narrows the hosts`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `a52b443e`.
+> `upstream/main` has been successfully merged through commit `cc85b51b`.
 
 ---
 
@@ -216,6 +216,12 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `dd975567` | `feat(ui): hide task cost when show_cost is false` | Hide task cost in task picker and status when `show_cost` is false |
 | `a775e775` | `fix(library_help): render MCP union schema types` | Render MCP union / oneOf / anyOf schema types in `library_help` |
 | `22c44740` | `Merge branch 'upstream/main' into main` | Merge upstream through `a52b443e`, including dynamic cwd resolution for relative tool paths, async headless interactive session spawning with blocking instruction load, updated todo_write status summary, and tokio::process async jobs with non-IO line cutting in Lua runtime, while preserving core fork customizations |
+| `165884d2` | `docs: update upstream tracking record to a52b443e` | Update the upstream tracking record to `a52b443e` |
+| `eaed68d4` | `feat(bash): collapse multi-line command headers to one line` | Collapse multi-line bash command headers into a single line |
+| `f550ee8b` | `style: run cargo fmt and stylua across the workspace` | Run cargo fmt and stylua across the workspace |
+| `987cc7b6` | `feat(ui): clearer hover affordance for compact tool rows` | Provide clearer hover affordance for compact tool rows |
+| `0fe68e0c` | `feat(ui): report plan-approval popup as blocked over OSC 7501` | Report plan-approval popup as blocked state over OSC 7501 protocol |
+| `a60b5153` | `Merge branch 'upstream/main' into main` | Merge upstream through `cc85b51b`, including child process reaping delegation to tokio, SharedBuf backed by tokio watch channel, non-blocking URL opening, cwd fast-fail and memory skip on missing cwd, batch tool_calls items schema fix, Lua host closure weak VM holding, TaskTracker for Lua restore items, providers.toml provider setup from model picker, and monty 1.6 update, while preserving core fork customizations |
 
 ---
 
