@@ -337,6 +337,33 @@ fn blocked_kind(attention: Option<&Notification>) -> BlockedKind {
     }
 }
 
+/// The plan form parks the turn on the user without entering `NeedsInput`,
+/// so it reports blocked on its own. The protocol's `kind` list has no plan
+/// value: approval maps to `permission`.
+fn program_state_of(
+    status: SessionStatus,
+    attention: Option<&Notification>,
+    outcome: Option<ProgramState>,
+) -> (ProgramState, Option<String>) {
+    if let Some(Notification::PlanReady) = attention {
+        return (
+            ProgramState::Blocked(BlockedKind::Permission),
+            Some(Notification::PlanReady.message()),
+        );
+    }
+    let state = match status {
+        SessionStatus::NeedsInput => {
+            return (
+                ProgramState::Blocked(blocked_kind(attention)),
+                attention.map(Notification::message),
+            );
+        }
+        SessionStatus::Working => ProgramState::Working,
+        SessionStatus::Idle => outcome.unwrap_or(ProgramState::Idle),
+    };
+    (state, None)
+}
+
 fn program_state_rank(state: ProgramState) -> u8 {
     match state {
         ProgramState::Idle => 0,
@@ -463,16 +490,11 @@ impl SessionRuntime {
     }
 
     fn program_state(&self) -> (ProgramState, Option<String>) {
-        let state = match self.last_status {
-            SessionStatus::NeedsInput => {
-                let attention = self.app.attention();
-                let msg = attention.as_ref().map(Notification::message);
-                return (ProgramState::Blocked(blocked_kind(attention.as_ref())), msg);
-            }
-            SessionStatus::Working => ProgramState::Working,
-            SessionStatus::Idle => self.notifications.outcome.unwrap_or(ProgramState::Idle),
-        };
-        (state, None)
+        program_state_of(
+            self.last_status,
+            self.app.attention().as_ref(),
+            self.notifications.outcome,
+        )
     }
 
     /// New work cancels an `exit_on_done` exit still waiting on its drain.
@@ -2756,6 +2778,25 @@ mod tests {
         ];
         let (_, title) = select_program_status(candidates.into_iter()).unwrap();
         assert_eq!(title, expected_title);
+    }
+
+    #[test_case(SessionStatus::Idle, Some(Notification::PlanReady), None, ProgramState::Blocked(BlockedKind::Permission) ; "plan_form_blocks_idle")]
+    #[test_case(SessionStatus::Idle, Some(Notification::PlanReady), Some(ProgramState::Done), ProgramState::Blocked(BlockedKind::Permission) ; "plan_form_beats_done_outcome")]
+    #[test_case(SessionStatus::NeedsInput, Some(Notification::PermissionRequested { tool: None }), None, ProgramState::Blocked(BlockedKind::Permission) ; "permission_prompt_blocks")]
+    #[test_case(SessionStatus::NeedsInput, Some(Notification::QuestionRequested), None, ProgramState::Blocked(BlockedKind::Question) ; "question_blocks")]
+    #[test_case(SessionStatus::NeedsInput, Some(Notification::AuthenticationRequired), None, ProgramState::Blocked(BlockedKind::Auth) ; "auth_blocks")]
+    #[test_case(SessionStatus::Working, None, None, ProgramState::Working ; "working")]
+    #[test_case(SessionStatus::Idle, None, Some(ProgramState::Done), ProgramState::Done ; "done_outcome")]
+    #[test_case(SessionStatus::Idle, None, None, ProgramState::Idle ; "idle")]
+    fn program_state_cases(
+        status: SessionStatus,
+        attention: Option<Notification>,
+        outcome: Option<ProgramState>,
+        expected: ProgramState,
+    ) {
+        let (state, msg) = program_state_of(status, attention.as_ref(), outcome);
+        assert_eq!(state, expected);
+        assert_eq!(msg, attention.map(|n| n.message()));
     }
 
     #[test]
