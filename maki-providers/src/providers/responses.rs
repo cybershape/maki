@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures::TryStreamExt;
 use reqwest::Client;
 use reqwest::header::HeaderMap;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
@@ -15,19 +15,30 @@ use std::sync::Arc;
 use crate::model::{Model, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::{ResolvedAuth, SseBody, Timeouts, ok_sse, sse_error_status};
-use crate::types::EffortDialect;
+use crate::types::{EffortDialect, ThinkingFields};
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
     StreamResponse, ThinkingConfig, TokenUsage, dialect,
 };
 
 use maki_config::providers::ProvidersConfig;
-use maki_storage::id::SessionRef;
+use maki_storage::frame::ReasoningFrame;
+use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::sessions::Effort;
 
 const RESPONSES_PATH: &str = "/responses";
 const FAILED_RESPONSE_STATUS: u16 = 500;
 const NANO_AIU_PER_USD: f64 = 100_000_000_000.0;
 const SERVICE_TIER_FAST: &str = "fast";
+const GPT_6_2_FRAGMENT: &[u8] = b"gpt-6.2";
+const CONFIGURATION_UPDATE: &str = "configuration_update";
+
+fn is_gpt_6_2(model_id: &str) -> bool {
+    model_id
+        .as_bytes()
+        .windows(GPT_6_2_FRAGMENT.len())
+        .any(|fragment| fragment.eq_ignore_ascii_case(GPT_6_2_FRAGMENT))
+}
 
 fn copilot_usd(copilot_usage: &Value) -> Option<f64> {
     copilot_usage["total_nano_aiu"]
@@ -49,16 +60,33 @@ pub fn build_body(
     tools: &Value,
     replay_reasoning: bool,
 ) -> Value {
-    let input = convert_input(messages, replay_reasoning);
+    build_body_with_frame(model, messages, system, tools, replay_reasoning, None)
+}
+
+fn build_body_with_frame(
+    model: &Model,
+    messages: &[Message],
+    system: &str,
+    tools: &Value,
+    replay_reasoning: bool,
+    frame: Option<MakiId>,
+) -> Value {
+    let developer_prompt = is_gpt_6_2(&model.id);
+    let input_prompt = developer_prompt
+        .then_some(system)
+        .filter(|prompt| !prompt.trim().is_empty());
+    let input = convert_input(messages, replay_reasoning, input_prompt, frame);
     let wire_tools = convert_tools(tools);
 
     let mut body = json!({
         "model": model.id,
-        "instructions": system,
         "input": input,
         "stream": true,
         "store": false,
     });
+    if !developer_prompt {
+        body["instructions"] = json!(system);
+    }
     if wire_tools.as_array().is_some_and(|a| !a.is_empty()) {
         body["tools"] = wire_tools;
     }
@@ -66,6 +94,9 @@ pub fn build_body(
 }
 
 pub fn plan_dialect(model_id: &str) -> &'static EffortDialect<'static> {
+    if is_gpt_6_2(model_id) {
+        return &dialect::GPT_6;
+    }
     if !model_id.contains("-codex") {
         return if model_id.starts_with("gpt-6-") || model_id.starts_with("gpt-6.") {
             &dialect::GPT_6
@@ -103,11 +134,7 @@ pub fn apply_responses_reasoning(
     dialect: &EffortDialect,
 ) {
     if let Some(effort) = thinking.effort_str(dialect, model) {
-        let mut reasoning = json!({ "effort": effort });
-        if effort != dialect::OFF {
-            reasoning["summary"] = json!("auto");
-        }
-        body["reasoning"] = reasoning;
+        body["reasoning"] = reasoning_config(effort);
     }
 }
 
@@ -121,12 +148,84 @@ pub fn apply_responses_fast(body: &mut Value, fast: bool) {
     }
 }
 
-pub(crate) fn convert_input(messages: &[Message], replay_reasoning: bool) -> Value {
+fn reasoning_config(effort: &str) -> Value {
+    let mut reasoning = json!({ "effort": effort });
+    if effort != dialect::OFF {
+        reasoning["summary"] = json!("auto");
+    }
+    reasoning
+}
+
+fn native_reasoning(body: &Map<String, Value>) -> Option<(Effort, &Value)> {
+    let reasoning = body.get("reasoning")?;
+    let fields = reasoning.as_object()?;
+    if body.len() != 1 || fields.keys().any(|key| key != "effort" && key != "summary") {
+        return None;
+    }
+    Some((fields.get("effort")?.as_str()?.parse().ok()?, reasoning))
+}
+
+fn declared_frame_reasoning(fields: &ThinkingFields, effort: Effort) -> Option<&Value> {
+    let mut choices = fields
+        .levels
+        .values()
+        .chain(&fields.adaptive)
+        .chain(&fields.off)
+        .filter_map(native_reasoning);
+    let (_, first) = choices.next()?;
+    let mut selected = (first["effort"] == effort.as_str()).then_some(first);
+    for (level, reasoning) in choices {
+        if reasoning.get("summary") != first.get("summary") {
+            return None;
+        }
+        if level == effort {
+            selected = Some(reasoning);
+        }
+    }
+    selected
+}
+
+fn can_replay(body: &Value, model: &Model) -> bool {
+    body["model"].as_str() == Some(model.id.as_str())
+        && body["store"] == false
+        && body["previous_response_id"].is_null()
+        && body["conversation"].is_null()
+        && ["/mode", "/reasoning/mode"].into_iter().all(|path| {
+            body.pointer(path)
+                .is_none_or(|mode| mode.is_null() || mode == "standard")
+        })
+        && ["/multi_agent", "/reasoning/multi_agent"]
+            .into_iter()
+            .all(|path| {
+                body.pointer(path)
+                    .is_none_or(|mode| mode.is_null() || mode == false)
+            })
+}
+
+fn convert_input(
+    messages: &[Message],
+    replay_reasoning: bool,
+    developer_prompt: Option<&str>,
+    frame: Option<MakiId>,
+) -> Value {
     let mut input = Vec::new();
+    if let Some(text) = developer_prompt {
+        input.push(json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": text}]
+        }));
+    }
 
     for msg in messages {
         match msg.role {
             Role::User => {
+                if let Some(effort) = frame.and_then(|frame| msg.reasoning_effort(frame)) {
+                    input.push(json!({
+                        "type": CONFIGURATION_UPDATE,
+                        "reasoning": {"effort": effort.as_str()},
+                    }));
+                }
                 for block in &msg.content {
                     match block {
                         ContentBlock::Text { text } => {
@@ -157,6 +256,7 @@ pub(crate) fn convert_input(messages: &[Message], replay_reasoning: bool) -> Val
                         ContentBlock::ToolUse { .. }
                         | ContentBlock::Thinking { .. }
                         | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::ReasoningEffort { .. }
                         | ContentBlock::Unknown(_) => {}
                     }
                 }
@@ -186,6 +286,7 @@ pub(crate) fn convert_input(messages: &[Message], replay_reasoning: bool) -> Val
                         ContentBlock::ToolResult { .. }
                         | ContentBlock::Image { .. }
                         | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::ReasoningEffort { .. }
                         | ContentBlock::Unknown(_) => {}
                     }
                 }
@@ -543,6 +644,23 @@ impl ResponsesProvider {
         self
     }
 
+    fn apply_request_reasoning(&self, body: &mut Value, model: &Model, thinking: ThinkingConfig) {
+        if let Some((fields, fallback)) = model.effective_thinking_fields() {
+            thinking.apply_fields(body, model, fields, fallback);
+        } else {
+            let discovered = crate::model_registry::discovered(&self.slug, &model.id);
+            let dialect = responses_dialect(&model.id, discovered.as_ref());
+            apply_responses_reasoning(body, thinking, model, &dialect);
+        }
+    }
+
+    fn frame_reasoning(model: &Model, effort: Effort) -> Option<Value> {
+        if let Some((fields, _)) = model.effective_thinking_fields() {
+            return declared_frame_reasoning(fields, effort).cloned();
+        }
+        Some(reasoning_config(effort.as_str()))
+    }
+
     fn resolve_url(&self, auth: &ResolvedAuth) -> Option<String> {
         if let Some(b) = &auth.base_url {
             return Some(b.clone());
@@ -627,44 +745,115 @@ impl Provider for ResponsesProvider {
         tools: &'a Value,
         event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        self.stream_message_with_reasoning_frame(
+            model, messages, system, tools, event_tx, opts, session_id, None,
+        )
+    }
+
+    fn configuration_effort(&self, model: &Model, opts: RequestOptions) -> Option<Effort> {
+        if !is_gpt_6_2(&model.id) {
+            return None;
+        }
+        let mut body = json!({});
+        self.apply_request_reasoning(&mut body, model, opts.clamped(model).thinking);
+        let (effort, _) = native_reasoning(body.as_object()?)?;
+        if let Some((fields, _)) = model.effective_thinking_fields() {
+            declared_frame_reasoning(fields, effort)?;
+        }
+        Some(effort)
+    }
+
+    fn stream_message_with_reasoning_frame<'a>(
+        &'a self,
+        model: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        tools: &'a Value,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
+        opts: RequestOptions,
+        session_id: Option<&'a SessionRef>,
+        reasoning_frame: Option<&'a ReasoningFrame>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        let frame_reasoning = reasoning_frame
+            .filter(|frame| is_gpt_6_2(&model.id) && frame.model == model.spec())
+            .filter(|_| {
+                session_id.is_none()
+                    || !matches!(
+                        self.session_id.body_field.as_deref(),
+                        Some(
+                            "model"
+                                | "input"
+                                | "reasoning"
+                                | "store"
+                                | "previous_response_id"
+                                | "conversation"
+                                | "mode"
+                                | "multi_agent"
+                        )
+                    )
+            })
+            .and_then(|frame| Some((frame, Self::frame_reasoning(model, frame.effort)?)));
         let mut auth = self.auth.lock().unwrap().clone();
         if auth.base_url.is_none() {
             auth.base_url = self.resolve_url(&auth);
         }
         Box::pin(async move {
             let effective_system = match &self.system_prefix {
-                Some(prefix) => format!("{prefix}\n\n{system}"),
-                None => system.to_string(),
+                Some(prefix) => Cow::Owned(format!("{prefix}\n\n{system}")),
+                None => Cow::Borrowed(system),
             };
-            let mut body = build_body(
+            let mut body = build_body_with_frame(
                 model,
                 messages,
                 &effective_system,
                 tools,
                 self.replay_reasoning,
+                frame_reasoning
+                    .as_ref()
+                    .filter(|_| self.body_hook.is_none())
+                    .map(|(frame, _)| frame.id),
             );
-            if let Some((fields, fallback)) = model.effective_thinking_fields() {
-                opts.thinking
-                    .apply_fields(&mut body, model, fields, fallback);
-            } else {
-                let discovered = crate::model_registry::discovered(&self.slug, &model.id);
-                let dialect = responses_dialect(&model.id, discovered.as_ref());
-                apply_responses_reasoning(&mut body, opts.thinking, model, &dialect);
+            if self.body_hook.is_some() || frame_reasoning.is_none() {
+                self.apply_request_reasoning(&mut body, model, opts.thinking);
             }
             apply_responses_fast(&mut body, opts.fast);
-            if let Some(session) = _session_id {
+            if let Some(session) = session_id {
                 let _ = self.session_id.apply(session, &mut body, &mut auth);
             }
             if let Some(hook) = &self.body_hook {
+                let original = frame_reasoning
+                    .as_ref()
+                    .map(|_| (body["input"].clone(), body.get("reasoning").cloned()));
                 let ctx = super::codec::RequestCtx {
                     model,
                     opts: &opts,
-                    session: _session_id,
+                    session: session_id,
                     discovered: None,
                 };
                 body = hook.call(body, &ctx).await?;
+                if let (Some((frame, baseline)), Some((input, reasoning))) =
+                    (frame_reasoning, original)
+                {
+                    if body["input"] == input
+                        && body.get("reasoning") == reasoning.as_ref()
+                        && can_replay(&body, model)
+                    {
+                        body["reasoning"] = baseline;
+                        body["input"] = convert_input(
+                            messages,
+                            self.replay_reasoning,
+                            (!effective_system.trim().is_empty())
+                                .then_some(effective_system.as_ref()),
+                            Some(frame.id),
+                        );
+                    } else {
+                        warn!(provider = %self.slug, model = %model.id, "body hook changed the Responses replay fields; sending its request without frame updates");
+                    }
+                }
+            } else if let Some((_, baseline)) = frame_reasoning {
+                body["reasoning"] = baseline;
             }
             do_stream(
                 &self.client,
@@ -1017,7 +1206,7 @@ mod tests {
     use test_case::test_case;
     use tokio::sync::mpsc::unbounded_channel;
 
-    use crate::test_support::{sse_body, sse_event};
+    use crate::test_support::{Canned, serve, sse_body, sse_event};
 
     const OVERLOAD_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
     const BAD_REQUEST_MESSAGE: &str = "Invalid value for 'model'";
@@ -1235,9 +1424,15 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
         );
     }
 
-    #[test]
-    fn convert_input_structure() {
-        let messages = vec![
+    #[test_case("gpt-6.2", true ; "exact")]
+    #[test_case("代理-GpT-6.20-preview", true ; "mixed_case_substring")]
+    #[test_case("gpt-6.1-sol", false ; "older_model")]
+    #[test_case("gpt-６.2", false ; "non_ascii_lookalike")]
+    fn build_body_places_system_prompt_before_history(model_id: &str, developer_prompt: bool) {
+        const SYSTEM: &str = "You are a coding agent.";
+
+        let model = Model::from_spec(&format!("responses/{model_id}")).unwrap();
+        let messages = [
             Message::user("hello".to_string()),
             Message {
                 role: Role::Assistant,
@@ -1256,8 +1451,24 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
             },
         ];
 
-        let input = convert_input(&messages, false);
-        let items = input.as_array().unwrap();
+        let body = build_body(&model, &messages, SYSTEM, &json!([]), false);
+        let items = body["input"].as_array().unwrap();
+        let items = if developer_prompt {
+            assert!(body.get("instructions").is_none());
+            assert_eq!(
+                items[0],
+                json!({
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": SYSTEM}]
+                })
+            );
+            &items[1..]
+        } else {
+            assert_eq!(body["instructions"], SYSTEM);
+            items.as_slice()
+        };
+        assert_eq!(items.len(), 4);
 
         assert_eq!(items[0]["type"], "message");
         assert_eq!(items[0]["role"], "user");
@@ -1276,6 +1487,406 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
         assert_eq!(items[3]["type"], "function_call_output");
         assert_eq!(items[3]["call_id"], "tc_1");
         assert_eq!(items[3]["output"], "file.txt");
+    }
+
+    #[test_case("gpt-6.2", "", None ; "empty_matching_prompt")]
+    #[test_case("gpt-6.2", " \n\t", None ; "blank_matching_prompt")]
+    #[test_case("gpt-6.1-sol", "", Some("") ; "empty_older_prompt")]
+    fn build_body_handles_blank_system_prompt(
+        model_id: &str,
+        system: &str,
+        instructions: Option<&str>,
+    ) {
+        let model = Model::from_spec(&format!("responses/{model_id}")).unwrap();
+        let body = build_body(&model, &[], system, &json!([]), false);
+
+        assert_eq!(
+            body.get("instructions"),
+            instructions.map(Value::from).as_ref()
+        );
+        assert_eq!(body["input"], json!([]));
+    }
+
+    #[test_case("System prompt.", "Prefix.\n\nSystem prompt." ; "prefix_and_system")]
+    #[test_case("", "Prefix.\n\n" ; "prefix_only")]
+    #[tokio::test]
+    async fn responses_stream_carries_prefixed_developer_prompt(system: &str, expected: &str) {
+        use crate::test_support::{Canned, serve};
+
+        const PREFIX: &str = "Prefix.";
+        const SCRIPT: &[Canned] = &[Canned::json(401, r#"{"error":{"message":"no"}}"#)];
+
+        let (base_url, requests) = serve(SCRIPT);
+        let auth = ResolvedAuth::bearer("responses", "sk-test")
+            .unwrap()
+            .with_base_url(Some(base_url));
+        let provider = ResponsesProvider::new(
+            "responses".to_string(),
+            None,
+            Arc::new(Mutex::new(auth)),
+            Timeouts::default(),
+        )
+        .with_system_prefix(Some(PREFIX.to_string()));
+        let model = Model::from_spec("responses/gpt-6.2").unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let _ = provider
+            .stream_message(
+                &model,
+                &[],
+                system,
+                &json!([]),
+                &tx,
+                RequestOptions::default(),
+                None,
+            )
+            .await;
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let body = recorded[0].json();
+        assert!(body.get("instructions").is_none());
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["content"][0]["text"], expected);
+    }
+
+    const FRAME_MODEL: &str = "responses/proxy/GpT-6.2-sol";
+    const FRAME_PROMPT: &str = "Follow the system prompt.";
+    const FRAME_USER_TEXT: &str = "Read the file.";
+    const COMPLETE: Canned = Canned::sse(
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+    );
+
+    fn frame_provider(base_url: String) -> ResponsesProvider {
+        let auth = ResolvedAuth::bearer("responses", "sk-test")
+            .unwrap()
+            .with_base_url(Some(base_url));
+        ResponsesProvider::new(
+            "responses".to_owned(),
+            None,
+            Arc::new(Mutex::new(auth)),
+            Timeouts::default(),
+        )
+    }
+
+    fn frame_user(frame: MakiId, effort: Effort) -> Message {
+        let mut message = Message::user(FRAME_USER_TEXT.to_owned());
+        message
+            .content
+            .insert(0, ContentBlock::ReasoningEffort { frame, effort });
+        message
+    }
+
+    #[tokio::test]
+    async fn reasoning_frame_keeps_the_request_prefix_through_switches_and_tool_round() {
+        const TURNS: [(Effort, bool); 4] = [
+            (Effort::Low, false),
+            (Effort::High, true),
+            (Effort::High, false),
+            (Effort::Low, true),
+        ];
+        const SCRIPT: &[Canned] = &[COMPLETE; TURNS.len() + 1];
+        let (base_url, requests) = serve(SCRIPT);
+        let provider = frame_provider(base_url);
+        let model = Model::from_spec(FRAME_MODEL).unwrap();
+        let frame = ReasoningFrame {
+            id: MakiId::generate(),
+            model: model.spec(),
+            effort: Effort::Low,
+        };
+        let (tx, _rx) = unbounded_channel();
+        let mut messages = Vec::new();
+        for (effort, update) in TURNS {
+            messages.push(if update {
+                frame_user(frame.id, effort)
+            } else {
+                Message::user(FRAME_USER_TEXT.to_owned())
+            });
+            provider
+                .stream_message_with_reasoning_frame(
+                    &model,
+                    &messages,
+                    FRAME_PROMPT,
+                    &json!([]),
+                    &tx,
+                    RequestOptions {
+                        thinking: ThinkingConfig::Effort(effort),
+                        fast: false,
+                    },
+                    None,
+                    Some(&frame),
+                )
+                .await
+                .unwrap();
+            messages.push(Message::empty_marker());
+        }
+        messages.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use("call", TOOL_NAME, json!({}))],
+            ..Default::default()
+        });
+        messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::tool_result("call", "42", false)],
+            ..Default::default()
+        });
+        provider
+            .stream_message_with_reasoning_frame(
+                &model,
+                &messages,
+                FRAME_PROMPT,
+                &json!([]),
+                &tx,
+                RequestOptions::default(),
+                None,
+                Some(&frame),
+            )
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), SCRIPT.len());
+        let mut previous_input = Vec::new();
+        for request in requests.iter() {
+            let body = request.json();
+            assert_eq!(body["reasoning"], json!({"effort":"low", "summary":"auto"}));
+            assert_eq!(body["store"], false);
+            let input = body["input"].as_array().unwrap();
+            assert!(input.starts_with(&previous_input));
+            previous_input.clone_from(input);
+        }
+        let updates: Vec<_> = previous_input
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                (item["type"] == CONFIGURATION_UPDATE)
+                    .then_some((index, &item["reasoning"]["effort"]))
+            })
+            .collect();
+        assert_eq!(updates, [(3, &json!("high")), (8, &json!("low"))]);
+        for (index, _) in updates {
+            assert_eq!(previous_input[index + 1]["role"], "user");
+        }
+        assert_eq!(
+            previous_input.last().unwrap()["type"],
+            "function_call_output"
+        );
+    }
+
+    #[test_case(FRAME_MODEL, ThinkingConfig::Off, None ; "empty")]
+    #[test_case(FRAME_MODEL, ThinkingConfig::Adaptive, Some(Effort::Medium) ; "adaptive")]
+    #[test_case(FRAME_MODEL, ThinkingConfig::Effort(Effort::Minimal), Some(Effort::Low) ; "snapped")]
+    #[test_case("responses/gpt-6.1-sol", ThinkingConfig::Effort(Effort::High), None ; "other_model")]
+    #[test_case("responses/gpt-６.2", ThinkingConfig::Effort(Effort::High), None ; "non_ascii_lookalike")]
+    fn configuration_effort_uses_explicit_native_levels(
+        spec: &str,
+        thinking: ThinkingConfig,
+        expected: Option<Effort>,
+    ) {
+        let model = Model::from_spec(spec).unwrap();
+        let provider = frame_provider(String::new());
+        assert_eq!(
+            provider.configuration_effort(
+                &model,
+                RequestOptions {
+                    thinking,
+                    fast: false
+                }
+            ),
+            expected
+        );
+    }
+
+    #[test_case(json!({"reasoning":{"effort":"high","summary":"detailed"}}), Some(Effort::High) ; "native_summary")]
+    #[test_case(json!({"reasoning":{"effort":"high","summary":"auto"}}), None ; "different_summary")]
+    #[test_case(json!({"reasoning":{"effort":"high","summary":"detailed"},"thinking":true}), None ; "additional_setting")]
+    #[test_case(json!({"reasoning_effort":"high"}), None ; "non_native")]
+    #[tokio::test]
+    async fn reasoning_frame_preserves_declared_native_summary(
+        fragment: Value,
+        expected: Option<Effort>,
+    ) {
+        const SCRIPT: &[Canned] = &[COMPLETE];
+        let (base_url, requests) = serve(SCRIPT);
+        let provider = frame_provider(base_url);
+        let mut model = Model::from_spec(FRAME_MODEL).unwrap();
+        model.thinking_fields = Some(Box::new(ThinkingFields {
+            levels: [
+                (
+                    Effort::Low,
+                    json!({"reasoning":{"effort":"low","summary":"detailed"}})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+                (Effort::High, fragment.as_object().unwrap().clone()),
+            ]
+            .into(),
+            ..Default::default()
+        }));
+        let frame = ReasoningFrame {
+            id: MakiId::generate(),
+            model: model.spec(),
+            effort: Effort::Low,
+        };
+        let (tx, _rx) = unbounded_channel();
+        let opts = RequestOptions {
+            thinking: ThinkingConfig::Effort(Effort::High),
+            fast: false,
+        };
+        assert_eq!(provider.configuration_effort(&model, opts), expected);
+        provider
+            .stream_message_with_reasoning_frame(
+                &model,
+                &[frame_user(frame.id, Effort::High)],
+                FRAME_PROMPT,
+                &json!([]),
+                &tx,
+                opts,
+                None,
+                expected.map(|_| &frame),
+            )
+            .await
+            .unwrap();
+        let body = requests.lock().unwrap()[0].json();
+        if expected.is_some() {
+            assert_eq!(
+                body["reasoning"],
+                json!({"effort":"low","summary":"detailed"})
+            );
+            assert_eq!(body["input"][1]["type"], CONFIGURATION_UPDATE);
+        } else {
+            for (key, value) in fragment.as_object().unwrap() {
+                assert_eq!(&body[key], value);
+            }
+            assert_eq!(body["input"][1]["role"], "user");
+        }
+    }
+
+    #[test_case(FRAME_MODEL, true ; "matching_model")]
+    #[test_case("responses/gpt-6.1-sol", false ; "other_model")]
+    #[tokio::test]
+    async fn reasoning_frame_filters_model_and_message_boundaries(spec: &str, supported: bool) {
+        const SCRIPT: &[Canned] = &[COMPLETE; 2];
+        let (base_url, requests) = serve(SCRIPT);
+        let provider = frame_provider(base_url);
+        let model = Model::from_spec(spec).unwrap();
+        let frame = ReasoningFrame {
+            id: MakiId::generate(),
+            model: model.spec(),
+            effort: Effort::Low,
+        };
+        let mut late = Message::user(FRAME_USER_TEXT.to_owned());
+        late.content.push(ContentBlock::ReasoningEffort {
+            frame: frame.id,
+            effort: Effort::High,
+        });
+        let mut assistant = frame_user(frame.id, Effort::High);
+        assistant.role = Role::Assistant;
+        let messages = [
+            frame_user(MakiId::generate(), Effort::High),
+            late,
+            assistant,
+            frame_user(frame.id, Effort::High),
+        ];
+        let (tx, _rx) = unbounded_channel();
+        for current in [None, Some(&frame)] {
+            provider
+                .stream_message_with_reasoning_frame(
+                    &model,
+                    &messages,
+                    FRAME_PROMPT,
+                    &json!([]),
+                    &tx,
+                    RequestOptions::default(),
+                    None,
+                    current,
+                )
+                .await
+                .unwrap();
+        }
+        let requests = requests.lock().unwrap();
+        let no_frame = requests[0].json();
+        if supported {
+            assert!(no_frame.get("reasoning").is_none());
+        }
+        assert!(
+            !no_frame["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == CONFIGURATION_UPDATE)
+        );
+        let with_frame = requests[1].json();
+        assert_eq!(
+            with_frame["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == CONFIGURATION_UPDATE)
+                .count(),
+            usize::from(supported)
+        );
+        if !supported {
+            assert_eq!(with_frame, no_frame);
+        }
+    }
+
+    struct ReasoningHook(Option<&'static str>);
+
+    impl super::super::codec::BodyHook for ReasoningHook {
+        fn call<'a>(
+            &'a self,
+            mut body: Value,
+            ctx: &super::super::codec::RequestCtx<'_>,
+        ) -> BoxFuture<'a, Result<Value, AgentError>> {
+            assert_eq!(ctx.opts.thinking, ThinkingConfig::Effort(Effort::High));
+            body["metadata"] = json!({"source": "hook"});
+            if let Some(effort) = self.0 {
+                body["reasoning"]["effort"] = json!(effort);
+            }
+            Box::pin(async move { Ok(body) })
+        }
+    }
+
+    #[test_case(None, "low", true ; "unchanged_reasoning")]
+    #[test_case(Some("medium"), "medium", false ; "rewritten_reasoning")]
+    #[tokio::test]
+    async fn reasoning_frame_preserves_hook_options(
+        change: Option<&'static str>,
+        effort: &str,
+        replay: bool,
+    ) {
+        const SCRIPT: &[Canned] = &[COMPLETE];
+        let (base_url, requests) = serve(SCRIPT);
+        let provider =
+            frame_provider(base_url).with_body_hook(Some(Arc::new(ReasoningHook(change))));
+        let model = Model::from_spec(FRAME_MODEL).unwrap();
+        let frame = ReasoningFrame {
+            id: MakiId::generate(),
+            model: model.spec(),
+            effort: Effort::Low,
+        };
+        let (tx, _rx) = unbounded_channel();
+        provider
+            .stream_message_with_reasoning_frame(
+                &model,
+                &[frame_user(frame.id, Effort::High)],
+                FRAME_PROMPT,
+                &json!([]),
+                &tx,
+                RequestOptions {
+                    thinking: ThinkingConfig::Effort(Effort::High),
+                    fast: false,
+                },
+                None,
+                Some(&frame),
+            )
+            .await
+            .unwrap();
+        let body = requests.lock().unwrap()[0].json();
+        assert_eq!(body["metadata"]["source"], "hook");
+        assert_eq!(body["reasoning"]["effort"], effort);
+        assert_eq!(body["input"][1]["type"] == CONFIGURATION_UPDATE, replay);
     }
 
     #[test]
@@ -1297,7 +1908,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
         };
         let messages = [Message::user("hello".to_string()), assistant(None)];
 
-        let input = convert_input(&messages, true);
+        let input = convert_input(&messages, true, None, None);
         let items = input.as_array().unwrap();
 
         assert_eq!(items[1]["type"], "reasoning");
@@ -1309,7 +1920,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
         assert_eq!(items[2]["role"], "assistant");
         assert_eq!(items[2]["content"][0]["text"], "answer");
 
-        let dropped = convert_input(&messages, false);
+        let dropped = convert_input(&messages, false, None, None);
         assert_eq!(dropped[1]["type"], "message");
         assert_eq!(dropped[1]["role"], "assistant");
 
@@ -1317,7 +1928,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
             Message::user("hello".to_string()),
             assistant(Some("rs_1".to_string())),
         ];
-        let input = convert_input(&with_id, true);
+        let input = convert_input(&with_id, true, None, None);
         assert_eq!(input[1]["id"], "rs_1");
     }
 
@@ -1329,7 +1940,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
             ..Default::default()
         }];
 
-        let input = convert_input(&messages, false);
+        let input = convert_input(&messages, false, None, None);
         assert_eq!(input[0]["type"], "function_call_output");
         assert_eq!(input[0]["output"], crate::types::EMPTY_RESPONSE_MARKER);
     }

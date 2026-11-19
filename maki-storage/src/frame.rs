@@ -9,6 +9,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::id::MakiId;
+use crate::sessions::Effort;
+
 /// What a rendered system prompt states that can change later, kept as data
 /// so a newer value can be spotted and told as an update.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +130,13 @@ impl LiveFacts {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningFrame {
+    pub id: MakiId,
+    pub model: String,
+    pub effort: Effort,
+}
+
 /// Base tools are kept as part of a fingerprint only. They are rebuilt from
 /// the registry on every run, and a stored schema could resurrect a tool a
 /// newer plugin set dropped.
@@ -156,6 +166,8 @@ pub struct StoredFrame {
     /// resumed process cannot reproduce.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_tools: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningFrame>,
 }
 
 impl StoredFrame {
@@ -171,6 +183,7 @@ impl StoredFrame {
             facts,
             inherited: FactsUpdate::default(),
             mcp_tools,
+            reasoning: None,
         }
     }
 
@@ -183,6 +196,7 @@ impl StoredFrame {
             facts: Some(facts),
             inherited: FactsUpdate::default(),
             mcp_tools: Vec::new(),
+            reasoning: None,
         }
     }
 

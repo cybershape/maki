@@ -16,7 +16,7 @@ use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, ImageSource, InputTransformation, Message,
     Model, ModelTier, RequestOptions, Role, StopReason, StreamResponse, model_registry,
 };
-use maki_storage::frame::{LiveFacts, PromptFacts};
+use maki_storage::frame::{LiveFacts, PromptFacts, ReasoningFrame};
 
 use super::compaction::{self, CompactReason, CompactSteer, Compacted, CompactionPlan};
 use super::display_order::{observation_detail, observation_line};
@@ -45,7 +45,7 @@ use crate::{
     TurnCompleteEvent, TurnTiming,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 /// One compaction is the whole remedy for an overflowing prompt, so a second
@@ -361,7 +361,10 @@ impl<'h> Agent<'h> {
                 prompt = Some(text.clone());
                 Message::user_with_images(text, images)
             });
-            self.land_input(preamble, kept, true)?;
+            let mailbox_wake = kept
+                .as_ref()
+                .is_some_and(|message| message.content.is_empty());
+            self.land_input(preamble, kept, true, mailbox_wake)?;
         }
         let Some(message) = prompt else {
             self.emit_done(DoneReason::Dropped)?;
@@ -401,7 +404,7 @@ impl<'h> Agent<'h> {
     ) -> Result<DoneReason, AgentError> {
         self.begin(opts);
         let landed = async {
-            self.land_input(notices, None, false)?;
+            self.land_input(notices, None, false, true)?;
             self.handle_queued_command().await
         }
         .await;
@@ -419,6 +422,10 @@ impl<'h> Agent<'h> {
             .as_slice()
             .last()
             .is_some_and(|message| matches!(message.role, Role::User))
+    }
+
+    pub(crate) fn request_options(&self) -> RequestOptions {
+        self.opts
     }
 
     fn begin(&mut self, opts: RequestOptions) {
@@ -490,11 +497,17 @@ impl<'h> Agent<'h> {
         preamble: Vec<Message>,
         message: Option<Message>,
         drain_mailbox: bool,
+        mailbox_wake: bool,
     ) -> Result<(), AgentError> {
-        for message in preamble {
+        let mut wake = mailbox_wake;
+        for mut message in preamble {
+            if wake && message.is_observation() && message.first_text_content().is_some() {
+                self.apply_reasoning_effort(&mut message);
+                wake = false;
+            }
             self.land_observation(message)?;
         }
-        let Some(message) = message else {
+        let Some(mut message) = message else {
             return Ok(());
         };
         if drain_mailbox {
@@ -502,9 +515,39 @@ impl<'h> Agent<'h> {
         }
         self.tell_changes();
         if !message.content.is_empty() {
+            self.apply_reasoning_effort(&mut message);
             self.history.push(message);
         }
         Ok(())
+    }
+
+    fn apply_reasoning_effort(&mut self, message: &mut Message) {
+        let Some(frame) = self.history.reasoning_frame() else {
+            return;
+        };
+        if frame.model != self.model.spec() {
+            return;
+        }
+        let Some(effort) = self.provider.configuration_effort(&self.model, self.opts) else {
+            self.history.set_reasoning_frame(None);
+            return;
+        };
+        let current = self
+            .history
+            .as_slice()
+            .iter()
+            .rev()
+            .find_map(|message| message.reasoning_effort(frame.id))
+            .unwrap_or(frame.effort);
+        if effort != current {
+            message.content.insert(
+                0,
+                ContentBlock::ReasoningEffort {
+                    frame: frame.id,
+                    effort,
+                },
+            );
+        }
     }
 
     fn land_mailbox(&mut self) -> Result<(), AgentError> {
@@ -675,6 +718,24 @@ impl<'h> Agent<'h> {
         if self.history.live_frame().is_none() {
             self.refresh_frame()?;
         }
+        let spec = self.model.spec();
+        if self
+            .history
+            .reasoning_frame()
+            .is_none_or(|frame| frame.model != spec)
+        {
+            let reasoning = self
+                .provider
+                .configuration_effort(&self.model, self.opts)
+                .map(|effort| ReasoningFrame {
+                    id: MakiId::generate(),
+                    model: spec,
+                    effort,
+                });
+            if reasoning.is_some() || self.history.reasoning_frame().is_some() {
+                self.history.set_reasoning_frame(reasoning);
+            }
+        }
         if let Some(mcp) = &self.mcp {
             self.history.append_late_tools(mcp);
         }
@@ -713,6 +774,7 @@ impl<'h> Agent<'h> {
                 opts: self.opts,
                 output_budget: self.config.max_turn_output,
                 session_id: self.session_id.as_ref(),
+                reasoning_frame: self.history.reasoning_frame(),
                 retry: self.timeouts.retry,
             },
             Some(self.gauge),
@@ -1316,6 +1378,12 @@ impl<'h> Agent<'h> {
             ExtractedCommand::Interrupt(inputs) => {
                 let mut kept_any = false;
                 let last = inputs.len().saturating_sub(1);
+                let opts = RequestOptions {
+                    thinking: inputs
+                        .last()
+                        .map_or(self.opts.thinking, |input| input.thinking),
+                    ..self.opts
+                };
                 for (index, input) in inputs.into_iter().enumerate() {
                     self.event_tx.send(AgentEvent::QueueItemConsumed {
                         text: input.message.clone(),
@@ -1329,6 +1397,15 @@ impl<'h> Agent<'h> {
                         interrupt_message(text, input.images, input.source)
                     });
                     if message.is_some() {
+                        if !kept_any
+                            && (self.history.reasoning_frame().is_some()
+                                || self
+                                    .provider
+                                    .configuration_effort(&self.model, opts)
+                                    .is_some())
+                        {
+                            self.opts = opts;
+                        }
                         self.mode = input.mode;
                         // The user spoke, so `agent.stop` gets its full
                         // allowance back.
@@ -1337,7 +1414,7 @@ impl<'h> Agent<'h> {
                     }
                     // Each prompt is drawn as it is consumed, so a note
                     // drained earlier would show up between them.
-                    self.land_input(input.preamble, message, index == last)?;
+                    self.land_input(input.preamble, message, index == last, false)?;
                 }
                 Ok(kept_any)
             }
@@ -1436,16 +1513,20 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use maki_providers::model::FastSupport;
     use maki_providers::provider::{BoxFuture, Provider};
-    use maki_providers::test_support::isolated_home;
+    use maki_providers::test_support::{Canned, isolated_home, serve};
     use maki_providers::{
-        ContentBlock, FastPricing, Message, Model, ModelPricing, ProviderEvent, RequestOptions,
-        Role, StopReason, StreamResponse, ThinkingSupport, TokenUsage,
+        ContentBlock, Effort, FastPricing, Message, Model, ModelPricing, ProviderEvent,
+        RequestOptions, ResolvedAuth, ResponsesProvider, Role, StopReason, StreamResponse,
+        ThinkingConfig, ThinkingSupport, Timeouts, TokenUsage,
     };
+    use maki_storage::StateDir;
     use maki_storage::frame::{FactsUpdate, PlanChange};
     use maki_storage::id::MakiId;
+    use maki_storage::sessions::SessionClaim;
     use serde_json::Value;
     use test_case::test_case;
     use tokio::sync::Mutex as AsyncMutex;
@@ -1769,6 +1850,131 @@ mod tests {
             prompt: None,
             source: InputSource::Tui,
         }
+    }
+
+    #[tokio::test]
+    async fn responses_effort_updates_preserve_the_wire_prefix_across_restore() {
+        const ANSWER: &str = concat!(
+            "event: response.output_text.delta\ndata: {\"delta\":\"done\"}\n\n",
+            "event: response.completed\ndata: {\"response\":{\"status\":\"completed\"}}\n\n",
+        );
+        const SCRIPT: &[Canned] = &[
+            Canned::sse(ANSWER),
+            Canned::json(503, r#"{"error":{"message":"temporarily unavailable"}}"#),
+            Canned::sse(ANSWER),
+            Canned::sse(ANSWER),
+            Canned::sse(ANSWER),
+            Canned::sse(ANSWER),
+            Canned::sse(ANSWER),
+            Canned::sse(ANSWER),
+        ];
+        const MODEL: &str = "responses/proxy/GpT-6.2-sol";
+        const OLDER_MODEL: &str = "responses/gpt-6.1-sol";
+        const TURNS: [(&str, &str, Effort); 7] = [
+            ("first", MODEL, Effort::Low),
+            ("raise", MODEL, Effort::High),
+            ("same", MODEL, Effort::High),
+            ("lower", MODEL, Effort::Low),
+            ("switch", OLDER_MODEL, Effort::High),
+            ("switch back", MODEL, Effort::Medium),
+            ("rewind", MODEL, Effort::Low),
+        ];
+
+        let (url, recorded) = serve(SCRIPT);
+        let auth = ResolvedAuth::bearer("responses", "test-key")
+            .unwrap()
+            .with_base_url(Some(url));
+        let provider: Arc<dyn Provider> = Arc::new(ResponsesProvider::new(
+            "responses".into(),
+            None,
+            Arc::new(Mutex::new(auth)),
+            Timeouts::default(),
+        ));
+        let mut history = History::new(Vec::new());
+        let mut before_raise = 0;
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_path(temp.path().to_path_buf());
+        let mut stored = StoredSession::new(MODEL, ".");
+        let claim = SessionClaim::acquire(stored.id, &state_dir).unwrap();
+        for (index, (prompt, model, effort)) in TURNS.into_iter().enumerate() {
+            if index == 1 {
+                before_raise = history.len();
+            }
+            if index == 2 {
+                stored.replace_messages(history.as_slice().to_vec());
+                stored.set_frame(history.frame().cloned());
+                stored.save(&claim, &state_dir).unwrap();
+            }
+            if matches!(index, 2 | 6) {
+                let mut loaded = StoredSession::load_claimed(&claim, &state_dir).unwrap();
+                if index == 6 {
+                    loaded.truncate_messages(before_raise);
+                    loaded = loaded.fork(MakiId::generate(), ".", &state_dir).unwrap();
+                }
+                let frame = loaded.frame().cloned();
+                history = History::restored(loaded.take_messages()).with_frame(frame);
+            }
+            let model = Model::from_spec(model).unwrap();
+            let (mut agent, _events) = make_agent_with(provider.clone(), model, &mut history);
+            agent.timeouts.retry.base_delay = Duration::ZERO;
+            let reason = agent
+                .run(AgentInput {
+                    message: prompt.into(),
+                    thinking: ThinkingConfig::Effort(effort),
+                    ..default_input()
+                })
+                .await
+                .unwrap();
+            assert_eq!(reason, DoneReason::EndTurn);
+        }
+
+        let mut bodies: Vec<_> = recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.json())
+            .collect();
+        assert_eq!(bodies.len(), SCRIPT.len());
+        let retry = bodies.remove(1);
+        assert_eq!(retry, bodies[1]);
+        assert_eq!(bodies.len(), TURNS.len());
+        let inputs: Vec<_> = bodies
+            .iter()
+            .map(|body| body["input"].as_array().unwrap())
+            .collect();
+        for (body, expected) in bodies
+            .iter()
+            .zip(["low", "low", "low", "low", "high", "medium", "low"])
+        {
+            assert_eq!(body["reasoning"]["effort"], expected);
+        }
+        for (previous, next) in [(0, 1), (1, 2), (2, 3), (0, 6)] {
+            assert!(inputs[next].starts_with(inputs[previous]));
+        }
+        for (input, expected) in inputs.iter().zip([0, 1, 1, 2, 0, 0, 0]) {
+            assert_eq!(
+                input
+                    .iter()
+                    .filter(|item| item["type"] == "configuration_update")
+                    .count(),
+                expected
+            );
+        }
+        let input = inputs[1];
+        assert_eq!(
+            input[input.len() - 2],
+            json!({
+                "type": "configuration_update", "reasoning": {"effort": "high"},
+            })
+        );
+        assert_eq!(input.last().unwrap()["content"][0]["text"], TURNS[1].0);
+        let input = inputs[3];
+        assert_eq!(
+            input[input.len() - 2],
+            json!({
+                "type": "configuration_update", "reasoning": {"effort": "low"},
+            })
+        );
     }
 
     #[test_case(false ; "section_replacement")]

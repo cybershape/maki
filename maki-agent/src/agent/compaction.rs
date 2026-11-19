@@ -11,7 +11,9 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use super::frame::{RunContext, fit_frame};
-use super::history::{History, remove_orphaned_tool_results, stamp_new, strip_thinking};
+use super::history::{
+    History, remove_orphaned_tool_results, stamp_new, strip_reasoning_effort, strip_thinking,
+};
 use super::hook::{AgentHooks, AgentSlot};
 use super::streaming::{
     StreamError, StreamRequest, StreamedResponse, min_output, stream_with_retry,
@@ -236,6 +238,7 @@ pub(super) async fn compact_history(
     remove_orphaned_tool_results(&mut compaction_history);
     strip_images(&mut compaction_history);
     strip_thinking(&mut compaction_history);
+    strip_reasoning_effort(&mut compaction_history);
     prepare_collapse(hooks, &mut compaction_history, RECENT_TOOL_RESULT_BUDGET).await;
     compaction_history.push(Message::user(summary_prompt(config, instructions)));
 
@@ -255,6 +258,7 @@ pub(super) async fn compact_history(
                 opts: RequestOptions::default(),
                 output_budget: SUMMARY_OUTPUT_BUDGET,
                 session_id: hooks.session_id,
+                reasoning_frame: None,
                 retry,
             },
             // A stripped, collapsed rewrite of the transcript, far smaller than
@@ -726,10 +730,10 @@ mod tests {
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
+        ContentBlock, Effort, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, TokenUsage,
     };
-    use maki_storage::id::SessionRef;
+    use maki_storage::id::{MakiId, SessionRef};
     use serde_json::Value;
     use test_case::test_case;
     use tokio::sync::mpsc::UnboundedSender;
@@ -1859,10 +1863,23 @@ mod tests {
     #[tokio::test]
     async fn compact_history_carries_the_tail_past_the_summary() {
         let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
-        let mut history = History::new(vec![
-            Message::user("first".into()),
-            Message::user(CARRIED.into()),
-        ]);
+        let frame = MakiId::generate();
+        let mut history = History::new(
+            ["first", CARRIED]
+                .into_iter()
+                .map(|text| {
+                    let mut message = Message::user(text.into());
+                    message.content.insert(
+                        0,
+                        ContentBlock::ReasoningEffort {
+                            frame,
+                            effort: Effort::High,
+                        },
+                    );
+                    message
+                })
+                .collect(),
+        );
         summarize_history(&provider, &mut history, 1, None).await;
 
         let carried = |messages: &[Message]| {
@@ -1876,6 +1893,13 @@ mod tests {
             "{CARRY_UNSENT_MSG}"
         );
         assert!(carried(history.as_slice()), "{CARRY_KEPT_MSG}");
+        let requests = provider.requests.lock().unwrap();
+        assert!(
+            requests[0]
+                .iter()
+                .chain(history.as_slice())
+                .all(|message| message.reasoning_effort(frame).is_none())
+        );
     }
 
     #[tokio::test]

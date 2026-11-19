@@ -69,7 +69,7 @@ pub async fn run_turns(
     input: AgentInput,
 ) -> Result<(), CutShort> {
     let _idle = IdleOnDrop(control);
-    let opts = RequestOptions {
+    let mut opts = RequestOptions {
         thinking: input.thinking,
         fast: input.fast,
     };
@@ -89,6 +89,7 @@ pub async fn run_turns(
             }
         })
         .await;
+        opts = agent.request_options();
         // Right away, so an interrupt landing while the run is judged finds no
         // turn to cut and leaves alone what its calls kept running.
         control.set_activity(Activity::Waiting);

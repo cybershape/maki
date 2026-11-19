@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use maki_providers::provider::Provider;
-use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
+use maki_providers::{ContentBlock, Message, Model, ProviderEvent, RequestOptions};
+use maki_storage::frame::ReasoningFrame;
 use maki_storage::id::SessionRef;
-use maki_storage::sessions::SessionTools;
 use serde_json::Value;
 use tokio::sync::mpsc::{Sender, channel, unbounded_channel};
 
@@ -52,12 +52,10 @@ impl App {
             .map(|s| Vec::clone(&s.messages))
             .unwrap_or_default();
         maki_agent::close_dangling_tool_calls(&mut messages, maki_agent::UNAVAILABLE_RESULT);
-        messages.push(btw_question(&question));
         // The session's own prompt, so the side question reads the transcript
         // under the instructions it was written under.
-        let system = snapshot
-            .as_ref()
-            .and_then(|s| s.frame.as_ref())
+        let frame = snapshot.as_ref().and_then(|s| s.frame.as_deref());
+        let system = frame
             .and_then(|f| f.prefix())
             .unwrap_or(BTW_FALLBACK_SYSTEM)
             .to_owned();
@@ -70,23 +68,53 @@ impl App {
         // rebuild. With thinking off the API would ignore them, but some
         // models cannot turn it off, so the signatures go and the reasoning
         // text stays.
+        let model_spec = model.spec();
         let fitted = snapshot
             .as_ref()
             .and_then(|s| s.tools.as_ref())
-            .filter(|tools| tools.model == model.spec());
+            .filter(|tools| tools.model == model_spec);
         let (tools, opts) = match fitted {
-            Some(SessionTools { wire, .. }) => (Arc::clone(wire), self.request_options()),
+            Some(tools) => (Arc::clone(&tools.wire), self.request_options()),
             None => {
                 maki_agent::unbind_thinking(&mut messages);
                 (Arc::new(NO_TOOLS), RequestOptions::default())
             }
         };
+        let opts = opts.clamped(&model);
+        let reasoning = fitted
+            .and(frame)
+            .and_then(|f| f.reasoning.as_ref())
+            .filter(|frame| frame.model == model_spec)
+            .and_then(|frame| {
+                provider
+                    .configuration_effort(&model, opts)
+                    .map(|effort| (frame, effort))
+            });
+        let mut question_message = btw_question(&question);
+        if let Some((frame, effort)) = reasoning {
+            let current = messages
+                .iter()
+                .rev()
+                .find_map(|message| message.reasoning_effort(frame.id))
+                .unwrap_or(frame.effort);
+            if effort != current {
+                question_message.content.insert(
+                    0,
+                    ContentBlock::ReasoningEffort {
+                        frame: frame.id,
+                        effort,
+                    },
+                );
+            }
+        }
+        messages.push(question_message);
 
         let (tx, rx) = channel(BTW_EVENT_CAPACITY);
         self.open_prompt(|app| app.btw_modal.open(&question, rx));
         let request = BtwRequest {
-            opts: opts.clamped(&model),
+            opts,
             session_id: SessionRef::from(self.state.session.id),
+            reasoning_frame: reasoning.map(|(frame, _)| frame.clone()),
             provider,
             model,
             system,
@@ -105,6 +133,7 @@ struct BtwRequest {
     messages: Vec<Message>,
     opts: RequestOptions,
     session_id: SessionRef,
+    reasoning_frame: Option<ReasoningFrame>,
 }
 
 impl BtwRequest {
@@ -117,7 +146,7 @@ impl BtwRequest {
         let stream = async {
             let result = self
                 .provider
-                .stream_message(
+                .stream_message_with_reasoning_frame(
                     &self.model,
                     &messages,
                     &self.system,
@@ -125,6 +154,7 @@ impl BtwRequest {
                     &event_tx,
                     self.opts,
                     Some(&self.session_id),
+                    self.reasoning_frame.as_ref(),
                 )
                 .await;
             drop(event_tx);
@@ -173,24 +203,34 @@ impl BtwRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::app::tests::test_app;
-    use crate::components::test_model;
+    use std::iter;
+    use std::sync::Arc;
+
     use arc_swap::ArcSwap;
     use maki_agent::HistorySnapshot;
     use maki_agent::prompt::{PromptId, Slot};
     use maki_agent::tools::ToolRegistry;
     use maki_lua::PluginHost;
-    use maki_providers::provider::BoxFuture;
+    use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        AgentError, ContentBlock, Effort, ModelInfo, Role, StopReason, StreamResponse,
-        ThinkingConfig, TokenUsage,
+        AgentError, ContentBlock, Effort, Message, Model, ModelInfo, ProviderEvent, RequestOptions,
+        Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
     };
-    use maki_storage::frame::{PromptFacts, StoredFrame};
-    use serde_json::json;
-    use std::iter;
+    use maki_storage::frame::{PromptFacts, ReasoningFrame, StoredFrame};
+    use maki_storage::id::{MakiId, SessionRef};
+    use maki_storage::sessions::SessionTools;
+    use serde_json::{Value, json};
     use test_case::test_case;
-    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::{UnboundedSender, channel, unbounded_channel};
+
+    use super::{
+        BTW_EVENT_CAPACITY, BTW_FALLBACK_SYSTEM, BTW_REMINDER, BtwRequest, NO_TOOLS, btw_question,
+        reached_for_tool,
+    };
+    use crate::app::App;
+    use crate::app::tests::test_app;
+    use crate::components::btw_modal::BtwEvent;
+    use crate::components::test_model;
 
     const Q: &str = "why sqlite?";
     const FRAME_POLICY: &str = "Use the active conversation policy.";
@@ -204,6 +244,7 @@ mod tests {
         system: String,
         tools: Value,
         opts: RequestOptions,
+        reasoning_frame: Option<ReasoningFrame>,
     }
 
     struct FakeProvider {
@@ -212,7 +253,29 @@ mod tests {
     }
 
     impl Provider for FakeProvider {
+        fn configuration_effort(&self, _: &Model, opts: RequestOptions) -> Option<Effort> {
+            match opts.thinking {
+                ThinkingConfig::Effort(effort) => Some(effort),
+                _ => None,
+            }
+        }
+
         fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            messages: &'a [Message],
+            system: &'a str,
+            tools: &'a Value,
+            events: &'a UnboundedSender<ProviderEvent>,
+            opts: RequestOptions,
+            session_id: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            self.stream_message_with_reasoning_frame(
+                model, messages, system, tools, events, opts, session_id, None,
+            )
+        }
+
+        fn stream_message_with_reasoning_frame<'a>(
             &'a self,
             _: &'a Model,
             messages: &'a [Message],
@@ -221,6 +284,7 @@ mod tests {
             events: &'a UnboundedSender<ProviderEvent>,
             opts: RequestOptions,
             _: Option<&'a SessionRef>,
+            reasoning_frame: Option<&'a ReasoningFrame>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let _ = self.sent.send(Recorded {
@@ -228,6 +292,7 @@ mod tests {
                     system: system.to_owned(),
                     tools: tools.clone(),
                     opts,
+                    reasoning_frame: reasoning_frame.cloned(),
                 });
                 for event in self.script.iter().cloned() {
                     events.send(event).unwrap();
@@ -337,7 +402,82 @@ mod tests {
         let sent = ask(&mut app).await;
         assert_eq!(sent.tools, tools);
         assert_eq!(sent.opts.thinking, thinking);
+        assert!(sent.reasoning_frame.is_none());
         assert_eq!(sent.messages[0].content, [thought(signature)]);
+    }
+
+    #[tokio::test]
+    async fn side_question_reuses_the_reasoning_frame_without_changing_the_session() {
+        let mut app = test_app();
+        let reasoning = ReasoningFrame {
+            id: MakiId::generate(),
+            model: test_model().spec(),
+            effort: Effort::Low,
+        };
+        let mut frame = rendered_frame();
+        frame.reasoning = Some(reasoning.clone());
+        let frame = Arc::new(frame);
+        let mut previous = Message::user(Q.into());
+        previous.content.insert(
+            0,
+            ContentBlock::ReasoningEffort {
+                frame: reasoning.id,
+                effort: Effort::High,
+            },
+        );
+        let mut other_frame = Message::user(Q.into());
+        other_frame.content.insert(
+            0,
+            ContentBlock::ReasoningEffort {
+                frame: MakiId::generate(),
+                effort: Effort::Low,
+            },
+        );
+        let history = vec![previous, other_frame];
+        let session = Arc::make_mut(&mut app.state.session);
+        session.replace_messages(history.clone());
+        session.set_frame(Some(Arc::clone(&frame)));
+        let mut snapshot = HistorySnapshot::new(history.clone());
+        snapshot.frame = Some(Arc::clone(&frame));
+        snapshot.tools = Some(SessionTools {
+            model: reasoning.model.clone(),
+            wire: Arc::new(wire()),
+        });
+        let snapshot = Arc::new(snapshot);
+        app.shared_history = Some(Arc::new(ArcSwap::from(Arc::clone(&snapshot))));
+
+        app.state.thinking = ThinkingConfig::Effort(Effort::High);
+        let sent = ask(&mut app).await;
+        let question = btw_question(Q);
+        let mut expected = history.clone();
+        expected.push(question.clone());
+        assert_eq!(sent.reasoning_frame.as_ref(), Some(&reasoning));
+        assert_eq!(sent.messages, expected);
+
+        app.state.thinking = ThinkingConfig::Effort(Effort::Low);
+        let sent = ask(&mut app).await;
+        let mut updated_question = question;
+        updated_question.content.insert(
+            0,
+            ContentBlock::ReasoningEffort {
+                frame: reasoning.id,
+                effort: Effort::Low,
+            },
+        );
+        assert_eq!(sent.reasoning_frame.as_ref(), Some(&reasoning));
+        assert_eq!(&sent.messages[..history.len()], history);
+        assert_eq!(&sent.messages[history.len()..], [updated_question]);
+
+        app.state.thinking = ThinkingConfig::Off;
+        let sent = ask(&mut app).await;
+        assert!(sent.reasoning_frame.is_none());
+        assert_eq!(sent.messages, expected);
+        assert!(Arc::ptr_eq(
+            &app.shared_history.as_ref().unwrap().load_full(),
+            &snapshot,
+        ));
+        assert_eq!(app.state.session.messages(), history);
+        assert_eq!(app.state.session.frame(), Some(&frame));
     }
 
     /// `Done` once never came: the provider's sender outlived the stream, so
@@ -366,6 +506,7 @@ mod tests {
             messages: vec![btw_question(Q)],
             opts: RequestOptions::default(),
             session_id: SessionRef::generate(),
+            reasoning_frame: None,
         }
         .run(tx)
         .await;

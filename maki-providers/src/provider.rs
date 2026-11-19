@@ -13,7 +13,9 @@ use tracing::{debug, warn};
 
 use maki_config::ModelPolicy;
 use maki_storage::blocking;
+use maki_storage::frame::ReasoningFrame;
 use maki_storage::id::SessionRef;
+use maki_storage::sessions::Effort;
 
 use crate::model::{Model, ModelInfo};
 use crate::model_registry::{discovery_complete, set_known_models};
@@ -39,6 +41,25 @@ pub trait Provider: Send + Sync {
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
+
+    fn configuration_effort(&self, _model: &Model, _opts: RequestOptions) -> Option<Effort> {
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_message_with_reasoning_frame<'a>(
+        &'a self,
+        model: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        tools: &'a Value,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
+        opts: RequestOptions,
+        session_id: Option<&'a SessionRef>,
+        _reasoning_frame: Option<&'a ReasoningFrame>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        self.stream_message(model, messages, system, tools, event_tx, opts, session_id)
+    }
 
     /// The models this provider serves right now. A failed listing must return
     /// an error, never a static or cached fallback: discovery reads a clean

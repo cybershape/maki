@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 use arc_swap::ArcSwap;
 use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, Role};
 use maki_storage::auth::now_millis;
-use maki_storage::frame::{LiveFacts, StoredFrame};
+use maki_storage::frame::{LiveFacts, ReasoningFrame, StoredFrame};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionTools, TitleSource, next_epoch};
 use serde_json::Value;
@@ -166,6 +166,18 @@ impl History {
         self.snapshot.frame.as_ref()
     }
 
+    pub(crate) fn reasoning_frame(&self) -> Option<&ReasoningFrame> {
+        self.frame()?.reasoning.as_ref()
+    }
+
+    pub(crate) fn set_reasoning_frame(&mut self, reasoning: Option<ReasoningFrame>) {
+        if let Some(frame) = &mut self.snapshot.frame {
+            Arc::make_mut(frame).reasoning = reasoning;
+            self.unsaved = true;
+            self.publish();
+        }
+    }
+
     pub(crate) fn live_frame(&self) -> Option<&LiveFrame> {
         self.live.as_ref()
     }
@@ -234,6 +246,7 @@ impl History {
     /// request.
     pub(crate) fn restart(&mut self, mut messages: Vec<Message>) {
         messages.retain(|m| !m.is_context_update());
+        strip_reasoning_effort(&mut messages);
         self.live = None;
         self.snapshot.frame = None;
         self.replace(messages);
@@ -502,6 +515,14 @@ fn remove_orphaned_tool_results_tracked(
     }
 
     changed
+}
+
+pub(super) fn strip_reasoning_effort(messages: &mut [Message]) {
+    for message in messages {
+        message
+            .content
+            .retain(|block| !matches!(block, ContentBlock::ReasoningEffort { .. }));
+    }
 }
 
 /// Thought signatures go with the thinking: they are bound to the same

@@ -10,7 +10,9 @@ use arc_swap::ArcSwap;
 use maki_config::host_allowed;
 use maki_config::providers::{Protocol, ProvidersConfig, base_url_override, plan_base_url};
 use maki_storage::auth::{lock_credentials, plugin_auth_stamp};
+use maki_storage::frame::ReasoningFrame;
 use maki_storage::id::SessionRef;
+use maki_storage::sessions::Effort;
 use maki_storage::{StateDir, blocking, joined};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1270,6 +1272,26 @@ impl Provider for PluginProvider {
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        self.stream_message_with_reasoning_frame(
+            model, messages, system, tools, event_tx, opts, session_id, None,
+        )
+    }
+
+    fn configuration_effort(&self, model: &Model, opts: RequestOptions) -> Option<Effort> {
+        self.inner.configuration_effort(model, opts)
+    }
+
+    fn stream_message_with_reasoning_frame<'a>(
+        &'a self,
+        model: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        tools: &'a Value,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
+        opts: RequestOptions,
+        session_id: Option<&'a SessionRef>,
+        reasoning_frame: Option<&'a ReasoningFrame>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let result = async {
                 self.entry.ensure_auth().await?;
@@ -1286,7 +1308,16 @@ impl Provider for PluginProvider {
                     let attempt = async {
                         let result = self
                             .inner
-                            .stream_message(model, messages, system, tools, &tx, opts, session_id)
+                            .stream_message_with_reasoning_frame(
+                                model,
+                                messages,
+                                system,
+                                tools,
+                                &tx,
+                                opts,
+                                session_id,
+                                reasoning_frame,
+                            )
                             .await;
                         drop(tx);
                         result
@@ -1677,10 +1708,13 @@ mod tests {
     use futures::FutureExt;
     use maki_config::providers::base_url_env_var;
     use maki_storage::auth::{PluginAuthData, save_plugin_auth};
+    use maki_storage::id::MakiId;
+    use serde_json::json;
     use test_case::test_case;
 
     use super::spec::{UNKNOWN_MODEL_CONTEXT_WINDOW, UNKNOWN_MODEL_MAX_OUTPUT};
     use super::*;
+    use crate::ContentBlock;
     use crate::model::ModelTier;
     use crate::model_registry;
     use crate::retry::RetryKind;
@@ -2422,18 +2456,39 @@ mod tests {
         register_loaded(reg).unwrap();
 
         let provider = create(slug, Timeouts::default()).unwrap();
-        let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
-        let messages = [Message::user(PROMPT.to_owned())];
+        let model = Model::from_spec(&format!("{slug}/proxy/GPT-6.2-sol")).unwrap();
+        let opts = RequestOptions {
+            thinking: ThinkingConfig::Effort(Effort::High),
+            fast: false,
+        };
+        let frame = ReasoningFrame {
+            id: MakiId::generate(),
+            model: model.spec(),
+            effort: Effort::Low,
+        };
+        let mut message = Message::user(PROMPT.to_owned());
+        message.content.insert(
+            0,
+            ContentBlock::ReasoningEffort {
+                frame: frame.id,
+                effort: Effort::High,
+            },
+        );
         let (tx, _rx) = unbounded_channel();
+        assert_eq!(
+            provider.configuration_effort(&model, opts),
+            Some(Effort::High)
+        );
         let result = provider
-            .stream_message(
+            .stream_message_with_reasoning_frame(
                 &model,
-                &messages,
+                &[message],
                 "",
-                &serde_json::json!([]),
+                &json!([]),
                 &tx,
-                RequestOptions::default(),
+                opts,
                 None,
+                Some(&frame),
             )
             .await;
 
@@ -2441,7 +2496,17 @@ mod tests {
             result.as_ref().err().is_some_and(AgentError::is_auth_error),
             "{STILL_UNAUTHORIZED}"
         );
-        assert_eq!(requests.lock().unwrap().len(), expected, "{WRONG_REPLAYS}");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), expected, "{WRONG_REPLAYS}");
+        let initial = requests[0].json();
+        assert_eq!(initial["reasoning"]["effort"], "low");
+        assert_eq!(
+            initial["input"][0],
+            json!({"type":"configuration_update", "reasoning":{"effort":"high"}})
+        );
+        for replay in &requests[1..] {
+            assert_eq!(replay.body, requests[0].body);
+        }
     }
 
     /// Anthropic and Google know their vendor's host, so before they took the

@@ -18,7 +18,9 @@ use serde::de;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-use super::history::{HistorySnapshot, facts_told, sanitize_restored, strip_thinking};
+use super::history::{
+    HistorySnapshot, facts_told, sanitize_restored, strip_reasoning_effort, strip_thinking,
+};
 use crate::session::{SessionHeader, StoredSession};
 
 /// Versions the envelope only. Messages inside it grow additively forever,
@@ -142,6 +144,7 @@ impl Transcript {
         let mut messages = self.messages;
         sanitize_restored(&mut messages);
         strip_thinking(&mut messages);
+        strip_reasoning_effort(&mut messages);
 
         if !messages.is_empty() {
             base.meta.yolo = None;
@@ -284,7 +287,7 @@ fn required_role(block: &ContentBlock) -> Option<Role> {
         ContentBlock::ToolUse { .. }
         | ContentBlock::Thinking { .. }
         | ContentBlock::RedactedThinking { .. } => Some(Role::Assistant),
-        ContentBlock::ToolResult { .. } => Some(Role::User),
+        ContentBlock::ToolResult { .. } | ContentBlock::ReasoningEffort { .. } => Some(Role::User),
         _ => None,
     }
 }

@@ -4,8 +4,9 @@ use maki_providers::provider::Provider;
 use maki_providers::retry::{RetryPolicy, RetryState};
 use maki_providers::{
     ContentBlock, ContextGauge, Message, Model, Overflow, ProviderEvent, RequestOptions,
-    StreamResponse, estimate_prompt_tokens,
+    StreamResponse, ThinkingConfig, estimate_prompt_tokens,
 };
+use maki_storage::frame::ReasoningFrame;
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -245,6 +246,7 @@ pub(crate) struct StreamRequest<'a> {
     /// than a coding turn, so the caller decides.
     pub output_budget: u32,
     pub session_id: Option<&'a SessionRef>,
+    pub reasoning_frame: Option<&'a ReasoningFrame>,
     pub retry: RetryPolicy,
 }
 
@@ -275,6 +277,7 @@ pub(crate) async fn stream_with_retry(
         opts,
         output_budget,
         session_id,
+        reasoning_frame,
         retry,
     } = req;
     let opts = opts.clamped(model);
@@ -286,7 +289,17 @@ pub(crate) async fn stream_with_retry(
     let measured = gauge.as_deref().map_or(0, ContextGauge::size);
     let prompt = estimate_prompt_tokens(messages, system, tools).max(measured);
     let floor = min_output(model);
-    let mut budget = planned_output(model, opts, output_budget, prompt);
+    let budget_opts = reasoning_frame.map_or(opts, |frame| RequestOptions {
+        thinking: ThinkingConfig::Effort(
+            messages
+                .iter()
+                .rev()
+                .find_map(|message| message.reasoning_effort(frame.id))
+                .unwrap_or(frame.effort),
+        ),
+        ..opts
+    });
+    let mut budget = planned_output(model, budget_opts, output_budget, prompt);
     let mut budget_retries = 0;
     // Counted here rather than off `retry`, which neither a budget retry nor a
     // rotation spends, so the number otel and the status bar show never repeats
@@ -326,7 +339,9 @@ pub(crate) async fn stream_with_retry(
         let stream_call = async {
             tokio::select! {
                 biased;
-                res = provider.stream_message(model, messages, system, tools, &ptx, opts, session_id) => res,
+                res = provider.stream_message_with_reasoning_frame(
+                    model, messages, system, tools, &ptx, opts, session_id, reasoning_frame,
+                ) => res,
                 slept = crate::sleep::watch_for_sleep(
                     Duration::from_millis(500),
                     crate::sleep::DEFAULT_SLEEP_THRESHOLD,
@@ -849,6 +864,7 @@ mod tests {
                 opts: RequestOptions::default(),
                 output_budget: TURN_BUDGET,
                 session_id: None,
+                reasoning_frame: None,
                 retry,
             },
             gauge,
@@ -904,6 +920,7 @@ mod tests {
                 opts: RequestOptions::default(),
                 output_budget: TURN_BUDGET,
                 session_id: None,
+                reasoning_frame: None,
                 retry: RetryPolicy::default(),
             },
             None,

@@ -12,6 +12,7 @@ use std::sync::{Arc, OnceLock};
 
 use jiff::Timestamp;
 use maki_storage::frame::FactsUpdate;
+use maki_storage::id::MakiId;
 use maki_storage::intern;
 pub use maki_storage::sessions::Effort;
 use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, THINKING_ADAPTIVE, TitleSource};
@@ -349,6 +350,10 @@ pub enum ContentBlock {
     },
     Image {
         source: ImageSource,
+    },
+    ReasoningEffort {
+        frame: MakiId,
+        effort: Effort,
     },
     /// A block this build cannot read, most likely written by a newer one.
     /// Kept as raw JSON and written back unchanged, never sent to a provider.
@@ -822,6 +827,23 @@ impl Message {
             Some(t) => Some(t),
             None => self.first_text_content(),
         }
+    }
+
+    pub fn reasoning_effort(&self, frame: MakiId) -> Option<Effort> {
+        let [
+            ContentBlock::ReasoningEffort { frame: id, effort },
+            rest @ ..,
+        ] = self.content.as_slice()
+        else {
+            return None;
+        };
+        (self.role == Role::User
+            && *id == frame
+            && matches!(
+                rest.first(),
+                Some(ContentBlock::Text { .. } | ContentBlock::Image { .. })
+            ))
+        .then_some(*effort)
     }
 
     pub fn first_text_content(&self) -> Option<&str> {
