@@ -3,6 +3,8 @@ use std::time::Duration;
 use reqwest::redirect::Policy;
 use reqwest::{Client, ClientBuilder, RequestBuilder};
 
+use crate::with_platform_tls;
+
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 const RELEASES_URL: &str = "https://api.github.com/repos/tontinton/maki/releases/latest";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,7 +37,7 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
 
 /// Redirects stay off.
 pub fn client() -> ClientBuilder {
-    Client::builder()
+    with_platform_tls(Client::builder())
         .redirect(Policy::none())
         .user_agent(USER_AGENT)
 }

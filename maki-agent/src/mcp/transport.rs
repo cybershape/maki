@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use maki_providers::headers::parse_headers;
 use maki_providers::http::error_chain;
 use maki_providers::strip_provider_keys;
-use maki_storage::{StateDir, blocking};
+use maki_storage::{StateDir, blocking, with_platform_tls};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderName, HeaderValue};
 use reqwest::redirect::{Action, Attempt, Policy};
 use reqwest::{Certificate, Client, ClientBuilder, Error as ReqwestError, StatusCode};
@@ -463,7 +463,7 @@ fn client_builder(certs: Option<&[Certificate]>) -> ClientBuilder {
     let builder = Client::builder().user_agent(CLIENT_NAME);
     match certs {
         Some(certs) => builder.tls_certs_only(certs.iter().cloned()),
-        None => builder,
+        None => with_platform_tls(builder),
     }
 }
 

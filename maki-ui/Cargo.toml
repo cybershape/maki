@@ -22,7 +22,6 @@ syntect = { workspace = true }
 unicode-width = { workspace = true }
 unicode-segmentation = { workspace = true }
 serde_json = { workspace = true }
-arboard = { workspace = true }
 jiff = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -44,7 +43,10 @@ shell-words = { workspace = true }
 open = { workspace = true }
 notify-rust = { workspace = true }
 
-[target.'cfg(not(target_os = "haiku"))'.dependencies]
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = { workspace = true }
+
+[target.'cfg(all(not(target_os = "haiku"), not(target_os = "android")))'.dependencies]
 arboard = { workspace = true, features = ["wayland-data-control"] }
 
 [target.'cfg(unix)'.dependencies]

@@ -18,6 +18,11 @@ pub mod theme;
 pub mod trusted_folders;
 pub mod version;
 
+#[cfg(target_os = "android")]
+use reqwest::Certificate;
+use reqwest::ClientBuilder;
+#[cfg(target_os = "android")]
+use std::env;
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
@@ -37,6 +42,49 @@ use paths::state_dir;
 const CANCELLED_JOIN: &str = "joined task was cancelled";
 #[cfg(windows)]
 const RENAME_ATTEMPTS: usize = 20;
+#[cfg(target_os = "android")]
+const TERMUX_CA_BUNDLE: &str = "/data/data/com.termux/files/usr/etc/tls/cert.pem";
+#[cfg(target_os = "android")]
+const TERMUX_CA_RELATIVE_PATH: &str = "etc/tls/cert.pem";
+#[cfg(target_os = "android")]
+const SSL_CERT_FILE: &str = "SSL_CERT_FILE";
+#[cfg(target_os = "android")]
+const TERMUX_PREFIX: &str = "PREFIX";
+
+pub fn with_platform_tls(builder: ClientBuilder) -> ClientBuilder {
+    #[cfg(target_os = "android")]
+    {
+        let path = env::var_os(SSL_CERT_FILE)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                env::var_os(TERMUX_PREFIX)
+                    .filter(|value| !value.is_empty())
+                    .map(|prefix| PathBuf::from(prefix).join(TERMUX_CA_RELATIVE_PATH))
+            })
+            .unwrap_or_else(|| PathBuf::from(TERMUX_CA_BUNDLE));
+        let roots = match fs::read(&path) {
+            Ok(pem) => match Certificate::from_pem_bundle(&pem) {
+                Ok(roots) if !roots.is_empty() => roots,
+                Ok(_) => {
+                    tracing::warn!(path = %path.display(), "CA bundle contains no certificates");
+                    Vec::new()
+                }
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "cannot parse CA bundle");
+                    Vec::new()
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "cannot read CA bundle");
+                Vec::new()
+            }
+        };
+        builder.tls_certs_only(roots)
+    }
+    #[cfg(not(target_os = "android"))]
+    builder
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateDir(PathBuf);

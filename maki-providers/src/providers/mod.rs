@@ -24,6 +24,7 @@ use tracing::{debug, warn};
 use maki_storage::auth::{
     OAuthTokens, delete_tokens, load_tokens_async, lock_tokens_async, save_tokens,
 };
+use maki_storage::with_platform_tls;
 #[allow(unused_imports)]
 use maki_storage::{StateDir, blocking};
 
@@ -443,6 +444,10 @@ impl Timeouts {
 /// which reqwest only adds to a request that names none, so a user agent anyone
 /// else sets replaces maki's instead of going out beside it.
 pub fn client_builder() -> ClientBuilder {
+    with_platform_tls(provider_client_builder())
+}
+
+fn provider_client_builder() -> ClientBuilder {
     Client::builder()
         .redirect(Policy::none())
         .http1_only()
@@ -462,7 +467,7 @@ pub(crate) fn http_client(timeouts: Timeouts) -> Client {
         .unwrap_or_else(|error| {
             warn!(%error, "no trust roots could be loaded, TLS connections will fail");
             timeouts
-                .bound(client_builder())
+                .bound(provider_client_builder())
                 .tls_certs_only(iter::empty())
                 .build()
                 .expect("an HTTP client without trust roots always builds")

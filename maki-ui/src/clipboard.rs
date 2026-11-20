@@ -1,4 +1,5 @@
 use crate::terminal;
+#[cfg(not(target_os = "android"))]
 use arboard::Clipboard;
 #[cfg(target_os = "linux")]
 use arboard::{GetExtLinux, LinuxClipboardKind, SetExtLinux};
@@ -28,18 +29,26 @@ pub(crate) fn read_primary_selection() -> Option<String> {
 }
 
 /// Blocks, so never call it on the UI thread.
+#[cfg(not(target_os = "android"))]
 pub(crate) fn read_text() -> Option<String> {
     let text = Clipboard::new().ok()?.get_text().ok()?;
     (!text.is_empty()).then_some(text)
 }
 
+#[cfg(target_os = "android")]
+pub(crate) fn read_text() -> Option<String> {
+    None
+}
+
 pub(crate) struct ClipboardState {
+    #[cfg(not(target_os = "android"))]
     native: Option<Clipboard>,
 }
 
 impl ClipboardState {
     pub(crate) fn new() -> Self {
         Self {
+            #[cfg(not(target_os = "android"))]
             native: Clipboard::new().ok(),
         }
     }
@@ -48,7 +57,10 @@ impl ClipboardState {
     /// desktop's clipboard.
     #[cfg(test)]
     pub(crate) fn terminal_only() -> Self {
-        Self { native: None }
+        Self {
+            #[cfg(not(target_os = "android"))]
+            native: None,
+        }
     }
 
     pub(crate) fn copy_text(&mut self, text: &str) -> Result<CopyResult, String> {
@@ -73,6 +85,12 @@ impl ClipboardState {
         }
     }
 
+    #[cfg(target_os = "android")]
+    fn copy_native(&mut self, _text: &str) -> Result<(), String> {
+        Err("native clipboard unavailable".into())
+    }
+
+    #[cfg(not(target_os = "android"))]
     fn copy_native(&mut self, text: &str) -> Result<(), String> {
         let Some(clipboard) = &mut self.native else {
             return Err("native clipboard unavailable".into());
