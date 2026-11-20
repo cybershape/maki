@@ -1,10 +1,7 @@
 //! What a `providers.toml` entry means for a slug a declaration serves.
-//!
-//! Out of line rather than beside [`maki_providers::plugin`]'s own tests
-//! because the config is read from the process-wide home directory: each case
-//! needs its own, and `cargo nextest` is what gives a test its own process.
 
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use maki_config::providers::Protocol;
 use maki_providers::Timeouts;
@@ -12,11 +9,10 @@ use maki_providers::plugin::{
     self, DeclAuthority, PlanDecl, ProviderDecl, RegisterError, Registration,
 };
 use maki_providers::spec::Owner;
-use maki_providers::test_support::isolated_home;
+use maki_providers::test_support::run_with_isolated_home;
 use maki_storage::StateDir;
 use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
 use serde_json::json;
-use tempfile::TempDir;
 use test_case::test_case;
 
 const PROVIDERS_FILE: &str = "providers.toml";
@@ -45,15 +41,17 @@ const PLAN_KEY: &str = "coding";
 const PLAN_HOST: &str = "plan.overlaid.example";
 const PLAN_KEY_ENV: &str = "MAKI_TEST_PLANNED_PROVIDER_KEY";
 
-/// Points every base directory at a throwaway tree holding `providers.toml`,
-/// so no case reads this machine's config. The file goes wherever maki's own
-/// path resolution says it lives, so a test can never quietly write somewhere
-/// nothing reads.
-fn isolated(providers_toml: &str) -> TempDir {
-    let dir = isolated_home();
+fn config_test_home() -> Option<PathBuf> {
+    run_with_isolated_home(&[(UNSET_VAR, None), (KEY_ENV, None)])
+}
+
+fn seed_providers(home: &Path, providers_toml: &str) {
     let config = maki_storage::paths::config_dir().expect(CONFIG_DIR_FAILED);
+    assert!(
+        config.starts_with(home),
+        "config must stay under the test home"
+    );
     fs::write(config.join(PROVIDERS_FILE), providers_toml).expect(WRITE_FAILED);
-    dir
 }
 
 fn own_definition() -> String {
@@ -94,7 +92,10 @@ fn load_bundled() {
 #[test_case(LONE_KEY, DECLARED_URL ; "a_lone_key")]
 #[test_case(&own_definition(), CONFIGURED_URL ; "a_whole_definition")]
 fn an_entry_keeps_the_bundled_declaration(entry: &str, origin: &str) {
-    let _home = isolated(&format!("[{DECLARED_SLUG}]\n{entry}\n"));
+    let Some(home) = config_test_home() else {
+        return;
+    };
+    seed_providers(&home, &format!("[{DECLARED_SLUG}]\n{entry}\n"));
     load_bundled();
 
     assert!(
@@ -112,10 +113,13 @@ fn an_entry_keeps_the_bundled_declaration(entry: &str, origin: &str) {
 /// user may never pick.
 #[test]
 fn a_bad_header_on_a_bundled_slug_fails_only_its_build() {
-    let _home = isolated(&format!(
-        "[{DECLARED_SLUG}.headers]\n\"{GATEWAY_HEADER}\" = \"${{{UNSET_VAR}}}\"\n"
-    ));
-    unsafe { std::env::remove_var(UNSET_VAR) };
+    let Some(home) = config_test_home() else {
+        return;
+    };
+    seed_providers(
+        &home,
+        &format!("[{DECLARED_SLUG}.headers]\n\"{GATEWAY_HEADER}\" = \"${{{UNSET_VAR}}}\"\n"),
+    );
     load_bundled();
 
     assert!(
@@ -141,7 +145,13 @@ fn a_planned_origin_is_vouched_only_for_a_bundled_declaration(
     authority: DeclAuthority,
     vouched: bool,
 ) {
-    let _home = isolated(&format!("[{DECLARED_SLUG}]\nplan = \"{PLAN_KEY}\"\n"));
+    let Some(home) = config_test_home() else {
+        return;
+    };
+    seed_providers(
+        &home,
+        &format!("[{DECLARED_SLUG}]\nplan = \"{PLAN_KEY}\"\n"),
+    );
     let plan_url = format!("https://{PLAN_HOST}/v1");
     let mut reg = declaration(DECLARED_SLUG, DECLARED_DISPLAY_NAME, DECLARED_HOST);
     reg.decl.api_key_env = Some(PLAN_KEY_ENV.to_owned());
@@ -172,7 +182,10 @@ fn a_planned_origin_is_vouched_only_for_a_bundled_declaration(
 /// plugin taking the same slug would be a second provider with the same name.
 #[test]
 fn a_slug_providers_toml_defines_is_still_refused() {
-    let _home = isolated(&format!("[{OWN_SLUG}]\n{}\n", own_definition()));
+    let Some(home) = config_test_home() else {
+        return;
+    };
+    seed_providers(&home, &format!("[{OWN_SLUG}]\n{}\n", own_definition()));
     plugin::begin_load();
     let error = plugin::register(
         declaration(OWN_SLUG, OWN_DISPLAY_NAME, OWN_HOST),
@@ -194,8 +207,8 @@ const CREDENTIALS_LOST: &str = "the takeover must hand the plugin the saved key"
 
 /// The takeover's whole point, and its risk: `maki auth login` saved the key
 /// under the slug, and the plugin that replaced the catalog provider sends it.
-fn saved_catalog_key() -> TempDir {
-    let home = isolated("");
+fn save_catalog_key(home: &Path) {
+    seed_providers(home, "");
     let cache = maki_storage::paths::cache_dir().unwrap();
     fs::write(
         cache.join(CATALOG_FILE),
@@ -217,13 +230,14 @@ fn saved_catalog_key() -> TempDir {
         },
     )
     .unwrap();
-    unsafe { std::env::remove_var(KEY_ENV) };
-    home
 }
 
 #[test]
 fn a_taken_over_slugs_saved_key_becomes_the_plugins() {
-    let _home = saved_catalog_key();
+    let Some(home) = config_test_home() else {
+        return;
+    };
+    save_catalog_key(&home);
     let mut reg = declaration(CATALOG_SLUG, DECLARED_DISPLAY_NAME, DECLARED_HOST);
     reg.decl.api_key_env = Some(KEY_ENV.to_owned());
     plugin::begin_load();
@@ -245,7 +259,13 @@ const LEGACY_WARNED: &str = "a legacy selection warns the user to migrate";
 
 #[test]
 fn a_legacy_plugin_selection_keeps_the_slug_owned() {
-    let _home = isolated(&format!("[{LEGACY_SLUG}]\nplugin = \"{LEGACY_PACKAGE}\"\n"));
+    let Some(home) = config_test_home() else {
+        return;
+    };
+    seed_providers(
+        &home,
+        &format!("[{LEGACY_SLUG}]\nplugin = \"{LEGACY_PACKAGE}\"\n"),
+    );
 
     plugin::begin_load();
     let warnings = plugin::keep_legacy_selections();

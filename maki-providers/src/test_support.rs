@@ -10,12 +10,16 @@
 //! to decide for itself what counts as a difference.
 
 use std::collections::BTreeMap;
+use std::env;
 #[cfg(test)]
 use std::io::Cursor;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ops::Index;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::thread;
 #[cfg(test)]
 use std::time::Duration;
 
@@ -43,6 +47,7 @@ const HEADER_REPEATED: &str = "the client sent a header more than once";
 const HEADER_NOT_SENT: &str = "the client did not send the header";
 const BAD_DECLARATION: &str = "the test declaration must register";
 const TEMPDIR_FAILED: &str = "cannot create the isolated home";
+const TEST_HOME: &str = "MAKI_ISOLATED_TEST_HOME";
 const HOME_VARS: &[&str] = &["HOME", "USERPROFILE"];
 // Logs sit beside the state base, so keep its parent inside the guard.
 // Windows reads `APPDATA` and `LOCALAPPDATA` instead of the XDG variables.
@@ -361,6 +366,51 @@ pub(crate) mod transport {
         let (listener, port) = loopback_listener();
         thread::spawn(move || drop(listener.accept()));
         port
+    }
+}
+
+pub fn run_with_isolated_home(vars: &[(&str, Option<&str>)]) -> Option<PathBuf> {
+    if let Some(home) = env::var_os(TEST_HOME) {
+        return Some(home.into());
+    }
+
+    let home = TempDir::new().expect(TEMPDIR_FAILED);
+    let test_thread = thread::current();
+    let test = test_thread.name().expect("named test thread");
+    let mut command = Command::new(env::current_exe().expect("test binary"));
+    isolate_home_command(&mut command, home.path());
+    command.args(["--exact", test]).env(TEST_HOME, home.path());
+    for (key, value) in vars {
+        if let Some(value) = value {
+            command.env(key, value);
+        } else {
+            command.env_remove(key);
+        }
+    }
+    let output = command.output().expect("run isolated test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed;"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    None
+}
+
+fn isolate_home_command(command: &mut Command, home: &Path) {
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_str()
+            .is_some_and(|key| key.ends_with(BASE_URL_ENV_SUFFIX))
+        {
+            command.env_remove(key);
+        }
+    }
+    for var in HOME_VARS {
+        command.env(var, home);
+    }
+    for (var, dir) in USER_DIRS {
+        command.env(var, home.join(dir));
     }
 }
 

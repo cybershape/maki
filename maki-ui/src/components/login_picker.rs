@@ -889,8 +889,10 @@ pub enum LoginPickerAction {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use crossterm::event::KeyModifiers;
-    use maki_providers::test_support::isolated_home;
+    use maki_providers::test_support::run_with_isolated_home;
     use test_case::test_case;
 
     use super::*;
@@ -987,32 +989,31 @@ mod tests {
     const PRESERVED_PROTOCOL: &str = "openai-responses";
     const DISPLAY_NAME: &str = "Declared Gateway";
 
-    /// Seeds providers.toml and hands back the picker with its storage set.
-    /// The home guard and config path come back too, so tests can open the
-    /// picker or inspect the file after a step ran.
-    fn picker_with_config(seeded: &str) -> (tempfile::TempDir, std::path::PathBuf, LoginPicker) {
-        let home = isolated_home();
-        let config_dir = maki_storage::paths::config_dir().expect("config dir");
-        std::fs::create_dir_all(&config_dir).expect("config dir");
-        std::fs::write(config_dir.join("providers.toml"), seeded).expect("seed providers.toml");
-        let storage = StateDir::from_path(home.path().to_path_buf());
-        let mut picker = LoginPicker::new();
-        picker.storage = Some(storage);
-        (home, config_dir, picker)
+    fn config_test_home(key: Option<&str>) -> Option<PathBuf> {
+        run_with_isolated_home(&[(PRESERVED_ENV, key)])
     }
 
-    fn endpoint_picker(
-        seeded: &str,
-        input: &str,
-    ) -> (tempfile::TempDir, std::path::PathBuf, LoginPicker) {
-        let (home, config_dir, mut picker) = picker_with_config(seeded);
+    fn picker_with_config(home: &Path, seeded: &str) -> (PathBuf, LoginPicker) {
+        let config_dir = maki_storage::paths::config_dir().expect("config dir");
+        assert!(
+            config_dir.starts_with(home),
+            "config must stay under the test home"
+        );
+        std::fs::write(config_dir.join("providers.toml"), seeded).expect("seed providers.toml");
+        let mut picker = LoginPicker::new();
+        picker.storage = Some(StateDir::from_path(home.to_path_buf()));
+        (config_dir, picker)
+    }
+
+    fn endpoint_picker(home: &Path, seeded: &str, input: &str) -> (PathBuf, LoginPicker) {
+        let (config_dir, mut picker) = picker_with_config(home, seeded);
         picker.step = Step::EditEndpoint {
             input: TextBuffer::new(input.to_owned()),
             slug: SETUP_SLUG.to_owned(),
             name: DISPLAY_NAME.to_owned(),
             api_key_optional: true,
         };
-        (home, config_dir, picker)
+        (config_dir, picker)
     }
 
     /// A declared provider keeps protocol, api_key_env, models and headers
@@ -1021,7 +1022,11 @@ mod tests {
     /// one still pointing at the old address.
     #[test]
     fn setup_edits_only_the_endpoint_of_an_existing_entry() {
-        let (_home, _, mut picker) = endpoint_picker(
+        let Some(home) = config_test_home(None) else {
+            return;
+        };
+        let (_, mut picker) = endpoint_picker(
+            &home,
             &format!(
                 "[{SETUP_SLUG}]\nprotocol = \"{PRESERVED_PROTOCOL}\"\nbase_url = \"{OLD_URL}\"\napi_key_env = \"{PRESERVED_ENV}\"\ndefault_model = \"kept-model\"\ndiscover_models = true\n\n[[{SETUP_SLUG}.models]]\nid = \"kept-model\"\ntier = \"strong\"\n"
             ),
@@ -1078,7 +1083,10 @@ mod tests {
         let seeded = format!(
             "# keep this comment\n[{SETUP_SLUG}]\nprotocol = \"openai\"\napi_key_env = \"{PRESERVED_ENV}\"\n"
         );
-        let (_home, config_dir, mut picker) = endpoint_picker(&seeded, "");
+        let Some(home) = config_test_home(None) else {
+            return;
+        };
+        let (config_dir, mut picker) = endpoint_picker(&home, &seeded, "");
         picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         let Step::EnterKey { builtin_url, .. } = &picker.step else {
@@ -1105,7 +1113,10 @@ mod tests {
         let seeded = format!(
             "# keep this comment\n[{SETUP_SLUG}]\nprotocol = \"openai\"\nbase_url = \"{OLD_URL}\"\n"
         );
-        let (_home, config_dir, mut picker) = endpoint_picker(&seeded, OLD_URL);
+        let Some(home) = config_test_home(None) else {
+            return;
+        };
+        let (config_dir, mut picker) = endpoint_picker(&home, &seeded, OLD_URL);
         picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         let Step::EnterKey { builtin_url, .. } = &picker.step else {
@@ -1128,10 +1139,16 @@ mod tests {
     /// the check, so the test fails if the fix is reverted.
     #[test]
     fn inline_api_key_counts_as_saved_auth() {
-        let (_home, _, mut picker) = picker_with_config(&format!(
-            "[{SETUP_SLUG}]\nprotocol = \"openai\"\nbase_url = \"{OLD_URL}\"\napi_key = \"inline-secret\"\n"
-        ));
-        let storage = StateDir::from_path(_home.path().to_path_buf());
+        let Some(home) = config_test_home(None) else {
+            return;
+        };
+        let (_, mut picker) = picker_with_config(
+            &home,
+            &format!(
+                "[{SETUP_SLUG}]\nprotocol = \"openai\"\nbase_url = \"{OLD_URL}\"\napi_key = \"inline-secret\"\n"
+            ),
+        );
+        let storage = StateDir::from_path(home);
         assert!(
             load_provider_credentials(&storage, SETUP_SLUG).is_none(),
             "no storage credential exists for the slug"
@@ -1149,18 +1166,17 @@ mod tests {
     /// documented `<SLUG>_API_KEY` name, so a blank key must be accepted.
     #[test]
     fn default_api_key_env_counts_as_saved_auth() {
-        let (_home, _, mut picker) =
-            picker_with_config(&format!("[{SETUP_SLUG}]\nprotocol = \"openai\"\n"));
-        let env_var = format!("{}_API_KEY", SETUP_SLUG.to_uppercase().replace('-', "_"));
-        // SAFETY: Nextest runs this test in its own process, before any thread.
-        unsafe { std::env::set_var(&env_var, "from-env") };
-        picker.open(StateDir::from_path(_home.path().to_path_buf()));
+        let Some(home) = config_test_home(Some("from-env")) else {
+            return;
+        };
+        let (_, mut picker) =
+            picker_with_config(&home, &format!("[{SETUP_SLUG}]\nprotocol = \"openai\"\n"));
+        picker.open(StateDir::from_path(home));
         let item = picker
             .provider_items
             .iter()
             .find(|i| i.slug == SETUP_SLUG)
             .expect("listed");
         assert!(item.has_env, "the default env var name must count");
-        unsafe { std::env::remove_var(&env_var) };
     }
 }
