@@ -147,16 +147,26 @@ impl FileAccess {
     }
 
     pub fn check_before_edit(&self, key: &FileKey) -> Result<(), String> {
-        let mut guard = self.records.lock().unwrap();
-        let Some(recorded) = guard.get(key) else {
-            return Ok(());
+        let recorded = {
+            let guard = self.records.lock().unwrap();
+            let Some(recorded) = guard.get(key).cloned() else {
+                return Ok(());
+            };
+            recorded
         };
+
         let Ok(metadata) = fs::metadata(key.as_path()) else {
-            guard.remove(key);
+            let mut guard = self.records.lock().unwrap();
+            if guard.get(key).is_some_and(|r| r.mtime == recorded.mtime) {
+                guard.remove(key);
+            }
             return Ok(());
         };
         let Ok(current_mtime) = metadata.modified() else {
-            guard.remove(key);
+            let mut guard = self.records.lock().unwrap();
+            if guard.get(key).is_some_and(|r| r.mtime == recorded.mtime) {
+                guard.remove(key);
+            }
             return Ok(());
         };
         if recorded.mtime == current_mtime {
@@ -173,6 +183,7 @@ impl FileAccess {
                 path = %key.as_path().display(),
                 "mtime changed but content hash matched; refreshing recorded mtime"
             );
+            let mut guard = self.records.lock().unwrap();
             if let Some(entry) = guard.get_mut(key) {
                 entry.mtime = current_mtime;
             }

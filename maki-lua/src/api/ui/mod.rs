@@ -1400,14 +1400,6 @@ lua_table! {
     /// which the status bar calls `a plugin`. So does a rewound or forked
     /// turn that starts with `/` or `!`, or is `exit`.
     ///
-    /// Upgrading: `input_edit` needs `input` and `session_read` now, plus
-    /// `agent` and `session_write` to change the text, and the editing
-    /// built-in actions need `input`, `agent` and `session_write`. A binding
-    /// on a key that types text, like `a` or `<Paste>`, needs `session_read`
-    /// in any mode. A `plugin.toml` you wrote yourself grants them unless it
-    /// sets them to `false`. A package needs its author to add them, and you to approve
-    /// the package again.
-    ///
     /// ### Offsets and versions
     ///
     /// Offsets count bytes from 0, and a range leaves out `stop`. So the

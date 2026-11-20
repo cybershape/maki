@@ -251,10 +251,11 @@ pub(crate) fn lib_dir() -> &'static Dir<'static> {
         .dir
 }
 
-static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(|| {
-    let dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
-    Vec::leak(dirs)
-});
+pub(crate) fn bundled_source(rel_path: &str) -> Option<&'static str> {
+    BUNDLED_PLUGINS
+        .iter()
+        .find_map(|p| p.dir.get_file(rel_path).and_then(File::contents_utf8))
+}
 
 /// A package's entrypoints: every `plugin/*.lua`, sorted by filename so load
 /// order is deterministic across machines.
@@ -351,7 +352,6 @@ impl PluginHost {
         let plugin_rules = Arc::new(PluginRuleStore::default());
         let lua = runtime::spawn(
             Arc::clone(&registry),
-            *BUNDLED_DIRS,
             interaction,
             jit,
             Arc::clone(&plugin_rules),
@@ -1048,8 +1048,8 @@ impl PluginHost {
     /// own. `None` once taken. The loop closes it when it stops draining, before
     /// teardown runs `SessionEnd`, so a handler is turned away at the send
     /// instead of parking on a reply that never comes.
-    pub fn take_ui_action_rx(&self) -> Option<UnboundedReceiver<UiAction>> {
-        self.inner.ui_action_rx.lock().unwrap().take()
+    pub fn take_ui_action_rx(&mut self) -> Option<UnboundedReceiver<UiAction>> {
+        self.inner.ui_action_rx.take()
     }
 
     /// Rings when a plugin changes a window or what one shows.
@@ -1649,7 +1649,7 @@ mod tests {
     /// Waits for {presses} keybind handlers to report done, then checks that
     /// one of them registered {FIRED_COMMAND}, which is how a test on this
     /// side of the channel sees that a handler ran.
-    fn assert_fired_after(host: &PluginHost, presses: usize) {
+    fn assert_fired_after(host: &mut PluginHost, presses: usize) {
         let mut ui = host.take_ui_action_rx().unwrap();
         for _ in 0..presses {
             while !matches!(
@@ -1671,7 +1671,7 @@ mod tests {
     /// side effect. Unit tests only cover the pieces in isolation.
     #[test]
     fn keybind_callback_runs_end_to_end() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "kb",
             &format!(
@@ -1705,7 +1705,7 @@ mod tests {
         assert!(reader.dispatch(key, InputMode::Normal, None, |ticket| {
             handle.run_keybind_callback(ticket)
         }));
-        assert_fired_after(&host, 1);
+        assert_fired_after(&mut host, 1);
     }
 
     const VIM_PLUGIN: &str = "vim";
@@ -1716,7 +1716,7 @@ mod tests {
     /// is visible inside the handler that made it.
     #[test]
     fn a_vim_style_plugin_switches_modes() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             VIM_PLUGIN,
             r#"
@@ -1856,7 +1856,7 @@ mod tests {
     /// could not be typed in again.
     #[test]
     fn a_mode_switch_from_an_unloaded_plugin_is_dropped() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             VIM_PLUGIN,
             &format!(
@@ -1909,7 +1909,7 @@ mod tests {
         const VERSION: u64 = 7;
         const TEXT: &str = "ab";
         const TAB: &str = "<Tab>";
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "accept",
             r#"
@@ -1974,7 +1974,7 @@ mod tests {
     #[test]
     fn fallback_asks_once_and_only_while_the_handler_runs() {
         const PASTED: &str = "pasted";
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "fallback",
             r#"
@@ -2055,7 +2055,7 @@ mod tests {
     #[test_case(&["session_read"] => "true" ; "with_session_read")]
     #[test_case(&[] => "false" ; "without_session_read")]
     fn a_typing_key_on_a_buffer_needs_session_read(granted: &[&str]) -> String {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source_with_permissions(
             "popup",
             r#"
@@ -2091,7 +2091,7 @@ mod tests {
     fn a_key_handler_sees_the_draft_only_with_session_read(granted: &[&str]) -> String {
         const PASTED: &str = "pasted";
         const SHORTCUT: &str = "<C-g>";
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source_with_permissions(
             "peek",
             r#"
@@ -2187,7 +2187,7 @@ mod tests {
     /// What the host owes is that the raise wedges nothing.
     #[test]
     fn a_keybind_that_raises_leaves_the_plugin_dispatching() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "kb",
             &format!(
@@ -2225,7 +2225,7 @@ mod tests {
         assert!(run('g'));
         assert!(run('h'));
 
-        assert_fired_after(&host, 2);
+        assert_fired_after(&mut host, 2);
     }
 
     /// Unloading has to take the bindings with it, or a `/reload` leaves keys
@@ -3113,7 +3113,7 @@ mod tests {
     /// A callback the load scheduled runs later and gets its answer.
     #[test]
     fn a_ui_roundtrip_fails_fast_while_its_plugin_loads() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let mut ui = host.take_ui_action_rx().unwrap();
         host.load_source("early_ui", UI_CALLS_AT_LOAD).unwrap();
         let mut next = || loop {

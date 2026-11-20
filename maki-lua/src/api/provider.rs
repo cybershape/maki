@@ -14,7 +14,7 @@ use maki_providers::plugin::{self, Hook, ProviderDecl, ProviderHooks, Registrati
 use maki_providers::provider::BoxFuture;
 use maki_storage::StateDir;
 use maki_storage::auth::{
-    delete_plugin_auth, load_plugin_auth, lock_credentials, save_plugin_auth,
+    delete_plugin_auth, load_plugin_auth_async, lock_credentials_async, save_plugin_auth,
 };
 use maki_storage::stdin;
 use mlua::{
@@ -976,39 +976,42 @@ fn http_error(_lua: &Lua, res: Table) -> LuaResult<ProviderError> {
 /// Read the credentials this plugin stored for one of its providers. Returns
 /// nil when nothing was stored yet, for example before the first login.
 ///
+/// Reading the store yields, so this fails in a callback that cannot yield,
+/// like a `table.sort` comparator or a metamethod.
+///
 /// @param slug string A provider slug this plugin registered.
 /// @return (table?, string?) The stored credentials, or nil plus an error.
 /// @example
 /// local creds = maki.provider.auth.get("acme")
 /// if creds then print(creds.access_token) end
 #[lua_fn]
-fn get(lua: &Lua, #[ctx] slugs: OwnedSlugs, slug: String) -> LuaResult<Pair<Table>> {
+async fn get(lua: Lua, #[ctx] slugs: OwnedSlugs, slug: String) -> LuaResult<Pair<Table>> {
     owned(&slugs, &slug)?;
     let dir = try_pair!(StateDir::resolve());
-    let Some(data) = load_plugin_auth(&dir, &slug) else {
+    let Some(data) = load_plugin_auth_async(&dir, &slug).await else {
         return Ok((None, None));
     };
-    match json_to_lua(lua, &Value::Object(data))? {
+    match json_to_lua(&lua, &Value::Object(data))? {
         LuaValue::Table(table) => Ok((Some(table), None)),
         _ => Ok((None, None)),
     }
 }
 
-/// Every change to the credential store, off the plugin host's thread.
+/// Every change to the credential store.
 ///
-/// [`lock_credentials`] waits on a file lock another maki process may hold, and
-/// the host is single threaded: waiting for it here would stall every tool
-/// call, timer and provider hook in this process behind one plugin's token
-/// rotation. The common case takes no file lock at all, because the host
-/// already holds this slug while its hook runs and the lock lets it back in,
-/// so the write costs one hop off the thread and back.
+/// [`lock_credentials_async`] may wait on a file lock another maki process
+/// holds. It waits on the timer, so the single-threaded host goes on serving
+/// every other tool call, timer and provider hook meanwhile. The write itself
+/// runs off the host's thread and takes the guard along, so a call dropped
+/// mid-write still finishes it under the lock.
 async fn write_credentials(
     slug: String,
     write: impl FnOnce(&StateDir, &str) -> Result<(), String> + Send + 'static,
 ) -> Result<(), String> {
+    let dir = StateDir::resolve().map_err(|e| e.to_string())?;
+    let lock = lock_credentials_async(&dir, &slug).await;
     spawn_blocking(move || {
-        let dir = StateDir::resolve().map_err(|e| e.to_string())?;
-        let _lock = lock_credentials(&dir, &slug);
+        let _lock = lock;
         write(&dir, &slug)
     })
     .await
@@ -1133,6 +1136,7 @@ pub(crate) fn create_provider_namespace(
 mod tests {
     use maki_providers::ProviderUsage;
     use maki_providers::plugin::DeclAuthority;
+    use maki_providers::test_support::isolated_home;
     use serde_json::json;
     use test_case::test_case;
     use tokio::sync::mpsc::unbounded_channel;
@@ -1159,6 +1163,8 @@ mod tests {
     const UNAUTHORIZED: u16 = 401;
     const RATE_LIMITED: u16 = 429;
     const HOOK_ERROR: &str = "balance unavailable";
+    const TOKEN_FIELD: &str = "token";
+    const STORED_TOKEN: &str = "stored";
     const HOOK_NEVER_CALLED: &str = "the hook call never reached the host";
 
     fn keys_from(
@@ -1446,11 +1452,13 @@ mod tests {
     #[test_case("set", OTHER_SLUG, true ; "set_refuses_a_foreign_slug")]
     #[test_case("clear", OTHER_SLUG, true ; "clear_refuses_a_foreign_slug")]
     #[test_case("get", SLUG_NAME, false ; "an_owned_slug_gets_through")]
-    fn auth_calls_are_scoped_to_the_slugs_the_plugin_registered(
+    #[tokio::test]
+    async fn auth_calls_are_scoped_to_the_slugs_the_plugin_registered(
         call: &str,
         slug: &str,
         refused: bool,
     ) {
+        let _home = isolated_home();
         let lua = Lua::new();
         lua.globals()
             .set("auth", auth_table(&lua, &[SLUG_NAME]))
@@ -1458,11 +1466,38 @@ mod tests {
 
         let error = lua
             .load(format!(r#"auth.{call}("{slug}", {{}})"#))
-            .exec()
+            .exec_async()
+            .await
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert_eq!(error.contains(NOT_OWNED), refused, "{error}");
+    }
+
+    #[test_case(None ; "nothing_stored_is_nil")]
+    #[test_case(Some(STORED_TOKEN) ; "a_stored_table_comes_back")]
+    #[tokio::test]
+    async fn get_reads_what_the_slug_has_stored(token: Option<&str>) {
+        let _home = isolated_home();
+        let lua = Lua::new();
+        let auth = auth_table(&lua, &[SLUG_NAME]);
+        if let Some(token) = token {
+            let credentials = lua.create_table_from([(TOKEN_FIELD, token)]).unwrap();
+            let set: Function = auth.get("set").unwrap();
+            set.call_async::<bool>((SLUG_NAME, credentials))
+                .await
+                .unwrap();
+        }
+        let get: Function = auth.get("get").unwrap();
+
+        let (stored, error) = get
+            .call_async::<(Option<Table>, Option<String>)>(SLUG_NAME)
+            .await
+            .unwrap();
+
+        assert_eq!(error, None);
+        let read = stored.map(|table| table.get::<String>(TOKEN_FIELD).unwrap());
+        assert_eq!(read.as_deref(), token);
     }
 
     /// Decodes `{ slug = ..., <fields> }` the way `register` does, before any

@@ -880,7 +880,7 @@ fn user_message_shows_as_typed(text: &str) {
 }
 
 #[test]
-fn search_text_includes_role_marker() {
+fn search_text_includes_role_label() {
     let md = "# Heading\n\nSome **bold** text";
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
@@ -1364,7 +1364,8 @@ fn extract_mixed_fully_enclosed_and_partial() {
     let panel = panel_with_msgs(&["full segment", "partial here"], 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     let seg1_start = seg_start_row(&panel, 2);
-    let sel = make_sel(&panel, area, (0, 0), (seg1_start, GUTTER_COLS + 6));
+    let partial_end = GUTTER_COLS + "partial".len() as u16 - 1;
+    let sel = make_sel(&panel, area, (0, 0), (seg1_start, partial_end));
     let text = panel.extract_selection_text(&sel, area);
     assert!(text.contains("full segment"));
     assert!(text.contains("partial"));
@@ -4769,8 +4770,10 @@ fn a_task_notice_opens_with_its_ending_dot(
     panel.messages[0].task_end = task_end;
     render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
 
-    let gutter = panel.cache.get(0).unwrap().gutter.clone().unwrap();
-    let dot = (gutter.content == TOOL_INDICATOR).then_some(gutter.style);
+    let gutter = panel.cache.get(0).unwrap().gutter.clone();
+    let dot = gutter
+        .filter(|gutter| gutter.content == TOOL_INDICATOR)
+        .map(|gutter| gutter.style);
     assert_eq!(dot, style.map(|style| style(&theme::current())));
 }
 
@@ -5136,7 +5139,6 @@ fn compact_tools_question_error_leaves_children_empty() {
 
 const GUTTER_TEST_WIDTH: u16 = 40;
 const GUTTER_TEST_HEIGHT: u16 = 12;
-const USER_MARKER_TEXT: &str = "❯ ";
 const GUTTER_INDENT: &str = "  ";
 const LONG_PROSE: &str = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi";
 
@@ -5148,6 +5150,8 @@ fn screen_rows(panel: &mut MessagesPanel) -> Vec<String> {
         .map(|row| row.strip_prefix(' ').unwrap_or(row).to_owned())
         .collect()
 }
+
+const USER_MARKER_TEXT: &str = "❯ ";
 
 #[test_case(DisplayRole::User, USER_MARKER_TEXT ; "user")]
 #[test_case(DisplayRole::Assistant, TOOL_INDICATOR ; "assistant")]

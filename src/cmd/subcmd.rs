@@ -20,7 +20,7 @@ use maki_storage::StateDir;
 use maki_storage::auth::ProviderCredentials;
 use maki_storage::auth::{
     delete_plugin_auth, delete_provider_credentials, load_plugin_auth, load_provider_credentials,
-    load_tokens, lock_credentials, save_provider_credentials,
+    load_tokens, lock_credentials_async, save_provider_credentials,
 };
 use maki_storage::model::persist_model;
 use maki_storage::stdin;
@@ -151,6 +151,7 @@ async fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
+
 async fn login_interactive(storage: &StateDir) -> Result<()> {
     let config = ProvidersConfig::load();
     let mut rows: Vec<(&str, String, String)> = Vec::new();
@@ -162,6 +163,7 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
         let display = def.display_name.clone().unwrap_or_else(|| slug.clone());
         rows.push((mark(saved(slug)), slug.clone(), display));
     }
+
 
     println!();
     println!("  Available providers (from providers.toml):");
@@ -317,7 +319,7 @@ pub async fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
     let hook = plugin::logout(&slug).await;
     let removed_key = delete_provider_credentials(storage, &slug).context("delete credentials")?;
     let removed_login = {
-        let _lock = lock_credentials(storage, &slug);
+        let _lock = lock_credentials_async(storage, &slug).await;
         delete_plugin_auth(storage, &slug).context("delete plugin login")?
     };
     if removed_key {
@@ -438,6 +440,7 @@ pub async fn models(
 ) -> Result<()> {
     // Model listing calls plugin hooks, so the host outlives the fetch.
     let (_host, config) = super::cli_stack(no_plugins, no_jit, trust_mode).await?;
+
 
     fetch_all_models(
         &config.provider.model_policy,
@@ -568,7 +571,7 @@ pub async fn prompt(
             mcp: false,
             mcp_libraries: None,
         };
-        let defs = reg.definitions(&vars, &ctx, true);
+        let defs = reg.described_definitions(&vars, &ctx, true, true).await;
         if names {
             for name in defs
                 .as_array()
@@ -603,7 +606,7 @@ pub async fn prompt(
             let model = Model::from_spec_or_warm_catalog(model_spec)
                 .await
                 .context("invalid default model")?;
-            let tools = RequestTools::build(reg, &vars, &model, &config.agent, &[], false, None);
+            let tools = RequestTools::build(reg, &vars, &model, &config.agent, &[], false, None).await;
             let prompt = host_prompt
                 .context(&vars, &instructions, &slots, &model, tools)
                 .system;

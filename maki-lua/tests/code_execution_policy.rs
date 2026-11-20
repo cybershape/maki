@@ -208,17 +208,21 @@ fn describe(
     audience: ToolAudience,
     workflow: bool,
 ) -> String {
-    reg.get(CODE_EXECUTION)
+    let asked = reg
+        .get(CODE_EXECUTION)
         .expect("code_execution registered")
         .tool
-        .description(&DescriptionContext {
+        .describe(&DescriptionContext {
             filter,
             audience,
             workflow,
             mcp: false,
             mcp_libraries: None,
         })
-        .into_owned()
+        .expect("code_execution asks its plugin");
+    runtime()
+        .block_on(asked)
+        .expect("the plugin describes code_execution")
 }
 
 fn run_tool(
@@ -760,8 +764,8 @@ fn library_help_errors_when_function_not_found() {
     );
 }
 
-#[test]
-fn library_help_is_excluded_when_no_mcp() {
+#[tokio::test]
+async fn library_help_is_excluded_when_no_mcp() {
     let (reg, _host) = setup_global();
     let model = maki_providers::Model::from_spec("responses/claude-opus-4-8").unwrap();
     let tools = maki_agent::tools::RequestTools::build(
@@ -772,7 +776,8 @@ fn library_help_is_excluded_when_no_mcp() {
         &[],
         false,
         None,
-    );
+    )
+    .await;
     let names: Vec<&str> = tools
         .definitions()
         .as_array()
@@ -786,8 +791,8 @@ fn library_help_is_excluded_when_no_mcp() {
     );
 }
 
-#[test]
-fn library_help_is_included_when_mcp_present() {
+#[tokio::test]
+async fn library_help_is_included_when_mcp_present() {
     let (reg, _host) = setup_global();
     let model = maki_providers::Model::from_spec("responses/claude-opus-4-8").unwrap();
     let session = stub_session(&[("github.create_issue", "")]);
@@ -800,7 +805,8 @@ fn library_help_is_included_when_mcp_present() {
         &[],
         false,
         Some(&modules),
-    );
+    )
+    .await;
     let names: Vec<&str> = tools
         .definitions()
         .as_array()

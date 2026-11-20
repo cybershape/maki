@@ -15,6 +15,7 @@ use maki_agent::{FileQuery, FileReader, Ranked};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 use tokio::task::spawn_blocking;
+use tracing::warn;
 
 use crate::agent_autocmd::HostEvent;
 use crate::api::util::convert::{TableExt, bytes_arg};
@@ -285,6 +286,11 @@ impl LineCutter {
         self.kept.extend_from_slice(&rest[..room.min(rest.len())]);
         self.seen += rest.len() as u64;
         self.ends_in_cr = rest.last().map_or(self.ends_in_cr, |last| *last == b'\r');
+        // Don't wait for a `\n` that `/dev/zero` never sends. One byte past the
+        // cap can still be the `\r` of a `\r\n`, which does not count.
+        if self.max_bytes.is_none() && self.seen > self.keep() as u64 + 1 {
+            return Err(too_large());
+        }
         match newline {
             Some(newline) => Ok((newline + 1, Some(self.take()?))),
             None => Ok((buf.len(), None)),
@@ -1041,12 +1047,17 @@ fn descend(mut base: PathBuf, component: &Component<'_>) -> PathBuf {
 ///
 /// Resolving the path is a realpath per ancestor and one more per `..` left
 /// in the tail, and this runs on the one executor every plugin shares, so it
-/// waits for a blocking thread the way the call it follows did.
+/// waits for a blocking thread the way the call it follows did. By then the
+/// call has landed, so an invalidation that fails is only logged: the index
+/// still catches up on its next walk.
 async fn touched<E>(path: PathBuf, result: Result<(), E>) -> Result<(), E> {
     if result.is_ok() {
-        spawn_blocking(move || maki_agent::invalidate_for(&resolved(&path)))
-            .await
-            .expect("file index invalidation panicked");
+        let invalidated = path.clone();
+        if let Err(error) =
+            spawn_blocking(move || maki_agent::invalidate_for(&resolved(&invalidated))).await
+        {
+            warn!(path = %path.display(), %error, "file index invalidation failed");
+        }
     }
     result
 }
@@ -1641,6 +1652,13 @@ mod tests {
             line.text.len() as u64,
             MAX_READ_BYTES + LINE_CUT_MARKER.len() as u64
         );
+    }
+
+    #[test]
+    fn next_line_fails_an_endless_whole_line() {
+        let mut endless = BufReader::new(repeat(b'x'));
+        let err = next_line(&mut endless, None, false).unwrap_err();
+        assert_eq!(err.to_string(), too_large().to_string());
     }
 
     #[test_case("", &[]; "empty")]

@@ -7,7 +7,6 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
-use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
@@ -19,6 +18,7 @@ use maki_storage::sessions::Effort;
 
 use crate::model::{Model, ModelInfo};
 use crate::model_registry::{discovery_complete, set_known_models};
+
 use crate::providers::{KeyRotation, Timeouts, custom, plugin};
 use crate::spec::{Owner, ProviderRegistry, ProviderSpec};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
@@ -230,11 +230,38 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
             specs.push(spec);
         }
     }
+
     specs.retain(|spec| policy.allows(spec));
     specs
 }
 
+/// The registry providers whose credentials resolve right now. Each build
+/// reads credential files and `providers.toml`, so this belongs on the
+/// blocking pool, all of it in one job.
+pub(crate) fn build_registry() -> Vec<(&'static ProviderSpec, Box<dyn Provider>)> {
+    let timeouts = Timeouts::default();
+    ProviderRegistry::all()
+        .into_iter()
+        .filter_map(|spec| {
+            provider_for_slug(spec.slug, timeouts)
+                .inspect_err(|_| warn!(provider = spec.slug, "failed to create provider, skipping"))
+                .ok()
+                .map(|provider| (spec, provider))
+        })
+        .collect()
+}
+
 pub async fn fetch_all_models(
+    policy: &ModelPolicy,
+    on_ready: impl FnMut(ModelBatch),
+    on_done: Option<Box<dyn FnOnce() + Send>>,
+) {
+    fetch_built(blocking(build_registry).await, policy, on_ready, on_done).await;
+}
+
+/// [`fetch_all_models`] over registry providers [`build_registry`] built.
+pub(crate) async fn fetch_built(
+    built: Vec<(&'static ProviderSpec, Box<dyn Provider>)>,
     policy: &ModelPolicy,
     mut on_ready: impl FnMut(ModelBatch),
     on_done: Option<Box<dyn FnOnce() + Send>>,
@@ -242,25 +269,18 @@ pub async fn fetch_all_models(
     let (tx, mut rx) = unbounded_channel();
     let timeouts = Timeouts::default();
 
-    for spec in ProviderRegistry::all() {
-        let slug = spec.slug;
-        let Ok(provider) = spawn_blocking(move || provider_for_slug(slug, timeouts))
-            .await
-            .expect("provider construction panicked")
-        else {
-            warn!(provider = slug, "failed to create provider, skipping");
-            continue;
-        };
+    for (spec, provider) in built {
         let tx = tx.clone();
         tokio::spawn(async move {
             let listed = provider.list_models().await;
             let batch = listing_batch(spec, &listed);
             if let Ok(models) = listed {
-                set_known_models(slug, models);
+                set_known_models(spec.slug, models);
             }
             let _ = tx.send(batch);
         });
     }
+
 
     tokio::spawn(custom::discover_models(timeouts, move |batch| {
         let _ = tx.send(batch);

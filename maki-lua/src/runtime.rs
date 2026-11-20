@@ -17,7 +17,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
-use include_dir::Dir;
+
+
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::permissions::{LayerAnswer, LayerVerdict, PluginRuleStore};
 use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
@@ -88,7 +89,7 @@ use crate::docs_render;
 use crate::error::PluginError;
 use crate::jobs::{JobEvent, JobOwner, JobReaper, JobStore, deliver_job_event};
 use crate::key_lint::KeyLint;
-use crate::loader::EventHandle;
+use crate::loader::{EventHandle, bundled_source};
 use crate::pack::Interaction;
 use crate::plugin_permissions::{
     Ceiling, Permission, PluginPermissions, PluginReach, denied_error, grant_hint,
@@ -620,7 +621,7 @@ pub enum Request {
         plugin: Arc<str>,
         tool: Arc<str>,
         dctx: Value,
-        reply: SyncSender<Option<String>>,
+        reply: oneshot::Sender<Option<String>>,
     },
     /// Runs the tool's `start` fn so it can publish a live buf before the
     /// permission prompt paints. Best-effort: Lua errors are logged, never
@@ -1544,7 +1545,6 @@ fn install_compiler(lua: &Lua, jit: bool) -> Compiler {
 /// VM rather than once per plugin.
 #[derive(Clone)]
 struct BundledModules {
-    dirs: &'static [&'static Dir<'static>],
     compiler: Compiler,
     bytecode: Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
 }
@@ -1555,11 +1555,7 @@ impl BundledModules {
         if let Some(cached) = cache.get(rel_path) {
             return Ok(Some(Arc::clone(cached)));
         }
-        let Some(source) = self
-            .dirs
-            .iter()
-            .find_map(|dir| dir.get_file(rel_path).and_then(|f| f.contents_utf8()))
-        else {
+        let Some(source) = bundled_source(rel_path) else {
             return Ok(None);
         };
         let compiled = Arc::new(self.compiler.compile(source)?);
@@ -1580,20 +1576,14 @@ fn queue_codegen(queue: &CodegenQueue, func: &Function) {
     }
 }
 
-/// Runs `f` against the package declarations `init.lua` built up.
-///
-/// Every reader goes through here: the store is app data behind a mutex, and
-/// each site that spelled that lookup out by hand was another place to get the
-/// missing-store case or the poisoned lock wrong.
+/// Runs `f` against the package declarations `init.lua` built up, or returns
+/// `R::default()` when this VM has no store.
 fn with_packs<R: Default>(
     lua: &Lua,
     f: impl FnOnce(&mut crate::api::pack::PackDeclarations) -> R,
 ) -> R {
-    let Some(store) = lua.app_data_ref::<crate::api::pack::PackStore>() else {
-        return R::default();
-    };
-    let mut declarations = store.lock().expect("pack declarations");
-    f(&mut declarations)
+    lua.app_data_mut::<crate::api::pack::PackDeclarations>()
+        .map_or_else(R::default, |mut packs| f(&mut packs))
 }
 
 fn module_io_error(modname: &str, path: &Path, error: &std::io::Error) -> mlua::Error {
@@ -3828,7 +3818,6 @@ impl LuaRuntime {
         registry: Arc<ToolRegistry>,
         tx: UnboundedSender<Request>,
         shutdown: Arc<AtomicBool>,
-        bundled_dirs: &'static [&'static Dir<'static>],
         ui_action_tx: Option<UnboundedSender<UiAction>>,
         command_writer: LuaCommandWriter,
         keymap_writer: KeymapWriter,
@@ -3874,7 +3863,7 @@ impl LuaRuntime {
         lua.set_app_data(command_writer);
         lua.set_app_data(PromptHintCallbacks::default());
         lua.set_app_data(PluginOptionSpecs::default());
-        lua.set_app_data(crate::api::pack::PackStore::default());
+        lua.set_app_data(crate::api::pack::PackDeclarations::default());
         lua.set_app_data(AutocmdStore::default());
         lua.set_app_data(SlotStore::new(Arc::clone(&layered)));
         registry.set_hook(crate::hook::SlotHook {
@@ -3940,7 +3929,6 @@ impl LuaRuntime {
             tx,
             shutdown,
             bundled: BundledModules {
-                dirs: bundled_dirs,
                 compiler,
                 bytecode: Arc::default(),
             },
@@ -4179,10 +4167,7 @@ impl LuaRuntime {
         let env = self.lua.create_table()?;
         env.set("maki", maki)?;
 
-        if require_root.is_some() || !self.bundled.dirs.is_empty() {
-            let require_fn = self.create_require_fn(&env, require_root)?;
-            env.set("require", require_fn)?;
-        }
+        env.set("require", self.create_require_fn(&env, require_root)?)?;
 
         let meta = self.lua.create_table()?;
         meta.set("__index", self.lua.globals())?;
@@ -5818,7 +5803,7 @@ pub(crate) struct LuaThread {
     pub keymap_reader: KeymapReader,
     pub hint_reader: crate::api::util::command::HintReader,
     pub input_rules_reader: InputRulesReader,
-    pub ui_action_rx: Mutex<Option<UnboundedReceiver<UiAction>>>,
+    pub ui_action_rx: Option<UnboundedReceiver<UiAction>>,
     pub ui_waker: UiWaker,
     /// What [`load_user_source`] found on the Lua thread, for the host to
     /// report.
@@ -5830,7 +5815,6 @@ pub(crate) struct LuaThread {
 /// in-flight tools.
 pub fn spawn(
     registry: Arc<ToolRegistry>,
-    bundled_dirs: &'static [&'static Dir<'static>],
     interaction: Interaction,
     jit: bool,
     plugin_rules: Arc<PluginRuleStore>,
@@ -5873,7 +5857,6 @@ pub fn spawn(
                 registry,
                 tx_clone,
                 shutdown_thread,
-                bundled_dirs,
                 (interaction == Interaction::Tty).then_some(ui_action_tx),
                 command_writer,
                 keymap_writer,
@@ -6382,7 +6365,7 @@ pub fn spawn(
         keymap_reader,
         hint_reader,
         input_rules_reader,
-        ui_action_rx: Mutex::new(Some(ui_action_rx)),
+        ui_action_rx: Some(ui_action_rx),
         ui_waker,
         key_lint,
     })

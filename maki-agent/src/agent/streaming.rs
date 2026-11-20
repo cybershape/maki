@@ -150,7 +150,13 @@ async fn forward_provider_events(
 /// attempt's text (`stream_reset`), and history must agree with the view.
 #[derive(Debug)]
 pub(crate) enum StreamError {
-    Cancelled { streamed: String },
+    Cancelled {
+        streamed: String,
+    },
+    /// The server turned the body down before sending anything back. Only
+    /// then can the body be the cause. An error frame after the reply began
+    /// means the server took the body and failed later.
+    Refused(AgentError),
     Other(AgentError),
 }
 
@@ -164,7 +170,7 @@ impl From<StreamError> for AgentError {
     fn from(e: StreamError) -> Self {
         match e {
             StreamError::Cancelled { .. } => Self::Cancelled,
-            StreamError::Other(e) => e,
+            StreamError::Refused(e) | StreamError::Other(e) => e,
         }
     }
 }
@@ -383,6 +389,9 @@ pub(crate) async fn stream_with_retry(
                 emit_api_error(model, &e, attempt, started.elapsed());
                 if let AgentError::SystemSleep(_) = &e {
                     retry.note_wake(crate::sleep::WAKE_GRACE_DURATION);
+                }
+                if forwarded.ttft.is_none() && forwarded.streamed.is_empty() && e.is_body_refused() {
+                    return Err(StreamError::Refused(e));
                 }
                 // Rotation is decided above anything `retry_kind()` says: a
                 // fresh key and a delay cure different problems. A 401 or a 403

@@ -1985,7 +1985,6 @@ impl MessagesPanel {
     /// so a [`ScrollPos`] still points at the same text after the flush.
     fn rebuild_live_segments(&mut self, width: u16) {
         self.live_start = self.cache.len();
-        let width = body_width(width);
         if !self.streaming_thinking.is_empty() {
             let collapsed = thinking::collapsed_view(
                 thinking::tail_rows(self.thinking_lines, self.live_thinking_expanded),

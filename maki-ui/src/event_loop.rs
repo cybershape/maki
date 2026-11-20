@@ -830,8 +830,8 @@ impl<'t> EventLoop<'t> {
             host_prompt,
         } = params;
         // Apply the config theme before the warmup thread spawns, or warmup
-        // could bake the syntax palette from the old theme. Only the
-        // in-memory name is set, so the user's saved pick survives.
+        // could bake the syntax palette from the old theme. It is not
+        // persisted, so the user's saved pick survives.
         if let Some(ref pair) = ui_config.theme {
             let background = appearance::background();
             if pair.follows_background() && background.is_none() {
@@ -839,10 +839,7 @@ impl<'t> EventLoop<'t> {
             }
             let name = pair.name(background == Some(Background::Light));
             match crate::theme::load_by_name(name) {
-                Ok(theme) => {
-                    crate::theme::set_current_name(name);
-                    crate::theme::set(theme);
-                }
+                Ok(theme) => crate::theme::set(theme),
                 Err(e) => startup_warnings.push(format!("config ui.theme: {e}")),
             }
         }
@@ -2118,11 +2115,12 @@ impl<'t> EventLoop<'t> {
             from: self.sessions[self.focused].id(),
         };
         let storage = self.ctx.storage.clone();
-        self.opening = Some(AbortOnDropHandle::new(spawn_blocking(move || {
+        self.opening = Some(AbortOnDropHandle::new(tokio::spawn(async move {
             // A session another maki owns is refused here, where it costs a
             // flash, rather than at the first write, after a whole conversation.
-            let opened =
-                OpenSession::load(id, &storage).map_err(|e| format!("Failed to load session: {e}"));
+            let opened = OpenSession::load_async(id, storage)
+                .await
+                .map_err(|e| format!("Failed to load session: {e}"));
             Box::new(OpenedSession { focus, opened })
         })));
     }
