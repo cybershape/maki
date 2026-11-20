@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `cc85b51b4f8955b54f1c0e96b9bde0b44abd06c2`
-  - **Commit date**: `Mon Nov 16 02:13:11 2026 +0100`
-  - **Commit author**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
-  - **Commit message**: `fix(providers): re-vet plugin base urls when a reload narrows the hosts`
+  - **Commit SHA**: `e5ae88506e698bfe08898c62cdae56ac954710a8`
+  - **Commit date**: `Fri Nov 20 00:39:41 2026 +0200`
+  - **Commit author**: `Tony Solomonik <tony.solomonik@gmail.com>`
+  - **Commit message**: `update to 0.7.3`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `cc85b51b`.
+> `upstream/main` has been successfully merged through commit `e5ae8850`.
 
 ---
 
@@ -222,6 +222,7 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `987cc7b6` | `feat(ui): clearer hover affordance for compact tool rows` | Provide clearer hover affordance for compact tool rows |
 | `0fe68e0c` | `feat(ui): report plan-approval popup as blocked over OSC 7501` | Report plan-approval popup as blocked state over OSC 7501 protocol |
 | `a60b5153` | `Merge branch 'upstream/main' into main` | Merge upstream through `cc85b51b`, including child process reaping delegation to tokio, SharedBuf backed by tokio watch channel, non-blocking URL opening, cwd fast-fail and memory skip on missing cwd, batch tool_calls items schema fix, Lua host closure weak VM holding, TaskTracker for Lua restore items, providers.toml provider setup from model picker, and monty 1.6 update, while preserving core fork customizations |
+| `35ffc3cb` | `Merge branch 'upstream/main' into main` | Merge upstream through `e5ae8850` (v0.7.3), including ACP multi-session relay architecture, async tool/run-context building, streaming image retry, and doc updates, while preserving core fork customizations |
 
 ---
 
