@@ -707,12 +707,14 @@ fn render_tool_row(
     }
     spans.push(Span::styled(tool.name.to_string(), name_style));
 
-    let duration_str = tool
-        .duration
-        .or_else(|| tool.started_at.map(|st| st.elapsed()))
-        .map(|d| format!("({})", format_tool_duration(d)));
-
-    let right_str = duration_str.unwrap_or_default();
+    let right_str = if is_in_progress || is_hovered {
+        tool.duration
+            .or_else(|| tool.started_at.map(|st| st.elapsed()))
+            .map(|d| format!("({})", format_tool_duration(d)))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let right_len = right_str.width();
     let right_style = theme.status_dim;
 
@@ -792,11 +794,15 @@ fn render_thinking_row(
     }
     spans.push(Span::styled(label.to_string(), label_style));
 
-    let duration_str = thinking
-        .duration
-        .or_else(|| thinking.started_at.map(|st| st.elapsed()))
-        .map(|d| format!("({})", format_tool_duration(d)));
-    let right_str = duration_str.unwrap_or_default();
+    let right_str = if thinking.active || is_hovered {
+        thinking
+            .duration
+            .or_else(|| thinking.started_at.map(|st| st.elapsed()))
+            .map(|d| format!("({})", format_tool_duration(d)))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let right_len = right_str.width();
     let right_style = theme.status_dim;
 
@@ -1005,6 +1011,7 @@ mod tests {
     #[test_case(ToolStatus::Error; "error_uses_tool_error")]
     #[test_case(ToolStatus::InProgress; "in_progress_uses_accent")]
     fn hovered_entry_open_icon_style_follows_status(status: ToolStatus) {
+        const DURATION_TEXT: &str = "(500ms)";
         let child = GroupToolEntry {
             id: String::new(),
             name: Arc::from("read"),
@@ -1014,7 +1021,7 @@ mod tests {
             status,
             receiving_args: false,
             started_at: None,
-            duration: None,
+            duration: Some(Duration::from_millis(500)),
             detail: None,
         };
         let group = ToolGroupRole {
@@ -1036,6 +1043,7 @@ mod tests {
             build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, Some(&hover_target));
         let hovered_row = &hovered_tl.lines[1];
         assert_eq!(hovered_row.spans[1].content, COMPACT_OPEN_ICON);
+        assert!(hovered_row.to_string().ends_with(DURATION_TEXT));
         let expected_style = match status {
             ToolStatus::Error => theme::current().tool_error,
             _ => theme::current().accent,
@@ -1058,6 +1066,10 @@ mod tests {
         let unhovered_tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
         let unhovered_row = &unhovered_tl.lines[1];
         assert_ne!(unhovered_row.spans[1].content, COMPACT_OPEN_ICON);
+        assert_eq!(
+            unhovered_row.to_string().ends_with(DURATION_TEXT),
+            status == ToolStatus::InProgress
+        );
         assert!(
             !unhovered_row.spans[2]
                 .style
@@ -1085,7 +1097,6 @@ mod tests {
         let mut batch = child.clone();
         batch.name = Arc::from(BATCH_TOOL);
         batch.summary = "2 tools".into();
-        batch.duration = Some(Duration::from_secs(1));
         batch.children = vec![child.clone(), child.clone()];
         batch.children[1].name = Arc::from("bash");
         batch.children[1].summary = "cargo check".into();
@@ -1111,7 +1122,6 @@ mod tests {
         let parent_idx = 1 + usize::from(preceded_by_tool);
         let parent = rendered.lines[parent_idx].to_string();
         assert!(parent.contains("batch 2 tools"), "{parent}");
-        assert!(parent.ends_with("(1.00s)"), "{parent}");
         let rail = if followed_by_tool {
             RAIL_CONTINUE
         } else {
@@ -1209,7 +1219,6 @@ mod tests {
         assert!(row_text.contains("✓"));
         assert!(row_text.contains("bash"));
         assert!(row_text.contains("cargo check"));
-        assert!(row_text.contains("(1.20s)"));
     }
 
     #[test]
@@ -1439,7 +1448,6 @@ mod tests {
             .collect();
         assert!(row1.starts_with(RAIL_CONTINUE));
         assert!(row1.contains("edit"));
-        assert!(row1.contains("(7.43s)"));
 
         let row2: String = tl.lines[2]
             .spans
@@ -1449,7 +1457,6 @@ mod tests {
         assert!(row2.starts_with(RAIL_LAST));
         assert!(row2.contains("✗"));
         assert!(row2.contains("bash"));
-        assert!(row2.contains("(15.9s)"));
     }
 
     #[test]
@@ -1852,16 +1859,18 @@ mod tests {
         assert!(hidden_line.contains("... (2 hidden)"));
     }
 
-    #[test]
-    fn thinking_row_displays_duration_on_the_right() {
+    #[test_case(true; "active")]
+    #[test_case(false; "completed")]
+    fn thinking_row_displays_duration_when_active_or_hovered(active: bool) {
+        const DURATION_TEXT: &str = "(1.50s)";
         let group = ToolGroupRole {
             id: "group-1".into(),
-            sealed: true,
+            sealed: !active,
             entries: vec![GroupEntry::Thinking(GroupThinkingEntry {
                 id: 0,
                 text: "thinking about something".into(),
                 tokens: 350,
-                active: false,
+                active,
                 started_at: None,
                 duration: Some(Duration::from_millis(1500)),
             })],
@@ -1880,8 +1889,16 @@ mod tests {
                 .any(|s| s.content.as_ref() == "thinking")
         );
         let thinking_line = tl.lines[1].to_string();
-        assert!(thinking_line.contains("(1.50s)"));
+        assert_eq!(thinking_line.ends_with(DURATION_TEXT), active);
         assert!(!thinking_line.contains("350t"));
+
+        let target = CompactTarget {
+            group_id: group.id.clone(),
+            entry: 0,
+            child: None,
+        };
+        let hovered = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, Some(&target));
+        assert!(hovered.lines[1].to_string().ends_with(DURATION_TEXT));
     }
 
     #[test_case("read", Some(serde_json::json!({"path": "src/main.rs", "offset": 10, "limit": 20, "toolcall_reason": "reading main"})), "fallback", "reading main · src/main.rs:10-29" ; "read_with_offset_and_limit")]

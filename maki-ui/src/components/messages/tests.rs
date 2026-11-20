@@ -33,7 +33,6 @@ const GROUP_RESIZE_TEXT: &str =
 const GROUP_RESIZE_DURATION: Duration = Duration::from_millis(7430);
 const GROUP_RESIZE_TOKENS: usize = 1234;
 const GROUP_RESIZE_DURATION_TEXT: &str = "(7.43s)";
-const GROUP_RESIZE_TOKENS_TEXT: &str = "(1.2k)";
 
 #[test_case(false ; "live")]
 #[test_case(true ; "loaded")]
@@ -3421,10 +3420,7 @@ fn resize_reflows_sealed_groups(tools: usize, thinking: usize) {
             .take(tools + thinking)
         {
             assert_eq!(line.width(), usize::from(to - 2));
-            assert!(
-                line.to_string().ends_with(GROUP_RESIZE_DURATION_TEXT)
-                    || line.to_string().ends_with(GROUP_RESIZE_TOKENS_TEXT)
-            );
+            assert!(!line.to_string().contains(GROUP_RESIZE_DURATION_TEXT));
         }
     }
 }
@@ -3646,6 +3642,7 @@ fn spinner_updates_preserve_display_mode(compact: bool) {
 fn compact_batch_children_follow_snapshots(restored: bool, cancelled: bool) {
     const TOOL_ID: &str = "batch-1";
     const CHILD_SUMMARY: &str = "src/main.rs";
+    const CHILD_DURATION_TEXT: &str = "(1.23s)";
     let mut panel = MessagesPanel::new(
         UiConfig {
             compact_tools: true,
@@ -3724,14 +3721,6 @@ fn compact_batch_children_follow_snapshots(restored: bool, cancelled: bool) {
         assert_eq!(batch.duration, Some(Duration::from_millis(1234)));
         assert_eq!(group.total_duration(), Duration::from_millis(1234));
     }
-    let rows = tool_group::build_tool_group_lines(
-        group,
-        VIEW_WIDTH,
-        0,
-        tool_group::DEFAULT_COMPACT_LINES,
-        None,
-    );
-    assert!(rows.lines[2].to_string().ends_with("(1.23s)"));
     assert_eq!(
         batch.children[0].status,
         if cancelled {
@@ -3741,6 +3730,21 @@ fn compact_batch_children_follow_snapshots(restored: bool, cancelled: bool) {
         }
     );
     assert!(!panel.live_bufs.contains_key(TOOL_ID));
+
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let target = panel.compact_target_at(2, view_area()).expect("child row");
+    let seg_idx = panel.cache.find_by_tool_id(&target.group_id).unwrap();
+    let shows_duration = |panel: &MessagesPanel| {
+        panel.cache.get(seg_idx).unwrap().lines()[2]
+            .to_string()
+            .ends_with(CHILD_DURATION_TEXT)
+    };
+    assert_eq!(target.child, Some(0));
+    assert!(!shows_duration(&panel));
+    assert!(panel.set_hovered_compact(Some(target)));
+    assert!(shows_duration(&panel));
+    assert!(panel.set_hovered_compact(None));
+    assert!(!shows_duration(&panel));
 }
 
 #[test]
