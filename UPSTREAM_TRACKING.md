@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `e5ae88506e698bfe08898c62cdae56ac954710a8`
-  - **Commit date**: `Fri Nov 20 00:39:41 2026 +0200`
-  - **Commit author**: `Tony Solomonik <tony.solomonik@gmail.com>`
-  - **Commit message**: `update to 0.7.3`
+  - **Commit SHA**: `9a28e3f7a3585c590662588e8f22b46deffbc690`
+  - **Commit date**: `Fri Nov 20 14:56:50 2026 +0100`
+  - **Commit author**: `Laurent Cheylus <foxy@free.fr>`
+  - **Commit message**: `build: fix support for OpenBSD aarch64`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `e5ae8850`.
+> `upstream/main` has been successfully merged through commit `9a28e3f7`.
 
 ---
 
@@ -223,6 +223,11 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `0fe68e0c` | `feat(ui): report plan-approval popup as blocked over OSC 7501` | Report plan-approval popup as blocked state over OSC 7501 protocol |
 | `a60b5153` | `Merge branch 'upstream/main' into main` | Merge upstream through `cc85b51b`, including child process reaping delegation to tokio, SharedBuf backed by tokio watch channel, non-blocking URL opening, cwd fast-fail and memory skip on missing cwd, batch tool_calls items schema fix, Lua host closure weak VM holding, TaskTracker for Lua restore items, providers.toml provider setup from model picker, and monty 1.6 update, while preserving core fork customizations |
 | `35ffc3cb` | `Merge branch 'upstream/main' into main` | Merge upstream through `e5ae8850` (v0.7.3), including ACP multi-session relay architecture, async tool/run-context building, streaming image retry, and doc updates, while preserving core fork customizations |
+| `b040d76c` | `docs: update upstream tracking record to e5ae8850` | Update the upstream tracking record to `e5ae8850` |
+| `22b4530f` | `feat(ui): show compact tool durations while active or hovered` | Show compact tool durations while active or hovered |
+| `addca4e9` | `test(providers): isolate provider configuration tests in subprocesses` | Isolate provider configuration tests in subprocesses |
+| `c4b964a7` | `build(android): support Android Termux builds with HTTPS` | Support Android Termux builds with native HTTPS CA bundle detection |
+| `efdf7444` | `Merge branch 'upstream/main' into main` | Merge upstream through `9a28e3f7`, including building model slots once off the event loop (`ModelSlots`), storage writer as tokio task, off-loop /btw and image pasting, in-memory picker recents and folds (`PickerMemory`), cancellation during context build, and read tool negative offset support, while preserving core fork customizations |
 
 ---
 
