@@ -22,6 +22,8 @@ use ratatui::widgets::{Block, Borders, Widget};
 
 use super::{App, KeyboardOwner, MAIN_CHAT, Mode, Status};
 
+const PICKING_ARROW: &str = " → ";
+
 /// A tab without an input box, a finished task's or a moved call's, has
 /// only this hint to say how to get out and where to stop it.
 pub(super) const NO_INPUT_TAB_HINT: &str = " esc back · ctrl+x tasks ";
@@ -493,7 +495,22 @@ impl App {
             fast: self.state.fast,
         });
         let (mode_label, mode_style) = self.mode_label();
-        let model_str = if self.ui_config.prefer_model_name {
+        let picking = self
+            .picking
+            .as_ref()
+            .filter(|_| chat.model_id.is_none())
+            .map(|picked| {
+                if self.ui_config.prefer_model_name {
+                    let from = self.state.model.display_name();
+                    let to = maki_providers::model_registry::resolve_model_name_or(picked, picked);
+                    format!("{from}{PICKING_ARROW}{to}")
+                } else {
+                    format!("{}{PICKING_ARROW}{picked}", self.state.session.model)
+                }
+            });
+        let model_str = if let Some(p) = picking {
+            p
+        } else if self.ui_config.prefer_model_name {
             if let Some(ref chat_model_id) = chat.model_id {
                 maki_providers::model_registry::resolve_model_name_or(chat_model_id, chat_model_id)
             } else {

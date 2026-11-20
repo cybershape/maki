@@ -3453,13 +3453,8 @@ mod tests {
         );
         ctx.model = Arc::new(Model::from_spec(SESSION_SPEC).unwrap());
         let ctx = AgentContext::from(&ctx);
-        let dir = tempfile::TempDir::new().unwrap();
         if let Some(spec) = assigned {
-            model_registry::set_and_persist(
-                spec.into(),
-                ModelTier::Weak,
-                &maki_storage::StateDir::from_path(dir.path().to_path_buf()),
-            );
+            model_registry::set(spec.into(), ModelTier::Weak);
         }
 
         let resolved = resolve_model_from_ctx(&ctx, Some(ModelTier::Weak.to_string().as_str()))
@@ -3479,11 +3474,7 @@ mod tests {
             }
         }
         if let Some(spec) = assigned {
-            model_registry::unset_and_persist(
-                spec,
-                ModelTier::Weak,
-                &maki_storage::StateDir::from_path(dir.path().to_path_buf()),
-            );
+            model_registry::unset(spec, ModelTier::Weak);
         }
     }
 

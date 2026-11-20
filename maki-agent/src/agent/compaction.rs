@@ -10,7 +10,7 @@ use maki_providers::{
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use super::frame::{RunContext, fit_frame};
+use super::frame::{RunContextBuilder, fit_frame};
 use super::history::{
     History, remove_orphaned_tool_results, stamp_new, strip_reasoning_effort, strip_thinking,
 };
@@ -411,8 +411,8 @@ fn finish_compact(
     Ok((summary, history.len() - summary_len))
 }
 
-/// `next` is what the session would start with now. The summary goes out under
-/// a fresh frame built from it, for the session's own model in `hooks`, so the
+/// `context` builds what the session would start with now. The summary goes
+/// out under a fresh frame built from it, for the session's own model in `hooks`, so the
 /// gauge measures the prompt the next request really sends and the frame never
 /// goes missing between runs. `model` is the one writing the summary, billed to
 /// `ledger`, whose totals the `Done` reports.
@@ -432,7 +432,8 @@ pub async fn compact(
     model: &Model,
     history: &mut History,
     gauge: &mut ContextGauge,
-    next: RunContext,
+    context: &RunContextBuilder,
+    workflow: bool,
     mcp: Option<&McpSession>,
     event_tx: &EventSender,
     hooks: &AgentHooks<'_>,
@@ -474,6 +475,11 @@ pub async fn compact(
     // housekeeping and does not treat it as a turn boundary.
     let CompactionPlan::Proceed(steer) = plan else {
         return end(DoneReason::Compact, false, size_before);
+    };
+    // Asked for before the transcript goes, while a cancel can still end
+    // this with nothing changed.
+    let Ok(next) = hooks.cancel.race(context(hooks.model, workflow)).await else {
+        return end(DoneReason::Cancelled, false, size_before);
     };
     let Compacted {
         summary, duration, ..
@@ -742,6 +748,7 @@ pub(super) fn auto_compact_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::future::{pending, ready};
     use std::iter;
     use std::sync::{Arc, Mutex};
 
@@ -757,6 +764,7 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
+    use crate::agent::frame::RunContext;
     use crate::agent::hook::testing::script;
     use crate::cancel::CancelToken;
     use crate::tools::{RequestTools, ToolRegistry};
@@ -834,11 +842,12 @@ mod tests {
     /// other, so the baseline would only add noise.
     const NO_SYSTEM: &str = "";
 
-    fn bare_context(model: &Model) -> RunContext {
-        RunContext::fixed(
-            NO_SYSTEM.into(),
-            RequestTools::assembled(Value::Array(Vec::new()), &AgentConfig::default(), model),
-        )
+    fn bare_context() -> RunContextBuilder {
+        Arc::new(|model, _| {
+            let tools =
+                RequestTools::assembled(Value::Array(Vec::new()), &AgentConfig::default(), model);
+            Box::pin(ready(RunContext::fixed(NO_SYSTEM.into(), tools)))
+        })
     }
 
     struct MockProvider {
@@ -946,7 +955,8 @@ mod tests {
             &model,
             history,
             gauge,
-            bare_context(&model),
+            &bare_context(),
+            false,
             None,
             &EventSender::new(raw_tx, 0),
             &test_hooks(&registry, None, &model, cancel),
@@ -1091,7 +1101,8 @@ mod tests {
             &small_context_model(SUMMARY_CONTEXT_WINDOW),
             &mut history,
             &mut gauge,
-            bare_context(&model),
+            &bare_context(),
+            false,
             None,
             &EventSender::new(raw_tx, 0),
             &hooks,
@@ -1177,7 +1188,8 @@ mod tests {
             &model,
             &mut history,
             &mut ContextGauge::default(),
-            bare_context(&model),
+            &bare_context(),
+            false,
             None,
             &EventSender::new(raw_tx, 0),
             &test_hooks(&registry, None, &model, &cancel),
@@ -1271,6 +1283,7 @@ mod tests {
         history: &mut History,
         ledger: &RunLedger,
         cancel: &CancelToken,
+        context: &RunContextBuilder,
     ) -> (Result<DoneReason, AgentError>, Vec<AgentEvent>) {
         let (raw_tx, mut rx) = unbounded_channel();
         let registry = ToolRegistry::new();
@@ -1280,7 +1293,8 @@ mod tests {
             &model,
             history,
             &mut ContextGauge::default(),
-            bare_context(&model),
+            context,
+            false,
             None,
             &EventSender::new(raw_tx, 0),
             &test_hooks(&registry, None, &model, cancel),
@@ -1317,8 +1331,14 @@ mod tests {
             trigger.cancel();
         }
 
-        let (result, events) =
-            compact_events(&provider, &mut history, &RunLedger::default(), &cancel).await;
+        let (result, events) = compact_events(
+            &provider,
+            &mut history,
+            &RunLedger::default(),
+            &cancel,
+            &bare_context(),
+        )
+        .await;
 
         assert_eq!(result.unwrap(), expected);
         let endings: Vec<_> = events
@@ -1331,6 +1351,41 @@ mod tests {
             })
             .collect();
         assert_eq!(endings, [(0, expected)]);
+    }
+
+    /// The mock holds no responses, so a summary request would panic.
+    #[tokio::test]
+    async fn a_cancel_during_the_context_build_ends_it_before_the_summary() {
+        let provider = MockProvider::new(Vec::new());
+        let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
+        let (trigger, cancel) = CancelToken::new();
+        let fire = trigger.handle();
+        let stuck: RunContextBuilder = Arc::new(move |_, _| {
+            let fire = fire.clone();
+            Box::pin(async move {
+                fire.fire();
+                pending().await
+            })
+        });
+
+        let (result, events) = compact_events(
+            &provider,
+            &mut history,
+            &RunLedger::default(),
+            &cancel,
+            &stuck,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), DoneReason::Cancelled);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
+                reason: DoneReason::Cancelled,
+                ..
+            }
+        )));
+        assert_eq!(history.as_slice()[0].user_text(), Some(KEPT_TEXT));
     }
 
     /// A driver's ledger can open with what moved work spent, which read none
@@ -1354,8 +1409,14 @@ mod tests {
         };
         let ledger = RunLedger::carrying(&Arc::default(), carried);
 
-        let (result, events) =
-            compact_events(&provider, &mut history, &ledger, &CancelToken::none()).await;
+        let (result, events) = compact_events(
+            &provider,
+            &mut history,
+            &ledger,
+            &CancelToken::none(),
+            &bare_context(),
+        )
+        .await;
 
         assert_eq!(result.unwrap(), DoneReason::Compact);
         let sizes_before: Vec<_> = events
@@ -1435,7 +1496,8 @@ mod tests {
             &small_context_model(SUMMARY_CONTEXT_WINDOW),
             history,
             &mut ContextGauge::restored(SUMMARISED_PROMPT),
-            bare_context(&model),
+            &bare_context(),
+            false,
             None,
             &EventSender::new(raw_tx, 0),
             &test_hooks(&registry, None, &model, &cancel),

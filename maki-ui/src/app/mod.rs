@@ -46,7 +46,7 @@ use crate::components::keybindings::key;
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
-use crate::components::model_picker::{ModelPicker, ModelPickerAction};
+use crate::components::model_picker::{ModelPicker, ModelPickerAction, PickerMemory};
 use crate::components::pack_review::{PackReview, PackReviewAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
@@ -70,8 +70,8 @@ use maki_agent::{
     AgentConfig, AgentEvent, Envelope, McpConfigErrors, McpSnapshotReader, SessionMailbox,
     SharedBuf, SharedMessages, ToolPart,
 };
+use maki_config::UiConfig;
 use maki_config::project::{self, GatedFile, TrustState};
-use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks,
@@ -85,9 +85,10 @@ use maki_providers::{ContentBlock, Message, Model, ThinkingConfig};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::{
-    persist_project_model, persist_project_model_thinking, persist_thinking,
-    read_project_model_thinking,
+    persist_expanded_providers, persist_project_model, persist_project_model_thinking,
+    persist_thinking, read_project_model_thinking,
 };
+use maki_storage::sessions::StoredThinking;
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
@@ -661,6 +662,10 @@ pub struct App {
     /// was shown, so `/trust` must not cover it and the next start asks.
     pub(crate) trust: TrustState,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
+    /// The model picked for this tab while its provider is still building.
+    /// Until it lands a run starts on the old one, so the status bar shows
+    /// both.
+    pub(crate) picking: Option<String>,
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) paste_rx: Vec<oneshot::Receiver<Result<PastedContent, String>>>,
     pub(crate) mouse_paste_rx: Vec<oneshot::Receiver<Option<String>>>,
@@ -672,7 +677,6 @@ pub struct App {
     /// respawn. Nonempty means `/workflow` refuses to turn on.
     pub(crate) workflow_gaps: Vec<&'static str>,
     pub(crate) permissions: Arc<PermissionManager>,
-    pub(crate) model_policy: Arc<ModelPolicy>,
     pub(crate) lua_event_handle: EventHandle,
     /// The spec Lua was last told about. Seeded with the live model rather
     /// than the session's stored one: a restored session may name another
@@ -714,6 +718,7 @@ impl App {
         session: OpenSession,
         storage: StateDir,
         available_models: Arc<ArcSwapOption<ModelList>>,
+        picker_memory: Arc<PickerMemory>,
         mcp_reader: McpSnapshotReader,
         mcp_config_errors: McpConfigErrors,
         lua_command_reader: LuaCommandReader,
@@ -727,7 +732,6 @@ impl App {
         permissions: Arc<PermissionManager>,
         custom_commands: Arc<[maki_agent::command::CustomCommand]>,
         lua_event_handle: EventHandle,
-        model_policy: Arc<ModelPolicy>,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
         let state = SessionState::from_session(session, model, &storage);
@@ -745,7 +749,7 @@ impl App {
         input_box
             .buffer
             .set_rules(RuleSet::with_plugins(&input_rules));
-        let mut app = Self {
+        let app = Self {
             chats: vec![Chat::new(
                 state.session.id,
                 None,
@@ -764,6 +768,7 @@ impl App {
             ),
             theme_picker: ThemePicker::new(),
             model_picker: ModelPicker::new(available_models)
+                .sharing(picker_memory)
                 .with_prefer_model_name(ui_config.prefer_model_name)
                 .with_show_cost(ui_config.show_cost),
             login_picker: LoginPicker::new(),
@@ -806,6 +811,7 @@ impl App {
             storage,
             trust: TrustState::Inert,
             usage_slot: Arc::new(ArcSwapOption::empty()),
+            picking: None,
             shared_history: None,
             paste_rx: vec![],
             mouse_paste_rx: vec![],
@@ -815,7 +821,6 @@ impl App {
             workflow_gaps: workflow_tool_gaps(config, model),
             ui_config,
             permissions,
-            model_policy: Arc::clone(&model_policy),
             lua_event_handle,
             announced_model_spec: model.spec(),
             announced_input: InputAt::default(),
@@ -833,14 +838,6 @@ impl App {
             mailbox: None,
             restoring: Arc::new(AtomicBool::new(false)),
         };
-        app.model_picker.set_recents(
-            maki_storage::model::read_recents(&app.storage)
-                .into_iter()
-                .filter(|spec| model_policy.allows(spec))
-                .collect(),
-        );
-        app.model_picker
-            .set_expanded(maki_storage::model::read_expanded_providers(&app.storage));
         // The manager arrives forked from the prototype the process was
         // started with, so a tab that resumes or spawns blank runs on
         // `--yolo` until its own meta is read back here.
@@ -1022,7 +1019,7 @@ impl App {
     /// Stores the clamped value rather than the typed one, so the status bar
     /// can never read `off` on a model that is really sending minimal effort.
     ///
-    /// The value is also written to disk here, and only here: the next run
+    /// The value is also queued for disk here, and only here: the next run
     /// seeds its sessions from it (`SessionDefaults`), the same way the model
     /// is remembered. A clamp on model change is not the user's choice, so it
     /// does not overwrite the file.
@@ -1039,7 +1036,9 @@ impl App {
             .map_err(str::to_owned)?
             .clamped(&self.state.model);
         self.state.pending_thinking = None;
-        persist_thinking(&self.storage, self.state.thinking.into());
+        let stored = StoredThinking::from(self.state.thinking);
+        self.storage_writer
+            .persist(move |dir| persist_thinking(dir, stored));
         persist_project_model_thinking(
             &self.storage,
             Path::new(&self.state.session.cwd),
@@ -1339,14 +1338,6 @@ impl App {
             cursor_only,
         });
         self.announced_input = now;
-    }
-
-    pub(crate) fn record_recent_model(&mut self, spec: &str) {
-        let recents = maki_storage::model::push_recent(&self.storage, spec)
-            .into_iter()
-            .filter(|spec| self.model_policy.allows(spec))
-            .collect();
-        self.model_picker.set_recents(recents);
     }
 
     pub(crate) fn flash(&mut self, msg: String) {
@@ -1739,12 +1730,11 @@ impl App {
                     vec![Action::UnassignTier(spec, tier)]
                 }
                 // Saved right here instead of going through an `Action`. A fold
-                // only changes how the picker looks, and the state dir lives here.
+                // only changes how the picker looks, and the writer lives here.
                 ModelPickerAction::Folded => {
-                    maki_storage::model::persist_expanded_providers(
-                        &self.storage,
-                        self.model_picker.expanded_providers(),
-                    );
+                    let slugs = self.model_picker.expanded_providers();
+                    self.storage_writer
+                        .persist(move |dir| persist_expanded_providers(dir, &slugs));
                     vec![]
                 }
                 ModelPickerAction::Login(slug) => {

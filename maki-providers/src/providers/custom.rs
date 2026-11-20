@@ -38,8 +38,19 @@ fn resolve_custom_auth(slug: &str) -> Result<(ResolvedAuth, String), AgentError>
     }
 
     let env_var = resolve_api_key_env(slug, def);
-    let pool = KeyPool::resolve(slug, &env_var).ok();
-    let key = pool.map(|p| p.current().to_string()).unwrap_or_default();
+    let key = if let Some(def) = def {
+        if def.api_key_env.is_some() {
+            KeyPool::resolve(slug, &env_var)?.current().to_string()
+        } else {
+            KeyPool::resolve(slug, &env_var)
+                .map(|p| p.current().to_string())
+                .unwrap_or_default()
+        }
+    } else {
+        KeyPool::resolve(slug, &env_var)
+            .map(|p| p.current().to_string())
+            .unwrap_or_default()
+    };
 
     Ok((
         ResolvedAuth::bearer(slug, &key)?.with_base_url(resolve_base_url(slug, def)),
@@ -337,6 +348,14 @@ fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use test_case::test_case;
+
+    fn responses_def(model_id: &str) -> ProviderDef {
+        serde_json::from_str(&format!(
+            r#"{{"models":[{{"id":"{model_id}"}}]}}"#
+        ))
+        .unwrap()
+    }
 
     #[test]
     fn fast_pricing_alone_makes_the_model_fast_capable() {
@@ -482,6 +501,113 @@ mod tests {
             DeclaredTiers::from([("local".to_owned(), local)])
         );
     }
+
+
+    // The exact regression this fixes: discovery parsed context_window but
+    // never stored it, so custom models always got the protocol fallback.
+    #[test]
+    fn discovered_metadata_flows_into_custom_model_from_def() {
+        let slug = "custom-discovery-metadata-test";
+        let model_id = "vllm-model";
+        let expected_window: u32 = 131_072;
+        let expected_output: u32 = 8_192;
+
+        crate::model_registry::set_known_models(
+            slug,
+            vec![ModelInfo {
+                context_window: Some(expected_window),
+                max_output_tokens: Some(expected_output),
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+
+        let def = responses_def(model_id);
+        let model = model_from_def(&def, &RESPONSES_SPEC, slug, model_id);
+        assert_eq!(model.context_window, expected_window);
+        assert_eq!(model.max_output_tokens, Some(expected_output));
+    }
+
+    #[test_case(Some(true), Some(false), true ; "declared_outranks_discovery")]
+    #[test_case(None, Some(false), false ; "text_only_discovery_turns_vision_off")]
+    #[test_case(None, Some(true), true ; "image_discovery_keeps_vision_on")]
+    fn discovered_vision_flows_into_custom_model(
+        declared: Option<bool>,
+        discovered: Option<bool>,
+        expected: bool,
+    ) {
+        let slug = format!("custom-vision-test-{declared:?}-{discovered:?}");
+        let model_id = "vllm-model";
+        crate::model_registry::set_known_models(
+            &slug,
+            vec![ModelInfo {
+                supports_vision: discovered,
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+        let mut def = responses_def(model_id);
+        def.models[0].supports_vision = declared;
+        let model = model_from_def(&def, &RESPONSES_SPEC, &slug, model_id);
+        assert_eq!(model.supports_vision(), expected);
+    }
+
+    const ENDPOINT_INPUT_PRICE: f64 = 0.5;
+    const ENDPOINT_OUTPUT_PRICE: f64 = 1.5;
+    const DECLARED_INPUT_PRICE: f64 = 3.0;
+    const DECLARED_OUTPUT_PRICE: f64 = 15.0;
+
+    fn seed_discovered_pricing(slug: &str, model_id: &str, pricing: ModelPricing) {
+        crate::model_registry::set_known_models(
+            slug,
+            vec![ModelInfo {
+                pricing: Some(pricing),
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+    }
+
+    #[test]
+    fn discovered_pricing_fills_a_model_with_no_declared_rates() {
+        let slug = "custom-discovery-pricing-test";
+        let model_id = "endpoint-priced";
+        seed_discovered_pricing(
+            slug,
+            model_id,
+            ModelPricing::per_million(ENDPOINT_INPUT_PRICE, ENDPOINT_OUTPUT_PRICE, 0.0, 0.0),
+        );
+
+        let model = model_from_def(&responses_def(model_id), &RESPONSES_SPEC, slug, model_id);
+        assert_eq!(model.pricing.input, ENDPOINT_INPUT_PRICE);
+        assert_eq!(model.pricing.output, ENDPOINT_OUTPUT_PRICE);
+    }
+
+    #[test]
+    fn declared_pricing_wins_over_discovered_pricing() {
+        let slug = "custom-declared-pricing-test";
+        let model_id = "declared-price-wins";
+        seed_discovered_pricing(
+            slug,
+            model_id,
+            ModelPricing::per_million(ENDPOINT_INPUT_PRICE, ENDPOINT_OUTPUT_PRICE, 0.0, 0.0),
+        );
+        let mut def = responses_def(model_id);
+        def.models[0].pricing_input = Some(DECLARED_INPUT_PRICE);
+        def.models[0].pricing_output = Some(DECLARED_OUTPUT_PRICE);
+
+        let model = model_from_def(&def, &RESPONSES_SPEC, slug, model_id);
+        assert_eq!(model.pricing.input, DECLARED_INPUT_PRICE);
+        assert_eq!(model.pricing.output, DECLARED_OUTPUT_PRICE);
+    }
+
+    #[test]
+    fn discovered_zero_price_marks_the_model_free() {
+        let slug = "custom-discovery-free-test";
+        let model_id = "endpoint-free";
+        seed_discovered_pricing(slug, model_id, ModelPricing::ZERO);
+
+        let model = model_from_def(&responses_def(model_id), &RESPONSES_SPEC, slug, model_id);
+        assert!(model.is_free());
+    }
+
 
     #[test]
     fn overlay_declared_tiers_sets_tier_for_declared_models_only() {

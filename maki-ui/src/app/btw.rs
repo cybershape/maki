@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
+use maki_agent::HistorySnapshot;
 use maki_providers::provider::Provider;
 use maki_providers::{ContentBlock, Message, Model, ProviderEvent, RequestOptions};
 use maki_storage::frame::ReasoningFrame;
 use maki_storage::id::SessionRef;
+use maki_storage::sessions::SessionTools;
 use serde_json::Value;
 use tokio::sync::mpsc::{Sender, channel, unbounded_channel};
+use tokio::task::spawn_blocking;
 
 use crate::components::btw_modal::BtwEvent;
 
@@ -38,23 +41,70 @@ fn reached_for_tool(name: &str) -> String {
 }
 
 impl App {
+    /// Building the request deep-copies the transcript, megabytes on a long
+    /// session, so the loop only opens the modal and the copy runs on the
+    /// blocking pool.
     pub(crate) fn start_btw(
         &mut self,
         question: String,
         provider: Arc<dyn Provider>,
         model: Model,
     ) {
+        let (tx, rx) = channel(BTW_EVENT_CAPACITY);
+        self.open_prompt(|app| app.btw_modal.open(&question, rx));
+        let snapshot = self.shared_history.as_ref().map(|h| h.load_full());
+        let opts = self.request_options();
+        let session_id = SessionRef::from(self.state.session.id);
+        let build = move || {
+            BtwRequest::new(
+                snapshot.as_deref(),
+                &question,
+                provider,
+                model,
+                opts,
+                session_id,
+            )
+        };
+        tokio::spawn(async move {
+            match spawn_blocking(build).await {
+                Ok(request) => request.run(tx).await,
+                Err(e) => {
+                    let _ = tx.send(BtwEvent::Error(e.to_string())).await;
+                }
+            }
+        });
+    }
+}
+
+struct BtwRequest {
+    provider: Arc<dyn Provider>,
+    model: Model,
+    system: String,
+    tools: Arc<Value>,
+    messages: Vec<Message>,
+    opts: RequestOptions,
+    session_id: SessionRef,
+    reasoning_frame: Option<ReasoningFrame>,
+}
+
+impl BtwRequest {
+    fn new(
+        snapshot: Option<&HistorySnapshot>,
+        question: &str,
+        provider: Arc<dyn Provider>,
+        model: Model,
+        session_opts: RequestOptions,
+        session_id: SessionRef,
+    ) -> Self {
         // The mirror is verbatim, so mid-turn it can end on an open tool call.
         // Providers reject that, so close them off on our own copy.
-        let snapshot = self.shared_history.as_ref().map(|h| h.load_full());
         let mut messages = snapshot
-            .as_ref()
             .map(|s| Vec::clone(&s.messages))
             .unwrap_or_default();
         maki_agent::close_dangling_tool_calls(&mut messages, maki_agent::UNAVAILABLE_RESULT);
         // The session's own prompt, so the side question reads the transcript
         // under the instructions it was written under.
-        let frame = snapshot.as_ref().and_then(|s| s.frame.as_deref());
+        let frame = snapshot.and_then(|s| s.frame.as_deref());
         let system = frame
             .and_then(|f| f.prefix())
             .unwrap_or(BTW_FALLBACK_SYSTEM)
@@ -70,11 +120,10 @@ impl App {
         // text stays.
         let model_spec = model.spec();
         let fitted = snapshot
-            .as_ref()
             .and_then(|s| s.tools.as_ref())
             .filter(|tools| tools.model == model_spec);
         let (tools, opts) = match fitted {
-            Some(tools) => (Arc::clone(&tools.wire), self.request_options()),
+            Some(SessionTools { wire, .. }) => (Arc::clone(wire), session_opts),
             None => {
                 maki_agent::unbind_thinking(&mut messages);
                 (Arc::new(NO_TOOLS), RequestOptions::default())
@@ -90,7 +139,7 @@ impl App {
                     .configuration_effort(&model, opts)
                     .map(|effort| (frame, effort))
             });
-        let mut question_message = btw_question(&question);
+        let mut question_message = btw_question(question);
         if let Some((frame, effort)) = reasoning {
             let current = messages
                 .iter()
@@ -109,34 +158,18 @@ impl App {
         }
         messages.push(question_message);
 
-        let (tx, rx) = channel(BTW_EVENT_CAPACITY);
-        self.open_prompt(|app| app.btw_modal.open(&question, rx));
-        let request = BtwRequest {
+        Self {
             opts,
-            session_id: SessionRef::from(self.state.session.id),
+            session_id,
             reasoning_frame: reasoning.map(|(frame, _)| frame.clone()),
             provider,
             model,
             system,
             tools,
             messages,
-        };
-        tokio::spawn(request.run(tx));
+        }
     }
-}
 
-struct BtwRequest {
-    provider: Arc<dyn Provider>,
-    model: Model,
-    system: String,
-    tools: Arc<Value>,
-    messages: Vec<Message>,
-    opts: RequestOptions,
-    session_id: SessionRef,
-    reasoning_frame: Option<ReasoningFrame>,
-}
-
-impl BtwRequest {
     async fn run(self, btw_tx: Sender<BtwEvent>) {
         let (event_tx, mut event_rx) = unbounded_channel();
         let messages = maki_providers::adapt_images_for_model(&self.model, &self.messages).await;
@@ -238,6 +271,8 @@ mod tests {
     const OTHER_MODEL: &str = "anthropic/other-model";
     const THOUGHT: &str = "sqlite needs no server";
     const SIGNATURE: &str = "bound-to-the-old-prefix";
+    const CALL_ID: &str = "t1";
+    const TOOL: &str = "read";
 
     struct Recorded {
         messages: Vec<Message>,
@@ -478,6 +513,23 @@ mod tests {
         ));
         assert_eq!(app.state.session.messages(), history);
         assert_eq!(app.state.session.frame(), Some(&frame));
+    }
+
+    #[tokio::test]
+    async fn side_question_closes_a_dangling_tool_call() {
+        let calling = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(CALL_ID, TOOL, Value::Null)],
+            ..Default::default()
+        };
+        let mut app = test_app();
+        app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(vec![
+            calling,
+        ]))));
+        let sent = ask(&mut app).await;
+        let closed = ContentBlock::tool_result(CALL_ID, maki_agent::UNAVAILABLE_RESULT, true);
+        assert_eq!(sent.messages[1].content, [closed]);
+        assert_eq!(sent.messages[2], btw_question(Q));
     }
 
     /// `Done` once never came: the provider's sender outlived the stream, so
