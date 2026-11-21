@@ -228,6 +228,7 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `addca4e9` | `test(providers): isolate provider configuration tests in subprocesses` | Isolate provider configuration tests in subprocesses |
 | `c4b964a7` | `build(android): support Android Termux builds with HTTPS` | Support Android Termux builds with native HTTPS CA bundle detection |
 | `efdf7444` | `Merge branch 'upstream/main' into main` | Merge upstream through `9a28e3f7`, including building model slots once off the event loop (`ModelSlots`), storage writer as tokio task, off-loop /btw and image pasting, in-memory picker recents and folds (`PickerMemory`), cancellation during context build, and read tool negative offset support, while preserving core fork customizations |
+| `8cdf0afd` | `feat(plugins): optimize code_execution framing and add read rule-based elision` | Optimize code_execution framing for Monty sandbox and add read tool rule-based elision for large files |
 
 ---
 
@@ -271,11 +272,13 @@ Pay particular attention to the following potential conflicts and integration re
 - **Key changes**:
   - Limit builds and releases to `windows`, `linux`, and `mac-arm64`, removing targets such as NetBSD; trigger releases only on Git tags.
 
-### 3.6. Interpreter and Sandbox Filesystem Access Adaptation
+### 3.6. Interpreter, Sandbox and Read Tool Adaptations
 
-- **Affected files**: `plugins/code_execution/`, `maki-lua/`
+- **Affected files**: `plugins/code_execution/`, `plugins/read/`, `maki-lua/`
 - **Key changes**:
   - Update sandbox filesystem operations to use the renamed built-in `list_dir` tool.
+  - Reframe `code_execution` sandbox as a minimal embedded Python subset (Monty), directing package/runtime tasks to host shell, injecting MCP libraries as pre-bound global objects, adding diagnostic hints for unsupported syntax and library calls, and providing an `open()` polyfill that absorbs defensive parameters.
+  - Implement rule-based elision for `read` on large files (> 400 lines) without slice ranges, delegating directly to `index` for supported file types or head preview with navigation hints.
 
 ### 3.7. Storage & Per-Project Model Memory
 
