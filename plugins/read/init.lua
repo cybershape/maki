@@ -8,7 +8,7 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 
 - Supports absolute, relative, and ~/ paths.
 - **offset** and **limit** are required. Use offset=1 to read from the first line.
-- Use limit=0 to read until the end of file (capped at 2000 lines).
+- Use limit=0 to read until the end of file. For files exceeding 400 lines without a slice limit, returns an index skeleton (for supported file types) or the first 200 lines to prevent context bloat; use offset and limit to read specific sections.
 - A negative offset counts from the end: offset=-20 with limit=0 reads the last 20 lines.
 - Use the **index** tool or **grep** tool first to find the offset and limit.
 - Only read the sections you actually need.
@@ -21,6 +21,8 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 local opts = maki.api.register_options({
   max_line_bytes = { default = 500, min = 80, desc = "Truncate lines the model sees at this many bytes." },
   max_output_lines = output_limits.specs.max_output_lines,
+  elision_threshold = { default = 400, min = 50, desc = "File line threshold above which full reads are truncated." },
+  elision_lines = { default = 200, min = 20, desc = "Number of lines to return when a large file read is truncated." },
 })
 
 local function read_view_opts(ctx)
@@ -156,12 +158,65 @@ local function read_file(path, offset, limit, ctx)
 
   ctx:record_read(path)
 
+  local elision_threshold = opts.elision_threshold or 400
+  local elision_lines = opts.elision_lines or 200
+  local is_full_mode = ctx:output_mode() == "full"
+  local unspecified_range = (limit == 0 or limit > elision_threshold)
+  local remaining_lines = total_lines - start + 1
+  local warning_header = nil
+
+  if not is_full_mode and total_lines > elision_threshold and unspecified_range and remaining_lines > elision_threshold then
+    if start <= 1 and maki.agent and maki.agent.call_tool then
+      local index_out, index_err = maki.agent.call_tool(ctx, "index", { path = path })
+      if index_out and not index_err and not index_out:find("use the read tool instead", 1, true) and #index_out:gsub("%s+", "") > 0 then
+        local warning = string.format(
+          "Note: '%s' is large (%d lines) and no slice range was specified (limit=%d). Instead of reading the entire file, here is its compact structural index (skeleton) with line numbers to help you navigate:\n\n%s\n\nHint: Call `read` with `offset` and `limit` to inspect specific sections (e.g. `offset=100, limit=50`), or use `grep` to search.",
+          shorten_path(path),
+          total_lines,
+          limit,
+          index_out:gsub("\n+$", "")
+        )
+        local buf = maki.ui.buf()
+        local view = ToolView.new(buf, read_view_opts(ctx))
+        view:append({ { string.format("Index skeleton of %s (%d lines):", shorten_path(path), total_lines), "section" } })
+        for _, s_line in ipairs(maki.split(index_out:gsub("\n+$", ""), "\n")) do
+          view:append({ { s_line } })
+        end
+        view:finish()
+
+        local basename = path:match("([^/]+)$")
+        local parent = maki.fs.dirname(path)
+        if parent and not ctx:is_instruction_file(basename) then
+          ctx:load_instructions(parent)
+        end
+
+        return {
+          llm_output = warning,
+          body = buf,
+          annotation = string.format("index (%d lines)", total_lines),
+        }
+      end
+    end
+
+    if #lines > elision_lines then
+      lines = table.move(lines, 1, elision_lines, 1, {})
+    end
+    warning_header = string.format(
+      "Note: '%s' is large (%d lines) and no slice range was specified (limit=%d). Showing only lines %d-%d to prevent context bloat.\nHint: Call `read` with `offset` and `limit` to inspect subsequent sections, or use `grep` to search for patterns.\n\n",
+      shorten_path(path),
+      total_lines,
+      limit,
+      start,
+      start + #lines - 1
+    )
+  end
+
   local parts = {}
   local nr_fmt = ToolView.line_nr_fmt(start + #lines - 1) .. ": %s"
   for i, line in ipairs(lines) do
     parts[#parts + 1] = string.format(nr_fmt, start + i - 1, line)
   end
-  local llm_output = table.concat(parts, "\n")
+  local llm_output = (warning_header or "") .. table.concat(parts, "\n")
   if #lines == 0 then
     llm_output = total_lines == 0 and "(empty file)"
       or ("offset %d is past the end of the file (%d lines)"):format(start, total_lines)
@@ -197,7 +252,7 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- When using the **read** tool, only read the sections you actually need.",
+  content = "- When using the **read** tool, only read the sections you actually need. For files > 400 lines, use the **index** tool first or specify targeted offset/limit slices.",
 })
 
 maki.api.register_tool({

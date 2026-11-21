@@ -189,13 +189,13 @@ Executes multiple independent tool calls concurrently to reduce round-trips.
 
 ### `code_execution` {#code_execution}
 
-Execute Python in a sandbox where every tool is an async function.
+Execute a minimal embedded Python subset (Monty sandbox) — NOT a full standard Python runtime.
 
 **Permission:** undeclared
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `code` | string | yes |  | Python code. Tools return strings, not objects, and you MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. |
+| `code` | string | yes |  | Python code. Tools return strings, not objects, and you MUST await every call: `result = await read(path='/file', offset=1, limit=100)`. |
 | `timeout` | integer | no | 30 | Script execution timeout in seconds |
 
 ### `library_help` {#library_help}

@@ -40,7 +40,7 @@ local GATHER_HINT = "\n\nHint: `gather(...)` keeps the other results, returning 
 -- and a coroutine wrapper is lazy, so a call handed over that way would run alone.
 -- Only `RuntimeError` is caught, the shape a failed tool call arrives in; a
 -- TypeError from the script itself must still stop the run.
-local PREAMBLE = ([[
+local PREAMBLE = [[
 import re
 import asyncio
 import sys
@@ -55,9 +55,17 @@ async def gather(*calls):
         try:
             results.append(await c)
         except RuntimeError as e:
-            results.append('%s' + str(e))
+            results.append(']] .. ERROR_PREFIX .. [[' + str(e))
     return results
-]]):format(ERROR_PREFIX)
+_orig_open = open
+def open(file, mode='r', buffering=-1, encoding=None, errors=None, newline=None, closefd=True, opener=None):
+    if encoding is not None:
+        enc_norm = str(encoding).lower().replace('-', '').replace('_', '')
+        if enc_norm in ('utf8', 'cp65001'):
+            return _orig_open(file, mode, encoding='utf-8')
+        raise ValueError("Monty sandbox only supports UTF-8 encoding. For other encodings (" + repr(encoding) + "), execute a script via the shell tool on the host system.")
+    return _orig_open(file, mode)
+]]
 local TOOLS_HEADER = "\n\nAvailable tools (async Python functions, keyword args only):\n"
 local WORKFLOW_TOOLS_NOTE =
   "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `gather(task(...), task(...))` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
@@ -74,6 +82,62 @@ local function identifier_alias(name)
   end
   local alias = name:gsub("[^%w_]", "_")
   return alias:match(PY_IDENTIFIER) and alias or nil
+end
+
+local function mcp_library_hint(libs, code, err)
+  if not libs or #libs == 0 then
+    return ""
+  end
+  for _, lib in ipairs(libs) do
+    local lib_name = identifier_alias(lib.name)
+    if lib_name then
+      -- Check if model tried to 'import <lib_name>'
+      if code:match("import%s+" .. lib_name) or err:find("No module named '" .. lib_name .. "'", 1, true) then
+        return string.format(
+          "\n\nHint: '%s' is an external library already injected as a global object in this sandbox. DO NOT write `import %s`; call its functions directly via `await %s.<function>(...)`. Use `library_help(library_name=\"%s\", function_name=\"...\")` to inspect its available functions.",
+          lib_name,
+          lib_name,
+          lib_name,
+          lib_name
+        )
+      end
+      for _, fn in ipairs(lib.functions or {}) do
+        local name_str = type(fn) == "table" and fn.name or fn
+        local fn_name = identifier_alias(name_str) or name_str
+        if fn_name then
+          local wire = lib_name .. "__" .. fn_name
+          local dot_call = lib_name .. "." .. fn_name
+          if
+            err:find(wire, 1, true)
+            or (
+              code:find(dot_call, 1, true)
+              and (err:find(lib_name, 1, true) or err:find("RuntimeError", 1, true) or err:find("TypeError", 1, true))
+            )
+          then
+            return string.format(
+              "\n\nHint: Parameter or runtime error in external library '%s'. Please inspect its schema using `library_help(library_name=\"%s\", function_name=\"%s\")` before retrying.",
+              lib_name,
+              lib_name,
+              fn_name
+            )
+          end
+        end
+      end
+      local fn_call = code:match(lib_name .. "%.([%a_][%w_]*)")
+      if
+        fn_call
+        and (err:find(lib_name, 1, true) or err:find("RuntimeError", 1, true) or err:find("TypeError", 1, true))
+      then
+        return string.format(
+          "\n\nHint: Parameter or runtime error in external library '%s'. Please inspect its schema using `library_help(library_name=\"%s\", function_name=\"%s\")` before retrying.",
+          lib_name,
+          lib_name,
+          fn_call
+        )
+      end
+    end
+  end
+  return ""
 end
 
 local opts = maki.api.register_options(output_limits.extend({
@@ -134,41 +198,54 @@ local function build_body(ctx, code)
   return buf, view, highlight
 end
 
-local function build_description(batch_disabled)
+local function build_description(batch_disabled, mcp_lib_names)
   local use_prefix = batch_disabled and "Use for parallel/batch calls (the batch tool is disabled; use gather), "
     or "Use for "
   local concurrency = batch_disabled
-      and "- Concurrency / Batch execution: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`. The batch tool is disabled; use code_execution with `await gather(...)` to run multiple independent tool calls concurrently (replacing batch)."
-    or "- Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`."
+      and "- Concurrency / Batch execution: `a, b = await gather(read(path='a.py', offset=1, limit=100), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`. The batch tool is disabled; use code_execution with `await gather(...)` to run multiple independent tool calls concurrently (replacing batch)."
+    or "- Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=100), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`."
   local single_call = batch_disabled
       and "- NEVER use as a proxy or wrapper for a single tool call. If no code logic, chaining, or output filtering is needed, invoke the tool directly (batching 2+ independent calls via gather is allowed when batch is disabled)."
     or "- NEVER use as a proxy or wrapper for a single tool call. If no code logic, chaining, or output filtering is needed, invoke the tool directly."
 
-  return ([[Execute Python in a sandbox where every tool is an async function.
+  local mcp_line = ""
+  if mcp_lib_names and #mcp_lib_names > 0 then
+    mcp_line = string.format(
+      "\n- Pre-bound external libraries: %s (injected as global objects — DO NOT write `import <lib>`, call directly via `await <lib>.<fn>(...)`).",
+      table.concat(mcp_lib_names, ", ")
+    )
+  end
 
-%schained/dependent tool calls and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** cheaper than sequential tool calls!
+  return ([[Execute a minimal embedded Python subset (Monty sandbox) — NOT a full standard Python runtime.
 
-- All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Parse output yourself.
+Purpose:
+- %schained/dependent tool calls and filtering/processing results, e.g. filtering tool output. **DRAMATICALLY** cheaper than sequential tool calls!
+- Exclusively for orchestrating and chaining the available async tool functions listed below (such as `read`, `grep`, `bash`, `edit`).
+- For data analysis, third-party packages (e.g. pandas, openpyxl, scipy), or standard Python runtime features: DO NOT execute them here. Run scripts on the host system via the `bash` tool (using the host's `python3` or virtual environment) instead.
+
+Available Modules & Global Objects:
+- All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=100)`. Parse output yourself.
 - Tool results are complete. Only what you print/return is capped.
 %s
-- Available libs: re, asyncio, sys, os, json, pathlib, urllib.parse, glob. No other imports, no classes, no network access. `open()` works on text files, and `os`/`pathlib` can stat, listdir, walk, and mkdir. For file matching, prefer `Path.glob()`.
+- Importable modules ONLY: re, asyncio, sys, os, json, pathlib, urllib.parse, glob. No other standard or third-party packages can be imported.%s
+- `open()` supports basic text read/write (UTF-8 only; defensive parameters like `errors=`, `buffering=`, `newline=` are absorbed). For non-UTF-8 encodings or binary data, run via the host shell instead. `os`/`pathlib` can stat, listdir, walk, and mkdir. For file matching, prefer `Path.glob()`.
 - Fresh sandbox each run: no state persists between executions.
 - 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
 %s
 - NOT a thinking scratchpad. Reason in your response text.
-- Monty sandbox limitations (avoid common failures):
-  * Generator expressions `(x for ...)` materialize as `list`, and `iter()` is unavailable: DO NOT use `next(x for ...)`; use a `for` loop or `[...][0]` instead.
-  * No `:=` (walrus), no `del` (use `d.pop(k, None)`), no `*args` unpacking in calls (`f(*args)`), no `match/case`, no decorators (`@...`).
-  * Builtins NOT implemented: `iter`, `callable`, `dir`, `globals`, `locals`, `eval`, `exec`.
-  * Synchronous context restriction: DO NOT call file/OS operations (like `stat()`, `read_text()`) inside `sorted(key=...)`, `max(key=...)`, or `map()` (cannot suspend); extract attributes beforehand via list comprehension.
-  * `open()` supports basic text read/write only: NO `errors=` or `encoding=` parameter.
-  * `pathlib.Path` does NOT support `.relative_to()`.
-  * `re.sub()` replacement must be a string: callable/lambda replacements are NOT supported.
-]]):format(use_prefix, concurrency, single_call)
+
+Syntax & Execution Limitations (Frequent Failure Points):
+- NO generator iterators: Generator expressions `(x for ...)` materialize as `list`, and `iter()` is unavailable: DO NOT use `next(x for ...)`; use a `for` loop or `[...][0]` instead.
+- NO suspension inside sync callbacks: DO NOT call async tool functions or OS operations (like `stat()`, `read_text()`) inside `sorted(key=...)`, `max(key=...)`, or `map()` (cannot suspend); extract attributes beforehand via list comprehension.
+- Builtins NOT implemented: `iter`, `callable`, `dir`, `globals`, `locals`, `eval`, `exec`.
+- Unsupported syntax: No `:=` (walrus), no `del` (use `d.pop(k, None)`), no `*args` unpacking in calls (`f(*args)`), no `match/case`, no decorators (`@...`).
+- `pathlib.Path` does NOT support `.relative_to()`.
+- `re.sub()` replacement must be a string: callable/lambda replacements are NOT supported.
+]]):format(use_prefix, concurrency, mcp_line, single_call)
 end
 
-local description = build_description(false)
-local description_batch_disabled = build_description(true)
+local description = build_description(false, nil)
+local description_batch_disabled = build_description(true, nil)
 
 local schema = {
   type = "object",
@@ -177,7 +254,7 @@ local schema = {
   properties = {
     code = {
       type = "string",
-      description = "Python code. Tools return strings, not objects, and you MUST await every call: `result = await read(path='/file', offset=1, limit=0)`.",
+      description = "Python code. Tools return strings, not objects, and you MUST await every call: `result = await read(path='/file', offset=1, limit=100)`.",
     },
     timeout = {
       type = "integer",
@@ -269,7 +346,15 @@ end
 -- Keep cheap: runs on every request build. get_tools skips descriptions
 -- to avoid recursion from describe callbacks.
 local function describe(dctx)
-  local base_desc = matches_filter("batch", dctx) and description or description_batch_disabled
+  local mcp_lib_names = {}
+  if dctx.mcp and dctx.mcp_libraries and #dctx.mcp_libraries > 0 then
+    for _, lib in ipairs(dctx.mcp_libraries) do
+      local lib_name = identifier_alias(lib.name) or lib.name
+      table.insert(mcp_lib_names, lib_name)
+    end
+  end
+  local batch_disabled = not matches_filter("batch", dctx)
+  local base_desc = build_description(batch_disabled, mcp_lib_names)
   local parts = { base_desc, TOOLS_HEADER }
   local has_workflow_only, gated = false, {}
   -- Ask as if workflow were on, then hold back what it would unlock: those
@@ -292,7 +377,7 @@ local function describe(dctx)
   end
   if dctx.mcp and dctx.mcp_libraries and #dctx.mcp_libraries > 0 then
     local lines = {
-      "\nExternal libraries (callable in Python via `await <library_name>.<function_name>(...)`):",
+      "\nExternal libraries (pre-bound global objects, callable in Python via `await <library_name>.<function_name>(...)`; DO NOT import):",
     }
     for _, lib in ipairs(dctx.mcp_libraries) do
       local lib_name = identifier_alias(lib.name) or lib.name
@@ -311,7 +396,7 @@ local function describe(dctx)
     end
     table.insert(
       lines,
-      'Use `library_help(library_name="...", function_name="...")` to inspect parameter schemas and function documentation.\n'
+      'Use `library_help(library_name="...", function_name="...")` to inspect parameter schemas and function documentation. Always inspect unfamiliar external library functions with library_help before calling them for the first time.\n'
     )
     parts[#parts + 1] = table.concat(lines, "\n")
   end
@@ -354,6 +439,19 @@ local function shell_hint(tools, bash_text, powershell_text)
     return powershell_text
   end
   return bash_text
+end
+
+local function unsupported_module_hint(tools, err)
+  local mod = err:match("No module named ['\"]([%w_]+)['\"]")
+  if mod then
+    local shell_tool = shell_hint(tools, "bash", "powershell")
+    return string.format(
+      "\n\nHint: '%s' is not available in this minimal sandbox (importable modules are only: re, asyncio, sys, os, json, pathlib, urllib.parse, glob). For external packages or full Python capabilities, execute a Python script via the `%s` tool on the host system instead.",
+      mod,
+      shell_tool
+    )
+  end
+  return ""
 end
 
 local function file_access(tools, schemas, ctx)
@@ -513,7 +611,9 @@ local function handler(input, ctx)
     -- The run is already paid for, so point a script that reached for
     -- `asyncio.gather` at the wrapper that would have kept its other results.
     local hint = input.code:find(ASYNCIO_GATHER, 1, true) and GATHER_HINT or ""
-    return { llm_output = output_limits.cut_middle(err .. hint, max_lines, max_bytes), is_error = true, body = buf }
+    local mcp_hint = mcp_library_hint(libs, input.code, err)
+    local mod_hint = (mcp_hint == "") and unsupported_module_hint(tools, err) or ""
+    return { llm_output = output_limits.cut_middle(err .. hint .. mcp_hint .. mod_hint, max_lines, max_bytes), is_error = true, body = buf }
   end
 
   if result.output then

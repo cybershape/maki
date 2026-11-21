@@ -9808,8 +9808,10 @@ function ToolView.line_nr_fmt(max_line_nr)
 
 -- opts: max_lines (default 80) shown while collapsed, keep "head"|"tail"
 -- (default "tail"), max_expand_lines (default 2000) kept for expansion,
--- max_line_bytes (optional) per-line byte cap. Lines are stored already cut,
--- so a run of huge lines costs no more than short ones while kept for expansion.
+-- max_line_bytes (optional) per-line byte cap, max_header_lines (optional)
+-- header line cap while collapsed; a click expands the header too. Lines are
+-- stored already cut, so a run of huge lines costs no more than short ones
+-- while kept for expansion.
 -- With max_lines 0 only the set_header lines show until a click expands the
 -- view. The UI puts the line count in the tool header, so the row still says
 -- how much is hidden.

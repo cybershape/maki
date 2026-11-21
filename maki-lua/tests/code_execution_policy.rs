@@ -463,10 +463,22 @@ fn run_on_file(
 
 #[test_case::test_case("text = open(path).read()\nwith open(path, 'w') as f:\n    f.write(text.upper())", "HELLO\n" ; "read_then_write")]
 #[test_case::test_case("with open(path, 'a') as f:\n    f.write('world\\n')\n    f.write('!')", "hello\nworld\n!" ; "append")]
+#[test_case::test_case("text = open(path, 'r', encoding='utf-8', errors='replace', buffering=1).read()\nwith open(path, 'w', encoding='UTF_8', errors='ignore') as f:\n    f.write(text.upper())", "HELLO\n" ; "open_with_encoding_and_errors_shim")]
 fn open_reads_and_writes_through_the_file_tools(code: &str, expected: &str) {
     let (out, content) = run_on_file(code, NO_POLICY, |_| {}, &[]);
     out.expect("open must be served");
     assert_eq!(content, expected);
+}
+
+#[test]
+fn open_non_utf8_encoding_is_rejected_with_informative_error() {
+    let code = "open(path, 'r', encoding='gbk').read()";
+    let (out, _) = run_on_file(code, NO_POLICY, |_| {}, &[]);
+    let err = out.expect_err("non-utf8 encoding must be rejected");
+    assert!(
+        err.contains("Monty sandbox only supports UTF-8 encoding"),
+        "got: {err}"
+    );
 }
 
 /// Validation drops the `append` flag a replacement tool does not declare, so
@@ -624,6 +636,46 @@ fn mcp_tool_is_callable_from_the_sandbox(qualified: &'static str, bound: &str) {
     let err = run_code_with(&format!("await {bound}()"), with_mcp(qualified))
         .expect_err("the stub transport fails every call");
     assert!(err.contains(MCP_REACHED_ERR), "got: {err}");
+}
+
+const MCP_HINT_PREFIX: &str = "Hint: Parameter or runtime error in external library 'srv'";
+
+#[test_case::test_case("await srv.fetch_issue()", MCP_TOOL_QUALIFIED, "fetch_issue" ; "module_call_hints_library_help")]
+#[test_case::test_case("await srv.get_docs()", HYPHEN_QUALIFIED, "get_docs" ; "hyphenated_call_hints_library_help")]
+fn failed_mcp_call_hints_library_help(code: &str, qualified: &'static str, fn_name: &str) {
+    let err = run_code_with(code, with_mcp(qualified))
+        .expect_err("the stub transport fails every call");
+    assert!(err.contains(MCP_HINT_PREFIX), "got: {err}");
+    let expected_fn = format!("library_help(library_name=\"srv\", function_name=\"{fn_name}\")");
+    assert!(err.contains(&expected_fn), "got: {err}");
+}
+
+#[test]
+fn failed_mcp_import_hints_global_object() {
+    let err = run_code_with("import srv", with_mcp(MCP_TOOL_QUALIFIED))
+        .expect_err("import srv fails because srv is a global object, not a module");
+    assert!(
+        err.contains("Hint: 'srv' is an external library already injected as a global object"),
+        "got: {err}"
+    );
+    assert!(
+        err.contains("DO NOT write `import srv`"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn failed_unsupported_module_import_hints_host_shell() {
+    let err = run_code("import openpyxl")
+        .expect_err("importing openpyxl must fail in the minimal sandbox");
+    assert!(
+        err.contains("Hint: 'openpyxl' is not available in this minimal sandbox"),
+        "got: {err}"
+    );
+    assert!(
+        err.contains("execute a Python script via the `bash` tool"),
+        "got: {err}"
+    );
 }
 
 #[test]
