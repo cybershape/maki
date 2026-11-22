@@ -12,6 +12,7 @@
 use std::sync::OnceLock;
 
 use maki_config::ThemePair;
+use ratatui::style::Color;
 
 use crate::tty_probe::{self, find};
 
@@ -21,33 +22,85 @@ pub(crate) enum Background {
     Dark,
 }
 
-static BACKGROUND: OnceLock<Option<Background>> = OnceLock::new();
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TerminalAppearance {
+    pub background: Background,
+    pub bg_color: Option<Color>,
+}
+
+static APPEARANCE: OnceLock<Option<TerminalAppearance>> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static TEST_APPEARANCE: std::cell::RefCell<Option<Option<TerminalAppearance>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_for_test(app: Option<TerminalAppearance>) {
+    TEST_APPEARANCE.with(|cell| *cell.borrow_mut() = Some(app));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    TEST_APPEARANCE.with(|cell| *cell.borrow_mut() = None);
+}
 
 /// Same rules as `tty_probe::query`: raw mode, before the input reader.
 /// Only the first call decides. A `/reload` comes back here, but by then
 /// the input reader owns the tty and would swallow the reply.
 pub(crate) fn init(theme: Option<&ThemePair>) {
-    BACKGROUND.get_or_init(|| {
-        theme
-            .is_some_and(ThemePair::follows_background)
-            .then(detect)
-    });
+    APPEARANCE.get_or_init(|| should_probe(theme).then(detect));
+}
+
+fn should_probe(theme: Option<&ThemePair>) -> bool {
+    if let Some(pair) = theme {
+        pair.follows_background()
+            || crate::theme::theme_needs_probe(&pair.light)
+            || crate::theme::theme_needs_probe(&pair.dark)
+    } else {
+        crate::theme::current_or_saved_needs_probe()
+    }
 }
 
 /// `None` when startup did not ask.
 pub(crate) fn background() -> Option<Background> {
-    BACKGROUND.get().copied().flatten()
+    #[cfg(test)]
+    if let Some(test_val) = TEST_APPEARANCE.with(|cell| *cell.borrow()) {
+        return test_val.map(|a| a.background);
+    }
+    APPEARANCE.get().copied().flatten().map(|a| a.background)
 }
 
-fn detect() -> Background {
+/// The exact RGB background color detected from the terminal, if answered.
+pub(crate) fn background_color() -> Option<Color> {
+    #[cfg(test)]
+    if let Some(test_val) = TEST_APPEARANCE.with(|cell| *cell.borrow()) {
+        return test_val.and_then(|a| a.bg_color);
+    }
+    APPEARANCE.get().copied().flatten().and_then(|a| a.bg_color)
+}
+
+fn detect() -> TerminalAppearance {
     let reply = tty_probe::query(b"\x1b]11;?\x1b\\").and_then(|buf| parse_osc11(&buf));
+    let bg_color = reply.map(|(r, g, b)| {
+        Color::Rgb(
+            (r * 255.0).round() as u8,
+            (g * 255.0).round() as u8,
+            (b * 255.0).round() as u8,
+        )
+    });
     let background = reply.map_or(Background::Dark, classify);
     tracing::info!(
         ?background,
         answered = reply.is_some(),
+        ?bg_color,
         "terminal background"
     );
-    background
+    TerminalAppearance {
+        background,
+        bg_color,
+    }
 }
 
 /// Neovim's threshold: perceived luminance below half is dark.

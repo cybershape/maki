@@ -117,6 +117,15 @@ user_text = { fg = "foreground" }
 user_bg = { bg = "#1d2021" }
 ```
 
+Styles also take a `blend` table to interpolate between two colors by a ratio between 0.0 and 1.0:
+
+```toml
+[ui]
+user_bg = { blend = { base = "background", toward = "foreground", ratio = 0.06, fallback = "default" } }
+```
+
+When `base` is `background` under a theme using the terminal default background, Maki probes the background color with OSC 11 at startup and blends toward foreground (white on dark terminals, black on light). If the terminal gives no answer, it uses `fallback` (or leaves the color unset). Set `target = "fg"` to blend foreground instead of background.
+
 Diff signs use `diff_old_sign` and `diff_new_sign`, which default to `diff_old` and `diff_new`. These styles are applied after `code_block`, so their properties take precedence. Diff gutters use `diff_old_line_nr` and `diff_new_line_nr`, which default to `diff_line_nr`.
 
 The chat input uses your terminal's own cursor, in its shape and colors. The search, file, list and login pickers paint their caret with `cursor`.

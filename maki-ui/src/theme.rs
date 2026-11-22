@@ -9,6 +9,8 @@ use maki_highlight::SegmentColor;
 use maki_storage::StateDir;
 use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
+
+use crate::appearance;
 use syntect::highlighting::{
     Color as SynColor, FontStyle, ScopeSelectors, StyleModifier, ThemeItem, ThemeSettings,
 };
@@ -360,6 +362,27 @@ fn read_theme_name() -> Option<String> {
     maki_storage::theme::read_theme_name(&dir)
 }
 
+pub(crate) fn theme_needs_probe(name: &str) -> bool {
+    if name == "system" {
+        return true;
+    }
+    if let Some(entry) = BUNDLED_THEMES.iter().find(|e| e.name == name) {
+        return entry.toml.contains("blend");
+    }
+    if let Some(dir) = user_themes_dir() {
+        let path = dir.join(format!("{name}.toml"));
+        if let Ok(content) = std::fs::read_to_string(path) {
+            return content.contains("blend");
+        }
+    }
+    false
+}
+
+pub(crate) fn current_or_saved_needs_probe() -> bool {
+    let name = read_theme_name().unwrap_or_else(|| DEFAULT_THEME.to_string());
+    theme_needs_probe(&name)
+}
+
 pub fn current_theme_name() -> String {
     current().name.clone()
 }
@@ -523,10 +546,22 @@ pub struct Theme {
     pub syntax: syntect::highlighting::Theme,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub(crate) struct BlendDef {
+    pub base: String,
+    pub toward: String,
+    pub ratio: f32,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub fallback: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
 struct StyleDef {
     fg: Option<String>,
     bg: Option<String>,
+    blend: Option<BlendDef>,
     #[serde(default)]
     modifiers: Vec<String>,
 }
@@ -659,10 +694,123 @@ fn resolve_style(def: &StyleDef, palette: &HashMap<String, Color>) -> Style {
     if let Some(bg) = def.bg.as_ref().and_then(|n| resolve_color(n, palette)) {
         style = style.bg(bg);
     }
+    if let Some(blend) = &def.blend {
+        let is_fg = blend.target.as_deref() == Some("fg");
+        if let Some(color) = resolve_blend(blend, palette) {
+            if is_fg {
+                style = style.fg(color);
+            } else {
+                style = style.bg(color);
+            }
+        } else if let Some(fallback_name) = &blend.fallback
+            && let Some(fallback_color) = resolve_color(fallback_name, palette)
+        {
+            if is_fg {
+                style = style.fg(fallback_color);
+            } else {
+                style = style.bg(fallback_color);
+            }
+        }
+    }
     for m in &def.modifiers {
         style = style.add_modifier(resolve_modifier(m));
     }
     style
+}
+
+fn resolve_blend(blend: &BlendDef, palette: &HashMap<String, Color>) -> Option<Color> {
+    let base_color = resolve_color(&blend.base, palette)?;
+    let toward_color = resolve_color(&blend.toward, palette)?;
+
+    let (br, bg, bb) = color_to_rgb(&blend.base, base_color)?;
+    let (tr, tg, tb) = color_to_rgb(&blend.toward, toward_color)?;
+
+    Some(Color::Rgb(
+        lerp_u8(br, tr, blend.ratio),
+        lerp_u8(bg, tg, blend.ratio),
+        lerp_u8(bb, tb, blend.ratio),
+    ))
+}
+
+fn color_to_rgb(name: &str, color: Color) -> Option<(u8, u8, u8)> {
+    if let Some(rgb) = named_color_to_rgb(color) {
+        return Some(rgb);
+    }
+    if color == Color::Reset {
+        if name == "background" || name == "default" {
+            match appearance::background_color() {
+                Some(Color::Rgb(r, g, b)) => Some((r, g, b)),
+                _ => None,
+            }
+        } else if name == "foreground" {
+            match appearance::background() {
+                Some(appearance::Background::Dark) => Some((255, 255, 255)),
+                Some(appearance::Background::Light) => Some((0, 0, 0)),
+                None => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn named_color_to_rgb(c: Color) -> Option<(u8, u8, u8)> {
+    match c {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        Color::Indexed(i) => Some(indexed_to_rgb(i)),
+        Color::Black => Some((0, 0, 0)),
+        Color::Red => Some((128, 0, 0)),
+        Color::Green => Some((0, 128, 0)),
+        Color::Yellow => Some((128, 128, 0)),
+        Color::Blue => Some((0, 0, 128)),
+        Color::Magenta => Some((128, 0, 128)),
+        Color::Cyan => Some((0, 128, 128)),
+        Color::Gray => Some((192, 192, 192)),
+        Color::DarkGray => Some((128, 128, 128)),
+        Color::LightRed => Some((255, 0, 0)),
+        Color::LightGreen => Some((0, 255, 0)),
+        Color::LightYellow => Some((255, 255, 0)),
+        Color::LightBlue => Some((0, 0, 255)),
+        Color::LightMagenta => Some((255, 0, 255)),
+        Color::LightCyan => Some((0, 255, 255)),
+        Color::White => Some((255, 255, 255)),
+        Color::Reset => None,
+    }
+}
+
+fn indexed_to_rgb(i: u8) -> (u8, u8, u8) {
+    match i {
+        0 => (0, 0, 0),
+        1 => (128, 0, 0),
+        2 => (0, 128, 0),
+        3 => (128, 128, 0),
+        4 => (0, 0, 128),
+        5 => (128, 0, 128),
+        6 => (0, 128, 128),
+        7 => (192, 192, 192),
+        8 => (128, 128, 128),
+        9 => (255, 0, 0),
+        10 => (0, 255, 0),
+        11 => (255, 255, 0),
+        12 => (0, 0, 255),
+        13 => (255, 0, 255),
+        14 => (0, 255, 255),
+        15 => (255, 255, 255),
+        16..=231 => {
+            let n = i - 16;
+            let bi = (n % 6) as usize;
+            let gi = ((n / 6) % 6) as usize;
+            let ri = (n / 36) as usize;
+            const STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+            (STEPS[ri], STEPS[gi], STEPS[bi])
+        }
+        232..=255 => {
+            let g = 8 + (i - 232) * 10;
+            (g, g, g)
+        }
+    }
 }
 
 fn scope_fg(
@@ -1109,15 +1257,66 @@ mod tests {
 
     #[test]
     fn system_theme_keeps_colors_symbolic() {
+        appearance::reset_for_test();
         let t = load_by_name("system").expect("system theme must exist");
         assert_eq!(t.background, Color::Reset);
         assert_eq!(t.foreground, Color::Reset);
         assert_eq!(t.user.fg, Some(Color::Cyan));
-        assert_eq!(t.user_bg.bg, Some(Color::Indexed(236)));
+        assert_eq!(t.user_bg.bg, Some(Color::Reset));
         assert_eq!(
             t.syntax.settings.background,
             Some(SegmentColor::Default.to_syntect())
         );
+    }
+
+    #[test]
+    fn system_theme_blends_with_dark_terminal() {
+        appearance::set_for_test(Some(appearance::TerminalAppearance {
+            background: appearance::Background::Dark,
+            bg_color: Some(Color::Rgb(30, 30, 30)),
+        }));
+        let t = load_by_name("system").expect("system theme must exist");
+        assert_eq!(t.user_bg.bg, Some(Color::Rgb(43, 43, 43)));
+        appearance::reset_for_test();
+    }
+
+    #[test]
+    fn system_theme_blends_with_light_terminal() {
+        appearance::set_for_test(Some(appearance::TerminalAppearance {
+            background: appearance::Background::Light,
+            bg_color: Some(Color::Rgb(250, 250, 250)),
+        }));
+        let t = load_by_name("system").expect("system theme must exist");
+        assert_eq!(t.user_bg.bg, Some(Color::Rgb(235, 235, 235)));
+        appearance::reset_for_test();
+    }
+
+    #[test]
+    fn theme_blend_explicit_colors_and_target() {
+        let toml = r##"
+            [palette]
+            background = "#000000"
+            foreground = "#ffffff"
+            [ui]
+            user_bg = { blend = { base = "background", toward = "foreground", ratio = 0.1 } }
+            user = { blend = { base = "background", toward = "foreground", ratio = 0.2, target = "fg" } }
+        "##;
+        let t = Theme::from_toml(toml).expect("theme must parse");
+        assert_eq!(t.user_bg.bg, Some(Color::Rgb(25, 25, 25)));
+        assert_eq!(t.user.fg, Some(Color::Rgb(51, 51, 51)));
+    }
+
+    #[test]
+    fn theme_blend_fallback_when_base_unresolved() {
+        let toml = r##"
+            [palette]
+            background = "#000000"
+            foreground = "#ffffff"
+            [ui]
+            user_bg = { blend = { base = "nonexistent", toward = "foreground", ratio = 0.1, fallback = "236" } }
+        "##;
+        let t = Theme::from_toml(toml).expect("theme must parse");
+        assert_eq!(t.user_bg.bg, Some(Color::Indexed(236)));
     }
 
     #[test]
