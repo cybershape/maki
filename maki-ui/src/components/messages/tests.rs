@@ -357,6 +357,45 @@ fn scroll_up_pins_viewport_during_streaming() {
     assert_eq!(panel.scroll, pinned);
 }
 
+#[test]
+fn streaming_table_borders_align_while_text_keeps_arriving() {
+    const WIDTH: u16 = 80;
+    const HEIGHT: u16 = 40;
+    const TABLE: &str = "| 应用或场景 | 查到的情况 |\n| --- | --- |\n| 系统录音机「高品质音质」 | 我们在这台平板上查到的是两颗物理麦克风。底层开了四路 ADC，每两路对应同一个麦克风位置。 |\n| 腾讯会议、飞书、微信等视频通话 | 小米明确说平板 7 的通话工具箱能开启降噪。网上有商家声称四麦一起做会议降噪，但没给出应用、模式或实测依据。 |\n| 系统相机 | 这台平板的系统配置把原厂相机列在 support_audiozoom 下。标准版相机在录像时实际启用几颗，尚无实测。 |";
+    const TRAILING: &str = "\n\n表格已经接收完了，后面的文字还在继续流式输出。\n";
+    const WRAPPED: &str = "streaming table rows must not be re-wrapped at paint time";
+
+    let config = UiConfig {
+        typewriter_ms_per_char: 0,
+        ..UiConfig::default()
+    };
+    let mut panel = MessagesPanel::new(config, EventHandle::disconnected_for_test());
+    panel.text_delta(TABLE);
+    panel.text_delta(TRAILING);
+    let terminal = render(&mut panel, WIDTH, HEIGHT);
+
+    let rows = buffer_text(&terminal);
+    let mut border_cols: Vec<Vec<usize>> = Vec::new();
+    for (y, row) in rows.lines().enumerate() {
+        if !row.contains('│') {
+            continue;
+        }
+        let mut cols = Vec::new();
+        for x in 0..WIDTH {
+            let cell = &terminal.backend().buffer()[(x, y as u16)];
+            if cell.symbol() == "│" {
+                cols.push(usize::from(x));
+            }
+        }
+        border_cols.push(cols);
+    }
+    assert!(border_cols.len() >= 5, "table rows must be on screen");
+    let first = &border_cols[0];
+    for cols in &border_cols[1..] {
+        assert_eq!(cols, first, "{WRAPPED}");
+    }
+}
+
 fn render_sel(
     panel: &mut MessagesPanel,
     width: u16,

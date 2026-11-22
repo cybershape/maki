@@ -1985,6 +1985,10 @@ impl MessagesPanel {
     /// so a [`ScrollPos`] still points at the same text after the flush.
     fn rebuild_live_segments(&mut self, width: u16) {
         self.live_start = self.cache.len();
+        // Live segments draw with the same gutter as flushed messages, so the
+        // markdown (tables, code) must be laid out at the body width, not the
+        // full pane width, or paint-time wrapping breaks the box borders.
+        let body = body_width(width);
         if !self.streaming_thinking.is_empty() {
             let collapsed = thinking::collapsed_view(
                 thinking::tail_rows(self.thinking_lines, self.live_thinking_expanded),
@@ -1992,17 +1996,17 @@ impl MessagesPanel {
                 CLICKABLE,
                 |rows| {
                     self.streaming_thinking
-                        .render_tail(rows, width)
+                        .render_tail(rows, body)
                         .map(<[_]>::to_vec)
                 },
             );
             let drawn_collapsed = collapsed.is_some();
             let lines =
-                collapsed.unwrap_or_else(|| self.streaming_thinking.render_lines(width).to_vec());
+                collapsed.unwrap_or_else(|| self.streaming_thinking.render_lines(body).to_vec());
             self.push_live_segment(lines, drawn_collapsed, thinking_style().gutter());
         }
         if !self.streaming_text.is_empty() {
-            let lines = self.streaming_text.render_lines(width).to_vec();
+            let lines = self.streaming_text.render_lines(body).to_vec();
             self.push_live_segment(lines, false, assistant_style().gutter());
         }
     }
