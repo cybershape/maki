@@ -231,7 +231,6 @@ impl LoginPicker {
             });
         }
 
-
         items.push(ProviderItem {
             slug: "custom".to_string(),
             display_name: "Custom provider...".to_string(),

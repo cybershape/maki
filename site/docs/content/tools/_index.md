@@ -29,11 +29,11 @@ Commands run in the session's working directory (see Environment) by default.
 
 ### `powershell` {#powershell}
 
-Execute a command through Windows PowerShell. Do not use `&&` or `||`. Windows PowerShell 5.1 rejects them. Run one statement per call, or separate statements with `;`.
+Execute a command through Windows PowerShell. Windows PowerShell 5.1 environment. Prefer one statement per call or separate statements with `;` (chained `&&` / `||` are automatically shimmed).
 - Commands run in the configured working directory or the current directory.
-- Use `workdir` instead of `Set-Location`.
+- Use `workdir` param instead of `cd` or `Set-Location`.
 - Interactive commands are not supported.
-- Use `tail` to return only the last N output lines.
+- Use `head` or `tail` param to limit output lines instead of piping to `Select-Object -First`.
 - Provide a short `toolcall_reason` (3-5 words).
 
 **Permission:** `run`
@@ -41,8 +41,9 @@ Execute a command through Windows PowerShell. Do not use `&&` or `||`. Windows P
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `command` | string | yes |  | The PowerShell command to execute |
+| `head` | integer | no |  | Return only the first N lines |
 | `tail` | integer | no |  | Return only the last N lines |
-| `timeout` | integer | no | 120 | Timeout in seconds |
+| `timeout` | integer | no | 180 | Timeout in seconds |
 | `workdir` | string | no | current directory | Working directory |
 
 ### `list_dir` {#list_dir}

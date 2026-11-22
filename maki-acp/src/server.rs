@@ -697,7 +697,11 @@ async fn load_session(
     session_update(
         &srv.out_tx,
         &sid,
-        translate::gauge_usage_update(used, u64::from(recorded_model.context_window), restored_cost),
+        translate::gauge_usage_update(
+            used,
+            u64::from(recorded_model.context_window),
+            restored_cost,
+        ),
     );
     #[cfg(feature = "otel")]
     maki_otel::emit::session_started(maki_otel::emit::START_RESUME, Some(sid.0.as_ref()));
@@ -1268,7 +1272,10 @@ fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpEr
     ))
 }
 
-fn parse_thinking_value(value: &str, _defaults: &SessionDefaults) -> Result<ThinkingConfig, String> {
+fn parse_thinking_value(
+    value: &str,
+    _defaults: &SessionDefaults,
+) -> Result<ThinkingConfig, String> {
     let trimmed = value.trim();
     match trimmed.to_ascii_lowercase().as_str() {
         "off" => Ok(ThinkingConfig::Off),
@@ -4136,10 +4143,7 @@ mod tests {
         handle_set_config(&mut srv, &raw_bool)
             .await
             .expect("set thought_level to false");
-        assert_eq!(
-            only_session(&srv).current_thinking,
-            ThinkingConfig::Off
-        );
+        assert_eq!(only_session(&srv).current_thinking, ThinkingConfig::Off);
     }
 
     #[tokio::test]

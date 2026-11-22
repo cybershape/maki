@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 
-
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::permissions::{LayerAnswer, LayerVerdict, PluginRuleStore};
 use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};

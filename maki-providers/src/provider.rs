@@ -281,7 +281,6 @@ pub(crate) async fn fetch_built(
         });
     }
 
-
     tokio::spawn(custom::discover_models(timeouts, move |batch| {
         let _ = tx.send(batch);
     }));

@@ -151,7 +151,6 @@ async fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-
 async fn login_interactive(storage: &StateDir) -> Result<()> {
     let config = ProvidersConfig::load();
     let mut rows: Vec<(&str, String, String)> = Vec::new();
@@ -163,7 +162,6 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
         let display = def.display_name.clone().unwrap_or_else(|| slug.clone());
         rows.push((mark(saved(slug)), slug.clone(), display));
     }
-
 
     println!();
     println!("  Available providers (from providers.toml):");
@@ -441,7 +439,6 @@ pub async fn models(
     // Model listing calls plugin hooks, so the host outlives the fetch.
     let (_host, config) = super::cli_stack(no_plugins, no_jit, trust_mode).await?;
 
-
     fetch_all_models(
         &config.provider.model_policy,
         |batch| {
@@ -606,7 +603,8 @@ pub async fn prompt(
             let model = Model::from_spec_or_warm_catalog(model_spec)
                 .await
                 .context("invalid default model")?;
-            let tools = RequestTools::build(reg, &vars, &model, &config.agent, &[], false, None).await;
+            let tools =
+                RequestTools::build(reg, &vars, &model, &config.agent, &[], false, None).await;
             let prompt = host_prompt
                 .context(&vars, &instructions, &slots, &model, tools)
                 .system;

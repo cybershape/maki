@@ -643,8 +643,8 @@ const MCP_HINT_PREFIX: &str = "Hint: Parameter or runtime error in external libr
 #[test_case::test_case("await srv.fetch_issue()", MCP_TOOL_QUALIFIED, "fetch_issue" ; "module_call_hints_library_help")]
 #[test_case::test_case("await srv.get_docs()", HYPHEN_QUALIFIED, "get_docs" ; "hyphenated_call_hints_library_help")]
 fn failed_mcp_call_hints_library_help(code: &str, qualified: &'static str, fn_name: &str) {
-    let err = run_code_with(code, with_mcp(qualified))
-        .expect_err("the stub transport fails every call");
+    let err =
+        run_code_with(code, with_mcp(qualified)).expect_err("the stub transport fails every call");
     assert!(err.contains(MCP_HINT_PREFIX), "got: {err}");
     let expected_fn = format!("library_help(library_name=\"srv\", function_name=\"{fn_name}\")");
     assert!(err.contains(&expected_fn), "got: {err}");
@@ -658,10 +658,7 @@ fn failed_mcp_import_hints_global_object() {
         err.contains("Hint: 'srv' is an external library already injected as a global object"),
         "got: {err}"
     );
-    assert!(
-        err.contains("DO NOT write `import srv`"),
-        "got: {err}"
-    );
+    assert!(err.contains("DO NOT write `import srv`"), "got: {err}");
 }
 
 #[test]

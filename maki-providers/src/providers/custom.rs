@@ -351,10 +351,7 @@ mod tests {
     use test_case::test_case;
 
     fn responses_def(model_id: &str) -> ProviderDef {
-        serde_json::from_str(&format!(
-            r#"{{"models":[{{"id":"{model_id}"}}]}}"#
-        ))
-        .unwrap()
+        serde_json::from_str(&format!(r#"{{"models":[{{"id":"{model_id}"}}]}}"#)).unwrap()
     }
 
     #[test]
@@ -502,7 +499,6 @@ mod tests {
         );
     }
 
-
     // The exact regression this fixes: discovery parsed context_window but
     // never stored it, so custom models always got the protocol fallback.
     #[test]
@@ -607,7 +603,6 @@ mod tests {
         let model = model_from_def(&responses_def(model_id), &RESPONSES_SPEC, slug, model_id);
         assert!(model.is_free());
     }
-
 
     #[test]
     fn overlay_declared_tiers_sets_tier_for_declared_models_only() {

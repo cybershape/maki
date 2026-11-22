@@ -390,7 +390,8 @@ pub(crate) async fn stream_with_retry(
                 if let AgentError::SystemSleep(_) = &e {
                     retry.note_wake(crate::sleep::WAKE_GRACE_DURATION);
                 }
-                if forwarded.ttft.is_none() && forwarded.streamed.is_empty() && e.is_body_refused() {
+                if forwarded.ttft.is_none() && forwarded.streamed.is_empty() && e.is_body_refused()
+                {
                     return Err(StreamError::Refused(e));
                 }
                 // Rotation is decided above anything `retry_kind()` says: a
