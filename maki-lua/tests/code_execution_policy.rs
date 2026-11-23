@@ -319,6 +319,13 @@ fn interpreter_calls_advertised_tool_end_to_end() {
 }
 
 #[test]
+fn preamble_preimports_pathlib_and_path() {
+    let out = run_code("print(pathlib.Path is Path)")
+        .expect("pathlib and Path must be pre-imported");
+    assert!(out.contains("True"), "got: {out}");
+}
+
+#[test]
 fn describe_includes_list_dir_tool() {
     let (reg, _host) = setup();
     let desc = describe(&reg, &ToolFilter::All, ToolAudience::MAIN, false);

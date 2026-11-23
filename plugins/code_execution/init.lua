@@ -47,6 +47,8 @@ import sys
 import os
 import json
 import urllib.parse
+import pathlib
+from pathlib import Path
 async def gather(*calls):
     if len(calls) == 1 and isinstance(calls[0], list):
         calls = calls[0]
@@ -319,6 +321,7 @@ Available Modules & Global Objects:
 - Pass arguments by KEYWORD only: always specify parameter names (e.g. `await edit(path='...', old_string='...', new_string='...')`). NEVER pass positional arguments after keywords (e.g. `edit(path=p, old_string=s, 'b')` causes `SyntaxError: Positional argument cannot follow keyword argument`).
 %s
 - Importable modules ONLY: re, asyncio, sys, os, json, pathlib, urllib.parse, glob. No other standard or third-party packages can be imported.%s
+- Pre-imported globals (no import needed): re, asyncio, sys, os, json, pathlib, Path (= pathlib.Path), urllib.parse, gather.
 - `open()` supports basic text read/write (UTF-8 only; defensive parameters like `errors=`, `buffering=`, `newline=` are absorbed). For non-UTF-8 encodings or binary data, run via the host shell instead. `os`/`pathlib` can stat, listdir, walk, and mkdir. For file matching, prefer `Path.glob()`.
 - Fresh sandbox each run: no state persists between executions.
 - 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
