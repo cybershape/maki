@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `9a28e3f7a3585c590662588e8f22b46deffbc690`
-  - **Commit date**: `Fri Nov 20 14:56:50 2026 +0100`
-  - **Commit author**: `Laurent Cheylus <foxy@free.fr>`
-  - **Commit message**: `build: fix support for OpenBSD aarch64`
+  - **Commit SHA**: `f44a38c482605e174d6dfb4ec0a7915343c5290e`
+  - **Commit date**: `Sun Nov 22 09:20:27 2026 +0200`
+  - **Commit author**: `Vitalii <4005032+Crandel@users.noreply.github.com>`
+  - **Commit message**: `Fix lint issues`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `9a28e3f7`.
+> `upstream/main` has been successfully merged through commit `f44a38c4`.
 
 ---
 
@@ -229,6 +229,10 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `c4b964a7` | `build(android): support Android Termux builds with HTTPS` | Support Android Termux builds with native HTTPS CA bundle detection |
 | `efdf7444` | `Merge branch 'upstream/main' into main` | Merge upstream through `9a28e3f7`, including building model slots once off the event loop (`ModelSlots`), storage writer as tokio task, off-loop /btw and image pasting, in-memory picker recents and folds (`PickerMemory`), cancellation during context build, and read tool negative offset support, while preserving core fork customizations |
 | `8cdf0afd` | `feat(plugins): optimize code_execution framing and add read rule-based elision` | Optimize code_execution framing for Monty sandbox and add read tool rule-based elision for large files |
+| `5863a0ac` | `feat(ui): add theme color blend syntax and adaptive system user background` | Support theme color blending syntax and adaptive system/user background colors |
+| `bea92282` | `feat(powershell): harden powershell tool execution, output limits, and syntax shimming` | Harden PowerShell tool execution with strict output limits and syntax shimming |
+| `b245f2cd` | `fix(ui): lay out streaming markdown at gutter body width` | Lay out streaming markdown content matching gutter body width |
+| `f511fb56` | `Merge branch 'upstream/main' into main` | Merge upstream through `f44a38c4`, including `todo_write.toggle` action registration and its test coverage |
 
 ---
 
