@@ -226,6 +226,7 @@ Purpose:
 Available Modules & Global Objects:
 - All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=100)`. Parse output yourself.
 - Tool results are complete. Only what you print/return is capped.
+- Pass arguments by KEYWORD only: always specify parameter names (e.g. `await edit(path='...', old_string='...', new_string='...')`). NEVER pass positional arguments after keywords (e.g. `edit(path=p, old_string=s, 'b')` causes `SyntaxError: Positional argument cannot follow keyword argument`).
 %s
 - Importable modules ONLY: re, asyncio, sys, os, json, pathlib, urllib.parse, glob. No other standard or third-party packages can be imported.%s
 - `open()` supports basic text read/write (UTF-8 only; defensive parameters like `errors=`, `buffering=`, `newline=` are absorbed). For non-UTF-8 encodings or binary data, run via the host shell instead. `os`/`pathlib` can stat, listdir, walk, and mkdir. For file matching, prefer `Path.glob()`.
@@ -235,6 +236,9 @@ Available Modules & Global Objects:
 - NOT a thinking scratchpad. Reason in your response text.
 
 Syntax & Execution Limitations (Frequent Failure Points):
+- Formatting: Write standard multi-line Python with proper indentation. DO NOT chain compound statements (`for`, `if`, `while`, `def`) on the same line with semicolons (`;`) — this causes `SyntaxError: Compound statements are not allowed on the same line as simple statements`. Avoid long single-line semicolon chains.
+- NO JavaScript / TypeScript syntax: DO NOT use JS template backticks (`), Promise methods (`.catch()`, `Promise.all`), or arrow functions (`() => ...`) inside Python code. Use standard Python triple quotes `'''...'''` for multi-line strings.
+- Shell commands & Regex quotes: For Shell commands or regex patterns containing quotes or backslashes, use raw triple-quoted strings `r'''...'''` to avoid multi-level quote escaping failures.
 - NO generator iterators: Generator expressions `(x for ...)` materialize as `list`, and `iter()` is unavailable: DO NOT use `next(x for ...)`; use a `for` loop or `[...][0]` instead.
 - NO suspension inside sync callbacks: DO NOT call async tool functions or OS operations (like `stat()`, `read_text()`) inside `sorted(key=...)`, `max(key=...)`, or `map()` (cannot suspend); extract attributes beforehand via list comprehension.
 - Builtins NOT implemented: `iter`, `callable`, `dir`, `globals`, `locals`, `eval`, `exec`.

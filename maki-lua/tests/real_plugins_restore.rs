@@ -257,6 +257,20 @@ fn bash_title_leaves_out_the_session_directory() {
     assert_eq!(r.header, "print hi");
 }
 
+#[test]
+fn bash_header_parses_cd_hint_with_redirection() {
+    let host = load_host();
+    let r = restore(
+        &host,
+        "bash",
+        json!({ "command": "cd maki 2>/dev/null && sed foo" }),
+        "output",
+        None,
+        Vec::new(),
+    );
+    assert!(r.header.contains("in maki"), "header was: {}", r.header);
+}
+
 const MULTILINE_COMMAND: &str = "echo one\necho two\necho three";
 const HEADER_NOTICE: &str = "... (2 more lines) (click to expand)";
 

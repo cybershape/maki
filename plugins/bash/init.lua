@@ -50,18 +50,51 @@ local function unquote(s)
   return s
 end
 
+local function clean_dir(raw)
+  if not raw or raw == "" then
+    return nil
+  end
+  local s = raw:match("^%s*(.-)%s*$")
+  s = s:gsub("^%-[PL]%s+", "")
+  s = s:gsub("^%-%-%s+", "")
+  if s == "-" or s == "" then
+    return nil
+  end
+  local q = s:sub(1, 1)
+  if q == '"' or q == "'" then
+    local end_q = s:find(q, 2, true)
+    if end_q then
+      return s:sub(2, end_q - 1)
+    end
+  end
+  s = s:gsub("%s+[%d&]*>%s*[^%s;&]+", "")
+  s = s:gsub("%s+[%d&]*>&%d+", "")
+  s = s:match("^%s*(.-)%s*$")
+  if s == "" or s == "-" then
+    return nil
+  end
+  return unquote(s)
+end
+
 local function parse_cd_hint(input)
   if input.workdir then
     return input.command, input.workdir
   end
-  local rest = input.command:match("^cd%s+(.+)$")
+  local cmd = input.command or ""
+  local rest = cmd:match("^%s*cd%s+(.+)$")
   if rest then
     local dir, tail = rest:match("^(.-)%s+&&%s+(.+)$")
-    if dir and dir ~= "" then
-      return tail, unquote(dir)
+    if not dir then
+      dir, tail = rest:match("^(.-)%s*;%s*(.+)$")
+    end
+    if dir and dir ~= "" and tail and tail ~= "" then
+      local cleaned = clean_dir(dir)
+      if cleaned then
+        return tail, cleaned
+      end
     end
   end
-  return input.command, nil
+  return cmd, nil
 end
 
 local function normalize_sep(s)

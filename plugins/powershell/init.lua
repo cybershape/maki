@@ -51,7 +51,13 @@ local function parse_cd_hint(cmd, workdir)
     dir, tail = cmd:match("^%s*Set%-Location%s+([^\r\n;&]+)%s*[;&]+%s*(.+)$")
   end
   if dir and dir ~= "" and tail and tail ~= "" then
-    return tail, unquote(dir:match("^%s*(.-)%s*$"))
+    local s = dir:match("^%s*(.-)%s*$")
+    s = s:gsub("%s+[%d%*]*>%s*%$null", "")
+    s = s:gsub("%s+|%s*Out%-Null", "")
+    s = s:match("^%s*(.-)%s*$")
+    if s and s ~= "" and s ~= "-" then
+      return tail, unquote(s)
+    end
   end
   return cmd, nil
 end
