@@ -1114,3 +1114,144 @@ fn restore_expanded_shows_full_script_beyond_cap() {
         "output must stay below the expanded script"
     );
 }
+
+#[test]
+fn mcp_parameter_and_function_keywords_are_bidirectionally_converted() {
+    let (reg, _host) = setup_global();
+    let ctx = shaped_ctx(&reg, |ctx| {
+        ctx.mcp = Some(echo_session(&[
+            (
+                "engram.brain_supersede",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "from": { "type": "string" },
+                        "to": { "type": "string" },
+                        "target-branch": { "type": "string" },
+                        "user_id": { "type": "string" },
+                        "text_": { "type": "string" },
+                    },
+                    "required": vec!["from", "to"],
+                }),
+            ),
+            (
+                "srv.import",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "from": { "type": "string" },
+                    },
+                }),
+            ),
+        ]));
+    });
+
+    let code = r#"
+res = await engram.brain_supersede(
+    from_="source_doc",
+    to="dest_doc",
+    target_branch="feature",
+    user_id="user_42",
+    text_="already_has_underscore"
+)
+print("ENGRAM_RES:" + res)
+
+res2 = await srv.import_(from_="import_source")
+print("SRV_RES:" + res2)
+"#;
+    let out = exec_code(&reg, &ctx, code).expect("script must execute successfully");
+
+    let engram_line = out
+        .lines()
+        .find(|l| l.starts_with("ENGRAM_RES:"))
+        .expect("must find ENGRAM_RES in output");
+    let engram_json: serde_json::Value =
+        serde_json::from_str(&engram_line["ENGRAM_RES:".len()..]).expect("valid JSON");
+
+    assert_eq!(engram_json["from"], "source_doc");
+    assert_eq!(engram_json["to"], "dest_doc");
+    assert_eq!(engram_json["target-branch"], "feature");
+    assert_eq!(engram_json.get("from_"), None);
+    assert_eq!(engram_json.get("target_branch"), None);
+
+    assert_eq!(engram_json["user_id"], "user_42");
+    assert_eq!(engram_json.get("user-id"), None);
+    assert_eq!(engram_json["text_"], "already_has_underscore");
+    assert_eq!(engram_json.get("text"), None);
+
+    let srv_line = out
+        .lines()
+        .find(|l| l.starts_with("SRV_RES:"))
+        .expect("must find SRV_RES in output");
+    let srv_json: serde_json::Value =
+        serde_json::from_str(&srv_line["SRV_RES:".len()..]).expect("valid JSON");
+    assert_eq!(srv_json["from"], "import_source");
+    assert_eq!(srv_json.get("from_"), None);
+}
+
+#[test]
+fn library_help_formats_keyword_and_hyphen_signatures() {
+    let (reg, _host) = setup_global();
+    let ctx = shaped_ctx(&reg, |ctx| {
+        ctx.mcp = Some(echo_session(&[
+            (
+                "engram.brain_supersede",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "from": { "type": "string", "description": "Source path" },
+                        "target-branch": { "type": "string" },
+                    },
+                    "required": vec!["from"],
+                }),
+            ),
+            (
+                "srv.import",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "from": { "type": "string" },
+                    },
+                }),
+            ),
+        ]));
+    });
+
+    for fn_name in ["import", "import_"] {
+        let help = run_tool(
+            &reg,
+            &ctx,
+            "library_help",
+            serde_json::json!({
+                "library_name": "srv",
+                "function_name": fn_name,
+            }),
+        )
+        .expect("library_help must succeed");
+
+        assert!(
+            help.contains("async def import_("),
+            "signature must use import_, got: {help}"
+        );
+        assert!(
+            help.contains("from_: str"),
+            "parameter must be from_, got: {help}"
+        );
+    }
+
+    let engram_help = run_tool(
+        &reg,
+        &ctx,
+        "library_help",
+        serde_json::json!({
+            "library_name": "engram",
+            "function_name": "brain_supersede",
+        }),
+    )
+    .expect("library_help must succeed");
+
+    assert!(engram_help.contains("from_: str,"));
+    assert!(engram_help.contains("target_branch: str = None,"));
+    assert!(engram_help.contains("- from_ (str, required): Source path"));
+    assert!(engram_help.contains("- target_branch (str, optional)"));
+}

@@ -75,13 +75,103 @@ local CALLABLE_TOOLS_ERR = "cannot list callable tools: "
 -- a leading digit. Binding it would raise a SyntaxError the model cannot act on.
 local PY_IDENTIFIER = "^[%a_][%w_]*$"
 local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
+local PYTHON_KEYWORDS = {
+  ["False"] = true,
+  ["None"] = true,
+  ["True"] = true,
+  ["and"] = true,
+  ["as"] = true,
+  ["assert"] = true,
+  ["async"] = true,
+  ["await"] = true,
+  ["break"] = true,
+  ["class"] = true,
+  ["continue"] = true,
+  ["def"] = true,
+  ["del"] = true,
+  ["elif"] = true,
+  ["else"] = true,
+  ["except"] = true,
+  ["finally"] = true,
+  ["for"] = true,
+  ["from"] = true,
+  ["global"] = true,
+  ["if"] = true,
+  ["import"] = true,
+  ["in"] = true,
+  ["is"] = true,
+  ["lambda"] = true,
+  ["nonlocal"] = true,
+  ["not"] = true,
+  ["or"] = true,
+  ["pass"] = true,
+  ["raise"] = true,
+  ["return"] = true,
+  ["try"] = true,
+  ["while"] = true,
+  ["with"] = true,
+  ["yield"] = true,
+}
+
+local function to_py_identifier(name)
+  if not name or #name == 0 then
+    return nil
+  end
+  local clean = name:gsub("[^%w_]", "_")
+  if clean:match("^%d") then
+    clean = "_" .. clean
+  end
+  if PYTHON_KEYWORDS[clean] then
+    clean = clean .. "_"
+  end
+  return clean:match(PY_IDENTIFIER) and clean or nil
+end
 
 local function identifier_alias(name)
   if not name or #name == 0 or name:match("^%d") then
     return nil
   end
-  local alias = name:gsub("[^%w_]", "_")
-  return alias:match(PY_IDENTIFIER) and alias or nil
+  return to_py_identifier(name)
+end
+
+local function build_param_map(schema)
+  if not schema or not schema.properties then
+    return nil
+  end
+  local map = nil
+  local seen = {}
+  for raw_name in pairs(schema.properties) do
+    seen[raw_name] = true
+  end
+  for raw_name in pairs(schema.properties) do
+    local py_name = to_py_identifier(raw_name)
+    if py_name then
+      while seen[py_name] and py_name ~= raw_name do
+        py_name = py_name .. "_"
+      end
+      if py_name ~= raw_name then
+        map = map or {}
+        map[py_name] = raw_name
+        seen[py_name] = true
+      end
+    end
+  end
+  return map
+end
+
+local function apply_param_map(tool_input, param_map)
+  if not param_map or type(tool_input) ~= "table" then
+    return tool_input
+  end
+  for py_name, raw_name in pairs(param_map) do
+    if tool_input[py_name] ~= nil then
+      if tool_input[raw_name] == nil then
+        tool_input[raw_name] = tool_input[py_name]
+      end
+      tool_input[py_name] = nil
+    end
+  end
+  return tool_input
 end
 
 local function mcp_library_hint(libs, code, err)
@@ -341,8 +431,9 @@ local function signature(t)
   end)
   local params = {}
   for _, pname in ipairs(names) do
+    local py_pname = to_py_identifier(pname) or pname
     local ptype = PY_TYPES[schema_props[pname].type] or "any"
-    params[#params + 1] = required[pname] and (pname .. ": " .. ptype) or (pname .. ": " .. ptype .. " = None")
+    params[#params + 1] = required[pname] and (py_pname .. ": " .. ptype) or (py_pname .. ": " .. ptype .. " = None")
   end
   return "- " .. (t.alias or t.name) .. "(" .. table.concat(params, ", ") .. ") -> str"
 end
@@ -543,11 +634,16 @@ local function handler(input, ctx)
   end
 
   local tools, schemas = {}, {}
+  local param_maps = {}
   for _, t in ipairs(interpreter_tools(callable, ctx:audience(), ctx:workflow())) do
     local bind, name = t.alias or t.name, t.name
     if bind:match(PY_IDENTIFIER) then
       schemas[bind] = t.schema or {}
+      param_maps[bind] = build_param_map(t.schema)
       tools[bind] = function(tool_input)
+        if param_maps[bind] then
+          tool_input = apply_param_map(tool_input, param_maps[bind])
+        end
         if t.workflow_only then
           return maki.agent.call_tool(ctx, name, tool_input)
         end
@@ -577,10 +673,19 @@ local function handler(input, ctx)
       if lib_name then
         table.insert(ns_lines, string.format("%s = _McpNamespace()\n", lib_name))
         for _, fn in ipairs(lib.functions or {}) do
-          local fn_name = identifier_alias(fn.name)
+          local raw_fn_name = fn.name
+          local fn_name = identifier_alias(raw_fn_name) or raw_fn_name
           if fn_name then
-            local wire = lib_name .. "__" .. fn_name
+            local raw_wire = lib.name .. "__" .. raw_fn_name
+            local wire_alias = identifier_alias(raw_wire)
+            local wire = (tools[raw_wire] and raw_wire)
+              or (wire_alias and tools[wire_alias] and wire_alias)
+              or (lib_name .. "__" .. fn_name)
             if tools[wire] then
+              if fn.schema then
+                schemas[wire] = fn.schema
+                param_maps[wire] = build_param_map(fn.schema)
+              end
               table.insert(ns_lines, string.format("%s.%s = %s\n", lib_name, fn_name, wire))
             end
           end

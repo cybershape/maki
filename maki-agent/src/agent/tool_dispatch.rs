@@ -35,6 +35,13 @@ use crate::{
 use maki_config::ToolKey;
 use maki_storage::id::SessionRef;
 
+const PYTHON_KEYWORDS: &[&str] = &[
+    "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class",
+    "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global",
+    "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return",
+    "try", "while", "with", "yield",
+];
+
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const DOOM_LOOP_MESSAGE: &str = "You have called this tool with the same (or nearly identical) input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
@@ -851,11 +858,19 @@ pub fn identifier_alias(name: &str) -> Option<String> {
     if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
         return None;
     }
-    name.chars().any(|c| !is_body(c)).then(|| {
-        name.chars()
-            .map(|c| if is_body(c) { c } else { '_' })
-            .collect()
-    })
+    let has_non_body = name.chars().any(|c| !is_body(c));
+    let is_kw = PYTHON_KEYWORDS.contains(&name);
+    if !has_non_body && !is_kw {
+        return None;
+    }
+    let mut clean: String = name
+        .chars()
+        .map(|c| if is_body(c) { c } else { '_' })
+        .collect();
+    if PYTHON_KEYWORDS.contains(&clean.as_str()) {
+        clean.push('_');
+    }
+    Some(clean)
 }
 
 /// Pure router: every arm owns its own start event, permission gate and
@@ -3802,5 +3817,27 @@ mod layer_mark_tests {
             .collect();
         assert_eq!(rows, marked_rows);
         assert_eq!(sent, streamed);
+    }
+}
+
+#[cfg(test)]
+mod identifier_alias_tests {
+    use super::*;
+    use test_case::test_case;
+
+    #[test_case("from", Some("from_") ; "keyword_from")]
+    #[test_case("import", Some("import_") ; "keyword_import")]
+    #[test_case("class", Some("class_") ; "keyword_class")]
+    #[test_case("def", Some("def_") ; "keyword_def")]
+    #[test_case("False", Some("False_") ; "keyword_false_capitalized")]
+    #[test_case("get-docs", Some("get_docs") ; "hyphenated_name")]
+    #[test_case("from-docs", Some("from_docs") ; "hyphenated_with_keyword_prefix")]
+    #[test_case("from_", None ; "already_suffixed_keyword")]
+    #[test_case("srv__from", None ; "prefixed_keyword_is_not_keyword")]
+    #[test_case("valid_ident", None ; "regular_valid_identifier")]
+    #[test_case("123abc", None ; "leading_digit_declined")]
+    #[test_case("", None ; "empty_declined")]
+    fn identifier_alias_cases(name: &str, expected: Option<&str>) {
+        assert_eq!(identifier_alias(name).as_deref(), expected);
     }
 }

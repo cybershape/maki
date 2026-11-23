@@ -1,13 +1,63 @@
 local ToolView = require("maki.tool_view")
 
 local PY_IDENTIFIER = "^[%a_][%w_]*$"
+local PYTHON_KEYWORDS = {
+  ["False"] = true,
+  ["None"] = true,
+  ["True"] = true,
+  ["and"] = true,
+  ["as"] = true,
+  ["assert"] = true,
+  ["async"] = true,
+  ["await"] = true,
+  ["break"] = true,
+  ["class"] = true,
+  ["continue"] = true,
+  ["def"] = true,
+  ["del"] = true,
+  ["elif"] = true,
+  ["else"] = true,
+  ["except"] = true,
+  ["finally"] = true,
+  ["for"] = true,
+  ["from"] = true,
+  ["global"] = true,
+  ["if"] = true,
+  ["import"] = true,
+  ["in"] = true,
+  ["is"] = true,
+  ["lambda"] = true,
+  ["nonlocal"] = true,
+  ["not"] = true,
+  ["or"] = true,
+  ["pass"] = true,
+  ["raise"] = true,
+  ["return"] = true,
+  ["try"] = true,
+  ["while"] = true,
+  ["with"] = true,
+  ["yield"] = true,
+}
+
+local function to_py_identifier(name)
+  if not name or #name == 0 then
+    return nil
+  end
+  local clean = name:gsub("[^%w_]", "_")
+  if clean:match("^%d") then
+    clean = "_" .. clean
+  end
+  if PYTHON_KEYWORDS[clean] then
+    clean = clean .. "_"
+  end
+  return clean:match(PY_IDENTIFIER) and clean or nil
+end
 
 local function identifier_alias(name)
   if not name or #name == 0 or name:match("^%d") then
     return nil
   end
-  local alias = name:gsub("[^%w_]", "_")
-  return alias:match(PY_IDENTIFIER) and alias or nil
+  return to_py_identifier(name)
 end
 
 local PY_TYPES = {
@@ -60,11 +110,19 @@ local function format_python_docstring(name, desc, schema)
 
   local req_args = {}
   local opt_args = {}
+  local seen = {}
+  for k in pairs(props) do
+    seen[k] = true
+  end
   for k, v in pairs(props) do
+    local py_name = to_py_identifier(k) or k
+    while seen[py_name] and py_name ~= k do
+      py_name = py_name .. "_"
+    end
     if req_set[k] then
-      table.insert(req_args, { name = k, prop = v })
+      table.insert(req_args, { name = py_name, raw_name = k, prop = v })
     else
-      table.insert(opt_args, { name = k, prop = v })
+      table.insert(opt_args, { name = py_name, raw_name = k, prop = v })
     end
   end
 
@@ -98,8 +156,9 @@ local function format_python_docstring(name, desc, schema)
     sig_args_str = "\n" .. table.concat(sig_lines, "\n") .. "\n"
   end
 
+  local fn_name = to_py_identifier(name) or name
   local doc_lines = {}
-  table.insert(doc_lines, string.format("async def %s(%s) -> str:", name, sig_args_str))
+  table.insert(doc_lines, string.format("async def %s(%s) -> str:", fn_name, sig_args_str))
   table.insert(doc_lines, '    """')
   if desc and #desc > 0 then
     table.insert(doc_lines, "    " .. desc:gsub("\n", "\n    "))
