@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `31e149d66bdb2f2d3545232d9d22a9fd0467cb3c`
-  - **Commit date**: `Mon Nov 23 23:28:13 2026 +0100`
+  - **Commit SHA**: `cdef2f59ef064b30c42e5587d421b64ba595b52b`
+  - **Commit date**: `Tue Nov 24 23:38:40 2026 +0100`
   - **Commit author**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
-  - **Commit message**: `chore(plugins): type check text_input in strict mode`
+  - **Commit message**: `docs(plugins): explain bash \`file_tool_note\` on the token economy page`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `31e149d6`.
+> `upstream/main` has been successfully merged through commit `cdef2f59`.
 
 ---
 
@@ -237,6 +237,10 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `00a36a01` | `feat(mcp): bidirectionally map Python keywords and identifiers in tools` | Bidirectionally map Python keywords and identifiers in MCP tools |
 | `3aabc746` | `fix(plugins): pre-import pathlib and Path in code_execution preamble` | Pre-import pathlib and bind Path in code_execution preamble |
 | `b125f902` | `Merge branch 'upstream/main' into main` | Merge upstream through `31e149d6`, including MCP `startup_timeout` configuration, `--max-budget-usd` enforcement, model capability borrowing with `like`, `maki.model.info` fact source tracking, compile-time update disabling via `MAKI_DISABLE_UPDATE`, terminal capability detection refactoring, append-only headless turns, strict Luau typing across plugins, and dependency updates, while preserving core fork customizations |
+| `a1972a91` | `docs: update upstream tracking record to 31e149d6` | Update the upstream tracking record to `31e149d6` |
+| `e9efa48f` | `fix(ui): enable clipboard dual writes in herdr-app` | Enable clipboard dual writes in herdr-app |
+| `06085d9c` | `feat(prompt): instruct models to issue independent tool calls concurrently when code_execution is enabled` | Instruct models to issue independent tool calls concurrently when code_execution is enabled |
+| `07019f1b` | `Merge branch 'upstream/main' into main` | Merge upstream through `cdef2f59`, including bash `file_tool_note` recommending dedicated file tools, grep `count` parameter, code_execution exception-line matching and gather error slot documentation, focused float keyboard event resolution and `<C-c>` permission denial, file_access `Seen` digest caching without stale read on unchanged file rewrites, `htmd` 0.6 bump and `maki.text.html_to_text`, edit tool lines shift reporting, direct Kagi Search API integration, and exposing provider usage limits to Lua plugins, while preserving core fork customizations |
 
 ---
 
