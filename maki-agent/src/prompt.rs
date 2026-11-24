@@ -885,7 +885,9 @@ mod tests {
         let out = p.render_with_tools(PromptId::System, &Vars::default(), "", &|_| true);
         assert!(out.contains("- Use **batch** for parallel calls, **code_execution** for chained/filtered calls, **task** for delegation."));
         assert!(out.contains("- Combine **batch** and **task**: launch multiple tasks in a batch to parallelize research or implementation."));
-        assert!(out.contains("Concurrency: Consecutive tool calls that do not depend on each other"));
+        assert!(
+            out.contains("Concurrency: Consecutive tool calls that do not depend on each other")
+        );
         assert!(out.contains("via `gather(...)` in **code_execution** or via **batch**"));
         assert!(out.contains("Most efficient tools: batch, code_execution, task."));
     }
@@ -900,7 +902,9 @@ mod tests {
         ));
         assert!(!out.contains("Combine **batch** and **task**"));
         assert!(!out.contains("**task** for delegation"));
-        assert!(out.contains("Concurrency: Consecutive tool calls that do not depend on each other"));
+        assert!(
+            out.contains("Concurrency: Consecutive tool calls that do not depend on each other")
+        );
         assert!(out.contains("Most efficient tools: batch, code_execution."));
     }
 
@@ -914,7 +918,9 @@ mod tests {
         ));
         assert!(!out.contains("Combine **batch** and **task**"));
         assert!(!out.contains("**batch** for parallel calls"));
-        assert!(out.contains("via `gather(...)` in **code_execution**. Never call them one at a time sequentially."));
+        assert!(out.contains(
+            "via `gather(...)` in **code_execution**. Never call them one at a time sequentially."
+        ));
         assert!(!out.contains("or via **batch**"));
         assert!(out.contains("Most efficient tools: code_execution, task."));
     }
@@ -952,7 +958,9 @@ mod tests {
         assert!(out.contains(
             "- Use **code_execution** for parallel/batch calls (via gather) and chained/filtered calls."
         ));
-        assert!(out.contains("via `gather(...)` in **code_execution**. Never call them one at a time sequentially."));
+        assert!(out.contains(
+            "via `gather(...)` in **code_execution**. Never call them one at a time sequentially."
+        ));
         assert!(!out.contains("or via **batch**"));
         assert!(!out.contains("Combine **batch** and **task**"));
         assert!(!out.contains("**batch**"));

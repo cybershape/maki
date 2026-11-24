@@ -1,7 +1,14 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::cmp::Reverse;
+use std::convert::identity;
+use std::io;
+use std::iter::successors;
 
-use htmd::HtmlToMarkdown;
+use htmd::element_handler::{HandlerResult, Handlers};
+use htmd::node::{Node, NodeType};
+use htmd::options::{BulletListMarker, Options};
+use htmd::{Element, HtmlToMarkdown};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, LuaString, Result as LuaResult, Table};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
@@ -11,12 +18,82 @@ use tokio::task::spawn_blocking;
 use super::util::convert::TableExt;
 use super::util::pair::{Pair, pair};
 
+const PRE_TAG: &str = "pre";
+/// Elements that sit inside a line of text. Every other element starts and
+/// ends a line.
+const INLINE_TAGS: [&str; 32] = [
+    "a", "abbr", "b", "bdi", "bdo", "big", "cite", "code", "data", "del", "dfn", "em", "font", "i",
+    "ins", "kbd", "label", "mark", "q", "s", "samp", "small", "span", "strike", "strong", "sub",
+    "sup", "time", "tt", "u", "var", "wbr",
+];
+const TABLE_TAG: &str = "table";
+const CELL_TAGS: [&str; 2] = ["td", "th"];
+const HEADER_TAGS: [&str; 2] = ["th", "thead"];
+const CELL_END: char = '|';
+/// A pipe inside a cell is escaped, so only a cell's end has a bare one after a space.
+const PADDED_CELL_END: &str = " |";
+const SEPARATOR_CELL: &str = "---";
+const LIST_MARKER_SPACING: u8 = 1;
+
 thread_local! {
     /// `Matcher::new` allocates a score matrix of about 135KB, so building one
     /// per call would make the obvious loop over candidates allocate once per
     /// candidate. Its config is overwritten on every borrow, which is the only
     /// thing that differs between callers.
     static MATCHER: RefCell<Matcher> = RefCell::new(Matcher::new(Config::DEFAULT));
+}
+
+fn has_header(node: &Node<'_>) -> bool {
+    node.children().iter().any(|child| match child.tag_name() {
+        Some(tag) if HEADER_TAGS.contains(&tag) => true,
+        Some(TABLE_TAG) => false,
+        _ => has_header(&child),
+    })
+}
+
+/// htmd's own rule for writing a table as pipe rows. Any other table comes
+/// out as its cells' content, where a line that starts with `|` is somebody's
+/// code and not ours to touch.
+fn is_pipe_table(table: &Node<'_>) -> bool {
+    let in_cell = successors(table.parent(), Node::parent).any(|ancestor| {
+        ancestor
+            .tag_name()
+            .is_some_and(|tag| CELL_TAGS.contains(&tag))
+    });
+    !in_cell && has_header(table)
+}
+
+/// htmd pads every cell to its column's width, so one long cell costs its
+/// length again in every other row. Markdown needs none of it.
+fn unpad_table(table: HandlerResult) -> HandlerResult {
+    let content = table.content.split_inclusive('\n').map(unpad_row).collect();
+    HandlerResult { content, ..table }
+}
+
+fn unpad_row(line: &str) -> Cow<'_, str> {
+    let Some(cells) = line
+        .trim_end_matches('\n')
+        .strip_prefix(CELL_END)
+        .and_then(|row| row.strip_suffix(PADDED_CELL_END))
+    else {
+        return Cow::Borrowed(line);
+    };
+    let cells: Vec<&str> = cells.split(PADDED_CELL_END).map(str::trim).collect();
+    let is_separator = cells
+        .iter()
+        .all(|cell| cell.len() >= SEPARATOR_CELL.len() && cell.bytes().all(|b| b == b'-'));
+    let mut row = String::from(CELL_END);
+    for cell in cells {
+        let cell = if is_separator { SEPARATOR_CELL } else { cell };
+        if !cell.is_empty() {
+            row.push(' ');
+            row.push_str(cell);
+        }
+        row.push(' ');
+        row.push(CELL_END);
+    }
+    row.push('\n');
+    Cow::Owned(row)
 }
 
 /// Convert an HTML string to Markdown.
@@ -42,7 +119,24 @@ async fn html_to_markdown(
     let skip_tags: Vec<String> = opts.as_ref().opt("skip_tags")?.unwrap_or_default();
     Ok(pair(
         spawn_blocking(move || {
-            let mut builder = HtmlToMarkdown::builder();
+            let mut builder = HtmlToMarkdown::builder()
+                .options(Options {
+                    bullet_list_marker: BulletListMarker::Dash,
+                    ul_bullet_spacing: LIST_MARKER_SPACING,
+                    ol_number_spacing: LIST_MARKER_SPACING,
+                    ..Options::default()
+                })
+                .add_handler(
+                    vec![TABLE_TAG],
+                    |handlers: &dyn Handlers, element: &Element| {
+                        let unpad = if is_pipe_table(element.node) {
+                            unpad_table
+                        } else {
+                            identity
+                        };
+                        handlers.fallback(element).map(unpad)
+                    },
+                );
             // htmd asserts on an empty tag list.
             if !skip_tags.is_empty() {
                 builder = builder.skip_tags(skip_tags.iter().map(String::as_str).collect());
@@ -53,6 +147,102 @@ async fn html_to_markdown(
         .map_err(mlua::Error::external)?
         .map_err(|e| format!("html_to_markdown: {e}")),
     ))
+}
+
+/// Convert an HTML string to plain text.
+/// Entities are decoded and whitespace is collapsed outside `pre`. Inline elements such as
+/// `b` or `a` leave no trace, and every other element starts a new line.
+/// Invalid UTF-8 becomes U+FFFD.
+///
+/// @param html string HTML source text.
+/// @param opts table? `skip_tags` (string[]) elements dropped together with their content, like `script` or `nav`.
+/// @return (string?, string?) Plain text on success, or nil plus an error message.
+/// @example
+/// local text, err = maki.text.html_to_text("<h1>Fish &amp; chips</h1><p>to <b>go</b></p>")
+/// if err then return end
+/// print(text) -- "Fish & chips\nto go"
+#[lua_fn]
+async fn html_to_text(_lua: Lua, html: LuaString, opts: Option<Table>) -> LuaResult<Pair<String>> {
+    let html = html.to_string_lossy();
+    let skip_tags: Vec<String> = opts.as_ref().opt("skip_tags")?.unwrap_or_default();
+    Ok(pair(
+        spawn_blocking(move || visible_text(&html, &skip_tags))
+            .await
+            .map_err(mlua::Error::external)?
+            .map_err(|e| format!("html_to_text: {e}")),
+    ))
+}
+
+/// What separates the next visible character from the text before it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Gap {
+    None,
+    Space,
+    Line,
+}
+
+enum Step<'a> {
+    Visit(Node<'a>),
+    EndLine,
+    EndPre,
+}
+
+fn visible_text(html: &str, skip_tags: &[String]) -> io::Result<String> {
+    let mut text = String::new();
+    let mut gap = Gap::None;
+    let mut pre_depth = 0usize;
+    let tree = HtmlToMarkdown::new().html_to_tree(html)?;
+    let mut steps = vec![Step::Visit(tree.root())];
+    while let Some(step) = steps.pop() {
+        let node = match step {
+            Step::Visit(node) => node,
+            Step::EndLine => {
+                gap = Gap::Line;
+                continue;
+            }
+            Step::EndPre => {
+                pre_depth -= 1;
+                text.truncate(text.trim_end_matches('\n').len());
+                continue;
+            }
+        };
+        if let Some(contents) = node.text() {
+            for c in contents.chars() {
+                if pre_depth == 0 && c.is_whitespace() {
+                    gap = gap.max(Gap::Space);
+                    continue;
+                }
+                match gap {
+                    _ if text.is_empty() => {}
+                    Gap::None => {}
+                    Gap::Space => text.push(' '),
+                    Gap::Line => text.push('\n'),
+                }
+                gap = Gap::None;
+                text.push(c);
+            }
+            continue;
+        }
+        match node.tag_name() {
+            Some(tag) if skip_tags.iter().any(|skipped| skipped == tag) => continue,
+            Some(tag) => {
+                if !INLINE_TAGS.contains(&tag) {
+                    gap = Gap::Line;
+                    steps.push(Step::EndLine);
+                }
+                if tag == PRE_TAG {
+                    pre_depth += 1;
+                    steps.push(Step::EndPre);
+                }
+            }
+            None if node.node_type() == NodeType::Document => {}
+            None => continue,
+        }
+        let first_child = steps.len();
+        steps.extend(successors(node.first_child(), Node::next_sibling).map(Step::Visit));
+        steps[first_child..].reverse();
+    }
+    Ok(text)
 }
 
 /// Return {s} as valid UTF-8, with every invalid byte sequence replaced by
@@ -246,11 +436,12 @@ lua_table! {
     ///
     /// ```lua
     /// local md = maki.text.html_to_markdown(html)
+    /// local plain = maki.text.html_to_text(html)
     /// local text = maki.text.to_utf8(bytes)
     /// local hits = maki.text.fuzzy_list("mrs", names, { limit = 10 })
     /// ```
     "maki.text" => pub(crate) fn create_text_table(), DOCS [
-        html_to_markdown, to_utf8, fuzzy, fuzzy_list,
+        html_to_markdown, html_to_text, to_utf8, fuzzy, fuzzy_list,
     ]
 }
 
@@ -266,6 +457,14 @@ mod tests {
     const LATIN1_TEXT: &[u8] = b"caf\xe9 cr\xe8me";
     const LOSSY_TEXT: &str = "caf\u{fffd} cr\u{fffd}me";
     const PAGE_BODY: &str = "body";
+    const TEXT_SKIP_TAGS: [&str; 3] = ["script", "style", "noscript"];
+    const PADDED_TABLE: &[u8] = b"<table><tr><th>a</th><th>b</th></tr><tr><td>a much longer cell</td><td></td></tr><tr><td>x | y</td><td><code>a|b</code></td></tr><tr><td>-</td><td>-</td></tr></table>";
+    const UNPADDED_TABLE: &str =
+        "| a | b |\n| --- | --- |\n| a much longer cell | |\n| x \\| y | `a\\|b` |\n| \\- | \\- |";
+    const CODE_IN_LAYOUT_TABLE: &[u8] = b"<table><tr><td>1</td><td><pre><code>| id  | name |\n| --- | ---- |\n| 1   | a    |</code></pre></td></tr></table>";
+    const ALIGNED_CODE: &str = "1\n\n```\n| id  | name |\n| --- | ---- |\n| 1   | a    |\n```";
+    const LISTS: &[u8] = b"<ul><li>one<ul><li>nested</li></ul></li></ul><ol><li>first</li></ol><pre>| kept    |</pre>";
+    const COMPACT_LISTS: &str = "- one\n  - nested\n\n1. first\n\n| kept    |";
     const CHROME_PAGE: &[u8] = br#"<nav><a href="/">Home</a></nav><script type="application/json">{"menu":1}</script><p>body</p>"#;
 
     fn best(needle: &str) -> Option<&'static str> {
@@ -353,6 +552,14 @@ mod tests {
         assert_eq!(to_markdown(input, None).await, expected);
     }
 
+    #[test_case(PADDED_TABLE, UNPADDED_TABLE ; "tables_are_not_padded")]
+    #[test_case(CODE_IN_LAYOUT_TABLE, ALIGNED_CODE ; "code_in_a_headerless_table_keeps_its_alignment")]
+    #[test_case(LISTS, COMPACT_LISTS ; "list_markers_take_one_space")]
+    #[tokio::test]
+    async fn markdown_spends_no_bytes_on_alignment(input: &[u8], expected: &str) {
+        assert_eq!(to_markdown(input, None).await, expected);
+    }
+
     #[test_case(CHROME_PAGE, &["script", "nav"], PAGE_BODY ; "listed_tags")]
     #[test_case(PAGE_BODY.as_bytes(), &[], PAGE_BODY ; "empty_list")]
     #[tokio::test]
@@ -362,6 +569,25 @@ mod tests {
         expected: &str,
     ) {
         assert_eq!(to_markdown(input, Some(skip_tags)).await, expected);
+    }
+
+    fn to_text(html: &str) -> String {
+        let skip_tags = TEXT_SKIP_TAGS.map(str::to_owned);
+        visible_text(html, &skip_tags).unwrap()
+    }
+
+    #[test_case("<div><p>Hello <b>wor</b>ld</p></div>", "Hello world" ; "inline_tags_leave_no_gap")]
+    #[test_case("   <p>  lots   of\n\n spaces  </p>   ", "lots of spaces" ; "whitespace_collapses")]
+    #[test_case("<h1>Title</h1><p>one</p>two<br>three", "Title\none\ntwo\nthree" ; "blocks_start_a_line")]
+    #[test_case("<table><tr><td>a</td><td>b</td></tr></table>", "a\nb" ; "cells_are_blocks")]
+    #[test_case("<p>fish &amp; chips &lt;3 &#233;</p>", "fish & chips <3 \u{e9}" ; "entities_decoded")]
+    #[test_case(r#"<p title="a > b">x<!-- c > d -->y</p>"#, "xy" ; "gt_in_attributes_and_comments")]
+    #[test_case("a<SCRIPT>var x = '<div>no</div>';</SCRIPT>b<style>p{}</style><noscript>js</noscript>", "ab" ; "skipped_tags_drop_their_content")]
+    #[test_case("<p>run:</p><pre><code>fn main() {\n    body();\n}\n</code></pre><p>done</p>", "run:\nfn main() {\n    body();\n}\ndone" ; "pre_keeps_its_whitespace")]
+    #[test_case("hello<div", "hello" ; "unclosed_tag")]
+    #[test_case("<div><span></span></div>", "" ; "no_text")]
+    fn html_to_text_keeps_what_a_reader_sees(html: &str, expected: &str) {
+        assert_eq!(to_text(html), expected);
     }
 
     #[test_case(b"caf\xc3\xa9", "caf\u{e9}" ; "valid_utf8_is_unchanged")]

@@ -96,6 +96,7 @@ declare maki: {
     mkdir: @checked (path: string, opts: any) -> (true?, string?),
     glob: @checked (pattern: any, opts: any) -> (any, string?),
     grep: @checked (pattern: string, opts: any) -> (any, string?, any),
+    grep_count: @checked (pattern: string, opts: any) -> (any, string?),
     fuzzy_files: @checked (opts: any) -> (any, string?),
   },
   image: {
@@ -144,6 +145,7 @@ declare maki: {
   provider: {
     register: @checked (spec: any) -> (),
     is_selected: @checked (slug: string) -> (boolean),
+    usage: @checked (slug: string) -> (any, string?),
     http_error: @checked (res: any) -> (any),
     auth: {
       get: @checked (slug: string) -> (any, string?),
@@ -180,6 +182,7 @@ declare maki: {
   },
   text: {
     html_to_markdown: @checked (html: string, opts: any) -> (string?, string?),
+    html_to_text: @checked (html: string, opts: any) -> (string?, string?),
     to_utf8: @checked (s: string) -> (string),
     fuzzy: @checked (needle: string, haystack: string, opts: any) -> (number?, any),
     fuzzy_list: @checked (needle: string, haystacks: any, opts: any) -> (any),

@@ -29,6 +29,21 @@ local ASYNCIO_GATHER = "asyncio.gather"
 local GATHER_HINT = "\n\nHint: `gather(...)` keeps the other results, returning `"
   .. ERROR_PREFIX
   .. "...` for the failed call."
+-- Mistakes the description leaves out to save tokens on every request: the
+-- hint costs tokens only when the model actually makes one. Each key is a
+-- pattern for the start of the exception line, the first unindented line under
+-- the traceback header. A source preview is indented and a tool's error text
+-- sits behind `RuntimeError: <tool>: `, so neither can match, and neither can
+-- the later lines of a multi-line message.
+local EXCEPTION_LINE = "\n(%S[^\n]*)"
+local TOOLS_MODULE_HINT = "\n\nHint: tools are globals, call them directly. There is no `tools` module."
+local ASYNCIO_HINT = "\n\nHint: asyncio here has only `gather`, `run` and `sleep`."
+local ERROR_HINTS = {
+  { "^ModuleNotFoundError: No module named 'tools'", TOOLS_MODULE_HINT },
+  { "^NameError: name 'tools' is not defined", TOOLS_MODULE_HINT },
+  { "^AttributeError: module 'asyncio' has no attribute", ASYNCIO_HINT },
+  { "^ImportError: cannot import name '[^']*' from 'asyncio'", ASYNCIO_HINT },
+}
 -- `asyncio.gather` cancels its siblings the moment one call raises, throwing away
 -- results the model already paid for, so `gather` awaits each call in its own
 -- `try` instead. Awaiting one at a time is still concurrent: every call was made
@@ -292,8 +307,8 @@ local function build_description(batch_disabled, mcp_lib_names)
   local use_prefix = batch_disabled and "Use for parallel/batch calls (the batch tool is disabled; use gather), "
     or "Use for "
   local concurrency = batch_disabled
-      and "- Concurrency / Batch execution: `a, b = await gather(read(path='a.py', offset=1, limit=100), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`. The batch tool is disabled; use code_execution with `await gather(...)` to run multiple independent tool calls concurrently (replacing batch)."
-    or "- Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=100), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`."
+      and "- Concurrency / Batch execution: `a, b = await gather(read(path='a.py', offset=1, limit=100), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`. A failed call returns `[ERROR] ...` in its slot. The batch tool is disabled; use code_execution with `await gather(...)` to run multiple independent tool calls concurrently (replacing batch)."
+    or "- Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=100), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`. A failed call returns `[ERROR] ...` in its slot."
   local single_call = batch_disabled
       and "- NEVER use as a proxy or wrapper for a single tool call. If no code logic, chaining, or output filtering is needed, invoke the tool directly (batching 2+ independent calls via gather is allowed when batch is disabled)."
     or "- NEVER use as a proxy or wrapper for a single tool call. If no code logic, chaining, or output filtering is needed, invoke the tool directly."
@@ -721,6 +736,13 @@ local function handler(input, ctx)
     -- The run is already paid for, so point a script that reached for
     -- `asyncio.gather` at the wrapper that would have kept its other results.
     local hint = input.code:find(ASYNCIO_GATHER, 1, true) and GATHER_HINT or ""
+    local exception = err:match(EXCEPTION_LINE) or ""
+    for _, entry in ipairs(ERROR_HINTS) do
+      if exception:find(entry[1]) then
+        hint = hint .. entry[2]
+        break
+      end
+    end
     local mcp_hint = mcp_library_hint(libs, input.code, err)
     local mod_hint = (mcp_hint == "") and unsupported_module_hint(tools, err) or ""
     return { llm_output = output_limits.cut_middle(err .. hint .. mcp_hint .. mod_hint, max_lines, max_bytes), is_error = true, body = buf }

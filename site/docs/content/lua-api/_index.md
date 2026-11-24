@@ -3638,6 +3638,34 @@ if omitted then print(omitted.groups .. " more not shown") end
 
 ---
 
+### `maki.fs.grep_count()` {#maki-fs-grep_count}
+
+```lua
+maki.fs.grep_count({pattern}, {opts?})
+```
+
+Count the lines matching a regex {pattern} in each file, without
+returning the lines.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{pattern}` (`string`) Regular expression to search for.
+- `{opts?}` (`table?`) `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`).
+
+**Returns:** (`table?`, `string?`) Array of `{path, matches}` tables for the files with a match, newest first, or nil plus an error message.
+
+**Example:**
+
+```lua
+local counts, err = maki.fs.grep_count("TODO", { path = "src" })
+if err then return end
+for _, file in ipairs(counts) do print(file.path .. ": " .. file.matches) end
+```
+
+---
+
 ### `maki.fs.fuzzy_files()` {#maki-fs-fuzzy_files}
 
 ```lua
@@ -4157,11 +4185,15 @@ Each key runs one handler: the first match in this list, for the
 current mode.
 
 1. `<C-c>` and `<C-z>`, which no binding can take. `<C-z>` suspends
-   here, and `<C-c>` still goes to step 2 first.
-2. Maki's modals and prompts, then the focused window, then Maki's
-   pickers. They take every key, except the plan form and the `/`
-   command list, which pass on the keys they do not use. The focused
-   window runs its buffer's bindings, then its `win:recv`.
+   here, and `<C-c>` still goes to step 2 first. An open permission
+   prompt takes `<C-c>` even under the focused floating window, so it
+   can always be denied.
+2. Maki's alerts, then the focused floating window, then Maki's
+   prompts and modals, then the focused split, then Maki's pickers.
+   They take every key, except the plan form and the `/` command list,
+   which pass on the keys they do not use. The focused window runs its
+   buffer's bindings, then its `win:recv`. A hidden focused window, or
+   one sized to nothing, takes no keys here.
 3. Windows on screen, front first: each one's buffer bindings, then
    the keys it claimed with the `keys` option of `maki.ui.open_win`.
 4. `<Esc>` while the agent runs, in either mode. Maki takes it, and a
@@ -5234,6 +5266,45 @@ select; it now answers from the same list.
 
 ---
 
+### `maki.provider.usage()` {#maki-provider-usage}
+
+```lua
+maki.provider.usage({slug})
+```
+
+The provider's own usage limits, the data behind `/usage`. A limit carries
+a provider label, a used percentage, its reset time in epoch milliseconds
+and a free-form detail. `plan` and `by_model_today` come back when the
+provider reports them.
+
+With a UI attached the answer comes from a live session using that slug,
+the instance `/usage` reads, so a key rotated after a 429 is the one
+reported. Headless drivers build a fresh provider from the slug instead,
+which starts at the first key.
+
+A provider with no usage endpoint answers nil and an error, as does a
+failed fetch. The call fetches live data, so a plugin that polls should
+space its calls out.
+
+**Parameters:**
+
+- `{slug}` (`string`) Provider name, such as `"zai"`.
+
+**Returns:** (`table|nil`, `string|nil`) Usage, or nil and an error string.
+
+**Example:**
+
+```lua
+local usage, err = maki.provider.usage("zai")
+if usage then
+  for _, limit in ipairs(usage.limits or {}) do
+    maki.log.info(limit.label .. " " .. tostring(limit.percentage) .. "%")
+  end
+end
+```
+
+---
+
 ### `maki.provider.http_error()` {#maki-provider-http_error}
 
 ```lua
@@ -6250,6 +6321,7 @@ the built-in pickers use.
 
 ```lua
 local md = maki.text.html_to_markdown(html)
+local plain = maki.text.html_to_text(html)
 local text = maki.text.to_utf8(bytes)
 local hits = maki.text.fuzzy_list("mrs", names, { limit = 10 })
 ```
@@ -6281,6 +6353,34 @@ if err then return end
 print(md) -- "# Hello\n\nworld"
 
 local article = maki.text.html_to_markdown(page, { skip_tags = { "script", "style", "nav" } })
+```
+
+---
+
+### `maki.text.html_to_text()` {#maki-text-html_to_text}
+
+```lua
+maki.text.html_to_text({html}, {opts?})
+```
+
+Convert an HTML string to plain text.
+Entities are decoded and whitespace is collapsed outside `pre`. Inline elements such as
+`b` or `a` leave no trace, and every other element starts a new line.
+Invalid UTF-8 becomes U+FFFD.
+
+**Parameters:**
+
+- `{html}` (`string`) HTML source text.
+- `{opts?}` (`table?`) `skip_tags` (string[]) elements dropped together with their content, like `script` or `nav`.
+
+**Returns:** (`string?`, `string?`) Plain text on success, or nil plus an error message.
+
+**Example:**
+
+```lua
+local text, err = maki.text.html_to_text("<h1>Fish &amp; chips</h1><p>to <b>go</b></p>")
+if err then return end
+print(text) -- "Fish & chips\nto go"
 ```
 
 ---
