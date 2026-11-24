@@ -49,6 +49,14 @@ fmt:
 check-lua:
     cd plugins && lute check $(find . -name '*.lua')
 
+# Same command as CI: lute's default rules plus maki's own in `plugins/lint`. Prefix a deliberately unused variable with `_`.
+lint-lua:
+    cd plugins && lute lint --sequential $(find . -name '*.lua')
+
+# Same command as CI: Luau's built-in lints, minus the type errors `lute check` covers.
+analyze-lua:
+    cd plugins && ! luau-analyze --formatter=plain $(find . -name '*.lua') | grep -vE ': \([EW][0-9]+\) TypeError:'
+
 pylint:
     ruff check scripts/
     ty check scripts/

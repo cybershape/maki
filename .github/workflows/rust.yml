@@ -78,7 +78,7 @@ jobs:
       - run: ./stylua --check plugins/
 
   check-lua:
-    name: Type check (Lua)
+    name: Check (Lua)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
@@ -86,6 +86,8 @@ jobs:
       # Definition files in `lute check` (luau-lang/lute#1234) are not in a release yet.
       # renovate: datasource=github-releases depName=luau-lang/lute versioning=semver
       LUTE_VERSION: v1.0.1-nightly.20261103
+      # renovate: datasource=github-releases depName=luau-lang/luau versioning=loose
+      LUAU_VERSION: "0.748"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -100,8 +102,37 @@ jobs:
             "https://github.com/luau-lang/lute/releases/download/${LUTE_VERSION}/lute-linux-x86_64.zip"
           unzip -o lute.zip lute
           rm lute.zip
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: luau-cache
+        with:
+          path: luau-analyze
+          key: luau-${{ runner.os }}-${{ env.LUAU_VERSION }}
+      - name: Install luau-analyze
+        if: steps.luau-cache.outputs.cache-hit != 'true'
+        run: |
+          .github/scripts/retry.sh curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors -o luau.zip \
+            "https://github.com/luau-lang/luau/releases/download/${LUAU_VERSION}/luau-ubuntu.zip"
+          unzip -o luau.zip luau-analyze
+          rm luau.zip
       # lute looks for `.config.luau` upward from the working directory, not from the checked files.
-      - run: cd plugins && ../lute check $(find . -name '*.lua')
+      - name: Type check
+        run: cd plugins && ../lute check $(find . -name '*.lua')
+      # The lint parser rejects the `declare` syntax of `maki.d.luau`, so it gets the file list, not the dir.
+      # `--sequential`: the default parallel mode (one `vm.create` worker per core) races in lute's
+      # cross-VM runtime and crashes ~10% of runs (SIGSEGV, or "Cannot resume a non-thread reference").
+      - name: Lint
+        if: ${{ !cancelled() }}
+        run: cd plugins && ../lute lint --sequential $(find . -name '*.lua')
+      # A rule that stops matching after a lute update reports nothing, so check that ours still fires.
+      - name: Lint rules fire
+        if: ${{ !cancelled() }}
+        run: cd plugins && ../lute lint --no-default-lints -s 'maki.fs.rm("x")' | grep -qF 'maki.fs.rm returns'
+      # Luau's built-in lints until `lute lint` has them (luau-lang/lute#728). luau-analyze can't load
+      # `maki.d.luau`, so its type errors are left to `lute check`, and it exits 0 on findings.
+      - name: Analyzer lints
+        if: ${{ !cancelled() }}
+        run: |
+          cd plugins && ! ../luau-analyze --formatter=plain $(find . -name '*.lua') | grep -vE ': \([EW][0-9]+\) TypeError:'
 
   lint:
     name: Lint

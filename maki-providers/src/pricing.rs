@@ -212,7 +212,7 @@ pub fn model_cost(id: &str, usage: &StoredTokenUsage, current: &Model, fast: boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FastPricing, ModelFamily, ModelPricing, ModelTier};
+    use crate::model::{FactSources, FastPricing, ModelFamily, ModelPricing, ModelTier};
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -277,6 +277,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: None,
             turn_output_tokens: None,
+            sources: FactSources::default(),
             context_window: 0,
             thinking_fields: None,
         }

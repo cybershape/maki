@@ -10,5 +10,11 @@ home=$(mktemp -d "${TMPDIR:-/tmp}/maki-test-home.XXXXXX")
     echo "XDG_STATE_HOME=$home/state"
     echo "XDG_DATA_HOME=$home/data"
     echo "XDG_CACHE_HOME=$home/cache"
+    echo "http_proxy="
+    echo "https_proxy="
+    echo "all_proxy="
+    echo "HTTP_PROXY="
+    echo "HTTPS_PROXY="
+    echo "ALL_PROXY="
     env | sed -n 's/^\([A-Za-z0-9_]*_BASE_URL\)=.*/\1=/p'
 } >>"$NEXTEST_ENV"

@@ -696,6 +696,7 @@ mod tests {
             pricing_cache_read: None,
             pricing_fast_input: None,
             pricing_fast_output: None,
+            like: None,
         });
         let mut config = maki_config::providers::ProvidersConfig::default();
         config.providers.insert("my-provider".to_string(), def);

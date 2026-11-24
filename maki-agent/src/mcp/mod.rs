@@ -1633,7 +1633,10 @@ pub fn kill_process_groups(_pids: &[u32]) {}
 mod tests {
     use super::*;
     use crate::tools::schema::TOOLCALL_REASON_FIELD;
-    use config::{RawHttpFields, RawServerConfig, RawStdioFields, RawTransport};
+    use config::{
+        DEFAULT_STARTUP_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, RawHttpFields, RawServerConfig,
+        RawStdioFields, RawTransport,
+    };
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(unix)]
@@ -1642,7 +1645,6 @@ mod tests {
     use tokio::sync::{Mutex as AsyncMutex, Notify};
     use toml_edit::DocumentMut;
 
-    const DEFAULT_TIMEOUT_MS: u64 = 30_000;
     const MISSING_PROGRAM: &str = "/nonexistent/definitely-not-here";
     const MISSING_CA_FILE: &str = "/nonexistent/ca.pem";
     const MCP_TOML: &str = "mcp.toml";
@@ -1654,6 +1656,7 @@ mod tests {
             enabled: true,
             description: None,
             timeout: DEFAULT_TIMEOUT_MS,
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT_MS,
             always_load: false,
             transport: RawTransport::Stdio(RawStdioFields {
                 command: cmd.iter().map(|s| s.to_string()).collect(),
@@ -1751,6 +1754,7 @@ mod tests {
             name: name.into(),
             description: None,
             timeout: Duration::from_secs(1),
+            startup_timeout: Duration::from_secs(1),
             always_load: false,
             transport: Transport::Stdio {
                 program: MISSING_PROGRAM.into(),
@@ -1893,7 +1897,7 @@ mod tests {
     }
 
     /// `sleep` spawns fine and never answers `initialize`, so its connect only
-    /// ends on the request timeout, far past the shutdown one. Shutdown has to
+    /// ends on the startup timeout, far past the shutdown one. Shutdown has to
     /// preempt it, or quitting during startup hangs.
     #[cfg(unix)]
     #[tokio::test]
@@ -1954,6 +1958,7 @@ mod tests {
                 name: "github".into(),
                 description: Some("GitHub ops".into()),
                 timeout: Duration::from_secs(10),
+                startup_timeout: Duration::from_secs(10),
                 always_load: false,
                 transport: Transport::Stdio {
                     program: "echo".into(),

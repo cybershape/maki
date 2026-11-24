@@ -39,6 +39,9 @@ const TOOLS: &[&str] = &[
     "webfetch",
 ];
 const NO_OUTPUT: &str = "(no output)";
+const GREP_NOTE_TWO_LEFT: &str = "[limit of 1 reached, 2 more match groups from 2 files not shown]";
+const GREP_NOTE_ONE_LEFT: &str = "[limit of 1 reached, 1 more match group from 1 file not shown]";
+const GREP_FILES: &[&str] = &["a.rs", "b.toml", "c.md"];
 const MODEL_BYTES: usize = 1024;
 const MODEL_LINES: usize = 8;
 const COMPACT_GLOB_LIMIT: usize = 100;
@@ -48,6 +51,9 @@ const LATIN1_HTML: &[u8] = b"<h1>caf\xe9</h1>";
 const LOSSY_TEXT: &str = "caf\u{fffd}";
 const LOSSY_MARKDOWN: &str = "# caf\u{fffd}";
 const LEGACY_HTML_TYPE: &str = "text/html; charset=ISO-8859-1";
+const HTML_TYPE: &str = "text/html; charset=utf-8";
+const PAGE_BODY: &str = "body";
+const SCRIPTED_PAGE: &[u8] = br#"<style>p{}</style><noscript>enable js</noscript><script type="application/json">{"menu":1}</script><p>body</p>"#;
 const LATIN1_E_ACUTE: u8 = 0xe9;
 const BINARY_TYPE: &str = "application/pdf";
 const BINARY_PAYLOAD: &[u8] = b"%PDF-1.7\n\0\x01\x02";
@@ -240,6 +246,21 @@ fn python_grep_preserves_match_and_context_text() {
     )
     .unwrap();
     assert!(!model_output.contains("needle-end"));
+}
+
+#[test_case::test_case(3, 1, GREP_NOTE_TWO_LEFT ; "plural")]
+#[test_case::test_case(2, 1, GREP_NOTE_ONE_LEFT ; "singular")]
+#[test_case::test_case(3, 0, GREP_NOTE_TWO_LEFT ; "zero_limit_still_shows_one")]
+fn grep_tells_the_model_what_the_limit_cut(files: usize, limit: i64, expected: &str) {
+    let (_registry, _host, ctx) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    for name in &GREP_FILES[..files] {
+        fs::write(dir.path().join(name), "needle\n").unwrap();
+    }
+    let input = json!({ "pattern": "needle", "path": dir.path(),
+        "include": "*.{rs,toml,md}", "limit": limit });
+    let model_output = run(&ctx, "grep", input).unwrap();
+    assert!(model_output.ends_with(expected), "{model_output}");
 }
 
 #[test]
@@ -526,6 +547,15 @@ fn webfetch_decodes_legacy_bytes_for_display(
         output.as_deref().map(str::trim).map_err(String::as_str),
         expected
     );
+}
+
+#[test]
+fn webfetch_markdown_drops_scripts_and_styles() {
+    let (_registry, _host, ctx) = setup();
+    let (url, server) = serve_once(HTML_TYPE, SCRIPTED_PAGE);
+    let output = run(&ctx, "webfetch", json!({ "url": url })).unwrap();
+    server.join().unwrap();
+    assert_eq!(output.trim(), PAGE_BODY);
 }
 
 #[test_case::test_case("text" ; "stripped_html")]

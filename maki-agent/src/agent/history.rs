@@ -271,6 +271,7 @@ impl History {
         history
     }
 
+    #[cfg(test)]
     pub(crate) fn messages_with_timestamps(&self) -> Vec<(Message, Option<u64>)> {
         self.snapshot
             .messages

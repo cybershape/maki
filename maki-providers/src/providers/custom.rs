@@ -8,7 +8,9 @@ use maki_storage::blocking;
 use super::responses::ResponsesProvider;
 use super::{KeyPool, ResolvedAuth};
 use crate::AgentError;
-use crate::model::{FastPricing, Model, ModelEntry, ModelInfo, ModelPricing, ModelTier};
+use crate::model::{
+    FactSource, FactSources, FastPricing, Model, ModelEntry, ModelInfo, ModelPricing, ModelTier,
+};
 use crate::model_registry::{self, DeclaredTiers};
 use crate::provider::{ModelBatch, Provider, ProviderStatus};
 use crate::providers::Timeouts;
@@ -104,6 +106,7 @@ impl From<&ModelDef> for ModelEntry {
             thinking_fields: def.thinking_fields.clone(),
             family: None,
             default: false,
+            like: def.like.clone(),
         }
     }
 }
@@ -124,16 +127,30 @@ fn model_from_def(
     let subsidy_source = def.subsidised_by.as_deref();
     let def_model = def.models.iter().find(|m| m.id == model_id);
     let mut row = def_model.map(ModelEntry::from).unwrap_or_default();
+    let _ = row.inherit_like();
     let discovered = model_registry::discovered(slug, model_id);
     let discovered = discovered.as_ref();
-    row.max_output_tokens = row
-        .max_output_tokens
-        .or_else(|| discovered.and_then(|d| d.max_output_tokens))
-        .or(base.fallback_max_output);
-    row.context_window = row
-        .context_window
-        .or_else(|| discovered.and_then(|d| d.context_window))
-        .or(Some(base.fallback_context_window));
+    let max_output_source = fill(
+        &mut row.max_output_tokens,
+        discovered.and_then(|d| d.max_output_tokens),
+    );
+    if row.max_output_tokens.is_none() {
+        row.max_output_tokens = base.fallback_max_output;
+    }
+    let context_source = fill(
+        &mut row.context_window,
+        discovered.and_then(|d| d.context_window),
+    );
+    if row.context_window.is_none() {
+        row.context_window = Some(base.fallback_context_window);
+    }
+    let thinking_source = if row.supports_thinking.is_some() || row.thinking_fields.is_some() {
+        FactSource::Config
+    } else if discovered.and_then(|d| d.supports_thinking).is_some() {
+        FactSource::Discovery
+    } else {
+        FactSource::Default
+    };
     row.supports_thinking = row
         .supports_thinking
         .or_else(|| discovered.and_then(|d| d.supports_thinking))
@@ -142,15 +159,28 @@ fn model_from_def(
         || discovered
             .and_then(|d| d.effort.as_ref())
             .is_some_and(|e| e.send_off == Some(false) && !e.supported.is_empty());
+    let vision_source = if row.supports_vision.is_some() {
+        FactSource::Config
+    } else if discovered.and_then(|d| d.supports_vision).is_some() {
+        FactSource::Discovery
+    } else {
+        FactSource::Default
+    };
     row.supports_vision = row
         .supports_vision
         .or_else(|| discovered.and_then(|d| d.supports_vision))
         .or(Some(true));
 
-    let mut pricing = row
-        .pricing
-        .take()
-        .or_else(|| discovered.and_then(|d| d.pricing.clone()))
+    let declared_pricing = row.pricing.take();
+    let _using_discovered_pricing = declared_pricing.is_none();
+    let discovered_pricing = discovered.and_then(|d| d.pricing.as_ref());
+    let pricing_source = match (&declared_pricing, discovered_pricing) {
+        (Some(_), _) => FactSource::Config,
+        (None, Some(_)) => FactSource::Discovery,
+        (None, None) => FactSource::Default,
+    };
+    let mut pricing = declared_pricing
+        .or_else(|| discovered_pricing.cloned())
         .unwrap_or_default();
     // Discovered pricing never carries a fast tier, so a replayed listing
     // must not drop the one the config states.
@@ -173,9 +203,29 @@ fn model_from_def(
     model.name = def_model
         .and_then(|m| m.name.clone())
         .or_else(|| discovered.and_then(|d| d.name.clone()));
+    model.sources = FactSources {
+        context_window: context_source,
+        max_output_tokens: max_output_source,
+        pricing: pricing_source,
+        thinking: thinking_source,
+        vision: vision_source,
+    };
     model
 }
 
+/// A value the entry states is config. Otherwise discovery fills it, and a
+/// value neither gives is left to the protocol default.
+fn fill<T>(stated: &mut Option<T>, discovered: Option<T>) -> FactSource {
+    if stated.is_some() {
+        return FactSource::Config;
+    }
+    *stated = discovered;
+    if stated.is_some() {
+        FactSource::Discovery
+    } else {
+        FactSource::Default
+    }
+}
 pub fn declared_model_specs() -> Vec<String> {
     declared_specs_from(&ProvidersConfig::load())
 }
@@ -469,6 +519,7 @@ mod tests {
                     pricing_cache_read: None,
                     pricing_fast_input: None,
                     pricing_fast_output: None,
+                    like: None,
                 }],
                 ..Default::default()
             },
@@ -499,6 +550,55 @@ mod tests {
         );
     }
 
+    const LIKE_TARGET: &str = "zai/glm-5.3";
+    const LIKE_SLUG: &str = "custom-gw";
+    const LIKE_MODEL: &str = "local-v4";
+
+    fn like_row(like: &str, fields: &str) -> ProviderDef {
+        serde_json::from_str(&format!(
+            r#"{{"protocol":"openai","models":[{{"id":"{LIKE_MODEL}","like":"{like}"{fields}}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    #[ignore = "zai provider removed in this fork"]
+    fn like_lends_capabilities_but_not_limits_or_price() {
+        let model = model_from_def(
+            &like_row(LIKE_TARGET, ""),
+            &RESPONSES_SPEC,
+            LIKE_SLUG,
+            LIKE_MODEL,
+        );
+        assert_eq!(model.family, crate::model::ModelFamily::Glm);
+        assert_eq!(model.vision_with_source(), (false, FactSource::Like));
+        assert!(!model.supports_tool_examples());
+        assert_eq!(model.sources.context_window, FactSource::Default);
+        assert_eq!(model.context_window, RESPONSES_SPEC.fallback_context_window);
+        assert_eq!(model.max_output_tokens, RESPONSES_SPEC.fallback_max_output);
+        assert!(model.pricing.is_zero());
+    }
+
+    #[test]
+    fn a_stated_field_wins_over_like() {
+        let def = like_row(
+            LIKE_TARGET,
+            r#","supports_vision":true,"context_window":1024"#,
+        );
+        let model = model_from_def(&def, &RESPONSES_SPEC, LIKE_SLUG, LIKE_MODEL);
+        assert_eq!(model.vision_with_source(), (true, FactSource::Config));
+        assert_eq!(model.context_window, 1024);
+        assert_eq!(model.sources.context_window, FactSource::Config);
+    }
+
+    #[test]
+    fn an_unknown_like_is_ignored() {
+        let def = like_row("nobody/nothing", "");
+        let model = model_from_def(&def, &RESPONSES_SPEC, LIKE_SLUG, LIKE_MODEL);
+        assert_eq!(model.family, RESPONSES_SPEC.family);
+        assert_eq!(model.context_window, RESPONSES_SPEC.fallback_context_window);
+    }
+
     // The exact regression this fixes: discovery parsed context_window but
     // never stored it, so custom models always got the protocol fallback.
     #[test]
@@ -523,15 +623,17 @@ mod tests {
         assert_eq!(model.max_output_tokens, Some(expected_output));
     }
 
-    #[test_case(Some(true), Some(false), true ; "declared_outranks_discovery")]
-    #[test_case(None, Some(false), false ; "text_only_discovery_turns_vision_off")]
-    #[test_case(None, Some(true), true ; "image_discovery_keeps_vision_on")]
+    #[test_case(Some(true), Some(false), None, true ; "declared_outranks_discovery")]
+    #[test_case(None, Some(false), None, false ; "text_only_discovery_turns_vision_off")]
+    #[test_case(None, Some(true), None, true ; "image_discovery_keeps_vision_on")]
+    #[test_case(None, Some(true), Some(LIKE_TARGET), true ; "image_discovery_outranks_like")]
     fn discovered_vision_flows_into_custom_model(
         declared: Option<bool>,
         discovered: Option<bool>,
+        like: Option<&str>,
         expected: bool,
     ) {
-        let slug = format!("custom-vision-test-{declared:?}-{discovered:?}");
+        let slug = format!("custom-vision-test-{declared:?}-{discovered:?}-{like:?}");
         let model_id = "vllm-model";
         crate::model_registry::set_known_models(
             &slug,
@@ -542,8 +644,15 @@ mod tests {
         );
         let mut def = responses_def(model_id);
         def.models[0].supports_vision = declared;
+        def.models[0].like = like.map(str::to_string);
         let model = model_from_def(&def, &RESPONSES_SPEC, &slug, model_id);
         assert_eq!(model.supports_vision(), expected);
+    }
+
+    #[test]
+    #[ignore = "zai provider removed in this fork"]
+    fn discovered_vision_like_fills_what_discovery_leaves_out() {
+        discovered_vision_flows_into_custom_model(None, None, Some(LIKE_TARGET), false);
     }
 
     const ENDPOINT_INPUT_PRICE: f64 = 0.5;

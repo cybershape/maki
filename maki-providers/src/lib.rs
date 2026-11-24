@@ -15,6 +15,8 @@ pub mod spec;
 /// Tests only, here and in other crates. Always built because a cargo feature
 /// gating it would pass in the workspace build and fail a lone crate.
 pub mod test_support;
+#[cfg(webpki_store)]
+mod tls;
 pub mod tokens;
 pub(crate) mod types;
 
@@ -22,11 +24,10 @@ pub use child_env::{shell_command, strip_provider_keys};
 pub use error::{AgentError, Overflow};
 pub use maki_storage::sessions::add_cost;
 pub use model::{
-    FastPricing, FastSupport, Model, ModelEntry, ModelError, ModelFamily, ModelInfo, ModelPricing,
-    ModelTier, ThinkingOption, ThinkingSupport, TokenUsage, format_tokens,
+    FactSource, FactSources, FastPricing, FastSupport, Model, ModelEntry, ModelError, ModelFamily,
+    ModelInfo, ModelPricing, ModelTier, ThinkingOption, ThinkingSupport, TokenUsage, format_tokens,
 };
 pub use pricing::{model_cost, settle_session};
-pub use providers::client_builder;
 pub use providers::custom;
 pub use providers::plugin;
 pub use providers::responses::{
@@ -34,6 +35,7 @@ pub use providers::responses::{
 };
 pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 pub use providers::{Timeouts, user_agent};
+pub use providers::{client_builder, with_system_trust};
 
 pub fn warm_catalog() {}
 pub fn refresh_catalog() -> Result<(), AgentError> {

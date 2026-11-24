@@ -107,6 +107,7 @@ fn load_config(
     if let Some(max_width) = cli.max_width {
         config.ui.max_width = Some(max_width);
     }
+    config.agent.max_budget_usd = cli.max_budget_usd;
     config.validate()?;
     Ok(config)
 }
@@ -406,7 +407,6 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
             cli,
             resumed,
             claim,
-            storage: storage.clone(),
             model: stack.model,
             config: stack.config.agent,
             permissions_config: stack.config.permissions,
@@ -448,7 +448,6 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
             host_prompt,
             resumed,
             claim,
-            storage: storage.clone(),
             program_status: stack.config.ui.program_status,
             background_wait,
         })

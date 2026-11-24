@@ -998,8 +998,8 @@ where
     }
 }
 
-/// Headless rewrites the log every turn, so a wrong yes here would copy the
-/// whole log into the archive every turn. That is why the old head is read
+/// Every headless process starts with a rewrite, so a wrong yes here would
+/// copy the whole log into the archive on each run. That is why the old head is read
 /// and written again the way this build writes it: a head an older build
 /// wrote in another shape is still the same head. A head this build cannot
 /// read gives no verdict and leaves it to the count.
@@ -2486,11 +2486,7 @@ where
     /// The tool ids the turns behind `new` lose against this log. A pure
     /// append loses none, so only a compaction or a rewritten log ever
     /// yields a non-empty set.
-    pub fn dropped_tool_ids(
-        &self,
-        new: &[M],
-        tool_ids: impl Fn(&M) -> Vec<String>,
-    ) -> HashSet<String> {
+    fn dropped_tool_ids(&self, new: &[M], tool_ids: impl Fn(&M) -> Vec<String>) -> HashSet<String> {
         Self::lost_ids(&self.messages, new, &tool_ids)
     }
 
@@ -2501,7 +2497,7 @@ where
     /// a plugin run whose transcript arrives when its prompt ends) keep their
     /// state while they are live. Does not touch the cursors; the caller's
     /// log replacement already voided them when it matters.
-    pub fn drop_tool_state_of(
+    fn drop_tool_state_of(
         &mut self,
         dropped: &HashSet<String>,
         tool_ids: impl Fn(&M) -> Vec<String>,
@@ -3870,8 +3866,8 @@ mod tests {
         assert_eq!(archived.messages(), turns.as_slice());
     }
 
-    /// An older build may have written the same head in other bytes. Headless
-    /// rewrites every turn, so that must not park the log.
+    /// An older build may have written the same head in other bytes. Every
+    /// headless process starts with a rewrite, so that must not park the log.
     #[test]
     fn head_in_other_bytes_does_not_archive() {
         let tmp = TempDir::new().unwrap();
