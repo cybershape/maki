@@ -56,6 +56,7 @@ const PROGRAM_STATUS_ID_PUNCTUATION: &str = "_.+-";
 const TMUX_PANE_VAR: &str = "TMUX_PANE";
 const SCREEN_WINDOW_VAR: &str = "WINDOW";
 const HERDR_TERM_PROGRAM: &str = "herdr";
+const HC_TERMINAL_SOCKET_VAR: &str = "HC_TERMINAL_SOCKET";
 
 static CAPS: LazyLock<TerminalCaps> = LazyLock::new(|| {
     TerminalCaps::from_env(|key| env::var_os(key).map(|value| value.to_string_lossy().into()))
@@ -518,12 +519,17 @@ impl TerminalCaps {
     /// blank on an outer terminal without graphics.
     fn from_env(get: impl Fn(&str) -> Option<String>) -> Self {
         let mux = TerminalMux::from_env(&get);
-        let (image_protocol, clipboard) = match mux {
-            TerminalMux::Zellij | TerminalMux::Tmux | TerminalMux::Screen => {
-                (None, ClipboardRoute::NativeElseOsc52)
-            }
-            TerminalMux::Herdr => (Some(ProtocolType::Kitty), ClipboardRoute::NativeAndOsc52),
-            TerminalMux::None => (outer_image_protocol(&get), ClipboardRoute::NativeElseOsc52),
+        let image_protocol = match mux {
+            TerminalMux::Zellij | TerminalMux::Tmux | TerminalMux::Screen => None,
+            TerminalMux::Herdr => Some(ProtocolType::Kitty),
+            TerminalMux::None => outer_image_protocol(&get),
+        };
+        let clipboard = if mux == TerminalMux::Herdr
+            || get(HC_TERMINAL_SOCKET_VAR).is_some_and(|value| !value.is_empty())
+        {
+            ClipboardRoute::NativeAndOsc52
+        } else {
+            ClipboardRoute::NativeElseOsc52
         };
         Self {
             mux,
@@ -990,6 +996,9 @@ mod tests {
     #[test_case(&[("TERM", "xterm-kitty")], Some(ProtocolType::Kitty), ClipboardRoute::NativeElseOsc52 ; "known_term")]
     #[test_case(&[("TERM_PROGRAM", "unknown"), ("TERM", "xterm-kitty")], Some(ProtocolType::Kitty), ClipboardRoute::NativeElseOsc52 ; "unsupported_program_falls_back_to_term")]
     #[test_case(&[("TERM_PROGRAM", "unknown"), ("TERM", "xterm-256color")], None, ClipboardRoute::NativeElseOsc52 ; "unsupported_program_and_term")]
+    #[test_case(&[(HC_TERMINAL_SOCKET_VAR, "/tmp/herdr-app.sock")], None, ClipboardRoute::NativeAndOsc52 ; "herdr_app_socket_enables_dual_write")]
+    #[test_case(&[(HC_TERMINAL_SOCKET_VAR, "/tmp/herdr-app.sock"), ("TMUX", "/tmp/tmux")], None, ClipboardRoute::NativeAndOsc52 ; "herdr_app_socket_enables_dual_write_inside_tmux")]
+    #[test_case(&[(HC_TERMINAL_SOCKET_VAR, "")], None, ClipboardRoute::NativeElseOsc52 ; "empty_herdr_app_socket")]
     #[test_case(&[], None, ClipboardRoute::NativeElseOsc52 ; "missing_env")]
     fn caps_from_env(
         env: &[(&str, &str)],
