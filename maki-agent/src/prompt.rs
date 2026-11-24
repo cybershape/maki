@@ -384,6 +384,13 @@ fn default_tool_usage(prompt: PromptId, is_tool_enabled: &impl Fn(&str) -> bool)
             if batch && task {
                 lines.push("- Combine **batch** and **task**: launch multiple tasks in a batch to parallelize research or implementation.".to_string());
             }
+            if code_execution {
+                if batch {
+                    lines.push("- Concurrency: Consecutive tool calls that do not depend on each other (e.g. reading 2+ files, independent search or check) MUST be issued concurrently—either via `gather(...)` in **code_execution** or via **batch**. Never call them one at a time sequentially.".to_string());
+                } else {
+                    lines.push("- Concurrency: Consecutive tool calls that do not depend on each other (e.g. reading 2+ files, independent search or check) MUST be issued concurrently via `gather(...)` in **code_execution**. Never call them one at a time sequentially.".to_string());
+                }
+            }
             lines.push("- Read files before editing them. Match surrounding context, conventions, and imports.".to_string());
             lines.push("- Prefer edits over full file writes.".to_string());
             lines.push("- The `toolcall_reason` parameter is one short sentence explaining why you are calling this tool and what you expect. Do not mention file names or paths. It helps the user understand your rationale; providing it is strongly encouraged.".to_string());
@@ -878,6 +885,8 @@ mod tests {
         let out = p.render_with_tools(PromptId::System, &Vars::default(), "", &|_| true);
         assert!(out.contains("- Use **batch** for parallel calls, **code_execution** for chained/filtered calls, **task** for delegation."));
         assert!(out.contains("- Combine **batch** and **task**: launch multiple tasks in a batch to parallelize research or implementation."));
+        assert!(out.contains("Concurrency: Consecutive tool calls that do not depend on each other"));
+        assert!(out.contains("via `gather(...)` in **code_execution** or via **batch**"));
         assert!(out.contains("Most efficient tools: batch, code_execution, task."));
     }
 
@@ -891,6 +900,7 @@ mod tests {
         ));
         assert!(!out.contains("Combine **batch** and **task**"));
         assert!(!out.contains("**task** for delegation"));
+        assert!(out.contains("Concurrency: Consecutive tool calls that do not depend on each other"));
         assert!(out.contains("Most efficient tools: batch, code_execution."));
     }
 
@@ -904,6 +914,8 @@ mod tests {
         ));
         assert!(!out.contains("Combine **batch** and **task**"));
         assert!(!out.contains("**batch** for parallel calls"));
+        assert!(out.contains("via `gather(...)` in **code_execution**. Never call them one at a time sequentially."));
+        assert!(!out.contains("or via **batch**"));
         assert!(out.contains("Most efficient tools: code_execution, task."));
     }
 
@@ -915,6 +927,7 @@ mod tests {
         assert!(out.contains("- Use **batch** for parallel calls, **task** for delegation."));
         assert!(out.contains("- Combine **batch** and **task**: launch multiple tasks in a batch to parallelize research or implementation."));
         assert!(!out.contains("**code_execution**"));
+        assert!(!out.contains("Concurrency:"));
         assert!(out.contains("Most efficient tools: batch, task."));
     }
 
@@ -927,6 +940,7 @@ mod tests {
         assert!(!out.contains("Combine **batch** and **task**"));
         assert!(!out.contains("**batch**"));
         assert!(!out.contains("**code_execution**"));
+        assert!(!out.contains("Concurrency:"));
         assert!(out.contains("Most efficient tools: task."));
     }
 
@@ -938,6 +952,8 @@ mod tests {
         assert!(out.contains(
             "- Use **code_execution** for parallel/batch calls (via gather) and chained/filtered calls."
         ));
+        assert!(out.contains("via `gather(...)` in **code_execution**. Never call them one at a time sequentially."));
+        assert!(!out.contains("or via **batch**"));
         assert!(!out.contains("Combine **batch** and **task**"));
         assert!(!out.contains("**batch**"));
         assert!(!out.contains("**task**"));
@@ -952,6 +968,7 @@ mod tests {
         assert!(out.contains("- Use **batch** for parallel calls."));
         assert!(!out.contains("Combine **batch** and **task**"));
         assert!(!out.contains("**code_execution**"));
+        assert!(!out.contains("Concurrency:"));
         assert!(!out.contains("**task**"));
         assert!(out.contains("Most efficient tools: batch."));
     }
@@ -963,6 +980,7 @@ mod tests {
         let out = p.render_with_tools(PromptId::System, &Vars::default(), "", &is_enabled);
         assert!(!out.contains("- Use **"));
         assert!(!out.contains("Combine **batch** and **task**"));
+        assert!(!out.contains("Concurrency:"));
         assert!(!out.contains("Most efficient tools:"));
         assert!(out.contains("- Every tool result grows your context. Minimize use of verbose tool calls, prefer compact results."));
         assert!(out.contains(
