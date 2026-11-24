@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `f44a38c482605e174d6dfb4ec0a7915343c5290e`
-  - **Commit date**: `Sun Nov 22 09:20:27 2026 +0200`
-  - **Commit author**: `Vitalii <4005032+Crandel@users.noreply.github.com>`
-  - **Commit message**: `Fix lint issues`
+  - **Commit SHA**: `31e149d66bdb2f2d3545232d9d22a9fd0467cb3c`
+  - **Commit date**: `Mon Nov 23 23:28:13 2026 +0100`
+  - **Commit author**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
+  - **Commit message**: `chore(plugins): type check text_input in strict mode`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `f44a38c4`.
+> `upstream/main` has been successfully merged through commit `31e149d6`.
 
 ---
 
@@ -233,6 +233,10 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `bea92282` | `feat(powershell): harden powershell tool execution, output limits, and syntax shimming` | Harden PowerShell tool execution with strict output limits and syntax shimming |
 | `b245f2cd` | `fix(ui): lay out streaming markdown at gutter body width` | Lay out streaming markdown content matching gutter body width |
 | `f511fb56` | `Merge branch 'upstream/main' into main` | Merge upstream through `f44a38c4`, including `todo_write.toggle` action registration and its test coverage |
+| `9a04c18c` | `fix(plugins): strip redirections in cd hints and harden code_execution prompt` | Strip redirections in cd hints and harden code_execution prompt |
+| `00a36a01` | `feat(mcp): bidirectionally map Python keywords and identifiers in tools` | Bidirectionally map Python keywords and identifiers in MCP tools |
+| `3aabc746` | `fix(plugins): pre-import pathlib and Path in code_execution preamble` | Pre-import pathlib and bind Path in code_execution preamble |
+| `b125f902` | `Merge branch 'upstream/main' into main` | Merge upstream through `31e149d6`, including MCP `startup_timeout` configuration, `--max-budget-usd` enforcement, model capability borrowing with `like`, `maki.model.info` fact source tracking, compile-time update disabling via `MAKI_DISABLE_UPDATE`, terminal capability detection refactoring, append-only headless turns, strict Luau typing across plugins, and dependency updates, while preserving core fork customizations |
 
 ---
 
