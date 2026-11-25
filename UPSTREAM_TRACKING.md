@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `cdef2f59ef064b30c42e5587d421b64ba595b52b`
-  - **Commit date**: `Tue Nov 24 23:38:40 2026 +0100`
-  - **Commit author**: `Falk Woldmann Lu <52786457+FalkWoldmann@users.noreply.github.com>`
-  - **Commit message**: `docs(plugins): explain bash \`file_tool_note\` on the token economy page`
+  - **Commit SHA**: `2b6aaeeb71a4ce81d3f2176fccd6677ea5da91e3`
+  - **Commit date**: `Tue Nov 24 20:51:29 2026 +0100`
+  - **Commit author**: `Luca Barbato <lu_zero@gentoo.org>`
+  - **Commit message**: `feat(lua): job events, plugin chat items and status bar segments`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `cdef2f59`.
+> `upstream/main` has been successfully merged through commit `2b6aaeeb`.
 
 ---
 
@@ -241,6 +241,18 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `e9efa48f` | `fix(ui): enable clipboard dual writes in herdr-app` | Enable clipboard dual writes in herdr-app |
 | `06085d9c` | `feat(prompt): instruct models to issue independent tool calls concurrently when code_execution is enabled` | Instruct models to issue independent tool calls concurrently when code_execution is enabled |
 | `07019f1b` | `Merge branch 'upstream/main' into main` | Merge upstream through `cdef2f59`, including bash `file_tool_note` recommending dedicated file tools, grep `count` parameter, code_execution exception-line matching and gather error slot documentation, focused float keyboard event resolution and `<C-c>` permission denial, file_access `Seen` digest caching without stale read on unchanged file rewrites, `htmd` 0.6 bump and `maki.text.html_to_text`, edit tool lines shift reporting, direct Kagi Search API integration, and exposing provider usage limits to Lua plugins, while preserving core fork customizations |
+
+| `e0fcaba4` | `docs: update upstream tracking record to cdef2f59` | Update the upstream tracking record to `cdef2f59` |
+| `6c775edb` | `feat(code-execution): add runtime recovery hints for compound statement and positional arg syntax errors` | Add runtime recovery hints for compound statement and positional arg syntax errors in code_execution |
+| `1d68039f` | `feat(ui): add Ctrl+R input history picker` | Add Ctrl+R input history picker |
+| `8f98600f` | `feat(models): support partial model name matching in resolve_model` | Support partial model name matching in `resolve_model` |
+| `17b1a641` | `feat(code-execution): add configurable QuickJS-NG JavaScript sandbox engine` | Add configurable QuickJS-NG JavaScript sandbox engine |
+| `1e71c7ca` | `style(plugins): apply stylua formatting to code_execution, read, powershell` | Apply stylua formatting to `code_execution`, `read`, `powershell` |
+| `b6990c61` | `feat(models): add model combos and remove the tier system` | Add model combos and remove the strong/medium/weak tier system |
+| `68ec231d` | `feat(ui): show both thinking levels in the status bar for combos` | Show both thinking levels in the status bar for model combos |
+| `912784b8` | `feat(ui): show sandbox tool calls as compact children of code_execution` | Show sandbox tool calls as compact children of `code_execution` |
+| `7778d5ba` | `fix(ui): keep code_execution compact children hover-only, not clickable` | Keep `code_execution` compact children hover-only and non-clickable |
+| `89f5760a` | `Merge remote-tracking branch 'upstream/main'` | Merge upstream through `2b6aaeeb`, including bracketed tool notes, schema shorthand aliases/hints (`accept_single`, `value_alias`), malformed tool JSON error reporting (adapted to Responses provider), `read` default `offset=1` (preserving fork elision), dropping `block_anchor` edit fallback and approximate-span warnings, and Lua job events / `maki.ui.chat_item` / `maki.ui.status_segment`, while preserving core fork customizations |
 
 ---
 
