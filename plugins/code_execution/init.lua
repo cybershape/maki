@@ -27,6 +27,11 @@ local TIME_LIMIT_SUBSTR = "time limit exceeded"
 -- Same marker the batch tool uses for a failed child, so a failure reads the
 -- same wherever the model meets it.
 local ERROR_PREFIX = "[ERROR] "
+local CALL_RUNNING = "running"
+local CALL_SUCCESS = "success"
+local CALL_ERROR = "error"
+local NANOS_PER_MILLISECOND = 1000000
+local ANNOTATION_SEP = " · "
 local ASYNCIO_GATHER = "asyncio.gather"
 local GATHER_HINT = "\n\nHint: `gather(...)` keeps the other results, returning `"
   .. ERROR_PREFIX
@@ -757,11 +762,21 @@ local function handler(input, ctx)
     view:append(line)
   end
 
+  -- Every sandbox tool call, so the compact row can show one child per call
+  -- the way batch does. Concurrent calls append in dispatch order, which need
+  -- not be the script's. The body keeps the script and stdout; these records
+  -- travel in `state` only.
+  local calls = {}
+  local state = { calls = calls }
+
   -- Memoized, because a cancel reaches us twice: once through the hook and
   -- again as the interpreter's error, and the view is painted only once.
   local cut_reply
   local function cut(reason)
-    cut_reply = cut_reply or partial.cut(view, collected:result(), reason, timeout, started_at)
+    if not cut_reply then
+      cut_reply = partial.cut(view, collected:result(), reason, timeout, started_at)
+      cut_reply.state = state
+    end
     return cut_reply
   end
 
@@ -792,20 +807,53 @@ local function handler(input, ctx)
         if param_maps[bind] then
           tool_input = apply_param_map(tool_input, param_maps[bind])
         end
+        local record = {
+          tool = name,
+          params = type(tool_input) == "table" and tool_input or nil,
+          status = CALL_RUNNING,
+        }
+        calls[#calls + 1] = record
+        local call_started = maki.uv.hrtime()
+        local function annotate(ann)
+          local sep = ANNOTATION_SEP
+          if record.annotation and (sep .. record.annotation .. sep):find(sep .. ann .. sep, 1, true) then
+            return
+          end
+          record.annotation = record.annotation and (record.annotation .. sep .. ann) or ann
+        end
+        local function settle(is_error)
+          record.status = is_error and CALL_ERROR or CALL_SUCCESS
+          record.duration_ms = math.floor((maki.uv.hrtime() - call_started) / NANOS_PER_MILLISECOND)
+        end
+        local call_opts
         if t.workflow_only then
-          return maki.agent.call_tool(ctx, name, tool_input)
+          call_opts = {}
+        else
+          -- The script clock stops while a tool call is awaited. Child tools keep
+          -- their own default timeout unless overridden explicitly or relaxed by
+          -- an outer script timeout.
+          local explicit = type(tool_input) == "table" and tonumber(tool_input.timeout) or nil
+          if explicit then
+            call_opts = { timeout = explicit }
+          elseif input.timeout and input.timeout > opts.timeout_secs then
+            call_opts = { timeout = input.timeout }
+          else
+            call_opts = {}
+          end
         end
-        -- The script clock stops while a tool call is awaited. Child tools keep
-        -- their own default timeout unless overridden explicitly or relaxed by
-        -- an outer script timeout.
-        local explicit = type(tool_input) == "table" and tonumber(tool_input.timeout) or nil
-        local tool_opts
-        if explicit then
-          tool_opts = { timeout = explicit }
-        elseif input.timeout and input.timeout > opts.timeout_secs then
-          tool_opts = { timeout = input.timeout }
+        call_opts.annotation_marks_caller = true
+        call_opts.on_annotation = annotate
+        call_opts.on_usage = function(usage)
+          record.usage = usage
         end
-        return maki.agent.call_tool(ctx, name, tool_input, tool_opts)
+        call_opts.on_done = function(done)
+          settle(done.is_error)
+        end
+        local out, call_err = maki.agent.call_tool(ctx, name, tool_input, call_opts)
+        if record.status == CALL_RUNNING then
+          settle(call_err ~= nil)
+        end
+        return out, call_err
       end
     end
   end
@@ -906,6 +954,7 @@ local function handler(input, ctx)
       llm_output = output_limits.cut_middle(err .. hint .. mcp_hint .. mod_hint, max_lines, max_bytes),
       is_error = true,
       body = buf,
+      state = state,
     }
   end
 
@@ -927,7 +976,7 @@ local function handler(input, ctx)
   end
   view:finish()
 
-  return { llm_output = llm_output, is_error = over_full_limit, body = buf }
+  return { llm_output = llm_output, is_error = over_full_limit, body = buf, state = state }
 end
 
 local function header(input)
@@ -937,6 +986,14 @@ end
 
 local function restore(input, output, is_error, ctx)
   local buf, view, highlight = build_body(ctx, input.code)
+  local st = ctx:state()
+  if st and type(st.calls) == "table" then
+    for _, record in ipairs(st.calls) do
+      if record.status == CALL_RUNNING then
+        record.status = CALL_ERROR
+      end
+    end
+  end
   if is_error then
     view:append(output)
   elseif output == NO_OUTPUT then

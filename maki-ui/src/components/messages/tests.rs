@@ -3845,6 +3845,64 @@ fn compact_batch_children_formats_toolcall_reason() {
 }
 
 #[test]
+fn compact_code_execution_children_come_from_state() {
+    const TOOL_ID: &str = "ce-1";
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            compact_tools: true,
+            ..Default::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    let mut start_ev = start(TOOL_ID, "code_execution");
+    start_ev.summary = "run script · 3 lines".into();
+    start_ev.raw_input = Some(serde_json::json!({
+        "code": "await gather(read({ path: 'src/main.rs' }), bash({ command: 'cargo check' }))",
+        "toolcall_reason": "run script"
+    }));
+    panel.tool_start(start_ev);
+    let mut done_ev = done(TOOL_ID);
+    done_ev.tool = "code_execution".into();
+    done_ev.output = Arc::new(ToolOutput::Plain(maki_agent::TextOutput {
+        text: "out".into(),
+        instructions: None,
+        state: Some(serde_json::json!({
+            "calls": [
+                {
+                    "tool": "read",
+                    "params": { "path": "src/main.rs", "toolcall_reason": "reading main" },
+                    "status": "success",
+                    "duration_ms": 120
+                },
+                {
+                    "tool": "bash",
+                    "params": { "command": "cargo check" },
+                    "status": "error",
+                    "duration_ms": 30
+                }
+            ]
+        })),
+        loaded_tools: Vec::new(),
+        duration_ms: None,
+    }));
+    panel.tool_done(done_ev);
+    panel.seal_open_group();
+    let DisplayRole::ToolGroup(group) = &panel.messages[0].role else {
+        panic!("expected ToolGroup");
+    };
+    let GroupEntry::Tool(entry) = &group.entries[0] else {
+        panic!("expected GroupEntry::Tool");
+    };
+    assert_eq!(entry.summary, "run script · 3 lines · 2 tools");
+    assert_eq!(entry.children.len(), 2);
+    assert_eq!(entry.children[0].name.as_ref(), "read");
+    assert_eq!(entry.children[0].summary, "reading main · src/main.rs:1");
+    assert_eq!(entry.children[0].status, ToolStatus::Success);
+    assert_eq!(entry.children[1].name.as_ref(), "bash");
+    assert_eq!(entry.children[1].status, ToolStatus::Error);
+}
+
+#[test]
 fn compact_tools_state_text_transitions() {
     let ui_cfg = UiConfig {
         compact_tools: true,

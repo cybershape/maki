@@ -28,6 +28,7 @@ const RAIL_LAST: &str = "└  ";
 const CHILD_RAIL_CONTINUE: &str = "├  ";
 const CHILD_INDENT: &str = "   ";
 pub(super) const BATCH_TOOL: &str = "batch";
+pub(super) const CODE_EXECUTION_TOOL: &str = "code_execution";
 pub const QUESTION_TOOL: &str = "question";
 const NO_ANSWER: &str = "(no answer)";
 const DISMISSED_OUTPUT: &str = "(question dismissed by user)";
@@ -333,6 +334,17 @@ pub fn update_batch_compact_summary(current_summary: &str, count: usize) -> Stri
     }
 }
 
+/// Keeps the script's line count and appends the sandbox call count, so the
+/// compact row says both what ran and how many calls it made. The count always
+/// goes last; everything before a previous count is kept as is.
+pub fn update_code_execution_compact_summary(current_summary: &str, count: usize) -> String {
+    let base = match current_summary.rsplit_once(REASON_SEP) {
+        Some((head, tail)) if tail.ends_with(" tools") => head,
+        _ => current_summary,
+    };
+    format!("{base}{REASON_SEP}{count} tools")
+}
+
 pub fn extract_batch_child_input(batch_raw_input: &Value, index: usize) -> Option<Value> {
     let tool_calls = batch_raw_input.get("tool_calls")?.as_array()?;
     let entry = tool_calls.get(index)?.as_object()?;
@@ -424,6 +436,58 @@ pub(super) fn batch_children(
                 name: name.into(),
                 summary,
                 raw_input: child_input,
+                children: Vec::new(),
+                status,
+                receiving_args: false,
+                started_at: None,
+                duration,
+                detail: None,
+            })
+        })
+        .collect()
+}
+
+/// One child per sandbox tool call, from the `state` the plugin saves with
+/// the result. Unlike batch, the calls never render into the body, so the
+/// records are the only source.
+pub(super) fn code_execution_children(output: Option<&ToolOutput>) -> Vec<GroupToolEntry> {
+    let Some(calls) = output
+        .and_then(ToolOutput::state)
+        .and_then(|state| state.get("calls"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .filter_map(|call| {
+            let name = call.get("tool").and_then(Value::as_str)?;
+            let params = call.get("params").filter(|v| v.is_object()).cloned();
+            let mut summary = format_compact_summary(name, params.as_ref(), "");
+            for field in ["annotation", "usage"] {
+                if let Some(extra) = call.get(field).and_then(Value::as_str).filter(|s| !s.is_empty())
+                {
+                    if summary.is_empty() {
+                        summary = extra.to_string();
+                    } else {
+                        summary = format!("{summary}{REASON_SEP}{extra}");
+                    }
+                }
+            }
+            let status = match call.get("status").and_then(Value::as_str) {
+                Some("success") => ToolStatus::Success,
+                Some("error") => ToolStatus::Error,
+                _ => ToolStatus::InProgress,
+            };
+            let duration = call
+                .get("duration_ms")
+                .and_then(Value::as_u64)
+                .map(Duration::from_millis);
+            Some(GroupToolEntry {
+                id: String::new(),
+                name: name.into(),
+                summary,
+                raw_input: params,
                 children: Vec::new(),
                 status,
                 receiving_args: false,
@@ -1939,6 +2003,73 @@ mod tests {
     #[test_case("2 tools", 3, "3 tools" ; "plain_count_without_reason")]
     fn update_batch_summary(current: &str, count: usize, expected: &str) {
         assert_eq!(update_batch_compact_summary(current, count), expected);
+    }
+
+    #[test_case("3 lines", 2, "3 lines · 2 tools" ; "keeps_line_count")]
+    #[test_case("3 lines · 1 tools", 2, "3 lines · 2 tools" ; "replaces_previous_count")]
+    #[test_case("run script · 3 lines", 2, "run script · 3 lines · 2 tools" ; "keeps_reason")]
+    fn update_code_execution_summary(current: &str, count: usize, expected: &str) {
+        assert_eq!(update_code_execution_compact_summary(current, count), expected);
+    }
+
+    #[test]
+    fn code_execution_children_come_from_saved_call_state() {
+        let output = ToolOutput::Plain(maki_agent::TextOutput {
+            text: "script output".into(),
+            instructions: None,
+            state: Some(serde_json::json!({
+                "calls": [
+                    {
+                        "tool": "read",
+                        "params": {
+                            "path": "src/main.rs",
+                            "offset": 1,
+                            "limit": 50,
+                            "toolcall_reason": "reading entry point"
+                        },
+                        "status": "success",
+                        "duration_ms": 120
+                    },
+                    {
+                        "tool": "bash",
+                        "params": { "command": "cargo check" },
+                        "status": "error",
+                        "duration_ms": 30,
+                        "annotation": "exit 1"
+                    },
+                    { "tool": "grep", "status": "running" }
+                ]
+            })),
+            loaded_tools: Vec::new(),
+            duration_ms: None,
+        });
+        let children = code_execution_children(Some(&output));
+        assert_eq!(children.len(), 3);
+        assert_eq!(children[0].name.as_ref(), "read");
+        assert_eq!(
+            children[0].summary,
+            "reading entry point · src/main.rs:1-50"
+        );
+        assert_eq!(children[0].status, ToolStatus::Success);
+        assert_eq!(children[0].duration, Some(Duration::from_millis(120)));
+        assert_eq!(children[1].name.as_ref(), "bash");
+        assert_eq!(children[1].summary, "exit 1");
+        assert_eq!(children[1].status, ToolStatus::Error);
+        assert_eq!(children[2].status, ToolStatus::InProgress);
+        assert!(children[2].duration.is_none());
+    }
+
+    #[test_case(None ; "no_output")]
+    #[test_case(Some(serde_json::json!({})) ; "no_calls")]
+    fn code_execution_children_empty_without_calls(state: Option<Value>) {
+        let output = ToolOutput::Plain(maki_agent::TextOutput {
+            text: String::new(),
+            instructions: None,
+            state,
+            loaded_tools: Vec::new(),
+            duration_ms: None,
+        });
+        assert!(code_execution_children(Some(&output)).is_empty());
     }
 
     #[test]

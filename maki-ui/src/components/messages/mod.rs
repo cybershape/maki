@@ -583,6 +583,13 @@ impl MessagesPanel {
                 event.raw_input.as_ref(),
                 &event.summary,
             );
+            // The script's line count only arrives with the header snapshot;
+            // until then the compact row keeps the full summary, count and all.
+            let summary = if event.tool.as_ref() == tool_group::CODE_EXECUTION_TOOL {
+                event.summary.clone()
+            } else {
+                summary
+            };
             let mut found_group = None;
             for msg in self.messages.iter_mut().rev() {
                 if let DisplayRole::ToolGroup(g) = &mut msg.role {
@@ -834,6 +841,16 @@ impl MessagesPanel {
                                 entry.raw_input.as_ref(),
                                 Some(&event.output),
                             );
+                        }
+                        if entry.name.as_ref() == tool_group::CODE_EXECUTION_TOOL {
+                            let children = tool_group::code_execution_children(Some(&event.output));
+                            if !children.is_empty() {
+                                entry.summary = tool_group::update_code_execution_compact_summary(
+                                    &entry.summary,
+                                    children.len(),
+                                );
+                                entry.children = children;
+                            }
                         }
                         let dur = event
                             .call
@@ -2286,6 +2303,35 @@ impl MessagesPanel {
                 {
                     entry.children =
                         tool_group::question_children(entry.raw_input.as_ref(), Some(output));
+                }
+                if entry.name.as_ref() == tool_group::CODE_EXECUTION_TOOL {
+                    let output = entry.detail.as_ref().and_then(|d| d.output.as_deref());
+                    let mut children = tool_group::code_execution_children(output);
+                    for (index, child) in children.iter_mut().enumerate() {
+                        let previous = entry
+                            .children
+                            .get(index)
+                            .filter(|old| old.name == child.name);
+                        child.started_at = previous.and_then(|old| old.started_at);
+                        if child.status == ToolStatus::InProgress {
+                            child.started_at.get_or_insert_with(Instant::now);
+                        }
+                    }
+                    if entry.status == ToolStatus::Error {
+                        for child in &mut children {
+                            if child.status == ToolStatus::InProgress {
+                                child.status = ToolStatus::Error;
+                            }
+                        }
+                    }
+                    if !children.is_empty() {
+                        entry.summary = tool_group::update_code_execution_compact_summary(
+                            &entry.summary,
+                            children.len(),
+                        );
+                        entry.children = children;
+                    }
+                    return Some(group.id.clone());
                 }
                 if entry.name.as_ref() != tool_group::BATCH_TOOL {
                     return Some(group.id.clone());

@@ -901,6 +901,12 @@ async fn mcp_libraries(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pa
 ///   `on_task` (function?) - called with the task id when the child runs as
 ///     a subagent, which `/tasks` then lists as a task of its own. Must not
 ///     yield.
+///   `annotation_marks_caller` (boolean?) - with `on_annotation`, also keep
+///     the "allowed by" mark on your own tool's row (the event a call without
+///     callbacks would emit). For callers that only record annotations.
+///   `on_done` (function?) - called once when the call settles, with
+///     `{ is_error = boolean, annotation = string? }`. The annotation is the
+///     final one the child's row would carry. Must not yield.
 /// @return (string?, string?, string?) Tool output text and its format
 ///   (`"markdown"` or `"plain"`, as a tool handler sets it), or `(nil, err)`
 ///   on failure. Instruction files the child picks up (a subdirectory `AGENTS.md`) are
@@ -952,8 +958,9 @@ async fn dispatch_child(
     // permission prompt, the user still has to see it somewhere.
     let (live_tx, live_rx) = unbounded_channel();
     tctx.live_sink = Some(live_tx);
-    let (mut on_buf, mut on_ann, mut on_usage, mut on_movable, mut on_task) =
-        (None, None, None, None, None);
+    let (mut on_buf, mut on_ann, mut on_usage, mut on_movable, mut on_task, mut on_done) =
+        (None, None, None, None, None, None);
+    let mut ann_marks_caller = false;
     if let Some(o) = opts {
         if let Some(mode) = o.opt::<String>("output_mode")? {
             let Some(mode) = ToolOutputMode::parse(&mode) else {
@@ -969,6 +976,8 @@ async fn dispatch_child(
         on_usage = o.opt::<Function>("on_usage")?;
         on_movable = o.opt::<Function>("on_movable")?;
         on_task = o.opt::<Function>("on_task")?;
+        on_done = o.opt::<Function>("on_done")?;
+        ann_marks_caller = o.opt::<bool>("annotation_marks_caller")?.unwrap_or(false);
     }
     let cbs = LiveCallbacks {
         tool: name,
@@ -978,6 +987,7 @@ async fn dispatch_child(
         on_usage,
         on_movable,
         on_task,
+        ann_marks_caller,
     };
     drop(ctx);
     if let Err(e) = tctx.deadline.check() {
@@ -990,8 +1000,16 @@ async fn dispatch_child(
         .annotation
         .clone()
         .or_else(|| (!done.is_error).then(|| done.output.annotation()).flatten());
-    if let Some(a) = annotation {
+    if let Some(a) = annotation.clone() {
         cbs.deliver(ToolLive::Annotation(a)).await;
+    }
+    if let Some(f) = on_done {
+        let tbl = lua.create_table()?;
+        tbl.set("is_error", done.is_error)?;
+        tbl.set("annotation", annotation)?;
+        if let Err(e) = f.call_async::<()>(tbl).await {
+            tracing::warn!(tool = name, error = %e, "call_tool on_done callback failed");
+        }
     }
     Ok(Ok(done))
 }
@@ -1591,6 +1609,9 @@ struct LiveCallbacks<'a> {
     on_usage: Option<Function>,
     on_movable: Option<Function>,
     on_task: Option<Function>,
+    /// An on_annotation that only records the mark for state: the caller's
+    /// row still needs the AllowedByPlugin event, as without callbacks.
+    ann_marks_caller: bool,
 }
 
 impl LiveCallbacks<'_> {
@@ -1600,6 +1621,9 @@ impl LiveCallbacks<'_> {
             ToolLive::Annotation(ann) => call_opt(&self.on_ann, ann).await,
             ToolLive::Usage(usage) => call_opt(&self.on_usage, usage).await,
             ToolLive::AllowedBy(plugin) if self.on_ann.is_some() => {
+                if self.ann_marks_caller {
+                    tool_dispatch::mark_allowed_by(&self.caller, Arc::clone(&plugin));
+                }
                 call_opt(&self.on_ann, format!("{ALLOWED_BY} {plugin}")).await
             }
             ToolLive::AllowedBy(plugin) => {

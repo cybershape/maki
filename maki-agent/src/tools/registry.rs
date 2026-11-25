@@ -111,6 +111,9 @@ pub struct ToolExecResult {
     /// Set when `output` is a receipt: the call moved and finishes in the
     /// background.
     pub moved: Option<MovedCall>,
+    /// Structured state that survives a failed call too, so a tool which
+    /// recorded progress before dying still restores it.
+    pub error_state: Option<serde_json::Value>,
 }
 
 /// Settles a moved call with its filtered final reply, `None` when there is
@@ -138,6 +141,7 @@ impl From<Result<ToolOutput, String>> for ToolExecResult {
             annotation: None,
             written_path: None,
             moved: None,
+            error_state: None,
         }
     }
 }

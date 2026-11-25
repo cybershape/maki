@@ -2007,6 +2007,7 @@ impl ToolCallReply {
             moved,
             ..
         } = self;
+        let error_state = if result.is_err() { state.clone() } else { None };
         let output = result.map(|s| {
             if let Some(source) = image {
                 ToolOutput::Image { source, text: s }
@@ -2033,6 +2034,7 @@ impl ToolCallReply {
             annotation,
             written_path,
             moved,
+            error_state,
         }
     }
 

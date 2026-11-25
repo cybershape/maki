@@ -264,6 +264,7 @@ fn ran(id: String, tool: Arc<str>, result: ToolExecResult) -> Ran {
         annotation,
         written_path,
         moved,
+        error_state,
     } = result;
     let backgrounded = moved.is_some();
     let done = match output {
@@ -273,11 +274,21 @@ fn ran(id: String, tool: Arc<str>, result: ToolExecResult) -> Ran {
             backgrounded,
             ..ToolDoneEvent::new(id, tool, output, false)
         },
-        Err(message) => ToolDoneEvent {
-            tool,
-            backgrounded,
-            ..ToolDoneEvent::error(id, message)
-        },
+        Err(message) => {
+            let mut done = ToolDoneEvent {
+                tool,
+                backgrounded,
+                ..ToolDoneEvent::error(id, message)
+            };
+            if let Some(state) = error_state
+                && let ToolOutput::Plain(text) = done.output.as_ref()
+            {
+                let mut text = text.clone();
+                text.state = Some(state);
+                done.output = Arc::new(ToolOutput::Plain(text));
+            }
+            done
+        }
     };
     Ran { done, moved }
 }

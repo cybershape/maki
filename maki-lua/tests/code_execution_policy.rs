@@ -1033,6 +1033,49 @@ fn final_body_text(rx: &mut UnboundedReceiver<maki_agent::Envelope>) -> String {
         .expect("handler must publish a body")
 }
 
+/// Every sandbox tool call lands in `state.calls`, so the compact row can
+/// show one child per call without parsing the body. Concurrent calls may
+/// settle in any order, so the records are matched by tool, not position.
+#[test]
+fn sandbox_calls_record_state_for_compact_children() {
+    let (reg, _host) = setup();
+    let inv = parse_code(&reg, "ok, bad = await gather(interp_echo(msg='hi'), interp_fail())");
+    let (ctx, _rx) = event_ctx(&reg);
+    let result = runtime().block_on(inv.execute(&ctx));
+    let output = result.output.expect("execute ok");
+    let state = output.state().expect("state saved");
+    let calls = state["calls"].as_array().expect("calls array");
+    assert_eq!(calls.len(), 2);
+    let echo = calls
+        .iter()
+        .find(|c| c["tool"] == "interp_echo")
+        .expect("echo call recorded");
+    assert_eq!(echo["params"]["msg"], "hi");
+    assert_eq!(echo["status"], "success");
+    assert!(echo["duration_ms"].as_u64().is_some());
+    let fail = calls
+        .iter()
+        .find(|c| c["tool"] == "interp_fail")
+        .expect("fail call recorded");
+    assert_eq!(fail["status"], "error");
+}
+
+/// A script that dies mid-run still hands back the calls it made, so a cut
+/// run shows its children too. The reply is an error, whose state survives
+/// through `error_state`.
+#[test]
+fn sandbox_call_state_survives_a_script_error() {
+    let (reg, _host) = setup();
+    let inv = parse_code(&reg, "await interp_echo(msg='hi')\nprint(boom_undefined)");
+    let (ctx, _rx) = event_ctx(&reg);
+    let result = runtime().block_on(inv.execute(&ctx));
+    let state = result.error_state.expect("error state saved");
+    let calls = state["calls"].as_array().expect("calls array");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tool"], "interp_echo");
+    assert_eq!(calls[0]["status"], "success");
+}
+
 /// Some call paths skip `start`, so `handler` must render the script itself.
 #[test]
 fn handler_renders_script_when_start_never_ran() {
@@ -1088,7 +1131,13 @@ fn handler_error_keeps_script_and_drops_waiting_notice() {
     );
 }
 
-fn restore_lines_with(code: &str, output: &str, is_error: bool, clicks: Vec<usize>) -> Vec<String> {
+fn restore_lines_with_state(
+    code: &str,
+    output: &str,
+    is_error: bool,
+    clicks: Vec<usize>,
+    state: Option<serde_json::Value>,
+) -> Vec<String> {
     let (_reg, host) = setup();
     let eh = host.event_handle();
     let (tx, mut rx) = unbounded_channel::<maki_agent::Envelope>();
@@ -1102,7 +1151,7 @@ fn restore_lines_with(code: &str, output: &str, is_error: bool, clicks: Vec<usiz
             tool_output_lines: maki_config::ToolOutputLines::default(),
             theme_gen: None,
             clicks,
-            state: None,
+            state,
             task_id: None,
             session_id: None,
             reason: maki_lua::RestoreReason::default(),
@@ -1121,6 +1170,10 @@ fn restore_lines_with(code: &str, output: &str, is_error: bool, clicks: Vec<usiz
     snapshot.text().lines().map(str::to_owned).collect()
 }
 
+fn restore_lines_with(code: &str, output: &str, is_error: bool, clicks: Vec<usize>) -> Vec<String> {
+    restore_lines_with_state(code, output, is_error, clicks, None)
+}
+
 fn restore_lines(output: &str, is_error: bool) -> Vec<String> {
     restore_lines_with("print('x')", output, is_error, Vec::new())
 }
@@ -1132,6 +1185,23 @@ fn restore_body_is_script_divider_output(output: &str, is_error: bool, tail: &[&
     let mut expected = vec!["1 print('x')".to_owned(), DIVIDER_LINE.to_owned()];
     expected.extend(tail.iter().map(|s| (*s).to_owned()));
     assert_eq!(restore_lines(output, is_error), expected);
+}
+
+/// Saved call records restore without changing the body: the script and
+/// output render exactly as a stateless restore would.
+#[test]
+fn restore_with_call_state_keeps_the_body() {
+    let state = serde_json::json!({
+        "calls": [
+            { "tool": "interp_echo", "params": { "msg": "hi" }, "status": "running" },
+            { "tool": "interp_fail", "status": "error", "duration_ms": 3 },
+        ]
+    });
+    let lines = restore_lines_with_state("print('x')", "out1", false, Vec::new(), Some(state));
+    assert_eq!(
+        lines,
+        vec!["1 print('x')".to_owned(), DIVIDER_LINE.to_owned(), "out1".to_owned()]
+    );
 }
 
 /// Restoring a session saved with the script expanded replays the buf's

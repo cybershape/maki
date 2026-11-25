@@ -2769,8 +2769,10 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function(input, ctx)
         local ann = "nil"
+        local done_flag = "none"
         local text, err, format = maki.agent.call_tool(ctx, "annotated_child", {{}}, {{
             on_annotation = function(a) ann = a end,
+            on_done = function(d) done_flag = tostring(d.is_error) .. "/" .. tostring(d.annotation) end,
         }})
         local live_text = "none"
         local ann2 = "nil"
@@ -2786,13 +2788,15 @@ maki.api.register_tool({{
             on_usage = function(value) usage = value end,
         }})
         local ann3 = "nil"
+        local done_err = "none"
         local _, err3, format3 = maki.agent.call_tool(ctx, "failing_child", {{}}, {{
             on_annotation = function(a) ann3 = a end,
+            on_done = function(d) done_err = tostring(d.is_error) end,
         }})
-        return tostring(text) .. "/" .. ann .. "/" .. format
+        return tostring(text) .. "/" .. ann .. "/" .. format .. "/" .. done_flag
             .. " " .. tostring(text2) .. "/" .. live_text .. "/" .. ann2 .. "/" .. format2
             .. " " .. tostring(text3) .. "/" .. usage
-            .. " " .. tostring(err3) .. "/" .. ann3 .. "/" .. tostring(format3)
+            .. " " .. tostring(err3) .. "/" .. ann3 .. "/" .. tostring(format3) .. "/" .. done_err
     end
 }})
 "#,
@@ -2808,8 +2812,8 @@ maki.api.register_tool({{
     assert_eq!(
         out,
         format!(
-            "child_done/5 items/markdown stream_done/streamed line/1 line/plain \
-             {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil/nil"
+            "child_done/5 items/markdown/false/5 items stream_done/streamed line/1 line/plain \
+             {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil/nil/true"
         )
     );
 }

@@ -1749,6 +1749,12 @@ through optional callbacks while the tool runs.
   - `on_task` (`function?`) called with the task id when the child runs as
     a subagent, which `/tasks` then lists as a task of its own. Must not
     yield.
+  - `annotation_marks_caller` (`boolean?`) with `on_annotation`, also keep
+    the "allowed by" mark on your own tool's row (the event a call without
+    callbacks would emit). For callers that only record annotations.
+  - `on_done` (`function?`) called once when the call settles, with
+    `{ is_error = boolean, annotation = string? }`. The annotation is the
+    final one the child's row would carry. Must not yield.
 
 **Returns:** (`string?`, `string?`, `string?`) Tool output text and its format
   (`"markdown"` or `"plain"`, as a tool handler sets it), or `(nil, err)`
