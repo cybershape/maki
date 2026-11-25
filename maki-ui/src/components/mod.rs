@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
 use maki_agent::{BufferSnapshot, TaskEnd, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent};
-use maki_lua::{PackCommand, PackPlan};
+use maki_lua::{ChatItemStatus, PackCommand, PackPlan};
 use maki_providers::{ImageSource, Message};
 use ratatui::Frame;
 use ratatui::buffer::{Buffer, CellWidth};
@@ -715,6 +715,16 @@ impl ToolGroupRole {
     }
 }
 
+/// An item a plugin owns, e.g. a job it started. It is not a tool call: it
+/// outlives the turn that started it, so a turn settling or the user
+/// pressing Esc leaves it alone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginItemRole {
+    pub id: String,
+    pub status: ChatItemStatus,
+    pub name: Arc<str>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DisplayRole {
     User,
@@ -722,6 +732,7 @@ pub enum DisplayRole {
     Thinking,
     Tool(Box<ToolRole>),
     ToolGroup(Box<ToolGroupRole>),
+    PluginItem(Box<PluginItemRole>),
     Error,
     Done,
     /// One dim line about what the host told the model on the user's behalf.

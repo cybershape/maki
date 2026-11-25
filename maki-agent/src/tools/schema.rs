@@ -1,7 +1,8 @@
 //! Each tool has one `ParamSchema` that drives both the JSON Schema sent to the
-//! LLM and the validator that checks its response. If those two ever disagree
-//! the model gets a schema that lies about what we accept, so one source of
-//! truth keeps us honest.
+//! LLM and the validator that checks its response. One source of truth keeps
+//! them from drifting. A few keys (`alias`, `value_alias`, `accept_single`,
+//! `hint`) deliberately widen the validator past the advertised schema, so a
+//! model that sends the right thing in the wrong shape avoids a round trip.
 //!
 //! Validation errors are our own types with a single `Display` impl so the
 //! model never sees a raw serde message we did not write.
@@ -28,6 +29,8 @@ const PREVIEW_SUFFIX: &str = "...";
 const JSON_ENCODED_ARRAY_HINT: &str = "Pass a JSON array, not a JSON-encoded string.";
 const JSON_ENCODED_OBJECT_HINT: &str = "Pass a JSON object, not a JSON-encoded string.";
 const ARRAY_MISSING_ITEMS: &str = "array schema missing items";
+/// Beyond this many, a missing-parameter error says how many were left out.
+const UNKNOWN_KEYS_MAX: usize = 3;
 
 /// Keyed by the schema's JSON text, not `Value` equality, which ignores key
 /// order, so a hit always hands the model the property order the plugin wrote.
@@ -77,11 +80,14 @@ impl Display for ParamKind {
     }
 }
 
+/// `(name, schema, required, aliases, hint)`, where the hint is guidance for
+/// the model when this required property is missing.
 pub(crate) type Property = (
     &'static str,
     &'static ParamSchema,
     bool,
     &'static [&'static str],
+    &'static str,
 );
 
 #[derive(Debug)]
@@ -92,10 +98,18 @@ pub enum ParamSchema {
     },
     Enum {
         variants: &'static [&'static str],
+        /// Synonym to variant. The model never sees these, so a schema can
+        /// take what models say without inviting it.
+        aliases: &'static [(&'static str, &'static str)],
+        /// Guidance for the model when the value is not a variant.
+        hint: &'static str,
         description: &'static str,
     },
     Array {
         items: &'static ParamSchema,
+        /// Accept the item itself where the array should be, including at the
+        /// parent level when this property is the one that is missing.
+        accept_single: bool,
         description: &'static str,
     },
     Object {
@@ -125,6 +139,7 @@ pub fn to_json_schema(s: &ParamSchema) -> Value {
         ParamSchema::Enum {
             variants,
             description,
+            ..
         } => {
             let mut v = json!({ "type": "string", "enum": variants });
             if !description.is_empty() {
@@ -132,7 +147,9 @@ pub fn to_json_schema(s: &ParamSchema) -> Value {
             }
             v
         }
-        ParamSchema::Array { items, description } => {
+        ParamSchema::Array {
+            items, description, ..
+        } => {
             let mut v = json!({
                 "type": "array",
                 "items": to_json_schema(items),
@@ -148,11 +165,11 @@ pub fn to_json_schema(s: &ParamSchema) -> Value {
         } => {
             let props: serde_json::Map<String, Value> = properties
                 .iter()
-                .map(|(name, sub, _, _)| ((*name).into(), to_json_schema(sub)))
+                .map(|(name, sub, ..)| ((*name).into(), to_json_schema(sub)))
                 .collect();
             let required: Vec<&&str> = properties
                 .iter()
-                .filter_map(|(name, _, req, _)| req.then_some(name))
+                .filter_map(|(name, _, req, ..)| req.then_some(name))
                 .collect();
             let mut v = json!({
                 "type": "object",
@@ -194,6 +211,14 @@ pub fn try_from_json(v: &Value) -> Result<&'static ParamSchema, String> {
     }
 }
 
+fn hint_of(schema: &Value) -> &'static str {
+    schema
+        .get("hint")
+        .and_then(Value::as_str)
+        .map(|s| -> &'static str { Box::leak(s.to_owned().into_boxed_str()) })
+        .unwrap_or("")
+}
+
 fn build_schema(v: &Value) -> Result<&'static ParamSchema, String> {
     let description: &'static str = v
         .get("description")
@@ -217,8 +242,39 @@ fn build_schema(v: &Value) -> Result<&'static ParamSchema, String> {
                     .collect::<Result<Vec<_>, _>>()?
                     .into_boxed_slice(),
             );
+            let aliases: &'static [(&'static str, &'static str)] = match v.get("value_alias") {
+                None => &[],
+                Some(value_alias) => {
+                    let map = value_alias
+                        .as_object()
+                        .ok_or("value_alias must be an object")?;
+                    Box::leak(
+                        map.iter()
+                            .map(
+                                |(alias, target)| -> Result<(&'static str, &'static str), String> {
+                                    let target = target
+                                        .as_str()
+                                        .ok_or("value_alias target must be a string")?;
+                                    if !variants.contains(&target) {
+                                        return Err(format!(
+                                            "value_alias target '{target}' is not an enum variant"
+                                        ));
+                                    }
+                                    Ok((
+                                        Box::leak(alias.clone().into_boxed_str()),
+                                        Box::leak(target.to_owned().into_boxed_str()),
+                                    ))
+                                },
+                            )
+                            .collect::<Result<Vec<_>, _>>()?
+                            .into_boxed_slice(),
+                    )
+                }
+            };
             ParamSchema::Enum {
                 variants,
+                aliases,
+                hint: hint_of(v),
                 description,
             }
         }
@@ -241,7 +297,15 @@ fn build_schema(v: &Value) -> Result<&'static ParamSchema, String> {
         Some("array") => {
             let items_val = v.get("items").ok_or(ARRAY_MISSING_ITEMS)?;
             let items: &'static ParamSchema = build_schema(items_val)?;
-            ParamSchema::Array { items, description }
+            let accept_single = v
+                .get("accept_single")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            ParamSchema::Array {
+                items,
+                accept_single,
+                description,
+            }
         }
         Some("object") if v.get("properties").is_none() => ParamSchema::OpenObject { description },
         Some("object") => parse_object_schema(v, description)?,
@@ -303,7 +367,13 @@ fn parse_object_schema(v: &Value, description: &'static str) -> Result<ParamSche
                     ),
                     _ => &[],
                 };
-                Ok((static_name, static_schema, is_required, aliases))
+                Ok((
+                    static_name,
+                    static_schema,
+                    is_required,
+                    aliases,
+                    hint_of(sub),
+                ))
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_boxed_slice(),
@@ -366,6 +436,8 @@ impl Display for JsonPath {
 pub struct ToolInputError {
     pub path: JsonPath,
     pub kind: ToolInputErrorKind,
+    unknown: Vec<String>,
+    hint: &'static str,
 }
 
 #[derive(Debug)]
@@ -393,7 +465,13 @@ impl ToolInputError {
         Self {
             path: path.clone(),
             kind,
+            unknown: Vec::new(),
+            hint: "",
         }
+    }
+
+    pub(crate) fn missing(path: &JsonPath, expected: &'static str) -> Self {
+        Self::at(path, ToolInputErrorKind::Missing { expected })
     }
 }
 
@@ -415,13 +493,13 @@ impl Display for ToolInputError {
             } => {
                 write!(f, "expected {expected}, got {got}")?;
                 if let Some(p) = preview {
-                    let hint = match expected {
+                    let encoded = match expected {
                         ParamKind::Array => Some(JSON_ENCODED_ARRAY_HINT),
                         ParamKind::Object => Some(JSON_ENCODED_OBJECT_HINT),
                         _ => None,
                     };
-                    if let Some(hint) = hint {
-                        write!(f, ". {hint}")?;
+                    if let Some(encoded) = encoded {
+                        write!(f, ". {encoded}")?;
                     }
                     write!(f, " Preview: {p}")?;
                 }
@@ -448,7 +526,24 @@ impl Display for ToolInputError {
             ToolInputErrorKind::InternalBug { detail } => {
                 write!(f, "internal validator bug: {detail}")
             }
+        }?;
+        if !self.unknown.is_empty() {
+            f.write_str(" Unknown keys: ")?;
+            for (i, key) in self.unknown.iter().take(UNKNOWN_KEYS_MAX).enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                f.write_str(&preview(key))?;
+            }
+            let rest = self.unknown.len().saturating_sub(UNKNOWN_KEYS_MAX);
+            if rest > 0 {
+                write!(f, " and {rest} more")?;
+            }
         }
+        if !self.hint.is_empty() {
+            write!(f, " {}", self.hint)?;
+        }
+        Ok(())
     }
 }
 
@@ -488,7 +583,12 @@ fn walk(schema: &ParamSchema, value: Value, path: &mut JsonPath) -> Result<Value
     match schema {
         ParamSchema::Any { .. } => Ok(value),
         ParamSchema::Primitive { kind, .. } => validate_primitive(*kind, value, path),
-        ParamSchema::Enum { variants, .. } => validate_enum(variants, value, path),
+        ParamSchema::Enum {
+            variants,
+            aliases,
+            hint,
+            ..
+        } => validate_enum(variants, aliases, hint, value, path),
         ParamSchema::Array { items, .. } => validate_array(items, value, path),
         ParamSchema::Object { properties, .. } => validate_object(properties, value, path),
         ParamSchema::OpenObject { .. } => coerce_container(value, ParamKind::Object, path),
@@ -528,22 +628,33 @@ fn validate_primitive(
 
 fn validate_enum(
     variants: &'static [&'static str],
+    aliases: &'static [(&'static str, &'static str)],
+    hint: &'static str,
     value: Value,
     path: &mut JsonPath,
 ) -> Result<Value, ToolInputError> {
     match &value {
         Value::String(s) if variants.contains(&s.as_str()) => Ok(value),
-        Value::String(s) => Err(ToolInputError::at(
-            path,
-            ToolInputErrorKind::NotInEnum {
-                expected: variants,
-                got: preview(s),
-                suggested_variant: variants.iter().copied().find(|variant| {
-                    s.strip_prefix(variant)
-                        .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-                }),
-            },
-        )),
+        Value::String(s) => {
+            if let Some((alias, canonical)) = aliases.iter().find(|(alias, _)| *alias == s.as_str())
+            {
+                warn!(path = %path, alias = %alias, canonical = %canonical, "resolved enum alias");
+                return Ok(Value::String((*canonical).to_owned()));
+            }
+            let mut err = ToolInputError::at(
+                path,
+                ToolInputErrorKind::NotInEnum {
+                    expected: variants,
+                    got: preview(s),
+                    suggested_variant: variants.iter().copied().find(|variant| {
+                        s.strip_prefix(variant)
+                            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+                    }),
+                },
+            );
+            err.hint = hint;
+            Err(err)
+        }
         other => Err(ToolInputError::at(
             path,
             ToolInputErrorKind::TypeMismatch {
@@ -588,7 +699,7 @@ fn validate_object(
     let Value::Object(mut map) = coerce_container(value, ParamKind::Object, path)? else {
         unreachable!("coerce_container(_, Object) returns an Object")
     };
-    for &(name, _, _, aliases) in properties {
+    for &(name, _, _, aliases, _) in properties {
         if map.contains_key(name) {
             for alias in aliases {
                 if map.remove(*alias).is_some() {
@@ -606,7 +717,7 @@ fn validate_object(
         }
     }
     let mut out = serde_json::Map::new();
-    for (name, sub_schema, required, _) in properties {
+    for (name, sub_schema, required, _, hint) in properties {
         match map.remove(*name) {
             Some(v) if v.is_null() && !required => {}
             Some(v) => {
@@ -614,10 +725,17 @@ fn validate_object(
                 out.insert((*name).into(), validated);
             }
             None if *required => {
+                if let Some(single) = single_item_array(sub_schema, &map) {
+                    map.clear();
+                    let validated = path.with_field(name, |p| walk(sub_schema, single, p))?;
+                    out.insert((*name).into(), validated);
+                    continue;
+                }
                 let expected = schema_type_name(sub_schema);
-                return Err(path.with_field(name, |p| {
-                    ToolInputError::at(p, ToolInputErrorKind::Missing { expected })
-                }));
+                let mut err = path.with_field(name, |p| ToolInputError::missing(p, expected));
+                err.unknown = unknown_keys(&map, properties);
+                err.hint = *hint;
+                return Err(err);
             }
             None => {}
         }
@@ -626,6 +744,57 @@ fn validate_object(
         warn!(path = %path, key = %extra_key, "dropped unknown tool parameter");
     }
     Ok(Value::Object(out))
+}
+
+/// Keys at this object that the schema does not know, named when a required
+/// parameter is missing so the model can see what it sent instead.
+fn unknown_keys(
+    fields: &serde_json::Map<String, Value>,
+    properties: &'static [Property],
+) -> Vec<String> {
+    fields
+        .keys()
+        .filter(|key| {
+            !properties.iter().any(|(name, _, _, aliases, _)| {
+                key.as_str() == *name || aliases.contains(&key.as_str())
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// One item where the schema asks for an array of them, when the item's
+/// required fields already sit at the parent level. Opted into per property,
+/// so a call that forgot the array around one item still runs.
+fn single_item_array(
+    schema: &ParamSchema,
+    fields: &serde_json::Map<String, Value>,
+) -> Option<Value> {
+    let ParamSchema::Array {
+        items,
+        accept_single: true,
+        ..
+    } = schema
+    else {
+        return None;
+    };
+    let ParamSchema::Object { properties, .. } = items else {
+        return None;
+    };
+    let known = |key: &str| {
+        properties
+            .iter()
+            .any(|(name, _, _, aliases, _)| key == *name || aliases.contains(&key))
+    };
+    let present = |name: &str, aliases: &[&str]| {
+        fields.contains_key(name) || aliases.iter().any(|a| fields.contains_key(*a))
+    };
+    let complete = properties
+        .iter()
+        .filter(|(_, _, required, ..)| *required)
+        .all(|(name, _, _, aliases, _)| present(name, aliases));
+    (complete && !fields.is_empty() && fields.keys().all(|key| known(key)))
+        .then(|| Value::Array(vec![Value::Object(fields.clone())]))
 }
 
 /// Models sometimes stringify arrays and objects, so we try parsing the
@@ -1002,28 +1171,31 @@ mod tests {
 
     const EDIT_ENTRY: ParamSchema = ParamSchema::Object {
         properties: &[
-            ("old_string", &STR_PRIM, true, &[]),
-            ("new_string", &STR_PRIM, true, &[]),
-            ("replace_all", &BOOL_PRIM, false, &[]),
+            ("old_string", &STR_PRIM, true, &[], ""),
+            ("new_string", &STR_PRIM, true, &[], ""),
+            ("replace_all", &BOOL_PRIM, false, &[], ""),
         ],
         description: "",
     };
 
     const EDITS_ARRAY: ParamSchema = ParamSchema::Array {
         items: &EDIT_ENTRY,
+        accept_single: false,
         description: "",
     };
 
     const MULTIEDIT_LIKE: ParamSchema = ParamSchema::Object {
         properties: &[
-            ("path", &STR_PRIM, true, &[]),
-            ("edits", &EDITS_ARRAY, true, &[]),
+            ("path", &STR_PRIM, true, &[], ""),
+            ("edits", &EDITS_ARRAY, true, &[], ""),
         ],
         description: "",
     };
 
     const MODE_ENUM: ParamSchema = ParamSchema::Enum {
         variants: &["research", "general"],
+        aliases: &[],
+        hint: "",
         description: "",
     };
 
@@ -1036,7 +1208,7 @@ mod tests {
     #[test]
     fn to_json_schema_omits_required_when_empty() {
         const ALL_OPTIONAL: ParamSchema = ParamSchema::Object {
-            properties: &[("hint", &STR_PRIM, false, &[])],
+            properties: &[("hint", &STR_PRIM, false, &[], "")],
             description: "",
         };
         let v = to_json_schema(&ALL_OPTIONAL);
@@ -1077,6 +1249,59 @@ mod tests {
         assert_eq!(err.path.to_string(), "edits[0].new_string");
         let rendered = err.to_string();
         assert!(rendered.contains(MSG_MISSING), "render: {rendered}");
+    }
+
+    #[test]
+    fn missing_required_names_the_unknown_keys_and_the_property_hint() {
+        let schema_json = json!({
+            "type": "object",
+            "properties": {
+                "old_string": {
+                    "type": "string",
+                    "required": true,
+                    "hint": "Use multiedit for several edits.",
+                },
+                "new_string": {
+                    "type": "string",
+                    "required": true,
+                    "hint": "Use multiedit for several edits.",
+                },
+            },
+        });
+        let schema = try_from_json(&schema_json).unwrap();
+        let err = validate(schema, json!({"edits": [{"old_string": "a"}]})).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains(MSG_MISSING), "render: {rendered}");
+        assert!(
+            rendered.contains("Unknown keys: \"edits\""),
+            "render: {rendered}"
+        );
+        assert!(
+            rendered.ends_with("Use multiedit for several edits."),
+            "render: {rendered}"
+        );
+    }
+
+    #[test]
+    fn missing_required_omits_the_unknown_list_when_there_is_none() {
+        let err = validate(&MULTIEDIT_LIKE, json!({"path": "/x"})).unwrap_err();
+        assert!(!err.to_string().contains("Unknown keys"), "render: {err}");
+    }
+
+    #[test]
+    fn unknown_key_list_is_capped_and_says_how_many_are_left_out() {
+        let schema_json = json!({
+            "type": "object",
+            "properties": { "path": { "type": "string", "required": true } },
+        });
+        let schema = try_from_json(&schema_json).unwrap();
+        let input = json!({"aaaa": 1, "bbbb": 2, "cccc": 3, "dddd": 4, "eeee": 5});
+        let err = validate(schema, input).unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(r#"Unknown keys: "aaaa", "bbbb", "cccc" and 2 more"#),
+            "render: {rendered}"
+        );
     }
 
     #[test]
@@ -1159,6 +1384,21 @@ mod tests {
         assert_eq!(rendered, MSG_ENUM_ERROR);
     }
 
+    #[test]
+    fn enum_error_carries_the_schema_hint() {
+        let schema_json = json!({
+            "type": "string",
+            "enum": ["list", "read"],
+            "hint": "Use the command that matches what you need.",
+        });
+        let schema = try_from_json(&schema_json).unwrap();
+        let rendered = validate(schema, json!("search")).unwrap_err().to_string();
+        assert!(
+            rendered.ends_with("Use the command that matches what you need."),
+            "render: {rendered}"
+        );
+    }
+
     #[test_case("research notes.md tags: [a]", true ; "space_separated_arguments")]
     #[test_case("research\tnotes.md", true ; "tab_separated_arguments")]
     #[test_case("research\nnotes.md", true ; "newline_separated_arguments")]
@@ -1177,6 +1417,8 @@ mod tests {
     fn enum_accepts_exact_multiword_variant() {
         const SCHEMA: ParamSchema = ParamSchema::Enum {
             variants: &["research", "research notes"],
+            aliases: &[],
+            hint: "",
             description: "",
         };
         let input = json!("research notes");
@@ -1184,11 +1426,37 @@ mod tests {
     }
 
     #[test]
+    fn value_alias_resolves_and_stays_out_of_the_advertised_enum() {
+        let schema_json = json!({
+            "type": "string",
+            "enum": ["pending", "completed"],
+            "value_alias": {"done": "completed"},
+        });
+        let schema = try_from_json(&schema_json).unwrap();
+        assert_eq!(validate(schema, json!("done")).unwrap(), json!("completed"));
+        assert_eq!(
+            to_json_schema(schema),
+            json!({"type": "string", "enum": ["pending", "completed"]})
+        );
+    }
+
+    #[test]
+    fn value_alias_target_must_be_a_variant() {
+        let schema_json = json!({
+            "type": "string",
+            "enum": ["pending"],
+            "value_alias": {"done": "finished"},
+        });
+        let err = try_from_json(&schema_json).unwrap_err();
+        assert!(err.contains("is not an enum variant"), "err: {err}");
+    }
+
+    #[test]
     fn optional_null_treated_as_absent() {
         const SCHEMA: ParamSchema = ParamSchema::Object {
             properties: &[
-                ("name", &STR_PRIM, true, &[]),
-                ("hint", &STR_PRIM, false, &[]),
+                ("name", &STR_PRIM, true, &[], ""),
+                ("hint", &STR_PRIM, false, &[], ""),
             ],
             description: "",
         };
@@ -1210,7 +1478,7 @@ mod tests {
     #[test]
     fn extra_keys_dropped() {
         const SCHEMA: ParamSchema = ParamSchema::Object {
-            properties: &[("name", &STR_PRIM, true, &[])],
+            properties: &[("name", &STR_PRIM, true, &[], "")],
             description: "",
         };
         let out = validate(&SCHEMA, json!({"name": "x", "extra": 42})).unwrap();
@@ -1239,8 +1507,8 @@ mod tests {
         };
         const SCHEMA: ParamSchema = ParamSchema::Object {
             properties: &[
-                ("name", &STR_PRIM, true, &[]),
-                ("count", &INT_PRIM, false, &[]),
+                ("name", &STR_PRIM, true, &[], ""),
+                ("count", &INT_PRIM, false, &[], ""),
             ],
             description: "",
         };
@@ -1346,6 +1614,59 @@ mod tests {
         assert_eq!(out["edits"][0]["old_string"], "a");
     }
 
+    /// The shape models send to `question` when they flatten one question.
+    fn question_like() -> &'static ParamSchema {
+        try_from_json(&json!({
+            "type": "object",
+            "required": ["questions"],
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "accept_single": true,
+                    "items": {
+                        "type": "object",
+                        "required": ["question"],
+                        "properties": {
+                            "question": { "type": "string" },
+                            "header": { "type": "string" },
+                            "options": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["label"],
+                                    "properties": { "label": { "type": "string" } },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn accept_single_wraps_a_flattened_item() {
+        let out = validate(
+            question_like(),
+            json!({
+                "question": "Pick a color",
+                "header": "Color",
+                "options": r#"[{"label": "Red"}]"#,
+            }),
+        )
+        .unwrap();
+        assert_eq!(out["questions"][0]["question"], "Pick a color");
+        assert_eq!(out["questions"][0]["options"][0]["label"], "Red");
+    }
+
+    #[test]
+    fn accept_single_needs_every_required_item_field() {
+        let err = validate(question_like(), json!({"header": "Color"})).unwrap_err();
+        assert!(matches!(err.kind, ToolInputErrorKind::Missing { .. }));
+        assert_eq!(err.path.to_string(), "questions");
+    }
+
     #[test]
     fn coerce_stringified_single_object_wrapped_as_array() {
         let input = json!({
@@ -1371,8 +1692,8 @@ mod tests {
 
     const ALIAS_SCHEMA: ParamSchema = ParamSchema::Object {
         properties: &[
-            ("path", &STR_PRIM, true, &["file_path"]),
-            ("content", &STR_PRIM, true, &[]),
+            ("path", &STR_PRIM, true, &["file_path"], ""),
+            ("content", &STR_PRIM, true, &[], ""),
         ],
         description: "",
     };

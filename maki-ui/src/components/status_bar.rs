@@ -79,6 +79,7 @@ pub struct StatusBarContext<'a> {
     pub restricted: bool,
     pub yolo: bool,
     pub elapsed_time: Option<Duration>,
+    pub plugin_segments: Vec<(String, String)>,
 }
 
 pub(crate) fn format_elapsed_time(duration: Duration) -> String {
@@ -309,6 +310,12 @@ impl StatusBar {
                 }
                 if ctx.restricted {
                     rest_spans.push(Span::styled(RESTRICTED_LABEL, theme::current().status_dim));
+                }
+                for (text, style) in &ctx.plugin_segments {
+                    rest_spans.push(Span::styled(
+                        format!(" [{text}]"),
+                        theme::style_by_name(style),
+                    ));
                 }
                 rest_spans.extend(yolo_span);
 
@@ -586,6 +593,7 @@ mod tests {
             restricted: false,
             yolo,
             elapsed_time: None,
+            plugin_segments: Vec::new(),
         }
     }
 
@@ -599,6 +607,15 @@ mod tests {
         ctx.restricted = restricted;
 
         draw(&ctx).contains(RESTRICTED_LABEL.trim())
+    }
+
+    #[test]
+    fn plugin_segments_render_with_their_style() {
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.plugin_segments = vec![("2 running".into(), "error".into())];
+
+        let text = draw(&ctx);
+        assert!(text.contains("[2 running]"), "{text}");
     }
 
     /// The sigma is the whole session's bill, and only the session can hand it

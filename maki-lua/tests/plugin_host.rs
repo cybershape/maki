@@ -3222,6 +3222,116 @@ maki.api.register_tool({{
 
 #[cfg(unix)]
 #[test]
+fn a_shared_session_job_is_listed_and_stopped_by_another_plugin() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = maki_storage::id::MakiId::generate();
+    let _mailbox = maki_agent::SessionMailbox::register(session);
+    let sid = session.to_string();
+    let other_sid = maki_storage::id::MakiId::generate().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("job.pid");
+    let owner = format!(
+        r#"
+local shared, private
+maki.api.register_tool({{
+    name = "start_session_jobs",
+    description = "starts a shared and a private session job",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        shared = maki.fn.jobstart("printf %s $$ > '{pid}'; exec sleep 30", {{
+            scope = {{ session = "{sid}" }},
+            shared = true,
+        }})
+        private = maki.fn.jobstart("exec sleep 30", {{
+            scope = {{ session = "{sid}" }},
+        }})
+        return shared .. " " .. private
+    end,
+}})
+"#,
+        pid = pid_path.display(),
+        sid = sid,
+    );
+    host.load_source("job_owner", &owner).unwrap();
+    let ids = exec_tool(&reg, "start_session_jobs", json!({})).unwrap();
+    let (shared, _private) = ids.split_once(' ').expect("two job ids");
+
+    let watcher = format!(
+        r#"
+maki.api.register_tool({{
+    name = "try_stop_shared_with_wrong_session",
+    description = "tries to stop a shared job from another session or with none",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        maki.fn.jobstop({shared}, "{other_sid}")
+        maki.fn.jobstop({shared})
+        return "tried"
+    end,
+}})
+maki.api.register_tool({{
+    name = "list_shared_jobs",
+    description = "lists and stops the session's shared jobs",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local listed = {{}}
+        for _, row in ipairs(maki.fn.joblist("{sid}")) do
+            listed[#listed + 1] = tostring(row.id)
+            maki.fn.jobstop(row.id, "{sid}")
+        end
+        return table.concat(listed, ",")
+    end,
+}})
+"#,
+        shared = shared,
+        sid = sid,
+        other_sid = other_sid,
+    );
+    host.load_source("job_watcher", &watcher).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_path)
+            .unwrap_or_default()
+            .parse::<i32>()
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shared job did not publish its process id"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let pid = Pid::from_raw(pid).unwrap();
+    assert!(test_kill_process_group(pid).is_ok());
+    exec_tool(&reg, "try_stop_shared_with_wrong_session", json!({})).unwrap();
+    assert!(
+        test_kill_process_group(pid).is_ok(),
+        "a shared job must survive a stop that names no session or the wrong one"
+    );
+
+    let listed = exec_tool(&reg, "list_shared_jobs", json!({})).unwrap();
+    assert_eq!(
+        listed, shared,
+        "only the shared job crosses the plugin boundary"
+    );
+    while test_kill_process_group(pid).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a shared job must stop for the plugin that listed it"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    end_session(&host, session, SessionEndReason::Shutdown);
+}
+
+#[cfg(unix)]
+#[test]
 fn jobattach_re_arms_session_jobs_a_reload_dropped() {
     const EXIT_CODE: i32 = 3;
     const ATTACHED: &str = "attached";
@@ -7345,24 +7455,26 @@ fn job_callbacks_fire_while_command_handler_parked() {
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "job:hi"));
 }
 
-/// read tool requires offset and limit; missing fields should fail schema validation.
-mod read_tool_required_params {
+/// The read tool requires limit. offset defaults to the first line.
+mod read_tool_params {
     use super::*;
 
-    const MISSING_OFFSET_ERR: &str = "invalid parameter 'offset': required";
     const MISSING_LIMIT_ERR: &str = "invalid parameter 'limit': required";
     const MAX_OUTPUT_LINES: i32 = 2000;
 
     #[test]
-    fn missing_offset_fails_parse() {
+    fn missing_offset_reads_from_the_first_line() {
         let (reg, _host) = builtins_host();
-        let entry = reg.get("read").expect("read registered");
-        let err = entry
-            .tool
-            .parse(&serde_json::json!({ "path": "/tmp/foo.txt", "limit": 10 }))
-            .err()
-            .expect("missing offset should fail");
-        assert!(err.to_string().contains(MISSING_OFFSET_ERR), "got: {err}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        std::fs::write(&path, "line 1\nline 2\n").unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({ "path": path.to_str().unwrap(), "limit": 2 }),
+        );
+        assert_eq!(out.as_deref(), Ok("1: line 1\n2: line 2"));
     }
 
     #[test]
@@ -7375,6 +7487,11 @@ mod read_tool_required_params {
             .err()
             .expect("missing limit should fail");
         assert!(err.to_string().contains(MISSING_LIMIT_ERR), "got: {err}");
+        assert!(
+            err.to_string()
+                .contains("Use limit=0 to read the whole file"),
+            "the hint must say how to read it all: {err}"
+        );
     }
 
     #[test]
@@ -9686,7 +9803,7 @@ maki.api.register_tool({
     );
 }
 
-const FILE_TOOL_NOTE_HEAD: &str = "Use dedicated tools for files, not bash: ";
+const FILE_TOOL_NOTE_HEAD: &str = "[Use dedicated tools for files, not bash: ";
 const FILE_TOOL_NOTE_OPTION: &str = "file_tool_note";
 
 fn bash_reply(command: &str, config: impl FnOnce(&mut maki_config::AgentConfig)) -> String {
@@ -9708,7 +9825,7 @@ fn bash_reply(command: &str, config: impl FnOnce(&mut maki_config::AgentConfig))
 fn file_tool_note(reply: &str) -> Option<&str> {
     reply
         .strip_prefix(FILE_TOOL_NOTE_HEAD)
-        .and_then(|rest| rest.split_once(".\n"))
+        .and_then(|rest| rest.split_once(".]"))
         .map(|(items, _)| items)
 }
 

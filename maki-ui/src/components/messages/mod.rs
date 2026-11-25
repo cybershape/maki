@@ -13,15 +13,15 @@ use self::segment::{Segment, SegmentCache, body_width};
 
 use super::compact_detail::CompactTarget;
 use super::tool_display::{
-    MOVABLE_HINT, RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info,
-    assistant_style, build_instructions_lines, build_tool_lines, done_style, error_style,
-    format_timestamp_now, hint_columns, instructions_search_text, notice_style, outcome_glyph,
-    replace_header, search_text_for, thinking_style, truncate_to_header, user_style,
+    BLANK_MARKER, MOVABLE_HINT, RenderCtx, RoleStyle, ToolLines, append_annotation,
+    append_right_info, assistant_style, build_instructions_lines, build_tool_lines, done_style,
+    error_style, format_timestamp_now, hint_columns, instructions_search_text, notice_style,
+    outcome_glyph, replace_header, search_text_for, thinking_style, truncate_to_header, user_style,
 };
 use super::{
     BackgroundBadge, BackgroundOutcome, CompactDetail, DisplayMessage, DisplayRole, GroupEntry,
-    GroupThinkingEntry, GroupToolEntry, IMAGE_PLACEHOLDER, NoticeDetail, ToolGroupRole, ToolRole,
-    ToolStatus, code_view::SectionFlags, tool_group,
+    GroupThinkingEntry, GroupToolEntry, IMAGE_PLACEHOLDER, NoticeDetail, PluginItemRole,
+    ToolGroupRole, ToolRole, ToolStatus, code_view::SectionFlags, tool_group,
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
@@ -49,7 +49,7 @@ use maki_agent::{
     BufWatch, BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND,
     SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
-use maki_lua::{EventHandle, LuaCommandInfo, WARM_TOOL_CAP, WinView};
+use maki_lua::{ChatItem, ChatItemStatus, EventHandle, LuaCommandInfo, WARM_TOOL_CAP, WinView};
 use maki_storage::id::{MakiId, SessionRef};
 
 use ratatui::Frame;
@@ -945,6 +945,80 @@ impl MessagesPanel {
             }
         });
         self.sync_buf(tool_id);
+    }
+
+    /// A plugin's own item: it starts running, and its title may track
+    /// progress while it runs. It is not a tool call, so a turn settling or
+    /// an Esc leaves it alone.
+    pub fn plugin_item_start(&mut self, item: &ChatItem) {
+        if let Some(index) = self.plugin_item_index(&item.id) {
+            let Some(msg) = self.messages.get_mut(index) else {
+                return;
+            };
+            if let DisplayRole::PluginItem(role) = &mut msg.role {
+                role.status = ChatItemStatus::Running;
+                role.name = Arc::clone(&item.label);
+            }
+            msg.text = item.title.clone();
+            self.reflow_msg_segment(index);
+            return;
+        }
+        self.flush();
+        let msg = DisplayMessage::new(
+            DisplayRole::PluginItem(Box::new(PluginItemRole {
+                id: item.id.to_string(),
+                status: ChatItemStatus::Running,
+                name: Arc::clone(&item.label),
+            })),
+            item.title.clone(),
+        );
+        self.messages.push(msg);
+    }
+
+    /// Closes a plugin's item. A terminal call for an id the transcript
+    /// never showed creates the item already closed, so a job that finished
+    /// before its running call reached the screen still gets a row.
+    pub fn plugin_item_finish(&mut self, item: &ChatItem) {
+        if self.plugin_item_index(&item.id).is_none() {
+            self.flush();
+            let msg = DisplayMessage::new(
+                DisplayRole::PluginItem(Box::new(PluginItemRole {
+                    id: item.id.to_string(),
+                    status: item.status,
+                    name: Arc::clone(&item.label),
+                })),
+                item.detail.clone().unwrap_or_else(|| item.title.clone()),
+            );
+            self.messages.push(msg);
+            return;
+        }
+        let index = self
+            .plugin_item_index(&item.id)
+            .expect("the item was found");
+        let Some(msg) = self.messages.get_mut(index) else {
+            return;
+        };
+        if let DisplayRole::PluginItem(role) = &mut msg.role {
+            role.status = item.status;
+            role.name = Arc::clone(&item.label);
+        }
+        msg.text = item.detail.clone().unwrap_or_else(|| item.title.clone());
+        self.reflow_msg_segment(index);
+    }
+
+    fn plugin_item_index(&self, id: &str) -> Option<usize> {
+        self.messages
+            .iter()
+            .rposition(|m| matches!(&m.role, DisplayRole::PluginItem(item) if item.id == id))
+    }
+
+    /// Draws a message that changed in place again, so its row shows the new
+    /// text. A message the transcript has not drawn yet needs no redraw: the
+    /// next draw builds it from the message.
+    fn reflow_msg_segment(&mut self, msg_index: usize) {
+        if let Some(seg_idx) = self.cache.find_by_msg_index(msg_index) {
+            self.reflow_text_segment(seg_idx, self.viewport_width);
+        }
     }
 
     pub fn set_tool_movable(&mut self, tool_id: &str, movable: bool) {
@@ -2833,7 +2907,30 @@ fn message_style(role: &DisplayRole) -> RoleStyle {
         DisplayRole::Error => error_style(),
         DisplayRole::Done => done_style(),
         DisplayRole::Notice => notice_style(),
+        DisplayRole::PluginItem(item) => plugin_item_style(item.status),
         DisplayRole::Tool(_) | DisplayRole::ToolGroup(_) => unreachable!(),
+    }
+}
+
+/// A plugin item draws its own row: it is not a tool call, so it must not
+/// look like one.
+fn plugin_item_style(status: ChatItemStatus) -> RoleStyle {
+    let (accent, text_style) = match status {
+        ChatItemStatus::Running => (theme::current().tool_dim, theme::current().tool_dim),
+        ChatItemStatus::Done => (theme::current().tool_success, theme::current().assistant),
+        ChatItemStatus::Failed => (theme::current().tool_error, theme::current().error),
+        ChatItemStatus::Cancelled => (
+            theme::current().todo_cancelled,
+            theme::current().todo_cancelled,
+        ),
+    };
+    RoleStyle {
+        marker: BLANK_MARKER,
+        marker_style: accent,
+        label: "",
+        text_style,
+        use_markdown: false,
+        max_line_bytes: None,
     }
 }
 
@@ -2861,6 +2958,9 @@ fn message_gutter(msg: &DisplayMessage, style: &RoleStyle) -> Option<Span<'stati
 /// collapsed thinking draws its header from the same label, so neither needs
 /// a case of its own.
 fn message_search_text(msg: &DisplayMessage) -> String {
+    if let DisplayRole::PluginItem(item) = &msg.role {
+        return format!("{}{}", item.name, msg.text);
+    }
     let style = message_style(&msg.role);
     let marker = if message_gutter(msg, &style).is_some() {
         style.marker.trim_start()
@@ -2892,6 +2992,19 @@ fn message_view(
     } else {
         width
     };
+    if let DisplayRole::PluginItem(item) = &msg.role {
+        let label = format!("{}  ", item.name);
+        return MessageView {
+            lines: plain_lines(
+                &msg.text,
+                &label,
+                style.text_style,
+                theme::current().tool_dim,
+            ),
+            gutter,
+            collapsed: false,
+        };
+    }
     if matches!(msg.role, DisplayRole::Thinking)
         && let Some(lines) = thinking::collapsed_view(
             thinking::tail_rows(mode, msg.thinking_expanded),

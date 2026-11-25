@@ -1152,17 +1152,11 @@ pub(crate) async fn parse_sse(
     }
 
     for acc in tool_accumulators {
-        let input: Value = match serde_json::from_str(&acc.arguments) {
-            Ok(v) => {
-                debug!(tool = %acc.name, json = %acc.arguments, "tool input JSON");
-                v
-            }
-            Err(e) => {
-                warn!(error = %e, tool = %acc.name, json = %acc.arguments, "malformed tool JSON, falling back to {{}}");
-                Value::Object(Default::default())
-            }
+        let block = match super::parse_tool_input(&acc.name, &acc.arguments) {
+            Ok(input) => ContentBlock::tool_use(acc.call_id, acc.name, input),
+            Err(error) => ContentBlock::invalid_tool_use(acc.call_id, acc.name, error),
         };
-        content_blocks.push(ContentBlock::tool_use(acc.call_id, acc.name, input));
+        content_blocks.push(block);
     }
 
     Ok(StreamResponse {
@@ -2050,7 +2044,7 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"o
     }
 
     #[tokio::test]
-    async fn parse_sse_malformed_tool_json_yields_empty_object() {
+    async fn parse_sse_malformed_tool_json_keeps_the_error_for_dispatch() {
         let sse = "\
 event: response.output_item.added\n\
 data: {\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\
@@ -2064,10 +2058,15 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"ou
 
         let (resp, _) = run_sse(sse).await;
         let resp = resp.unwrap();
-        let tools: Vec<_> = resp.message.tool_uses().collect();
+        let tools: Vec<_> = resp.message.tool_uses_with_input_errors().collect();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].1, "bash");
         assert_eq!(*tools[0].2, Value::Object(Default::default()));
+        assert!(
+            tools[0].3.is_some_and(|e| e.contains("line 1")),
+            "input error: {:?}",
+            tools[0].3
+        );
     }
 
     // llama.cpp's /v1/responses endpoint omits output_index in SSE events

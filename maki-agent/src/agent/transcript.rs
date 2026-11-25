@@ -397,6 +397,7 @@ mod tests {
             name: TOOL_NAME.into(),
             input: json!({ "path": null }),
             thought_signature: Some(SIGNATURE.into()),
+            input_error: None,
         }
     }
 

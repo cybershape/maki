@@ -31,7 +31,7 @@ local WAITING_FMT = "batch is waiting on %s"
 local NOTHING_RUNNING = "batch has no running tool left to move"
 local MOVED_HEADER = "Still running in the background, each reports back as it finishes:"
 local BACKGROUND_PARAM = "background"
-local FOREGROUND_NOTE = "Could not start in the background (%s). Ran in the foreground.\n\n"
+local FOREGROUND_NOTE = "[Could not start in the background (%s). Ran in the foreground.]\n\n"
 local MOVED_ITEM_FMT = "- %s"
 local MOVED_ITEM_HEADER_FMT = ": %s"
 local TASK_ID_FMT = " (task %s)"
@@ -119,7 +119,7 @@ local function normalize_entry(entry)
   end
   local tool = entry.tool
   if type(tool) ~= "string" then
-    return nil, "batch entry missing 'tool'"
+    return nil, "batch entry missing 'tool'. Each entry needs a tool name: { tool = \"read\", parameters = {...} }."
   end
   -- Lua twin of `canonical_tool_name` (streaming.rs): strip GPT's
   -- `functions.` prefix so headers and the nested-batch guard match.

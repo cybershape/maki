@@ -30,7 +30,7 @@ local FALLBACK_TAIL_LINES = 2000
 local FALLBACK_TAIL_BYTES = 50 * 1024
 local LOG_MAX_BYTES = 32 * 1024 * 1024
 local LOG_MAX_BYTES_CEILING = 1024 * 1024 * 1024
-local FOREGROUND_NOTE = "Could not start in the background (%s). Ran in the foreground."
+local FOREGROUND_NOTE = "[Could not start in the background (%s). Ran in the foreground.]"
 local EARLIER_IN_LOG = "[%d earlier lines are in the full output log]"
 local EARLIER_ROTATED = "[%d earlier lines are in the full output log or %s; the oldest may be gone]"
 local EARLIER_DROPPED = "[%d earlier lines dropped]"
@@ -90,8 +90,8 @@ local FLAG_PATTERN = "%s(%-%-?%w[%w%-]*)"
 local SHORT_FLAGS_PATTERN = "^%-(%w+)$"
 local WRITES_FILE_PATTERN = ">>?%s*[^&%s]"
 local DEV_NULL = "/dev/null"
-local FILE_TOOL_NOTE_HEAD = "Use dedicated tools for files, not bash: "
-local FILE_TOOL_NOTE = FILE_TOOL_NOTE_HEAD .. "%s."
+local FILE_TOOL_NOTE_HEAD = "[Use dedicated tools for files, not bash: "
+local FILE_TOOL_NOTE = FILE_TOOL_NOTE_HEAD .. "%s.]"
 local FILE_TOOL_ITEM = "the %s tool instead of %s"
 
 local rtk_available
