@@ -657,6 +657,12 @@ pub fn question_children(
     }
 }
 
+/// Whether clicking a child row can show anything: its own detail, or a batch
+/// parent whose output sections the click handler splits per child.
+pub fn child_has_detail(parent: &GroupToolEntry, child: &GroupToolEntry) -> bool {
+    child.detail.is_some() || parent.name.as_ref() == BATCH_TOOL
+}
+
 pub fn compact_icon_columns(line: &Line<'_>) -> Option<Range<u16>> {
     if line.spans.len() >= 2 {
         let rail_w = line.spans[0].width() as u16;
@@ -683,6 +689,11 @@ struct ToolHover {
     child: Option<usize>,
 }
 
+struct RowHover {
+    hovered: bool,
+    openable: bool,
+}
+
 fn push_tool_rows(
     lines: &mut Vec<Line<'static>>,
     spinner_lines: &mut Vec<(usize, usize)>,
@@ -699,7 +710,10 @@ fn push_tool_rows(
         width,
         spinner_lines,
         lines.len(),
-        hover.parent,
+        RowHover {
+            hovered: hover.parent,
+            openable: true,
+        },
     ));
     let parent_rail = match rail {
         RAIL_LAST => CHILD_INDENT,
@@ -712,7 +726,6 @@ fn push_tool_rows(
             CHILD_RAIL_CONTINUE
         };
         let child_rail = format!("{parent_rail}{branch}");
-        let is_child_hovered = hover.child == Some(idx);
         lines.push(render_tool_row(
             &child_rail,
             child,
@@ -720,7 +733,10 @@ fn push_tool_rows(
             width,
             spinner_lines,
             lines.len(),
-            is_child_hovered,
+            RowHover {
+                hovered: hover.child == Some(idx),
+                openable: child_has_detail(tool, child),
+            },
         ));
     }
 }
@@ -732,11 +748,12 @@ fn render_tool_row(
     width: u16,
     spinner_lines: &mut Vec<(usize, usize)>,
     line_idx: usize,
-    is_hovered: bool,
+    hover: RowHover,
 ) -> Line<'static> {
     let theme = theme::current();
     let is_in_progress = tool.status == ToolStatus::InProgress;
-    let (icon, icon_style) = if is_hovered {
+    let show_open = hover.hovered && hover.openable;
+    let (icon, icon_style) = if show_open {
         let style = if tool.status == ToolStatus::Error {
             theme.tool_error
         } else {
@@ -759,19 +776,19 @@ fn render_tool_row(
         span_idx += 1;
     }
 
-    if is_in_progress && !is_hovered {
+    if is_in_progress && !show_open {
         spinner_lines.push((line_idx, span_idx));
     }
     let icon_width = icon.width();
     spans.push(Span::styled(icon, icon_style));
 
     let mut name_style = theme.tool.add_modifier(Modifier::BOLD);
-    if is_hovered {
+    if show_open {
         name_style = name_style.add_modifier(Modifier::UNDERLINED);
     }
     spans.push(Span::styled(tool.name.to_string(), name_style));
 
-    let right_str = if is_in_progress || is_hovered {
+    let right_str = if is_in_progress || hover.hovered {
         tool.duration
             .or_else(|| tool.started_at.map(|st| st.elapsed()))
             .map(|d| format!("({})", format_tool_duration(d)))
@@ -1070,6 +1087,31 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
     use test_case::test_case;
+
+    #[test_case(CODE_EXECUTION_TOOL, false, false; "code_execution_child_without_detail")]
+    #[test_case(BATCH_TOOL, false, true; "batch_child_splits_parent_output")]
+    #[test_case(CODE_EXECUTION_TOOL, true, true; "child_with_own_detail")]
+    fn child_has_detail_matrix(parent_name: &str, own_detail: bool, expected: bool) {
+        let mut child = GroupToolEntry {
+            id: String::new(),
+            name: Arc::from("read"),
+            summary: "src/main.rs".into(),
+            raw_input: None,
+            children: Vec::new(),
+            status: ToolStatus::Success,
+            receiving_args: false,
+            started_at: None,
+            duration: None,
+            detail: None,
+        };
+        if own_detail {
+            child.detail = Some(CompactDetail::default());
+        }
+        let mut parent = child.clone();
+        parent.name = Arc::from(parent_name);
+        parent.detail = None;
+        assert_eq!(child_has_detail(&parent, &child), expected);
+    }
 
     #[test_case(ToolStatus::Success; "success_uses_accent")]
     #[test_case(ToolStatus::Error; "error_uses_tool_error")]

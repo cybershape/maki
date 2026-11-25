@@ -4654,6 +4654,60 @@ fn compact_batch_child_click_names_the_child() {
 }
 
 #[test]
+fn compact_code_execution_child_hovers_duration_but_cannot_open() {
+    const TOOL_ID: &str = "ce-1";
+    const CHILD_DURATION_TEXT: &str = "(120ms)";
+    let mut panel = compact_panel();
+    let mut start_ev = start(TOOL_ID, "code_execution");
+    start_ev.raw_input = Some(serde_json::json!({ "code": "await read({ path: 'src/main.rs' })" }));
+    panel.tool_start(start_ev);
+    panel.tool_done(ToolDoneEvent {
+        tool: "code_execution".into(),
+        output: Arc::new(ToolOutput::Plain(maki_agent::TextOutput {
+            text: "out".into(),
+            instructions: None,
+            state: Some(serde_json::json!({
+                "calls": [{
+                    "tool": "read",
+                    "params": { "path": "src/main.rs" },
+                    "status": "success",
+                    "duration_ms": 120
+                }]
+            })),
+            loaded_tools: Vec::new(),
+            duration_ms: None,
+        })),
+        ..done(TOOL_ID)
+    });
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    let child = panel.compact_target_at(2, view_area()).expect("child row");
+    assert_eq!(child.child, Some(0));
+    let seg_idx = panel.cache.find_by_tool_id(&child.group_id).unwrap();
+    assert!(panel.set_hovered_compact(Some(child.clone())));
+    let hovered_row = panel.cache.get(seg_idx).unwrap().lines()[2].clone();
+    assert!(hovered_row.to_string().ends_with(CHILD_DURATION_TEXT));
+    assert_eq!(hovered_row.spans[1].content, "✓ ");
+    assert!(
+        !hovered_row.spans[2]
+            .style
+            .add_modifier
+            .contains(Modifier::UNDERLINED)
+    );
+    assert_ne!(
+        panel.handle_click(2, 6, view_area()),
+        ClickOutcome::OpenCompact(child)
+    );
+
+    let parent = panel.compact_target_at(1, view_area()).expect("parent row");
+    assert_eq!(parent.child, None);
+    assert_eq!(
+        panel.handle_click(1, 3, view_area()),
+        ClickOutcome::OpenCompact(parent)
+    );
+}
+
+#[test]
 fn hovering_compact_row_switches_icon_to_open_symbol_and_reverts() {
     let mut panel = compact_panel();
     let mut start_ev = start("call-1", BASH_TOOL_NAME);

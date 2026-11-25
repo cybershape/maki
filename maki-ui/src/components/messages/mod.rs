@@ -1505,13 +1505,7 @@ impl MessagesPanel {
         }
         let seg = self.cache.get(pos.seg)?;
         let group_id = seg.tool_id.as_deref()?;
-        let msg = self
-            .messages
-            .iter()
-            .rfind(|m| matches!(&m.role, DisplayRole::ToolGroup(g) if g.id == group_id))?;
-        let DisplayRole::ToolGroup(group) = &msg.role else {
-            return None;
-        };
+        let group = self.group_by_id(group_id)?;
         let line = seg.source_line_at(pos.row, self.viewport_width)?;
         if line == 0 {
             return None;
@@ -1539,10 +1533,31 @@ impl MessagesPanel {
         None
     }
 
+    fn group_by_id(&self, group_id: &str) -> Option<&ToolGroupRole> {
+        let msg = self
+            .messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::ToolGroup(g) if g.id == group_id))?;
+        match &msg.role {
+            DisplayRole::ToolGroup(group) => Some(group),
+            _ => None,
+        }
+    }
+
     /// The compact target if the click column lands on that row's status icon,
     /// or on the tool name when the row is hovered.
     pub fn compact_icon_at(&self, row: u16, col: u16, area: Rect) -> Option<CompactTarget> {
         let target = self.compact_target_at(row, area)?;
+        if let Some(child_idx) = target.child {
+            let group = self.group_by_id(&target.group_id)?;
+            let GroupEntry::Tool(tool) = group.entries.get(target.entry)? else {
+                return None;
+            };
+            let child = tool.children.get(child_idx)?;
+            if !tool_group::child_has_detail(tool, child) {
+                return None;
+            }
+        }
         let pos = self
             .layout()
             .advance(self.scroll, u32::from(row.saturating_sub(area.y)));
