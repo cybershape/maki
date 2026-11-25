@@ -38,11 +38,17 @@ local GATHER_HINT = "\n\nHint: `gather(...)` keeps the other results, returning 
 local EXCEPTION_LINE = "\n(%S[^\n]*)"
 local TOOLS_MODULE_HINT = "\n\nHint: tools are globals, call them directly. There is no `tools` module."
 local ASYNCIO_HINT = "\n\nHint: asyncio here has only `gather`, `run` and `sleep`."
+local COMPOUND_STMT_HINT =
+  "\n\nHint: In Python, compound statements (`for`, `if`, `while`, `def`, `try`, `with`) cannot follow another statement on the same line after a semicolon (`;`). Write standard multi-line Python with newlines and proper indentation:\n\n# Put each statement on its own line:\nx = await gather(...)\nfor item in x:\n    print(item)"
+local POSITIONAL_ARG_HINT =
+  "\n\nHint: All tool arguments in the sandbox must use keywords. Never place a positional argument after a keyword argument, e.g. use `read(path='...', offset=1, limit=10)`."
 local ERROR_HINTS = {
   { "^ModuleNotFoundError: No module named 'tools'", TOOLS_MODULE_HINT },
   { "^NameError: name 'tools' is not defined", TOOLS_MODULE_HINT },
   { "^AttributeError: module 'asyncio' has no attribute", ASYNCIO_HINT },
   { "^ImportError: cannot import name '[^']*' from 'asyncio'", ASYNCIO_HINT },
+  { "^SyntaxError: Compound statements are not allowed on the same line as simple statements", COMPOUND_STMT_HINT },
+  { "^SyntaxError: Positional argument cannot follow keyword argument", POSITIONAL_ARG_HINT },
 }
 -- `asyncio.gather` cancels its siblings the moment one call raises, throwing away
 -- results the model already paid for, so `gather` awaits each call in its own
