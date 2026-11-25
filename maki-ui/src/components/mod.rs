@@ -40,7 +40,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
 use maki_agent::{BufferSnapshot, TaskEnd, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent};
 use maki_lua::{PackCommand, PackPlan};
-use maki_providers::{ImageSource, Message, ModelTier};
+use maki_providers::{ImageSource, Message};
 use ratatui::Frame;
 use ratatui::buffer::{Buffer, CellWidth};
 use ratatui::layout::{Position, Rect};
@@ -327,8 +327,10 @@ pub enum Action {
     RefreshProvider {
         slug: String,
     },
-    AssignTier(String, ModelTier),
-    UnassignTier(String, ModelTier),
+    AssignCompaction(String),
+    UnassignCompaction(String),
+    /// A combo was created, removed, or its effort changed in the picker.
+    CombosChanged,
     RefreshModels,
     RefreshUsage,
     Compact(Option<String>),
@@ -752,7 +754,7 @@ pub(crate) fn test_model() -> maki_providers::Model {
         id: "test-model".into(),
         name: None,
         provider: std::sync::Arc::<str>::from("responses"),
-        tier: maki_providers::ModelTier::Medium,
+        combo: None,
         family: maki_providers::ModelFamily::Gpt,
         supports_tool_examples_override: None,
         thinking_override: None,

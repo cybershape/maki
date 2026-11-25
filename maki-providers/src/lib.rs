@@ -25,7 +25,7 @@ pub use error::{AgentError, Overflow};
 pub use maki_storage::sessions::add_cost;
 pub use model::{
     FactSource, FactSources, FastPricing, FastSupport, Model, ModelEntry, ModelError, ModelFamily,
-    ModelInfo, ModelPricing, ModelTier, ThinkingOption, ThinkingSupport, TokenUsage, format_tokens,
+    ModelInfo, ModelPricing, ThinkingOption, ThinkingSupport, TokenUsage, format_tokens,
 };
 pub use pricing::{model_cost, settle_session};
 pub use providers::custom;

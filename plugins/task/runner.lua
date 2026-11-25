@@ -22,7 +22,7 @@ local NUDGE_MISSING =
   "You did not call the structured_output tool. Call it now with your final result matching its input schema."
 local NUDGE_SUMMARY =
   "You finished your work but did not provide a summary. Reply with a concise summary of what you did and found."
-local ASSIGNED_MODEL_CONTEXT = "model `%s`, assigned to the %s tier: "
+local COMBO_MODEL_CONTEXT = "model `%s`, the subagent model of the current combo: "
 local INVALID_INPUT_PREFIX =
   "Input does not match the required schema. Fix the errors and call structured_output again:\n"
 
@@ -57,10 +57,6 @@ local schema = {
       type = "string",
       description = 'Subagent type: "research" (read-only, default) or "general" (can modify files)',
     },
-    model_tier = {
-      type = "string",
-      description = 'Model tier (optional, omit to use current model, capped at current tier):\n- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.\n- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.\n- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits.',
-    },
     thinking = {
       description = "Thinking: off|adaptive|minimal|low|medium|high|xhigh|max|int budget. Omit to inherit parent; capped at parent.",
     },
@@ -76,7 +72,7 @@ local schema = {
 if opts.allow_model then
   schema.properties.model = {
     type = "string",
-    description = 'Exact model spec (e.g. "proxy/codex/gpt-6.2-sol") or partial model name (e.g. "sol"). If multiple models match, an error lists the options so you can ask the user. Overrides model_tier.',
+    description = 'Exact model spec (e.g. "proxy/codex/gpt-6.2-sol") or partial model name (e.g. "sol"). If multiple models match, an error lists the options so you can ask the user. Overrides the combo default.',
   }
 end
 
@@ -135,13 +131,17 @@ function Runner.prepare(input, ctx)
     end
   end
 
+  local explicit_spec = opts.allow_model and input.model or nil
   local model, model_err = maki.agent.resolve_model(ctx, {
-    tier = input.model_tier,
-    spec = opts.allow_model and input.model or nil,
+    spec = explicit_spec,
   })
   if model_err then
     return nil, model_err
   end
+  -- A combo effort is the user's pick on the combo, so it outranks the
+  -- parent's thinking cap; an explicit spec or thinking input stays capped.
+  local combo_thinking = not explicit_spec and model.combo and model.thinking or nil
+  local thinking = input.thinking or combo_thinking
 
   local audience = subagent_type == "research" and "research_sub" or "general_sub"
   local prompt_id = subagent_type == "research" and "research" or "general"
@@ -192,14 +192,14 @@ function Runner.prepare(input, ctx)
       audience = audience,
       mcp = true,
       name = input.description,
-      thinking = input.thinking,
+      thinking = thinking,
+      thinking_unclamped = not input.thinking and combo_thinking ~= nil,
     },
     message = input.prompt .. (validator and STRUCTURED_OUTPUT_PROMPT_SUFFIX or ""),
     capture = capture,
-    -- The user may have made the assignment long ago and logged out of its
+    -- The user may have built the combo long ago and logged out of its
     -- provider since. Naming it turns a bare 401 into something they can fix.
-    error_context = model.assigned_tier and string.format(ASSIGNED_MODEL_CONTEXT, model.spec, model.assigned_tier)
-      or "",
+    error_context = model.combo and string.format(COMBO_MODEL_CONTEXT, model.spec) or "",
   }
 end
 

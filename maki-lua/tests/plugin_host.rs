@@ -1155,10 +1155,10 @@ fn agent_api_value_failures_return_err_pairs() {
     assert_eq!(out, "prompt_err tools_err model_err");
 }
 
-/// `spec` must win over `tier` when both are given, proving the task plugin's
-/// `model` field (forwarded as `spec`) takes precedence over `model_tier`.
+/// An explicit `spec` resolves directly, proving the task plugin's `model`
+/// field (forwarded as `spec`) takes precedence over the combo default.
 #[test]
-fn resolve_model_spec_takes_precedence_over_tier() {
+fn resolve_model_spec_resolves_directly() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
@@ -1169,7 +1169,6 @@ fn resolve_model_spec_takes_precedence_over_tier() {
             audiences = {{ "main" }},
             handler = function(input, ctx)
                 local m, err = maki.agent.resolve_model(ctx, {{
-                    tier = "weak",
                     spec = "responses/claude-opus-4-8",
                 }})
                 if err then return "err:" .. err end
@@ -1181,7 +1180,7 @@ fn resolve_model_spec_takes_precedence_over_tier() {
     let out = exec_tool(&reg, "spec_precedence_probe", serde_json::json!({})).unwrap();
     assert_eq!(
         out, "responses/claude-opus-4-8",
-        "spec must override tier when both are set"
+        "spec must resolve to the exact model"
     );
 }
 

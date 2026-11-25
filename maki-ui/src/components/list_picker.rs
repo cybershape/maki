@@ -21,7 +21,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const NO_MATCHES: &str = "No matches";
 const ERROR_LABEL: &str = "Error: ";
 const MIN_WIDTH_PERCENT: u16 = 65;
-/// Fits a long model id next to its tier and price columns.
+/// Fits a long model id next to its price column.
 const MIN_WIDTH_COLS: u16 = 72;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 const SEARCH_ROW: u16 = 1;
@@ -92,7 +92,7 @@ struct State<T> {
     inner_area: Rect,
     enabled: Option<Vec<bool>>,
     matcher: Matcher,
-    notice: Option<&'static str>,
+    notice: Option<String>,
 }
 
 impl<T: PickerItem> State<T> {
@@ -320,9 +320,9 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     /// A dim line under the list, for state that is not an item.
-    pub fn set_notice(&mut self, notice: Option<&'static str>) {
+    pub fn set_notice(&mut self, notice: Option<impl Into<String>>) {
         if let Some(s) = self.state.as_mut() {
-            s.notice = notice;
+            s.notice = notice.map(Into::into);
         }
     }
 
@@ -553,7 +553,8 @@ fn render_ready<T: PickerItem>(
     footer: Hints,
     error_text: Option<&str>,
 ) -> (Rect, Option<Position>) {
-    let notice = s.notice;
+    let notice = s.notice.clone();
+    let notice = notice.as_deref();
     let content_rows = if s.filtered.is_empty() {
         1
     } else {

@@ -1,15 +1,15 @@
 use std::collections::HashSet;
 
-use crate::model::{ModelEntry, ModelTier};
+use crate::model::ModelEntry;
 
 const NO_PREFIXES: &str = "no prefixes";
 const DUPLICATE_PREFIX: &str = "duplicate prefix";
-const DUPLICATE_DEFAULT: &str = "second default for tier";
+const DUPLICATE_DEFAULT: &str = "second default row";
 const OUTPUT_EXCEEDS_WINDOW: &str = "exceeds context_window";
 
 pub(crate) fn check_rows(rows: &[ModelEntry]) -> Result<(), String> {
     let mut prefixes_seen: HashSet<&str> = HashSet::new();
-    let mut defaults_seen: Vec<ModelTier> = Vec::new();
+    let mut default_seen = false;
 
     for (index, row) in rows.iter().enumerate() {
         let Some(name) = row.prefixes.first() else {
@@ -31,10 +31,10 @@ pub(crate) fn check_rows(rows: &[ModelEntry]) -> Result<(), String> {
             ));
         }
         if row.default {
-            if defaults_seen.contains(&row.tier) {
-                return Err(format!("{at}: {DUPLICATE_DEFAULT} {:?}", row.tier));
+            if default_seen {
+                return Err(format!("{at}: {DUPLICATE_DEFAULT}"));
             }
-            defaults_seen.push(row.tier);
+            default_seen = true;
         }
     }
     Ok(())
@@ -46,14 +46,12 @@ mod tests {
 
     fn test_entry(
         prefixes: Vec<&str>,
-        tier: ModelTier,
         default: bool,
         context_window: Option<u32>,
         max_output: Option<u32>,
     ) -> ModelEntry {
         ModelEntry {
             prefixes: prefixes.into_iter().map(String::from).collect(),
-            tier,
             default,
             context_window,
             max_output_tokens: max_output,
@@ -63,21 +61,15 @@ mod tests {
 
     #[test]
     fn check_rows_rejects_empty_prefixes() {
-        let rows = vec![test_entry(
-            vec![],
-            ModelTier::Strong,
-            true,
-            Some(1000),
-            None,
-        )];
+        let rows = vec![test_entry(vec![], true, Some(1000), None)];
         assert!(check_rows(&rows).unwrap_err().contains(NO_PREFIXES));
     }
 
     #[test]
     fn check_rows_rejects_duplicate_prefixes() {
         let rows = vec![
-            test_entry(vec!["a"], ModelTier::Strong, true, Some(1000), None),
-            test_entry(vec!["a"], ModelTier::Medium, false, Some(1000), None),
+            test_entry(vec!["a"], true, Some(1000), None),
+            test_entry(vec!["a"], false, Some(1000), None),
         ];
         assert!(check_rows(&rows).unwrap_err().contains(DUPLICATE_PREFIX));
     }
@@ -85,21 +77,15 @@ mod tests {
     #[test]
     fn check_rows_rejects_duplicate_defaults() {
         let rows = vec![
-            test_entry(vec!["a"], ModelTier::Strong, true, Some(1000), None),
-            test_entry(vec!["b"], ModelTier::Strong, true, Some(1000), None),
+            test_entry(vec!["a"], true, Some(1000), None),
+            test_entry(vec!["b"], true, Some(1000), None),
         ];
         assert!(check_rows(&rows).unwrap_err().contains(DUPLICATE_DEFAULT));
     }
 
     #[test]
     fn check_rows_rejects_output_exceeding_window() {
-        let rows = vec![test_entry(
-            vec!["a"],
-            ModelTier::Strong,
-            true,
-            Some(1000),
-            Some(2000),
-        )];
+        let rows = vec![test_entry(vec!["a"], true, Some(1000), Some(2000))];
         assert!(
             check_rows(&rows)
                 .unwrap_err()

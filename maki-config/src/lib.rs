@@ -37,6 +37,7 @@ pub const UNTRUSTED_PROJECT_WRITE: &str =
 /// the last write dropping the others.
 static PERMISSION_WRITE: Mutex<()> = Mutex::new(());
 
+pub mod combo;
 pub mod project;
 pub use project::{GatedFile, ProjectConfig, policy_grant};
 
@@ -1907,6 +1908,9 @@ impl ModelPolicy {
     }
 
     pub fn allows(&self, spec: &str) -> bool {
+        if let Some(parts) = combo::split(spec) {
+            return self.allows(parts.main) && self.allows(parts.sub);
+        }
         (!self.has_allowed_models || self.allowed.is_match(spec)) && !self.excluded.is_match(spec)
     }
 }

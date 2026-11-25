@@ -380,11 +380,14 @@ pub const KEYBINDS: &[Keybind] = &[
     ),
     single("Enter", "Remove item", Ctx::QueueFocus),
     single("Tab", "Complete command", Ctx::CommandPalette),
+    single("$", "Assign the compaction model", Ctx::ModelPicker),
     single(
-        "!/@/#/$",
-        "Set tier (strong/medium/weak/compaction)",
+        "+",
+        "Start a combo (main model), Enter on another to finish",
         Ctx::ModelPicker,
     ),
+    single("-", "Delete the combo under the cursor", Ctx::ModelPicker),
+    single("^", "Cycle the combo's subagent effort", Ctx::ModelPicker),
     single("%", "Fold or unfold provider", Ctx::ModelPicker),
     single("*", "Fold or unfold all providers", Ctx::ModelPicker),
 ];

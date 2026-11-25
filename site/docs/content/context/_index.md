@@ -203,7 +203,7 @@ Plugins can add their own entries to the popup, such as issues after `#` or peop
 
 ## When the window fills
 
-Long sessions eventually approach the model's context limit. Maki reserves a slice of the window (`agent.compaction_buffer`, default 20%) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/compact keep the repro steps` steers that one summary, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers every summary. The [compaction tier](/docs/providers/) model writes the summary when one is set. If the summary comes back empty twice, the session stays as it was.
+Long sessions eventually approach the model's context limit. Maki reserves a slice of the window (`agent.compaction_buffer`, default 20%) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/compact keep the repro steps` steers that one summary, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers every summary. The [compaction pick](/docs/providers/) writes the summary when one is set. If the summary comes back empty twice, the session stays as it was.
 
 Compaction replaces the older turns in the session's on-disk log with the summary. The dropped turns are not lost: before the rewrite, Maki parks the previous log at `sessions/archive/<session-id>/<n>.jsonl` in the [state directory](/docs/configuration/#directory-layout). It holds the dropped turns with their subagent transcripts and tool output, which the live session no longer keeps. Archives stay until you delete the session. The highest number is the newest.
 

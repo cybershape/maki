@@ -2,11 +2,9 @@
 //! request options, so most calls round-trip to it; `info` resolves
 //! locally and works without a UI.
 
-use std::fmt::Display;
-
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::provider::adjust_model;
-use maki_providers::{Model, ModelTier, Timeouts, model_registry};
+use maki_providers::{Model, Timeouts};
 use mlua::{Error as LuaError, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -16,12 +14,8 @@ use crate::api::util::pair::{Pair, err_pair};
 use crate::plugin_permissions::PluginPermissions;
 
 const SET_ARG_ERR: &str = "expected a model spec string or an options table";
-
-/// Shared with `maki.agent.resolve_model`, so a tier assignment that no longer
-/// resolves reads the same wherever it surfaces.
-pub(crate) fn stale_tier_err(tier: ModelTier, spec: &str, cause: impl Display) -> String {
-    format!("tier {tier} points at {spec}: {cause}")
-}
+const COMPACTION_SPEC: &str = "compaction";
+const UNKNOWN_PICK_ERR: &str = "unknown model pick (expected: compaction)";
 
 async fn roundtrip(
     lua: Lua,
@@ -41,7 +35,6 @@ fn model_info_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
     tbl.set("id", model.id.clone())?;
     tbl.set("provider", model.provider.to_string())?;
     tbl.set("provider_display", model.provider_display_name())?;
-    tbl.set("tier", model.tier.to_string())?;
     tbl.set("family", lua.to_value(&model.family)?)?;
     tbl.set("context_window", model.context_window)?;
     if let Some(max) = model.max_output_tokens {
@@ -85,7 +78,7 @@ fn model_info_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
     Ok(tbl)
 }
 
-/// Resolve a model spec to everything maki knows about it: identity, tier,
+/// Resolve a model spec to everything maki knows about it: identity,
 /// limits, capabilities, and the price table the session would be billed by --
 /// including rates resolved from provider config or the bundled catalog
 /// (e.g. subsidised custom providers), which the provider's own /v1/models
@@ -95,7 +88,7 @@ fn model_info_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
 ///
 /// @param spec string `"provider/id"`, as listed by `available()`.
 /// @return (table|nil, string|nil) `{spec, id, provider, provider_display,
-///   tier, family, subsidised_by?, context_window, max_output_tokens?, free?,
+///   family, subsidised_by?, context_window, max_output_tokens?, free?,
 ///   supports_thinking, supports_vision, pricing?, sources}`, or nil and an
 ///   error.
 ///
@@ -135,48 +128,37 @@ fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
     }
 }
 
-/// The model maki uses for a tier, the same one a subagent asking for that
-/// tier gets. The first match wins:
-///
-/// 1. The user's pick for that tier in the `/model` picker, from any provider.
-/// 2. The tier default within `provider`, curated or set in `providers.toml`.
-/// 3. The tier default of any provider.
-///
-/// `assigned` tells a pick apart from a default. Pass `provider` the way
-/// subagents pass the session's provider.
+/// The user's pick for a named model slot. The only slot is `"compaction"`:
+/// the cheap model that rewrites history, assigned with `$` in the `/model`
+/// picker.
 ///
 /// Resolving a models.dev model can wait for that catalog to download, so
 /// like `get`, this cannot run in a callback that must not yield.
 ///
-/// @param name string `"weak"`, `"medium"`, `"strong"`, or `"compaction"`.
-/// @param provider string|nil Provider slug to resolve within first.
-/// @return (table|nil, string|nil) The model in the shape `info` returns, plus
-///   `assigned` (boolean), true when you picked it for this tier. nil and nil
-///   when no model fits the tier, nil and an error when the spec no longer
-///   resolves.
+/// @param name string `"compaction"`.
+/// @return (table|nil, string|nil) The model in the shape `info` returns.
+///   nil and nil when nothing is assigned, nil and an error when the name is
+///   unknown or the spec no longer resolves.
 /// @example
-/// local m = maki.model.tier("weak", maki.model.get().provider)
-/// if m then maki.model.set(m.spec) end
+/// local m = maki.model.pick("compaction")
+/// if m then print(m.spec) end
 #[lua_fn]
-async fn tier(lua: Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Table>> {
-    let tier: ModelTier = match name.parse() {
-        Ok(tier) => tier,
-        Err(e) => return Ok(err_pair(e)),
-    };
-    let spec = match model_registry::resolve_tier(provider.as_deref(), tier) {
-        Some(spec) => spec,
-        None => return Ok((None, None)),
+async fn pick(lua: Lua, name: String) -> LuaResult<Pair<Table>> {
+    if name != COMPACTION_SPEC {
+        return Ok(err_pair(UNKNOWN_PICK_ERR));
+    }
+    let Some(spec) = maki_providers::model_registry::compaction() else {
+        return Ok((None, None));
     };
     let model = match Model::from_spec_or_warm_catalog(&spec).await {
         Ok(model) => model,
-        Err(e) => return Ok(err_pair(stale_tier_err(tier, &spec, e))),
+        Err(e) => {
+            return Ok(err_pair(format!(
+                "the compaction pick points at {spec}: {e}"
+            )));
+        }
     };
-    let tbl = model_info_table(&lua, &model)?;
-    tbl.set(
-        "assigned",
-        model_registry::override_tiers(&spec).contains(&tier),
-    )?;
-    Ok((Some(tbl), None))
+    Ok((Some(model_info_table(&lua, &model)?), None))
 }
 
 /// Reads the focused session's model, thinking level, and fast mode.
@@ -280,7 +262,7 @@ lua_table! {
         tx: Option<UnboundedSender<UiAction>>,
         perms: &PluginPermissions,
     ),
-    DOCS [get(tx), available(tx), set(perms, tx), tier(), info()]
+    DOCS [get(tx), available(tx), set(perms, tx), pick(), info()]
 }
 
 #[cfg(test)]
@@ -299,15 +281,14 @@ mod tests {
     const UI_FAILURE: &str = "Model is not allowed by policy: responses/claude-opus-4-6";
 
     /// Assignments live in a process-global registry, so a test that needs one
-    /// writes it and hands back the pair used to clear it afterwards. `unset`
-    /// only removes a matching spec, hence the spec is returned with the tier.
-    fn assign_tier(spec: &str, tier: ModelTier) -> (Lua, ModelTier, String) {
-        model_registry::set(spec.into(), tier);
-        (lua_with_model(None), tier, spec.into())
+    /// writes it and hands back the spec used to clear it afterwards.
+    fn assign_compaction(spec: &str) -> (Lua, String) {
+        model_registry::set_compaction(spec.into());
+        (lua_with_model(None), spec.into())
     }
 
-    fn clear_tier(tier: ModelTier, spec: String) {
-        model_registry::unset(&spec, tier);
+    fn clear_compaction(spec: String) {
+        model_registry::unset_compaction(&spec);
     }
 
     fn lua_with_model(tx: Option<UnboundedSender<UiAction>>) -> Lua {
@@ -418,32 +399,30 @@ mod tests {
         assert_eq!(val["free"], Json::Null);
     }
 
-    /// `tier` answers the assigned model in the same shape `info` does, so a
+    /// `pick` answers the assigned model in the same shape `info` does, so a
     /// plugin can hand the spec straight to `set`.
     #[tokio::test]
-    async fn tier_returns_the_assigned_model() {
-        let (lua, tier, spec) = assign_tier(SPEC, ModelTier::Strong);
-        let (val, err) = eval(&lua, "return model.tier('strong')").await;
-        clear_tier(tier, spec);
+    async fn pick_returns_the_assigned_compaction_model() {
+        let (lua, spec) = assign_compaction(SPEC);
+        let (val, err) = eval(&lua, "return model.pick('compaction')").await;
+        clear_compaction(spec);
         assert_eq!(err, None);
         assert_eq!(val["spec"], json!(SPEC));
-        assert_eq!(val["tier"], json!("strong"));
-        assert_eq!(val["assigned"], json!(true));
     }
 
     #[tokio::test]
-    async fn tier_with_nothing_to_resolve_answers_nil() {
-        let (val, err) = eval(&lua_with_model(None), "return model.tier('compaction')").await;
+    async fn pick_with_nothing_assigned_answers_nil() {
+        let (val, err) = eval(&lua_with_model(None), "return model.pick('compaction')").await;
         assert_eq!((val, err), (Json::Null, None));
     }
 
     /// A name maki does not know reports through the error slot, the same way
     /// `set` reports a spec it cannot parse.
     #[tokio::test]
-    async fn tier_with_an_unknown_name_returns_an_error_pair() {
-        let (val, err) = eval(&lua_with_model(None), "return model.tier('turbo')").await;
+    async fn pick_with_an_unknown_name_returns_an_error_pair() {
+        let (val, err) = eval(&lua_with_model(None), "return model.pick('turbo')").await;
         assert_eq!(val, Json::Null);
-        assert!(err.is_some());
+        assert_eq!(err.as_deref(), Some(UNKNOWN_PICK_ERR));
     }
 
     /// An assignment left over from a provider that is gone is an error, not a
@@ -451,10 +430,10 @@ mod tests {
     /// The spec has no provider slug, so it fails before the catalog is
     /// fetched and the test stays off the network.
     #[tokio::test]
-    async fn tier_with_a_stale_assignment_returns_an_error_pair() {
-        let (lua, tier, spec) = assign_tier("removed-model", ModelTier::Weak);
-        let (val, err) = eval(&lua, "return model.tier('weak')").await;
-        clear_tier(tier, spec);
+    async fn pick_with_a_stale_assignment_returns_an_error_pair() {
+        let (lua, spec) = assign_compaction("removed-model");
+        let (val, err) = eval(&lua, "return model.pick('compaction')").await;
+        clear_compaction(spec);
         assert_eq!(val, Json::Null);
         assert!(err.is_some());
     }

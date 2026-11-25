@@ -785,10 +785,11 @@ fn usage_value(usage: &maki_providers::ProviderUsage) -> Result<Value, String> {
 ///   `family` (string) `"generic"`, `"claude"`, `"gpt"`, `"gemini"`,
 ///           `"glm"` or `"synthetic"`. Applies to models without a row.
 ///           Defaults to the provider behind `codec` or `base`.
-///   `accepts_arbitrary_models` (boolean) Assign tiers to `list_models`
-///           results. When false, tiers come only from `models`. This and
-///           the next two default to the `base` provider's, or with a
-///           `codec` to `true`, `16384` and `128000`.
+///   `accepts_arbitrary_models` (boolean) Serve model ids `list_models`
+///           reports even without a row in `models`. When false, only
+///           `models` rows are served. This and the next two default to the
+///           `base` provider's, or with a `codec` to `true`, `16384` and
+///           `128000`.
 ///   `max_output_tokens` (integer|false) Output cap for rows that leave it
 ///           out and models without a row. `false` sends no cap.
 ///   `context_window` (integer) Context window for rows that leave it out
@@ -860,7 +861,7 @@ fn usage_value(usage: &maki_providers::ProviderUsage) -> Result<Value, String> {
 ///            catalogue only known at runtime. Without it, the provider
 ///            lists what its codec or base lists. Rows carry `id`,
 ///            `context_window`, `max_output_tokens`, `pricing`,
-///            `supports_thinking`, `supports_vision` and `tier`, plus three
+///            `supports_thinking` and `supports_vision`, plus three
 ///            optional fields. `extra` is any JSON value, handed back to
 ///            `build_body` as `opts.model_info`. `effort` replaces the
 ///            `openai.thinking` levels and off switch for this model:
@@ -897,7 +898,7 @@ fn usage_value(usage: &maki_providers::ProviderUsage) -> Result<Value, String> {
 ///   codec = "openai",
 ///   base_url = "https://api.acme.com/v1",
 ///   models = {
-///     { prefixes = { "acme-large" }, tier = "strong", context_window = 200000 },
+///     { prefixes = { "acme-large" }, context_window = 200000 },
 ///   },
 ///   auth = function(ctx)
 ///     local creds = maki.provider.auth.get(ctx.slug) or {}
@@ -1178,7 +1179,7 @@ lua_table! {
     ///   codec = "openai",
     ///   base_url = "https://api.acme.com/v1",
     ///   api_key_env = "ACME_API_KEY",
-    ///   models = { { prefixes = { "acme-large" }, tier = "strong" } },
+    ///   models = { { prefixes = { "acme-large" } } },
     /// })
     /// ```
     "maki.provider" => pub(crate) fn create_provider_table(perms: &PluginPermissions, owner: crate::api::Owner, egress: NetEgress, grants: PluginPermissions, tx: Option<UnboundedSender<UiAction>>), DOCS [

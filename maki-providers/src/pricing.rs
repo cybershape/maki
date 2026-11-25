@@ -212,7 +212,7 @@ pub fn model_cost(id: &str, usage: &StoredTokenUsage, current: &Model, fast: boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FactSources, FastPricing, ModelFamily, ModelPricing, ModelTier};
+    use crate::model::{FactSources, FastPricing, ModelFamily, ModelPricing};
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -262,7 +262,7 @@ mod tests {
             id: id.into(),
             name: None,
             provider: Arc::from("responses"),
-            tier: ModelTier::Medium,
+            combo: None,
             family: ModelFamily::Gpt,
             supports_tool_examples_override: None,
             thinking_override: None,

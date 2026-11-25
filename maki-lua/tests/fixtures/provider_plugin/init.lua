@@ -24,7 +24,6 @@ maki.provider.register({
   models = {
     {
       prefixes = { "acme-1", "acme" },
-      tier = "strong",
       context_window = 200000,
       max_output_tokens = 8192,
       supports_thinking = true,
@@ -57,7 +56,7 @@ maki.provider.register({
     end
     local models = {}
     for _, m in ipairs(body.data or {}) do
-      table.insert(models, { id = m.id, context_window = m.context_length, tier = "strong" })
+      table.insert(models, { id = m.id, context_window = m.context_length })
     end
     return models
   end,

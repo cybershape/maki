@@ -158,7 +158,7 @@ async fn cli_stack(
     // First, as in `cmd::tui::run`, so anything that resolves a model sees the
     // models the TUI would.
     let storage = StateDir::resolve().context("resolve data directory")?;
-    maki_providers::model_registry::load(&storage);
+    maki_providers::model_registry::load(&storage).map_err(|e| color_eyre::eyre::eyre!(e))?;
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     // The `trust.paths` policy deliberately stops at the session entry points
     // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the

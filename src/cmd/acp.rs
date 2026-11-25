@@ -63,7 +63,7 @@ pub async fn run(
     let child_env = env::vars_os().collect();
     let relay = env::var_os(maki_acp::RELAYED_ENV).is_none();
     let storage = StateDir::resolve().context("resolve data directory")?;
-    maki_providers::model_registry::load(&storage);
+    maki_providers::model_registry::load(&storage).map_err(|e| color_eyre::eyre::eyre!(e))?;
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     let launch_dir = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());

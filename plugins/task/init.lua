@@ -36,7 +36,6 @@ local examples = {
   {
     description = "Find auth middleware",
     prompt = "Search the codebase for authentication middleware. Return file paths and a summary of how auth is implemented.",
-    model_tier = "weak",
   },
 }
 

@@ -13,7 +13,7 @@ use maki_lua::{
     EventHandle, HintReader, InputEdit, InputRule, InputRulesReader, KeymapReader,
     LuaCommandReader, PatternRule, PluginPermissions, PluginReach, Reveal, SyntaxRule, TextEdit,
 };
-use maki_providers::{Model, ModelTier};
+use maki_providers::Model;
 use maki_storage::StateDir;
 use ratatui::layout::Rect;
 use tokio::sync::mpsc::unbounded_channel;
@@ -53,11 +53,11 @@ const STRONG_CAPTURE: &str = "strong";
 const INSTANT_REVEAL: u64 = 0;
 
 /// No Lua, no MCP and no agent, so the numbers are the UI's own work. The
-/// model is a tier default rather than a named one, so the bench keeps
+/// model is the provider default rather than a named one, so the bench keeps
 /// building after the catalogue drops a model. {storage} should be a scratch
 /// dir, because the fresh session takes a claim in it.
 pub fn app(storage: StateDir) -> App {
-    let model = Model::from_tier(PROVIDER, ModelTier::Medium).expect("provider has a default");
+    let model = Model::from_default(PROVIDER).expect("provider has a default");
     let tab = OpenSession::fresh(&model.spec(), CWD, &storage);
     let writer = Arc::new(StorageWriter::new(storage.clone(), unbounded_channel().0));
     let permissions = Arc::new(PermissionManager::new(

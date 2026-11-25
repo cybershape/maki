@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use maki_agent::tools::ToolRegistry;
 use maki_lua::test_support::runtime;
 use maki_lua::{DiscoveredPackage, Origin, PluginHost, PluginPermissions, Requested};
-use maki_providers::model::{Model, ModelTier};
+use maki_providers::model::Model;
 use maki_providers::provider::Provider;
 use maki_providers::retry::RetryKind;
 use maki_providers::test_support::{
@@ -432,7 +432,6 @@ fn list_models_and_fetch_usage_answer_from_their_hooks() {
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id, MODEL);
     assert_eq!(models[0].context_window, Some(LISTED_WINDOW));
-    assert_eq!(models[0].tier, Some(ModelTier::Strong));
     assert_eq!(models[0].max_output_tokens, None);
     let asked = fixture.server.lock().unwrap();
     assert_eq!(asked.len(), 1);

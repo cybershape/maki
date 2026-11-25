@@ -1719,8 +1719,7 @@ mod tests {
     use super::spec::{UNKNOWN_MODEL_CONTEXT_WINDOW, UNKNOWN_MODEL_MAX_OUTPUT};
     use super::*;
     use crate::ContentBlock;
-    use crate::model::{FactSource, ModelTier};
-    use crate::model_registry;
+    use crate::model::FactSource;
     use crate::retry::RetryKind;
     use crate::test_support::{Canned, isolated_home, serve};
 
@@ -1747,7 +1746,6 @@ mod tests {
     /// Matches [`MODEL_ALIAS`] by prefix and [`MODEL_ID`] more tightly, which
     /// is what makes a lookup prove it took the longest match.
     const MODEL_VARIANT: &str = "plug-1-mini";
-    const MODEL_TIER: ModelTier = ModelTier::Strong;
     const PROVIDER_MAX_OUTPUT: u32 = 32_000;
     const PROVIDER_CONTEXT: u32 = 96_000;
     const ROW_MAX_OUTPUT: u32 = 8_000;
@@ -1770,7 +1768,6 @@ mod tests {
             models: vec![
                 serde_json::from_value(serde_json::json!({
                     "prefixes": [MODEL_ID, MODEL_ALIAS],
-                    "tier": MODEL_TIER,
                 }))
                 .unwrap(),
             ],
@@ -2216,10 +2213,7 @@ mod tests {
         assert_eq!(spec(SLUG).map(|s| s.display_name), Some(DISPLAY_NAME));
         let variant = Model::from_spec(&format!("{SLUG}/{MODEL_VARIANT}")).unwrap();
         assert_eq!(variant.id, MODEL_VARIANT);
-        assert_eq!(
-            Model::from_tier_dynamic(SLUG, MODEL_TIER).unwrap().id,
-            MODEL_ID
-        );
+        assert_eq!(Model::from_default(SLUG).unwrap().id, MODEL_ID);
         assert_eq!(
             auth_providers(),
             [(SLUG.to_string(), DISPLAY_NAME.to_string())]
@@ -2295,13 +2289,13 @@ mod tests {
         assert_eq!(auth.header_list(), [(header.to_string(), value)]);
     }
 
-    /// Tier defaults are looked up through `default`, like in a curated table.
-    /// So a declaration that marks no row still needs one picked per tier, and
-    /// a row the author did mark has to keep it.
-    #[test_case(None, 0 ; "unmarked_tier_defaults_to_its_first_row")]
+    /// The default is looked up through `default`, like in a curated table.
+    /// So a declaration that marks no row still needs one picked, and a row
+    /// the author did mark has to keep it.
+    #[test_case(None, 0 ; "unmarked_table_defaults_to_its_first_row")]
     #[test_case(Some(1), 1 ; "a_marked_row_stays_the_default")]
-    fn every_declared_tier_has_one_default(marked: Option<usize>, expected: usize) {
-        const SLUG: &str = "tiered-plugin";
+    fn every_declaration_has_one_default(marked: Option<usize>, expected: usize) {
+        const SLUG: &str = "defaulted-plugin";
         const SECOND_MODEL: &str = "plug-2";
         let mut reg = registration(SLUG);
         let mut second = reg.decl.models[0].clone();
@@ -2717,28 +2711,6 @@ mod tests {
 
         let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
         assert_eq!(model.adaptive_effort(), None);
-    }
-
-    /// A plugin's `list_models` knows its own catalogue, so the tier it
-    /// reports for a model it alone serves is the one startup and the picker
-    /// use.
-    #[test]
-    fn a_codec_provider_takes_its_discovered_tiers() {
-        const SLUG: &str = "discovered-tiers-plugin";
-        const DISCOVERED_TIER: ModelTier = ModelTier::Weak;
-        let mut reg = registration(SLUG);
-        reg.decl.models.clear();
-        register_loaded(reg).unwrap();
-        model_registry::set_known_models(
-            SLUG,
-            vec![ModelInfo {
-                tier: Some(DISCOVERED_TIER),
-                ..ModelInfo::id_only(MODEL_VARIANT.to_string())
-            }],
-        );
-
-        let model = Model::from_tier_dynamic(SLUG, DISCOVERED_TIER).unwrap();
-        assert_eq!(model.spec(), format!("{SLUG}/{MODEL_VARIANT}"));
     }
 
     #[test_case(None, None, Some(None), None ; "unpublished_provider_cap_reaches_the_row")]

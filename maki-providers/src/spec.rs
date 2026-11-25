@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::AgentError;
-use crate::model::{Model, ModelEntry, ModelFamily, ModelTier};
+use crate::model::{Model, ModelEntry, ModelFamily};
 use crate::pricing::PricingSchedule;
 use crate::provider::Provider;
 use crate::providers::{ResolvedAuth, Timeouts, custom, plugin};
@@ -76,7 +76,7 @@ pub struct ProviderSpec {
     pub accepts_arbitrary_models: bool,
     /// The live listing is the account's entitlement: an answered listing is
     /// the whole list, with no curated rows from [`ProviderSpec::models`]
-    /// appended, and tier defaults stay inside it. A 401/403 lists nothing,
+    /// appended. A 401/403 lists nothing,
     /// the offline list leaves the provider to discovery, and any other
     /// failure falls back to the curated rows.
     pub catalog_is_authoritative: bool,
@@ -184,7 +184,7 @@ pub enum AuthDoc {
 
 #[derive(Debug)]
 pub enum CatalogDoc {
-    /// Render [`ProviderSpec::models`] as the tier table.
+    /// Render [`ProviderSpec::models`] as the model table.
     Table,
     /// The table is empty; say where models come from instead.
     Discovered(&'static str),
@@ -249,8 +249,8 @@ impl ProviderRegistry {
     }
 
     /// Like [`Self::get`], but a `providers.toml` slug resolves to its base
-    /// provider's spec, so thinking support, display name and tier defaults
-    /// still answer for a stub that declares no models.
+    /// provider's spec, so thinking support and the display name still answer
+    /// for a stub that declares no models.
     ///
     /// The fallback resolves through [`Self::compiled`], never back through
     /// here, so the lookup cannot recurse.
@@ -296,11 +296,12 @@ impl ProviderRegistry {
         Self::compiled(slug).is_some() || PROVIDER_BUILTINS.contains(&slug)
     }
 
-    pub fn find_default_for_tier(slug: &str, tier: ModelTier) -> Option<&'static ModelEntry> {
-        Self::for_slug(slug)?
-            .models()
+    pub fn find_default(slug: &str) -> Option<&'static ModelEntry> {
+        let spec = Self::for_slug(slug)?;
+        spec.models()
             .iter()
-            .find(|e| e.default && e.tier == tier)
+            .find(|e| e.default)
+            .or_else(|| spec.models().first())
     }
 }
 

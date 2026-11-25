@@ -292,7 +292,7 @@ async fn rebuild(
 
 pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
-    maki_providers::model_registry::load(&storage);
+    maki_providers::model_registry::load(&storage).map_err(|e| color_eyre::eyre::eyre!(e))?;
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 

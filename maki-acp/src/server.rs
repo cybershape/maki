@@ -3755,7 +3755,6 @@ mod tests {
                 pricing: None,
                 supports_thinking: Some(true),
                 supports_vision: Some(true),
-                tier: None,
                 provider_info: None,
                 extra: None,
                 effort: Some(maki_providers::model::ModelEffort {

@@ -874,7 +874,6 @@ mod tests {
     use futures::FutureExt;
     use maki_config::project::{self, TrustMode};
     use maki_config::providers::Protocol;
-    use maki_providers::model::ModelTier;
     use maki_providers::model_registry;
     use maki_providers::plugin::{
         self, AuthPurpose, DeclAuthority, Hook, PluginAuth, ProviderDecl, ProviderHooks,
@@ -1073,7 +1072,6 @@ mod tests {
                     models: vec![
                         serde_json::from_value(serde_json::json!({
                             "prefixes": [LISTED_MODEL],
-                            "tier": ModelTier::Strong,
                         }))
                         .unwrap(),
                     ],

@@ -91,7 +91,10 @@ Some pickers add extra bindings on top of the defaults:
 | Rewind Picker | `Ctrl+F` | Fork up to the selected prompt and switch to it |
 | Queue | `Enter` | Remove item |
 | Commands | `Tab` | Complete command |
-| Model Picker | `!/@/#/$` | Set tier (strong/medium/weak/compaction) |
+| Model Picker | `$` | Assign the compaction model |
+| Model Picker | `+` | Start a combo (main model), Enter on another to finish |
+| Model Picker | `-` | Delete the combo under the cursor |
+| Model Picker | `^` | Cycle the combo's subagent effort |
 | Model Picker | `%` | Fold or unfold provider |
 | Model Picker | `*` | Fold or unfold all providers |
 | Session Picker | `Ctrl+N` | New session |

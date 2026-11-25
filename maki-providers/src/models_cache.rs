@@ -4,7 +4,7 @@
 //! answer replaces what the cache said about it.
 //!
 //! The cache only ever feeds the picker list. It never touches the model
-//! registry, so pricing, context windows, tier picks and
+//! registry, so pricing, context windows and
 //! [`crate::model_registry::discovery_complete`] only ever see this run's
 //! probe.
 

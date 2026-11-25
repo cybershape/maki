@@ -1748,12 +1748,13 @@ impl App {
                 ModelPickerAction::Select(spec) => {
                     vec![Action::ChangeModel(spec)]
                 }
-                ModelPickerAction::AssignTier(spec, tier) => {
-                    vec![Action::AssignTier(spec, tier)]
+                ModelPickerAction::AssignCompaction(spec) => {
+                    vec![Action::AssignCompaction(spec)]
                 }
-                ModelPickerAction::UnassignTier(spec, tier) => {
-                    vec![Action::UnassignTier(spec, tier)]
+                ModelPickerAction::UnassignCompaction(spec) => {
+                    vec![Action::UnassignCompaction(spec)]
                 }
+                ModelPickerAction::CombosChanged => vec![Action::CombosChanged],
                 // Saved right here instead of going through an `Action`. A fold
                 // only changes how the picker looks, and the writer lives here.
                 ModelPickerAction::Folded => {

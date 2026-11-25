@@ -26,8 +26,6 @@ use maki_agent::{
     ToolDoneEvent, TurnHost, UNAVAILABLE_RESULT, event_stream, run_turns,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
-use maki_providers::model::ModelTier;
-use maki_providers::model_registry;
 use maki_providers::provider;
 use maki_providers::{
     AgentError, ContentBlock, ContextGauge, Message, Model, RequestOptions, Role, ThinkingConfig,
@@ -35,7 +33,7 @@ use maki_providers::{
 };
 use maki_storage::id::MakiId;
 use maki_storage::now_epoch;
-use maki_storage::sessions::StoredThinking;
+use maki_storage::sessions::{Effort, StoredThinking};
 use mlua::{
     Either as LuaEither, Function, IntoLuaMulti, Lua, Result as LuaResult, Table, UserDataRef,
     Value as LuaValue,
@@ -46,7 +44,6 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::spawn_blocking;
 use tracing::info;
 
-use crate::api::model::stale_tier_err;
 use crate::api::session::{not_live, required_session};
 use crate::api::tool::{audiences_to_lua, format_name, parse_audience};
 use crate::api::ui::buf::BufHandle;
@@ -76,43 +73,26 @@ const GRANT_HINT: &str = "or grant the permissions in plugin.toml";
 const TASK_REQUIRED_ERR: &str = "maki.agent.session({ session = id }) and its prompts must run \
      in a task: maki.async.spawn, an autocmd callback or a tool handler";
 
-/// Also returns the tier when the user's assignment picked the model. A curated
-/// default that does not resolve falls back quietly. An assigned model is an
-/// error instead, because running some other model would hide the stale
-/// assignment from the user. Headless loads the models.dev catalog only for
-/// the main model, so a catalog provider's spec has to warm it here first.
-async fn resolve_model_from_ctx(
-    ctx: &AgentContext,
-    tier: Option<&str>,
-) -> Result<(Model, Option<ModelTier>), String> {
-    let Some(tier_str) = tier else {
+/// The model a caller that names none runs on: the combo's subagent model
+/// when the session runs a combo, else the session model itself. The effort
+/// comes back only for a combo sub, where it is the user's pick and outranks
+/// the parent's thinking cap.
+async fn resolve_model_from_ctx(ctx: &AgentContext) -> Result<(Model, Option<Effort>), String> {
+    let Some(sub) = &ctx.model.combo else {
         return Ok((Model::clone(&ctx.model), None));
     };
-    let requested = tier_str.parse::<ModelTier>().map_err(|e| e.to_string())?;
-    let effective = requested.capped_at(ctx.model.tier);
-    if effective == ctx.model.tier {
-        return Ok((Model::clone(&ctx.model), None));
+    if !ctx.model_policy.allows(&sub.model.spec()) {
+        return Err(format!(
+            "combo subagent model {} is not allowed by provider model policy",
+            sub.model.spec()
+        ));
     }
-    let slug = &ctx.model.provider;
-    if let Some(spec) = model_registry::resolve_tier(Some(slug), effective)
-        .filter(|spec| ctx.model_policy.allows(spec))
-    {
-        let assigned = model_registry::override_tiers(&spec).contains(&effective);
-        match Model::from_spec_or_warm_catalog(&spec).await {
-            Ok(model) => return Ok((model, assigned.then_some(effective))),
-            Err(e) if assigned => return Err(stale_tier_err(effective, &spec, e)),
-            Err(_) => {}
-        }
-    }
-    Model::from_tier_with_policy(slug, effective, &ctx.model_policy)
-        .map(|model| (model, None))
-        .map_err(|e| e.to_string())
+    Ok((sub.model.clone(), sub.effort))
 }
 
 fn model_to_lua_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
     let tbl = lua.create_table()?;
     tbl.set("id", model.id.clone())?;
-    tbl.set("tier", model.tier.to_string())?;
     tbl.set("provider", model.provider.to_string())?;
     tbl.set("spec", model.spec())?;
     Ok(tbl)
@@ -141,17 +121,25 @@ fn required_opts(opts: Option<Table>) -> LuaResult<Table> {
 }
 
 /// Settings left out come from the parent, and a thinking level the plugin
-/// asks for can't go above the parent's. We clamp to the model once, right
-/// here, so the status badge, `AgentInput` and the request all agree on what
-/// this session really runs.
+/// asks for can't go above the parent's - unless `unclamped`, which marks the
+/// effort as the user's own pick on a model combo rather than a model's ask.
+/// We clamp to the model once, right here, so the status badge, `AgentInput`
+/// and the request all agree on what this session really runs.
 fn session_opts(
     thinking: Option<ThinkingConfig>,
+    unclamped: bool,
     fast: Option<bool>,
     parent: RequestOptions,
     model: &Model,
 ) -> RequestOptions {
     RequestOptions {
-        thinking: thinking.map_or(parent.thinking, |t| t.clamp_to(parent.thinking)),
+        thinking: thinking.map_or(parent.thinking, |t| {
+            if unclamped {
+                t
+            } else {
+                t.clamp_to(parent.thinking)
+            }
+        }),
         fast: fast.unwrap_or(parent.fast),
     }
     .clamped(model)
@@ -537,32 +525,28 @@ fn unattended_answer(event: &AgentEvent) -> Option<String> {
     }
 }
 
-/// Look up the model that the current agent is using, or pick a cheaper one.
-/// You might want a cheaper model for simple subtasks (summaries, classification)
-/// without hard-coding a model name.
+/// Look up the model a subtask should run on. With no `spec`, a session on a
+/// model combo answers the combo's subagent model; otherwise the session's
+/// own model comes back.
 ///
-/// The returned table has fields: `id` (string), `tier` (string),
-/// `provider` (string), `spec` (string), `assigned_tier` (string?).
-/// `assigned_tier` is set when the user assigned this model to that tier, and
-/// nil for an explicit `spec`, the inherited model or a curated default. Mention
-/// it in your errors, since the user may have forgotten the assignment. If an
-/// assigned model no longer resolves, you get an error instead of another model.
+/// The returned table has fields: `id` (string), `provider` (string),
+/// `spec` (string), `combo` (boolean), `thinking` (string?).
+/// `combo` is true when the combo's subagent model was picked, and `thinking`
+/// then carries the effort the user set on it (`"minimal"` to `"max"`), nil
+/// when the combo follows the session. A combo effort is the user's pick: pass
+/// it to `session` with `thinking_unclamped = true` so the parent's thinking
+/// cap does not lower it.
 ///
 /// @param ctx LuaCtx Agent context.
 /// @param opts table? Optional fields:
-///   `tier` (string?) - target tier, e.g. `"fast"`, `"mid"`, `"best"`. Clamped to
-///     the parent tier so you cannot escalate. Resolved by
-///     `maki.model.tier`, so a `/model` pick for the tier wins over the
-///     session provider's curated default.
 ///   `spec` (string?) - exact model spec or unique partial model name, e.g.
 ///     `"proxy/codex/gpt-6.2-sol"` or `"sol"`. Resolves directly when one known
 ///     model matches; errors with the matching choices when multiple match.
-///     Takes precedence over `tier`.
 /// @return (table?, string?) Model table on success, or `(nil, err)` on failure.
 /// @example
-/// local model, err = maki.agent.resolve_model(ctx, { tier = "fast" })
+/// local model, err = maki.agent.resolve_model(ctx)
 /// if err then error(err) end
-/// print(model.spec, model.tier)
+/// print(model.spec, model.combo)
 #[lua_fn]
 async fn resolve_model(
     lua: Lua,
@@ -570,14 +554,11 @@ async fn resolve_model(
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
     let agent = try_pair!(dispatch_ctx(&ctx, "resolve_model"));
-    let tier_str = opts
-        .as_ref()
-        .and_then(|t| t.opt::<String>("tier").ok().flatten());
     let spec_str = opts
         .as_ref()
         .and_then(|t| t.opt::<String>("spec").ok().flatten());
 
-    let (model, assigned_tier) = match spec_str {
+    let (model, combo_effort) = match spec_str {
         Some(ref spec) => (
             try_pair!(
                 Model::resolve_spec_or_partial(
@@ -589,10 +570,12 @@ async fn resolve_model(
             ),
             None,
         ),
-        None => try_pair!(resolve_model_from_ctx(agent, tier_str.as_deref()).await),
+        None => try_pair!(resolve_model_from_ctx(agent).await),
     };
+    let from_combo = spec_str.is_none() && agent.model.combo.is_some();
     let tbl = model_to_lua_table(&lua, &model)?;
-    tbl.set("assigned_tier", assigned_tier.map(|tier| tier.to_string()))?;
+    tbl.set("combo", from_combo)?;
+    tbl.set("thinking", combo_effort.map(|effort| effort.to_string()))?;
     Ok((Some(tbl), None))
 }
 
@@ -1097,6 +1080,9 @@ async fn dispatch_child(
 ///     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
 ///     `"max"`), or a budget integer (token count). Inherits the parent
 ///     setting if omitted, and is capped at it otherwise.
+///   `thinking_unclamped` (boolean?) - skip the parent thinking cap. For the
+///     effort a user set on a model combo (`resolve_model`'s `thinking`),
+///     which is their pick, not a model's ask. Default: `false`.
 ///   `fast` (boolean?) - use fast mode. Inherits parent setting if omitted.
 /// @return (Session?, string?) Session handle, or `(nil, err)` on failure.
 /// @example
@@ -1147,6 +1133,7 @@ async fn session(
     let local_tools_tbl: Option<Table> = opts.opt("local_tools")?;
     let name: Option<String> = opts.opt("name")?;
     let thinking_val: Option<LuaValue> = opts.opt("thinking")?;
+    let thinking_unclamped: bool = opts.opt::<bool>("thinking_unclamped")?.unwrap_or(false);
     let audience = match opts.opt::<String>("audience")? {
         Some(s) => {
             try_pair!(ToolAudience::parse_name(&s).ok_or_else(|| format!("unknown audience: {s}")))
@@ -1242,7 +1229,13 @@ async fn session(
             }
         }
     };
-    let opts = session_opts(requested_thinking, fast, agent_ctx.opts, &model);
+    let opts = session_opts(
+        requested_thinking,
+        thinking_unclamped,
+        fast,
+        agent_ctx.opts,
+        &model,
+    );
 
     let (stream_guard, sub_events) = event_stream();
     let sub_event_tx = stream_guard.sender(agent_ctx.event_tx.run_id());
@@ -2060,6 +2053,7 @@ async fn prompt(
             };
             s.opts = session_opts(
                 background.thinking,
+                false,
                 background.fast,
                 seed.chat_opts(),
                 &s.params.model,
@@ -2362,10 +2356,8 @@ mod tests {
     const OTHER_TOOL: &str = "other_tool";
     const TOOL_HINT: &str = "Call hinted_tool first.";
     const SESSION_SPEC: &str = "responses/primary";
-    const ASSIGNED_SPEC: &str = "responses/assigned-weak";
-    // Malformed on purpose: an unknown slug would warm the catalog, which
-    // fetches models.dev.
-    const STALE_SPEC: &str = "removed-model";
+    const COMBO_SUB_SPEC: &str = "responses/combo-sub";
+    const COMBO_SPEC: &str = "responses/primary+responses/combo-sub@high";
 
     #[test_case(ThinkingConfig::Effort(Effort::Low), json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Low) ; "toggle_keeps_ancestor_effort_ceiling")]
     #[test_case(ThinkingConfig::Adaptive, json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Max) ; "explicit_adaptive_stays_unbounded")]
@@ -2389,11 +2381,12 @@ mod tests {
         };
 
         for requested in [None, Some(ThinkingConfig::Adaptive)] {
-            let child = session_opts(requested, None, root, &intermediate);
+            let child = session_opts(requested, false, None, root, &intermediate);
             assert_eq!(child.thinking, parent);
             assert_eq!(child.thinking.shown(&intermediate), shown);
             let grandchild = session_opts(
                 Some(ThinkingConfig::Effort(Effort::Max)),
+                false,
                 None,
                 child,
                 &model,
@@ -3431,60 +3424,53 @@ mod tests {
         );
     }
 
-    static TIER_ASSIGNMENT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    #[test_case(None ; "unassigned_default_has_no_provenance")]
-    #[test_case(Some(ASSIGNED_SPEC) ; "assignment_beats_the_session_provider")]
-    #[test_case(Some(STALE_SPEC) ; "stale_assignment_fails_instead_of_falling_back")]
+    #[test_case(SESSION_SPEC, SESSION_SPEC, None ; "plain_session_inherits_its_model")]
+    #[test_case(COMBO_SPEC, COMBO_SUB_SPEC, Some(Effort::High) ; "combo_defaults_to_its_sub_model")]
     #[tokio::test]
-    async fn task_model_selection_follows_the_tier_assignment(assigned: Option<&str>) {
-        let _guard = TIER_ASSIGNMENT_LOCK.lock().await;
+    async fn task_model_selection_follows_the_combo(
+        session: &str,
+        expected_spec: &str,
+        expected_effort: Option<Effort>,
+    ) {
         let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
-        maki_providers::model_registry::set_known_models(
-            "responses",
-            vec![
-                maki_providers::ModelInfo {
-                    id: "default-weak".into(),
-                    tier: Some(ModelTier::Weak),
-                    ..Default::default()
-                },
-                maki_providers::ModelInfo {
-                    id: "primary".into(),
-                    tier: Some(ModelTier::Strong),
-                    ..Default::default()
-                },
-                maki_providers::ModelInfo {
-                    id: "assigned-weak".into(),
-                    tier: Some(ModelTier::Weak),
-                    ..Default::default()
-                },
-            ],
-        );
-        ctx.model = Arc::new(Model::from_spec(SESSION_SPEC).unwrap());
+        ctx.model = Arc::new(Model::from_spec(session).unwrap());
         let ctx = AgentContext::from(&ctx);
-        if let Some(spec) = assigned {
-            model_registry::set(spec.into(), ModelTier::Weak);
-        }
 
-        let resolved = resolve_model_from_ctx(&ctx, Some(ModelTier::Weak.to_string().as_str()))
-            .await
-            .map(|(model, tier)| (model.spec(), tier));
-        match assigned.map(|spec| (spec, Model::from_spec(spec))) {
-            None => {
-                let (spec, tier) = resolved.unwrap();
-                assert_eq!(spec.split_once('/').unwrap().0, &*ctx.model.provider);
-                assert_eq!(tier, None);
-            }
-            Some((spec, Ok(_))) => {
-                assert_eq!(resolved, Ok((spec.to_owned(), Some(ModelTier::Weak))));
-            }
-            Some((spec, Err(cause))) => {
-                assert_eq!(resolved, Err(stale_tier_err(ModelTier::Weak, spec, cause)));
-            }
-        }
-        if let Some(spec) = assigned {
-            model_registry::unset(spec, ModelTier::Weak);
-        }
+        let (model, effort) = resolve_model_from_ctx(&ctx).await.unwrap();
+        assert_eq!(model.spec(), expected_spec);
+        assert_eq!(effort, expected_effort);
+    }
+
+    #[tokio::test]
+    async fn combo_sub_excluded_by_policy_is_an_error() {
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        ctx.model = Arc::new(Model::from_spec(COMBO_SPEC).unwrap());
+        ctx.model_policy =
+            Arc::new(maki_config::ModelPolicy::new(&[], &[COMBO_SUB_SPEC.to_string()]).unwrap());
+        let ctx = AgentContext::from(&ctx);
+
+        let err = resolve_model_from_ctx(&ctx).await.unwrap_err();
+        assert!(err.contains(COMBO_SUB_SPEC), "got: {err}");
+    }
+
+    /// A combo effort is the user's pick, so it survives a parent that thinks
+    /// less; a plugin's own ask stays capped.
+    #[test_case(true, ThinkingConfig::Effort(Effort::High) ; "combo_effort_outranks_parent_cap")]
+    #[test_case(false, ThinkingConfig::Off ; "plugin_ask_stays_capped")]
+    fn session_opts_unclamped_skips_only_the_parent_cap(unclamped: bool, expected: ThinkingConfig) {
+        let parent = RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: false,
+        };
+        let model = Model::from_spec(SESSION_SPEC).unwrap();
+        let opts = session_opts(
+            Some(ThinkingConfig::Effort(Effort::High)),
+            unclamped,
+            None,
+            parent,
+            &model,
+        );
+        assert_eq!(opts.thinking, expected.clamped(&model));
     }
 
     fn live_chat() -> (MakiId, SessionMailbox, Arc<AgentSeed>) {
@@ -4080,7 +4066,6 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_model_supports_unique_and_ambiguous_partial_names() {
-        let _guard = TIER_ASSIGNMENT_LOCK.lock().await;
         maki_providers::model_registry::set_known_models(
             "responses",
             vec![

@@ -918,7 +918,7 @@ mod tests {
                 "display_name": LOCAL_PROVIDER_SLUG,
                 "codec": "openai",
                 "base_url": LOCAL_PROVIDER_URL,
-                "models": [{ "prefixes": [LOCAL_PROVIDER_SLUG], "tier": "strong" }],
+                "models": [{ "prefixes": [LOCAL_PROVIDER_SLUG] }],
             }),
             LOCAL_PROVIDER_HOST,
         );

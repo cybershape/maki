@@ -596,7 +596,6 @@ fn parse_model_info(m: &Value) -> Option<ModelInfo> {
         pricing,
         supports_thinking,
         supports_vision,
-        tier: None,
         provider_info: None,
         extra: Some(m.clone()),
         effort,
@@ -722,7 +721,6 @@ impl ResponsesProvider {
                             .supports_thinking
                             .or_else(|| effort.as_ref().map(|e| !e.supported.is_empty())),
                         supports_vision: m.supports_vision,
-                        tier: Some(m.tier),
                         provider_info: None,
                         extra: None,
                         effort,

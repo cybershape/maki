@@ -7,9 +7,9 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
 use maki_config::ModelPolicy;
+use maki_config::combo;
 use maki_providers::Model;
-use maki_providers::ModelTier;
-use maki_providers::model_registry;
+use maki_providers::model_registry::{self, ComboDef};
 use maki_providers::models_cache::ModelList;
 use maki_providers::provider::ProviderStatus;
 use maki_providers::spec::ProviderRegistry;
@@ -21,6 +21,10 @@ use crate::repaint::{Cadence, Dirty, Watch};
 
 const TITLE: &str = " Models ";
 const RECENT_SECTION: &str = "Recent";
+const COMBO_SECTION: &str = "Combos";
+const FOLLOW_SESSION_LABEL: &str = "follow session";
+const COMBO_PENDING_NOTICE: &str = "combo: pick the subagent model, Enter to create (+ cancels)";
+const COMBO_SEPARATOR_LABEL: &str = " + ";
 const FREE_LABEL: &str = "Free";
 const FREE_PREFIX: &str = "Free · ";
 const PRICE_SEPARATOR: &str = " · ";
@@ -33,33 +37,23 @@ const CURRENT_MARK: &str = "● ";
 const FAST_MARK: &str = "⚡";
 const FOOTER: &[(&str, &str)] = &[
     ("Enter", "select"),
-    ("!", "strong"),
-    ("@", "medium"),
-    ("#", "weak"),
+    ("+", "combo"),
+    ("-", "delete combo"),
+    ("^", "combo effort"),
     ("$", "compaction"),
     ("%", "fold"),
     ("*", "fold all"),
 ];
 const FOLD_KEY: KeyCode = KeyCode::Char('%');
 const FOLD_ALL_KEY: KeyCode = KeyCode::Char('*');
+const COMBO_KEY: KeyCode = KeyCode::Char('+');
+const COMBO_DELETE_KEY: KeyCode = KeyCode::Char('-');
+const COMBO_EFFORT_KEY: KeyCode = KeyCode::Char('^');
 
-fn tier_for_shortcut(key: KeyEvent) -> Option<ModelTier> {
+fn is_compaction_shortcut(key: KeyEvent) -> bool {
     // Shift+digit arrives as the character it types, with the SHIFT bit
     // already folded into it by key normalization.
-    let digit = match key.code {
-        KeyCode::Char('!' | '¡') => '1',       // US, ES
-        KeyCode::Char('@' | '"' | '™') => '2', // US, UK/DE
-        KeyCode::Char('#' | '§' | '£') => '3', // US, DE, UK
-        KeyCode::Char('$' | '€' | '¤') => '4', // US, EU, Nordic
-        _ => return None,
-    };
-    match digit {
-        '1' => Some(ModelTier::Strong),
-        '2' => Some(ModelTier::Medium),
-        '3' => Some(ModelTier::Weak),
-        '4' => Some(ModelTier::Compaction),
-        _ => None,
-    }
+    matches!(key.code, KeyCode::Char('$' | '€' | '¤')) // US, EU, Nordic
 }
 
 /// A provider's one row, which its models hide behind while it is folded. It
@@ -85,9 +79,10 @@ fn provider_row(
         provider_display: display,
         suffix: status.map(str::to_string),
         detail: format!("{count} {plural}"),
-        override_tiers: Vec::new(),
+        highlighted: false,
         free: false,
         is_provider: true,
+        combo: None,
         prefer_model_name: false,
         hidden: false,
         needs_setup,
@@ -97,8 +92,11 @@ fn provider_row(
 pub enum ModelPickerAction {
     Consumed,
     Select(String),
-    AssignTier(String, ModelTier),
-    UnassignTier(String, ModelTier),
+    AssignCompaction(String),
+    UnassignCompaction(String),
+    /// A combo was created, removed, or its effort changed. The picker has no
+    /// state dir, so the caller saves [`model_registry::combos`].
+    CombosChanged,
     /// The unfolded set changed. The picker has no state dir, so the caller
     /// saves [`ModelPicker::expanded_providers`].
     Folded,
@@ -116,9 +114,12 @@ struct ModelEntry {
     provider_display: String,
     suffix: Option<String>,
     detail: String,
-    override_tiers: Vec<ModelTier>,
+    /// The compaction pick, which the row highlights.
+    highlighted: bool,
     free: bool,
     is_provider: bool,
+    /// Set on a combo row: its two halves, for delete and effort cycling.
+    combo: Option<(String, String)>,
     prefer_model_name: bool,
     /// A model of a folded provider, listed only while searching.
     hidden: bool,
@@ -162,7 +163,7 @@ impl PickerItem for ModelEntry {
     }
 
     fn is_highlighted(&self) -> bool {
-        !self.override_tiers.is_empty()
+        self.highlighted
     }
 
     fn is_section_row(&self) -> bool {
@@ -213,6 +214,9 @@ pub struct ModelPicker {
     anchor: Option<(bool, String)>,
     prefer_model_name: bool,
     show_cost: bool,
+    /// The main half of a combo being built: `+` marked it, Enter on another
+    /// model completes the pair.
+    pending_main: Option<String>,
 }
 
 impl ModelPicker {
@@ -227,6 +231,7 @@ impl ModelPicker {
             anchor: None,
             prefer_model_name: true,
             show_cost: true,
+            pending_main: None,
         }
     }
 
@@ -258,6 +263,7 @@ impl ModelPicker {
     pub fn open(&mut self, current_spec: &str) {
         self.current_spec = current_spec.to_owned();
         self.anchor = None;
+        self.pending_main = None;
         self.needs_rebuild = false;
         let _ = self.available.poll(self.models.load_full());
         let entries = self.load_entries();
@@ -294,7 +300,14 @@ impl ModelPicker {
     }
 
     /// A slow provider leaves a short list that looks final without this.
+    /// A combo being built outranks it: the user is mid-gesture.
     fn show_loading(&mut self) {
+        if let Some(main) = &self.pending_main {
+            let name = model_registry::resolve_model_name_or(main, main);
+            self.picker
+                .set_notice(Some(format!("{COMBO_PENDING_NOTICE} [{name}]")));
+            return;
+        }
         let loading = self.available.get().is_some_and(|list| list.loading);
         self.picker.set_notice(loading.then_some(LOADING_NOTICE));
     }
@@ -315,6 +328,9 @@ impl ModelPicker {
             })
         };
         let mut entries = Vec::new();
+        for def in model_registry::combos() {
+            entries.push(combo_entry(&def, self.prefer_model_name, self.show_cost));
+        }
         for spec in self.memory.recents.load().iter() {
             if retired(spec) {
                 continue;
@@ -480,27 +496,89 @@ impl ModelPicker {
             }
             return self.toggle_fold(slug);
         }
-        if let Some(tier) = tier_for_shortcut(key)
+        if key.code == COMBO_KEY {
+            return self.combo_mark();
+        }
+        if key.code == COMBO_DELETE_KEY || key.code == COMBO_EFFORT_KEY {
+            return self.combo_edit(key.code == COMBO_EFFORT_KEY);
+        }
+        if is_compaction_shortcut(key)
             && let Some(entry) = self.picker.selected_item()
         {
-            if entry.is_provider {
+            if entry.is_provider || entry.combo.is_some() {
                 return ModelPickerAction::Consumed;
             }
             let spec = entry.spec.clone();
             self.needs_rebuild = true;
-            if entry.override_tiers.contains(&tier) {
-                ModelPickerAction::UnassignTier(spec, tier)
+            if entry.highlighted {
+                ModelPickerAction::UnassignCompaction(spec)
             } else {
-                ModelPickerAction::AssignTier(spec, tier)
+                ModelPickerAction::AssignCompaction(spec)
             }
+        } else if key.code == KeyCode::Enter
+            && self.pending_main.is_some()
+            && let Some(entry) = self.picker.selected_item()
+            && !entry.is_provider
+            && entry.combo.is_none()
+        {
+            let main = self.pending_main.take().expect("pending main checked");
+            let def = ComboDef {
+                main,
+                sub: entry.spec.clone(),
+                effort: None,
+            };
+            model_registry::add_combo(def);
+            self.needs_rebuild = true;
+            ModelPickerAction::CombosChanged
         } else {
             match self.picker.handle_key(key) {
                 PickerAction::Consumed => ModelPickerAction::Consumed,
                 PickerAction::Select(entry) => ModelPickerAction::Select(entry.spec),
-                PickerAction::Close => ModelPickerAction::Close,
+                PickerAction::Close => {
+                    self.pending_main = None;
+                    ModelPickerAction::Close
+                }
                 PickerAction::Toggle(..) => ModelPickerAction::Consumed,
             }
         }
+    }
+
+    /// `+` marks the selected model as a combo's main half, or cancels a
+    /// pending mark. Provider and combo rows cannot be halves.
+    fn combo_mark(&mut self) -> ModelPickerAction {
+        if self.pending_main.take().is_some() {
+            self.needs_rebuild = true;
+            return ModelPickerAction::Consumed;
+        }
+        if let Some(entry) = self.picker.selected_item()
+            && !entry.is_provider
+            && entry.combo.is_none()
+        {
+            self.pending_main = Some(entry.spec.clone());
+            self.needs_rebuild = true;
+        }
+        ModelPickerAction::Consumed
+    }
+
+    /// `-` deletes the combo under the cursor; `^` cycles its effort.
+    fn combo_edit(&mut self, cycle_effort: bool) -> ModelPickerAction {
+        let Some(entry) = self.picker.selected_item() else {
+            return ModelPickerAction::Consumed;
+        };
+        let Some((main, sub)) = entry.combo.clone() else {
+            return ModelPickerAction::Consumed;
+        };
+        self.needs_rebuild = true;
+        if cycle_effort {
+            let current = model_registry::combos()
+                .into_iter()
+                .find(|c| c.main == main && c.sub == sub)
+                .and_then(|c| c.effort);
+            model_registry::set_combo_effort(&main, &sub, combo::next_effort(current));
+        } else {
+            model_registry::remove_combo(&main, &sub);
+        }
+        ModelPickerAction::CombosChanged
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> (Rect, Option<Position>) {
@@ -549,39 +627,39 @@ fn provider_display(slug: &str) -> Option<String> {
     }
 }
 
+/// The free label and price of a resolved model, the detail column's halves.
+fn model_detail(model: Option<&Model>, show_cost: bool) -> (String, bool) {
+    let Some(model) = model else {
+        return (String::new(), false);
+    };
+    let free = model.is_free();
+    let detail = match (show_cost.then(|| format_pricing(model)).flatten(), free) {
+        (Some(price), true) => format!("{FREE_PREFIX}{price}"),
+        (Some(price), false) => price,
+        (None, true) => FREE_LABEL.to_string(),
+        (None, false) => String::new(),
+    };
+    (detail, free)
+}
+
 fn parse_model_entry(spec: &str, prefer_model_name: bool, show_cost: bool) -> Option<ModelEntry> {
+    if let Some(parts) = combo::split(spec) {
+        return Some(combo_entry(
+            &ComboDef {
+                main: parts.main.to_string(),
+                sub: parts.sub.to_string(),
+                effort: parts.effort,
+            },
+            prefer_model_name,
+            show_cost,
+        ));
+    }
     let (provider_str, model_id) = spec.split_once('/')?;
     let provider_display = provider_display(provider_str)?;
 
-    let override_tiers = model_registry::override_tiers(spec);
-    let (tier, free, price, fast) = match Model::from_spec(spec) {
-        Ok(m) => (
-            m.tier.to_string(),
-            m.is_free(),
-            show_cost.then(|| format_pricing(&m)).flatten(),
-            m.supports_fast(),
-        ),
-        Err(_) => (String::new(), false, None, false),
-    };
-    let tier = if override_tiers.is_empty() {
-        tier
-    } else {
-        override_tiers
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("/")
-    };
-    let tier = match (free, tier.is_empty()) {
-        (true, true) => FREE_LABEL.to_string(),
-        (true, false) => format!("{FREE_PREFIX}{tier}"),
-        (false, _) => tier,
-    };
-    let detail = match price {
-        Some(price) if !tier.is_empty() => format!("{tier}{PRICE_SEPARATOR}{price}"),
-        Some(price) => price,
-        None => tier,
-    };
+    let model = Model::from_spec(spec).ok();
+    let (detail, free) = model_detail(model.as_ref(), show_cost);
+    let fast = model.as_ref().is_some_and(Model::supports_fast);
     let id = model_id.to_string();
     let name = model_registry::resolve_model_name(provider_str, model_id);
     Some(ModelEntry {
@@ -592,13 +670,55 @@ fn parse_model_entry(spec: &str, prefer_model_name: bool, show_cost: bool) -> Op
         provider_display,
         suffix: fast.then(|| FAST_MARK.to_string()),
         detail,
-        override_tiers,
+        highlighted: model_registry::compaction().as_deref() == Some(spec),
         free,
         is_provider: false,
+        combo: None,
         prefer_model_name,
         hidden: false,
         needs_setup: false,
     })
+}
+
+/// A combo's row: the two names joined, the subagent half and its effort in
+/// the detail column. A half that no longer resolves still lists, named by
+/// its spec, so the user can delete the combo instead of losing it silently.
+fn combo_entry(def: &ComboDef, prefer_model_name: bool, show_cost: bool) -> ModelEntry {
+    let spec = def.spec();
+    let main_name = model_registry::resolve_model_name_or(&def.main, &def.main);
+    let sub_name = model_registry::resolve_model_name_or(&def.sub, &def.sub);
+    let label = format!("{main_name}{COMBO_SEPARATOR_LABEL}{sub_name}");
+    let effort = def
+        .effort
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| FOLLOW_SESSION_LABEL.to_string());
+    let model = Model::from_spec(&spec).ok();
+    let (price, free) = model_detail(model.as_ref(), show_cost);
+    let mut detail = format!("sub: {} @ {effort}", def.sub);
+    if !price.is_empty() {
+        detail = format!("{price}{PRICE_SEPARATOR}{detail}");
+    }
+    let provider = def
+        .main
+        .split_once('/')
+        .map(|(slug, _)| slug.to_string())
+        .unwrap_or_default();
+    ModelEntry {
+        spec,
+        id: label.clone(),
+        name: prefer_model_name.then_some(label),
+        provider,
+        provider_display: COMBO_SECTION.to_string(),
+        suffix: None,
+        detail,
+        highlighted: false,
+        free,
+        is_provider: false,
+        combo: Some((def.main.clone(), def.sub.clone())),
+        prefer_model_name,
+        hidden: false,
+        needs_setup: false,
+    }
 }
 
 #[cfg(test)]
@@ -927,7 +1047,6 @@ mod tests {
         let entry = parse_model_entry("responses/my-model", true, true).unwrap();
         assert_eq!(entry.id, "my-model");
         assert_eq!(entry.provider_display, "Responses API");
-        assert!(!entry.detail.is_empty());
     }
 
     #[test]
@@ -944,17 +1063,15 @@ mod tests {
         assert!(parse_model_entry("no-slash", true, true).is_none());
     }
 
-    #[test_case(key(KeyCode::Char('!')),           ModelTier::Strong     ; "legacy_bang_strong")]
-    #[test_case(key(KeyCode::Char('$')),           ModelTier::Compaction ; "legacy_dollar_compaction")]
-    #[test_case(key(KeyCode::Char('€')),           ModelTier::Compaction ; "legacy_euro_compaction")]
-    fn tier_shortcut_assigns_and_keeps_picker_open(k: KeyEvent, want: ModelTier) {
+    #[test_case(key(KeyCode::Char('$')) ; "dollar")]
+    #[test_case(key(KeyCode::Char('€')) ; "euro")]
+    fn compaction_shortcut_assigns_and_keeps_picker_open(k: KeyEvent) {
         let mut p = unfolded(test_models());
-        p.open("anthropic/claude-sonnet-4-20250514");
+        p.open(FOLD_SPEC);
         let action = p.handle_key(k);
         assert!(
-            matches!(&action, ModelPickerAction::AssignTier(s, t)
-                if s == "anthropic/claude-sonnet-4-20250514" && *t == want),
-            "expected AssignTier(claude-sonnet, {want:?}), got something else",
+            matches!(&action, ModelPickerAction::AssignCompaction(s) if s == FOLD_SPEC),
+            "expected AssignCompaction(claude-sonnet)",
         );
         assert!(p.is_open());
     }
@@ -1058,7 +1175,7 @@ mod tests {
         p.handle_key(key(KeyCode::Down));
         p.handle_key(key(KeyCode::Down));
         p.handle_key(key(KeyCode::Down));
-        p.handle_key(key(KeyCode::Char('!')));
+        p.handle_key(key(KeyCode::Char('$')));
 
         let _ = p.refresh();
 
@@ -1331,10 +1448,8 @@ mod tests {
     fn zero_priced_discovery_marks_entry_free() {
         register_discovered_models();
         let entry = parse_model_entry(OX_SPEC, true, true).unwrap();
-        assert!(
-            entry.detail.starts_with(FREE_PREFIX),
-            "zero-priced discovery must mark the entry free"
-        );
+        assert!(entry.free, "zero-priced discovery must mark the entry free");
+        assert_eq!(entry.detail, FREE_LABEL);
     }
 
     #[test]
@@ -1345,10 +1460,8 @@ mod tests {
             !entry.detail.starts_with(FREE_PREFIX),
             "paid discovery must not mark the entry free"
         );
-        assert!(
-            entry
-                .detail
-                .ends_with(&format!("{PRICE_SEPARATOR}{PAID_PRICE_LABEL}")),
+        assert_eq!(
+            entry.detail, PAID_PRICE_LABEL,
             "paid discovery must show its price"
         );
     }
@@ -1423,6 +1536,114 @@ mod tests {
         assert_eq!(ids, ["stealth/ox-alpha", PAID_ID]);
     }
 
+    const COMBO_MAIN_SPEC: &str = "anthropic/claude-opus-4-6-20260101";
+    const COMBO_SUB_SPEC: &str = "zai/glm-5";
+
+    fn select_model(p: &mut ModelPicker, spec: &str) {
+        assert!(
+            p.picker
+                .select_item_by(|e| e.spec == spec && !e.is_provider)
+        );
+    }
+
+    fn create_combo(p: &mut ModelPicker) -> model_registry::ComboDef {
+        select_model(p, COMBO_MAIN_SPEC);
+        assert!(matches!(
+            p.handle_key(key(COMBO_KEY)),
+            ModelPickerAction::Consumed
+        ));
+        select_model(p, COMBO_SUB_SPEC);
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Enter)),
+            ModelPickerAction::CombosChanged
+        ));
+        let _ = p.refresh();
+        model_registry::combos().pop().expect("combo created")
+    }
+
+    #[test]
+    fn two_step_gesture_creates_a_combo_listed_in_its_own_section() {
+        let mut p = unfolded(test_models());
+        p.open("");
+        let def = create_combo(&mut p);
+        assert_eq!(def.main, COMBO_MAIN_SPEC);
+        assert_eq!(def.sub, COMBO_SUB_SPEC);
+        assert_eq!(def.effort, None);
+
+        let entries = p.load_entries();
+        let row = entries
+            .iter()
+            .find(|e| e.combo.is_some())
+            .expect("combo row");
+        assert_eq!(row.section(), Some(COMBO_SECTION));
+        assert_eq!(row.spec, format!("{COMBO_MAIN_SPEC}+{COMBO_SUB_SPEC}"));
+        assert!(row.detail.contains(FOLLOW_SESSION_LABEL));
+        model_registry::remove_combo(&def.main, &def.sub);
+    }
+
+    #[test]
+    fn enter_on_a_combo_selects_its_full_spec() {
+        let mut p = unfolded(test_models());
+        p.open("");
+        let def = create_combo(&mut p);
+        select_model(&mut p, &def.spec());
+        let action = p.handle_key(key(KeyCode::Enter));
+        assert!(matches!(action, ModelPickerAction::Select(ref s) if s == &def.spec()));
+        model_registry::remove_combo(&def.main, &def.sub);
+    }
+
+    #[test]
+    fn the_delete_key_removes_the_combo_under_the_cursor() {
+        let mut p = unfolded(test_models());
+        p.open("");
+        let def = create_combo(&mut p);
+        select_model(&mut p, &def.spec());
+        assert!(matches!(
+            p.handle_key(key(COMBO_DELETE_KEY)),
+            ModelPickerAction::CombosChanged
+        ));
+        assert!(model_registry::combos().is_empty());
+    }
+
+    #[test]
+    fn the_effort_key_cycles_through_every_level_and_back() {
+        let mut p = unfolded(test_models());
+        p.open("");
+        let def = create_combo(&mut p);
+        select_model(&mut p, &def.spec());
+        let mut expected = combo::next_effort(None);
+        loop {
+            assert!(matches!(
+                p.handle_key(key(COMBO_EFFORT_KEY)),
+                ModelPickerAction::CombosChanged
+            ));
+            let current = model_registry::combos()[0].effort;
+            assert_eq!(current, expected);
+            let _ = p.refresh();
+            select_model(&mut p, &model_registry::combos()[0].spec());
+            match expected {
+                None => break,
+                Some(e) => expected = combo::next_effort(Some(e)),
+            }
+        }
+        model_registry::remove_combo(&def.main, &def.sub);
+    }
+
+    #[test]
+    fn the_combo_key_again_cancels_the_pending_main() {
+        let mut p = unfolded(test_models());
+        p.open("");
+        select_model(&mut p, COMBO_MAIN_SPEC);
+        p.handle_key(key(COMBO_KEY));
+        assert!(p.pending_main.is_some());
+        p.handle_key(key(COMBO_KEY));
+        assert!(p.pending_main.is_none());
+        select_model(&mut p, COMBO_SUB_SPEC);
+        let action = p.handle_key(key(KeyCode::Enter));
+        assert!(matches!(action, ModelPickerAction::Select(ref s) if s == COMBO_SUB_SPEC));
+        assert!(model_registry::combos().is_empty());
+    }
+
     #[test]
     fn model_entry_label_and_search_keys_respect_prefer_model_name() {
         let entry_with_name = ModelEntry {
@@ -1433,9 +1654,10 @@ mod tests {
             provider_display: "Responses".into(),
             suffix: None,
             detail: "".into(),
-            override_tiers: Vec::new(),
+            highlighted: false,
             free: false,
             is_provider: false,
+            combo: None,
             prefer_model_name: true,
             hidden: false,
             needs_setup: false,
@@ -1460,9 +1682,10 @@ mod tests {
             provider_display: "Responses".into(),
             suffix: None,
             detail: "".into(),
-            override_tiers: Vec::new(),
+            highlighted: false,
             free: false,
             is_provider: false,
+            combo: None,
             prefer_model_name: true,
             hidden: false,
             needs_setup: false,

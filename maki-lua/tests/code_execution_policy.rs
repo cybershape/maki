@@ -35,7 +35,7 @@ const TASK_PREFIX: &str = "task:";
 const WORKFLOW_NOTE_SUBSTR: &str = "Workflow mode: orchestrate subagents";
 const WF_TASK_GATED_LINE: &str = "Not callable: wf_task";
 const INTERP_ECHO_SIG: &str = "- interp_echo(msg: str, count: int = None, flag: bool = None, items: list = None, raw: any = None) -> str";
-const WF_TASK_SIG: &str = "- wf_task(prompt: str, model_tier: str = None) -> str";
+const WF_TASK_SIG: &str = "- wf_task(prompt: str, model: str = None) -> str";
 const SUB_TOOL_SIG: &str = "- sub_tool() -> str";
 const MCP_NOTE_SUBSTR: &str = "External libraries";
 const MCP_TOOL_QUALIFIED: &str = "srv.fetch_issue";
@@ -99,7 +99,7 @@ maki.api.register_tool({{
         required = {{ "prompt" }},
         properties = {{
             prompt = {{ type = "string" }},
-            model_tier = {{ type = "string" }},
+            model = {{ type = "string" }},
         }},
     }},
     handler = function(input) return "{TASK_PREFIX}" .. input.prompt end,

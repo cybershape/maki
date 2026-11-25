@@ -130,9 +130,9 @@ fn spec_row(decl: &ProviderDecl, target: Target, models: &'static [ModelEntry]) 
 /// unlisted one, through discovery, models.dev and only then the spec's
 /// fallback. Listing a model just to price it must never move its limits.
 ///
-/// Every tier needs a default, so a tier with nothing marked gets its first
-/// row. A `base` lends its table under the declared rows, so a model the author
-/// did not list keeps the base's price and limits. A codec lends nothing,
+/// The provider needs a default, so a table with nothing marked gets its
+/// first row. A `base` lends its table under the declared rows, so a model the
+/// author did not list keeps the base's price and limits. A codec lends nothing,
 /// because its native table lists another provider's models.
 fn declared_models(decl: &ProviderDecl, target: Target) -> Result<&'static [ModelEntry], String> {
     if let Target::Base(spec) = target
@@ -150,11 +150,8 @@ fn declared_models(decl: &ProviderDecl, target: Target) -> Result<&'static [Mode
         }
         row.context_window = row.context_window.or(decl.context_window);
     }
-    for index in 0..rows.len() {
-        let tier = rows[index].tier;
-        if !rows.iter().any(|row| row.tier == tier && row.default) {
-            rows[index].default = true;
-        }
+    if !rows.is_empty() && !rows.iter().any(|row| row.default) {
+        rows[0].default = true;
     }
     if let Target::Base(spec) = target {
         let lent = lent_rows(spec.models(), &rows);
@@ -163,15 +160,15 @@ fn declared_models(decl: &ProviderDecl, target: Target) -> Result<&'static [Mode
     Ok(leak_slice(rows))
 }
 
-/// The base's rows minus what the declaration took over: a prefix it lists,
-/// and the default of a tier it covers.
+/// The base's rows minus what the declaration took over: a prefix it lists.
+/// The declaration always owns the default, so a lent row never keeps it.
 fn lent_rows(base: &[ModelEntry], declared: &[ModelEntry]) -> Vec<ModelEntry> {
     let taken = |prefix: &String| declared.iter().any(|row| row.prefixes.contains(prefix));
     base.iter()
         .filter_map(|row| {
             let mut row = row.clone();
             row.prefixes.retain(|prefix| !taken(prefix));
-            row.default &= !declared.iter().any(|own| own.tier == row.tier);
+            row.default = false;
             (!row.prefixes.is_empty()).then_some(row)
         })
         .collect()

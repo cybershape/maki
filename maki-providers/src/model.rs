@@ -24,7 +24,7 @@ use crate::spec::{ProviderRegistry, ProviderSpec};
 use crate::types::{
     EffortDialect, FALLBACK_MAX_THINKING_BUDGET, ThinkingFallback, dialect, thinks_by_default,
 };
-pub use maki_config::providers::ModelTier;
+use maki_config::combo;
 use maki_config::providers::{
     ProviderDef, ProvidersConfig, ThinkingFields, base_url_override, builtin_provider,
 };
@@ -45,10 +45,10 @@ pub enum ModelError {
     InvalidFormat,
     #[error("unsupported provider '{0}'")]
     UnsupportedProvider(String),
-    #[error("no allowed model for {0}/{1}")]
-    NoAllowedModel(String, ModelTier),
-    #[error("no default model for {0}/{1}")]
-    NoDefault(String, ModelTier),
+    #[error("no allowed model for provider '{0}'")]
+    NoAllowedModel(String),
+    #[error("no default model for provider '{0}'")]
+    NoDefault(String),
     #[error("model '{0}' is not allowed by provider model policy")]
     NotAllowed(String),
     #[error("model must not be empty")]
@@ -165,8 +165,6 @@ pub struct ModelInfo {
     pub supports_thinking: Option<bool>,
     #[serde(default)]
     pub supports_vision: Option<bool>,
-    #[serde(default)]
-    pub tier: Option<ModelTier>,
     /// Store of additional metadata from the provider.
     #[serde(skip)]
     pub provider_info: Option<Arc<dyn Any + Send + Sync>>,
@@ -351,8 +349,6 @@ pub struct ModelEntry {
     /// used wherever a concrete model has to be named.
     pub prefixes: Vec<String>,
     #[serde(default)]
-    pub tier: ModelTier,
-    #[serde(default)]
     pub supports_tool_examples: Option<bool>,
     #[serde(default)]
     pub supports_thinking: Option<bool>,
@@ -381,7 +377,7 @@ pub struct ModelEntry {
     /// `None` speaks the family of the spec the row is served through.
     #[serde(default)]
     pub family: Option<ModelFamily>,
-    /// The model its tier resolves to when nothing else picked one.
+    /// The provider's default model, what startup picks when nothing else did.
     #[serde(default)]
     pub default: bool,
     /// `<slug>/<model>` this row is a copy of, see [`ModelEntry::inherit_like`].
@@ -445,7 +441,7 @@ impl ModelEntry {
             id,
             name: None,
             provider: Arc::from(slug),
-            tier: self.tier,
+            combo: None,
             family: self.family.unwrap_or(base.family),
             supports_tool_examples_override: self.supports_tool_examples,
             thinking_override: ThinkingSupport::from_flags(
@@ -711,12 +707,23 @@ pub enum FastSupport {
     Unsupported,
 }
 
+/// The subagent half of a combo: the model tasks run on when the caller
+/// names none, and the effort it thinks at (`None` follows the session).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComboSub {
+    pub model: Model,
+    pub effort: Option<Effort>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
     pub id: String,
     pub name: Option<String>,
     pub provider: Arc<str>,
-    pub tier: ModelTier,
+    /// Set when this model is a combo: the subagent model tasks default to,
+    /// and the effort it thinks at (`None` follows the session). Boxed so an
+    /// ordinary model clone stays cheap.
+    pub combo: Option<Box<ComboSub>>,
     pub family: ModelFamily,
     pub supports_tool_examples_override: Option<bool>,
     /// Resolved thinking support, used by gateway providers (e.g. Aperture)
@@ -765,18 +772,16 @@ impl Model {
 
     /// Rates and limits come from the most specific source that names this
     /// model: live discovery, then [`ModelSources`], then provider defaults.
-    /// Family and tier are about which dialect a model speaks and what role it
-    /// plays, which a relative answers just as well, so they read the curated
-    /// row whether or not it was an exact match.
+    /// Family is about which dialect a model speaks, which a relative answers
+    /// just as well, so it reads the curated row whether or not it was an
+    /// exact match.
     fn from_base(base: &ProviderSpec, slug: &str, model_id: &str) -> Self {
         let sources = ModelSources::resolve(base, model_id);
         let entry = sources.entry;
-        let spec = format!("{slug}/{model_id}");
         // Discovery keys `known_models` by the builtin slug, so a dynamic or
-        // custom slug reads positional tiers and metadata through its base.
+        // custom slug reads metadata through its base.
         let discovered = model_registry::discovered(base.slug, model_id);
         let discovered = discovered.as_ref();
-        let tier = model_registry::tier_for(&spec, base.slug, entry.map(|e| e.tier));
         let like = sources.like.as_ref();
         let family = entry
             .and_then(|entry| entry.family)
@@ -819,7 +824,7 @@ impl Model {
             id: model_id.to_string(),
             name,
             provider: Arc::from(slug),
-            tier,
+            combo: None,
             family,
             supports_tool_examples_override: entry
                 .and_then(|e| e.supports_tool_examples)
@@ -1097,8 +1102,33 @@ impl Model {
         self.supports_fast_override == Some(FastSupport::Pending)
     }
 
+    /// Assembles a combo: the outer model is the main one, so pricing, limits
+    /// and the status bar all describe what the session actually runs. The
+    /// sub half may not itself be a combo.
+    fn from_combo(main: &str, sub: &str, effort: Option<Effort>) -> Result<Self, ModelError> {
+        let mut model = Self::from_spec(main)?;
+        let sub_model = Self::from_spec(sub)?;
+        if sub_model.combo.is_some() {
+            return Err(ModelError::InvalidFormat);
+        }
+        model.name = Some(format!(
+            "{} + {}",
+            model.display_name(),
+            sub_model.display_name()
+        ));
+        model.combo = Some(Box::new(ComboSub {
+            model: sub_model,
+            effort,
+        }));
+        Ok(model)
+    }
+
     pub fn spec(&self) -> String {
-        format!("{}/{}", self.provider, self.id)
+        let main = format!("{}/{}", self.provider, self.id);
+        match &self.combo {
+            Some(sub) => combo::join(&main, &sub.model.spec(), sub.effort),
+            None => main,
+        }
     }
 
     /// What the provider charges right now, so it is only ever correct for a
@@ -1164,59 +1194,38 @@ impl Model {
         ProviderRegistry::for_slug(&self.provider).map_or("Unknown", |m| m.display_name)
     }
 
-    /// The model for a tier within given provider. This function only picks a
-    /// model within the given provider. Use `resolve_tier()` when needed to
-    /// resolve a model tier to model spec from any provider.
-    pub fn from_tier(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
-        if let Some(spec) = model_registry::spec_for_tier(slug, tier) {
-            return Self::from_spec(&spec);
+    /// The provider's default model: the row marked `default`, else its first
+    /// row. Custom providers answer through their `providers.toml` declaration.
+    pub fn from_default(slug: &str) -> Result<Self, ModelError> {
+        if let Some(spec) = ProviderRegistry::for_slug(slug) {
+            let entry = spec
+                .models()
+                .iter()
+                .find(|e| e.default)
+                .or_else(|| spec.models().first())
+                .ok_or_else(|| ModelError::NoDefault(slug.to_string()))?;
+            return Self::from_spec(&format!("{slug}/{}", entry.prefixes[0]));
         }
-        let entry = ProviderRegistry::find_default_for_tier(slug, tier)
-            .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
-        Self::from_spec(&format!("{slug}/{}", entry.prefixes[0]))
+        custom::default_model(slug).ok_or_else(|| ModelError::UnsupportedProvider(slug.to_string()))
     }
 
-    pub fn from_tier_with_policy(
-        slug: &str,
-        tier: ModelTier,
-        policy: &ModelPolicy,
-    ) -> Result<Self, ModelError> {
-        if let Ok(model) = Self::from_tier_dynamic(slug, tier)
+    pub fn from_default_with_policy(slug: &str, policy: &ModelPolicy) -> Result<Self, ModelError> {
+        if let Ok(model) = Self::from_default(slug)
             && policy.allows(&model.spec())
         {
             return Ok(model);
         }
-
         let Some(spec) = ProviderRegistry::for_slug(slug) else {
-            return Err(ModelError::NoAllowedModel(slug.to_string(), tier));
+            return Err(ModelError::NoAllowedModel(slug.to_string()));
         };
         spec.models()
             .iter()
-            .filter(|entry| entry.tier == tier)
             .flat_map(|entry| &entry.prefixes)
             .map(|model_id| format!("{slug}/{model_id}"))
             .find(|spec| policy.allows(spec))
             .map(|spec| Self::from_spec(&spec))
             .transpose()?
-            .ok_or_else(|| ModelError::NoAllowedModel(slug.to_string(), tier))
-    }
-
-    pub fn from_tier_dynamic(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
-        if ProviderRegistry::get(slug).is_some() {
-            return Self::from_tier(slug, tier);
-        }
-        // One providers.toml read, three answers: a model declared at this tier,
-        // the provider exists but declares nothing here (inherit the base
-        // protocol default under the custom slug, keeping its tier and pricing),
-        // or no such provider.
-        match custom::resolve_tier(slug, tier) {
-            custom::TierLookup::Model(model) => return Ok(model),
-            custom::TierLookup::NoModelForTier => {
-                return Err(ModelError::NoDefault(slug.to_string(), tier));
-            }
-            custom::TierLookup::Unknown => {}
-        }
-        Err(ModelError::UnsupportedProvider(slug.to_string()))
+            .ok_or_else(|| ModelError::NoAllowedModel(slug.to_string()))
     }
 
     pub async fn from_spec_with_policy(
@@ -1285,6 +1294,9 @@ impl Model {
     }
 
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
+        if let Some(parts) = combo::split(spec) {
+            return Self::from_combo(parts.main, parts.sub, parts.effort);
+        }
         let (slug, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
 
         // The first two never fight over a slug. A plugin can't register a
@@ -1545,7 +1557,7 @@ mod tests {
         assert!(!names_exactly(&entry, model_id));
         assert!(
             lookup_entry(std::slice::from_ref(&entry), model_id).is_some(),
-            "still the right row for family and tier, just not for rates"
+            "still the right row for family, just not for rates"
         );
     }
 
@@ -1589,7 +1601,7 @@ mod tests {
     fn a_declared_row_defaults_what_it_leaves_out() {
         let row = declared(json!({ "prefixes": [DECLARED_ID] })).unwrap();
 
-        assert_eq!(row.tier, ModelTier::Medium);
+        assert!(!row.default);
         assert!(row.max_output_tokens.is_none());
         assert!(row.context_window.is_none());
         assert!(row.pricing.is_none());
@@ -1701,15 +1713,52 @@ mod tests {
     }
 
     #[test]
-    fn tier_with_policy_errors_without_allowed_candidate() {
+    fn default_with_policy_errors_without_allowed_candidate() {
         let policy = policy(&["anthropic/*"], &[]);
 
-        let error = Model::from_tier_with_policy("openai", ModelTier::Weak, &policy).unwrap_err();
+        let error = Model::from_default_with_policy("responses", &policy).unwrap_err();
 
         assert!(matches!(
             error,
-            ModelError::NoAllowedModel(provider, ModelTier::Weak) if provider == "openai"
+            ModelError::NoAllowedModel(provider) if provider == "responses"
         ));
+    }
+
+    const COMBO_MAIN: &str = "responses/main-model";
+    const COMBO_SUB: &str = "responses/sub-model";
+
+    #[test]
+    fn combo_spec_resolves_both_halves_and_roundtrips() {
+        let spec = format!("{COMBO_MAIN}+{COMBO_SUB}@high");
+        let model = Model::from_spec(&spec).unwrap();
+        assert_eq!(model.spec(), spec);
+        assert_eq!(model.id, "main-model");
+        assert_eq!(model.name.as_deref(), Some("main-model + sub-model"));
+        let sub = model.combo.as_ref().unwrap();
+        assert_eq!(sub.model.spec(), COMBO_SUB);
+        assert_eq!(sub.effort, Some(Effort::High));
+        assert!(sub.model.combo.is_none());
+    }
+
+    #[test]
+    fn combo_without_effort_follows_the_session() {
+        let model = Model::from_spec(&format!("{COMBO_MAIN}+{COMBO_SUB}")).unwrap();
+        assert_eq!(model.combo.as_ref().unwrap().effort, None);
+    }
+
+    #[test]
+    fn combo_sub_may_not_itself_be_a_combo() {
+        let nested_sub = format!("{COMBO_SUB}+responses/other");
+        let err = Model::from_combo(COMBO_MAIN, &nested_sub, None).unwrap_err();
+        assert!(matches!(err, ModelError::InvalidFormat));
+    }
+
+    #[test_case(&["responses/*"], &[] => true ; "both_allowed")]
+    #[test_case(&["responses/main-model"], &[] => false ; "sub_not_allowed")]
+    #[test_case(&[], &["responses/sub-model"] => false ; "sub_excluded")]
+    fn combo_policy_checks_both_halves(allowed: &[&str], excluded: &[&str]) -> bool {
+        let spec = format!("{COMBO_MAIN}+{COMBO_SUB}");
+        policy(allowed, excluded).allows(&spec)
     }
 
     #[test]
@@ -1863,7 +1912,7 @@ mod tests {
             if spec.accepts_arbitrary_models {
                 continue;
             }
-            let model = Model::from_tier(spec.slug, ModelTier::Medium).unwrap();
+            let model = Model::from_default(spec.slug).unwrap();
             let round = Model::from_spec(&model.spec()).unwrap();
             assert_eq!(round.id, model.id);
             assert_eq!(round.provider, model.provider);
@@ -1890,7 +1939,6 @@ mod tests {
                 "pricing_schedule": { "windows": [[0, 24]], "multiplier": SURCHARGE },
                 "models": [{
                     "prefixes": [SCHEDULED_MODEL],
-                    "tier": "strong",
                     "supports_vision": false,
                     "pricing": { "input": 0.5, "output": 2.0, "cache_write": 0.0, "cache_read": 0.0 },
                 }],
@@ -1972,7 +2020,7 @@ mod tests {
             id: "test-model".into(),
             name: None,
             provider: Arc::from("responses"),
-            tier: ModelTier::Medium,
+            combo: None,
             family: ModelFamily::Gpt,
             supports_tool_examples_override: None,
             thinking_override: Some(support),

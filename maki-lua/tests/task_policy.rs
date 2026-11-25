@@ -52,9 +52,9 @@ const RAISE_MSG: &str = "stub prompt kaboom";
 const PARTIAL_TEXT: &str = "half a transcript";
 const CANCELLED_ERR: &str = "cancelled";
 const SESSION_OPEN_ERR: &str = "session admission failed";
-const ASSIGNED_TIER: &str = "weak";
-/// Mirrors the task plugin's `ASSIGNED_MODEL_CONTEXT` for the stub's model.
-const ASSIGNED_MODEL_CONTEXT: &str = "model `test/model`, assigned to the weak tier: ";
+/// Mirrors the task plugin's `COMBO_MODEL_CONTEXT` for the stub's model.
+const COMBO_MODEL_CONTEXT: &str = "model `test/model`, the subagent model of the current combo: ";
+const COMBO_EFFORT: &str = "high";
 /// Mirrors the task plugin's `max_concurrent` default.
 const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
 
@@ -143,7 +143,10 @@ end
 
 maki.agent.resolve_model = function(ctx, opts)
   recorder.resolve_opts = opts
-  return { spec = "test/model", assigned_tier = opts.tier }
+  if opts and opts.spec then
+    return { spec = "test/model", combo = false }
+  end
+  return { spec = "test/model", combo = true, thinking = "@COMBO_EFFORT@" }
 end
 
 maki.agent.system_prompt = function(ctx, opts)
@@ -224,6 +227,7 @@ maki.agent.session = function(ctx, opts)
   end
   recorder.has_local_tools = opts.local_tools ~= nil
   recorder.thinking = opts.thinking
+  recorder.thinking_unclamped = opts.thinking_unclamped
   local sess = { opts = opts }
   sessions[opts.name] = sess
   function sess:id() return opts.name end
@@ -312,6 +316,7 @@ maki.api.register_tool({
       prompt_count = #recorder.prompts,
       has_local_tools = recorder.has_local_tools,
       thinking = recorder.thinking,
+      thinking_unclamped = recorder.thinking_unclamped,
       first_ack = recorder.first_ack,
       first_err = recorder.first_err,
       second_ack = recorder.second_ack,
@@ -351,6 +356,7 @@ fn load_task_host_with_opts(
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let prelude = STUB_PRELUDE
+        .replace("@COMBO_EFFORT@", COMBO_EFFORT)
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
         .replace("@RECOVERED_TEXT@", RECOVERED_TEXT)
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
@@ -439,11 +445,12 @@ const FULL_MODEL_SPEC: &str = "aperture/ollama/glm-5.2";
 
 /// Advertised to the model, so the wording lives in the docs, not here: what
 /// matters is that the property exists and that whatever the model writes
-/// reaches the session verbatim, capping being the session's job.
-#[test_case::test_case(Some(json!("high")) ; "effort")]
-#[test_case::test_case(Some(json!(4096)) ; "token_budget")]
-#[test_case::test_case(None ; "inherit_parent_when_omitted")]
-fn thinking_forwards_to_session(thinking: Option<Value>) {
+/// reaches the session verbatim, capping being the session's job. With nothing
+/// written, the stub combo's effort is what reaches the session.
+#[test_case::test_case(Some(json!("high")), json!("high") ; "effort")]
+#[test_case::test_case(Some(json!(4096)), json!(4096) ; "token_budget")]
+#[test_case::test_case(None, json!(COMBO_EFFORT) ; "combo_effort_when_omitted")]
+fn thinking_forwards_to_session(thinking: Option<Value>, expected: Value) {
     let (reg, _host) = load_task_host();
     let entry = reg.get(TASK_TOOL).expect("task tool missing");
     assert!(entry.tool.schema()["properties"]["thinking"].is_object());
@@ -454,7 +461,7 @@ fn thinking_forwards_to_session(thinking: Option<Value>) {
 
     exec_tool(&reg, TASK_TOOL, input).expect("task failed");
     let snap = probe(&reg);
-    assert_eq!(snap.get("thinking"), thinking.as_ref());
+    assert_eq!(snap.get("thinking"), Some(&expected));
 }
 
 #[test]
@@ -472,10 +479,6 @@ fn model_spec_forwards_full_spec_to_resolve_model() {
         .as_object()
         .expect("resolve_opts missing");
     assert_eq!(opts["spec"], json!(FULL_MODEL_SPEC));
-    assert!(
-        opts.get("tier").is_none_or(Value::is_null),
-        "tier should be unset when only model spec is given"
-    );
 }
 
 #[test]
@@ -637,21 +640,45 @@ fn invalid_only_errors_with_bounded_schema_errors() {
 fn prompt_error_maps_to_sub_agent_error() {
     let (reg, _host) = load_task_host();
     let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PROMPT_ERROR, None)).unwrap_err();
-    assert_eq!(err, format!("{SUB_AGENT_ERROR_PREFIX}{PROMPT_ERR_MSG}"));
+    assert_eq!(
+        err,
+        format!("{SUB_AGENT_ERROR_PREFIX}{COMBO_MODEL_CONTEXT}{PROMPT_ERR_MSG}")
+    );
     let snap = probe(&reg);
     assert_eq!(snap["closed"], json!(1));
 }
 
-/// The stub reports every requested tier as assigned, so both the session
-/// open and the prompt failure must name the assignment that picked the model.
-#[test_case::test_case(SCENARIO_SESSION_ERROR, format!("{ASSIGNED_MODEL_CONTEXT}{SESSION_OPEN_ERR}") ; "session_open")]
-#[test_case::test_case(SCENARIO_PROMPT_ERROR, format!("{SUB_AGENT_ERROR_PREFIX}{ASSIGNED_MODEL_CONTEXT}{PROMPT_ERR_MSG}") ; "prompt")]
-fn assigned_tier_failure_names_the_assignment(scenario: &str, expected: String) {
+/// The stub reports the combo's subagent model, so both the session open and
+/// the prompt failure must name the combo that picked the model.
+#[test_case::test_case(SCENARIO_SESSION_ERROR, format!("{COMBO_MODEL_CONTEXT}{SESSION_OPEN_ERR}") ; "session_open")]
+#[test_case::test_case(SCENARIO_PROMPT_ERROR, format!("{SUB_AGENT_ERROR_PREFIX}{COMBO_MODEL_CONTEXT}{PROMPT_ERR_MSG}") ; "prompt")]
+fn combo_failure_names_the_combo(scenario: &str, expected: String) {
     let (reg, _host) = load_task_host();
-    let mut input = task_input(scenario, None);
-    input["model_tier"] = json!(ASSIGNED_TIER);
-    let err = exec_tool(&reg, TASK_TOOL, input).unwrap_err();
+    let err = exec_tool(&reg, TASK_TOOL, task_input(scenario, None)).unwrap_err();
     assert_eq!(err, expected);
+}
+
+/// With no explicit model or thinking, the combo's effort reaches the session
+/// unclamped: it is the user's pick, not the calling model's ask.
+#[test]
+fn combo_effort_forwards_unclamped_to_session() {
+    let (reg, _host) = load_task_host();
+    exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PLAIN, None)).expect("task failed");
+    let snap = probe(&reg);
+    assert_eq!(snap.get("thinking"), Some(&json!(COMBO_EFFORT)));
+    assert_eq!(snap.get("thinking_unclamped"), Some(&json!(true)));
+}
+
+/// An explicit thinking input stays the caller's ask: capped, not unclamped.
+#[test]
+fn explicit_thinking_overrides_the_combo_effort() {
+    let (reg, _host) = load_task_host();
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    input["thinking"] = json!("low");
+    exec_tool(&reg, TASK_TOOL, input).expect("task failed");
+    let snap = probe(&reg);
+    assert_eq!(snap.get("thinking"), Some(&json!("low")));
+    assert_eq!(snap.get("thinking_unclamped"), Some(&json!(false)));
 }
 
 /// Esc during a sub-agent run: the prompt hands back both an error and
@@ -663,7 +690,9 @@ fn interrupted_prompt_reports_the_partial_transcript() {
     let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PARTIAL_ERROR, None)).unwrap_err();
     assert_eq!(
         err,
-        format!("sub-agent interrupted ({CANCELLED_ERR}). Partial output:\n{PARTIAL_TEXT}")
+        format!(
+            "sub-agent interrupted ({COMBO_MODEL_CONTEXT}{CANCELLED_ERR}). Partial output:\n{PARTIAL_TEXT}"
+        )
     );
 }
 

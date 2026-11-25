@@ -8,7 +8,7 @@
 //! it wakes the moment any of them has something and never blocks a worker:
 //! it runs under `block_on` on the main thread.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::future::{pending, ready};
 use std::mem;
 use std::path::Path;
@@ -50,7 +50,7 @@ use maki_providers::Timeouts;
 use maki_providers::model_registry;
 use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
 use maki_providers::provider::{Provider, from_model};
-use maki_providers::{Message, Model, ModelTier};
+use maki_providers::{Message, Model};
 use maki_storage::StateDir;
 use maki_storage::blocking;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
@@ -2703,11 +2703,18 @@ impl<'t> EventLoop<'t> {
             Action::OpenFork(open) => self.open_fork(idx, *open),
             Action::ChangeModel(spec) => self.change_model(spec, PickOrigin::Picker),
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
-            Action::AssignTier(spec, tier) => {
-                self.persist_tiers(model_registry::set(spec, tier));
+            Action::AssignCompaction(spec) => {
+                self.persist_compaction(model_registry::set_compaction(spec));
             }
-            Action::UnassignTier(spec, tier) => {
-                self.persist_tiers(model_registry::unset(&spec, tier));
+            Action::UnassignCompaction(spec) => {
+                self.persist_compaction(model_registry::unset_compaction(&spec));
+            }
+            Action::CombosChanged => {
+                let combos = model_registry::combos();
+                self.ctx
+                    .storage_writer
+                    .persist(move |dir| model_registry::persist_combos(dir, &combos));
+                self.rebuild_models();
             }
             Action::Compact(instructions) => {
                 self.queue_compact(idx, instructions, CompactReason::Manual);
@@ -2896,10 +2903,10 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn persist_tiers(&self, overrides: BTreeMap<ModelTier, String>) {
+    fn persist_compaction(&self, spec: Option<String>) {
         self.ctx
             .storage_writer
-            .persist(move |dir| model_registry::persist_overrides(dir, &overrides));
+            .persist(move |dir| model_registry::persist_compaction(dir, spec.as_deref()));
     }
 
     async fn shutdown(mut self) -> ShutdownReport {

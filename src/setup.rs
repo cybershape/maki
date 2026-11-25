@@ -8,7 +8,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, bail, eyre};
 
 use maki_config::{ModelPolicy, ProviderConfig, SessionDefaults};
-use maki_providers::model::{Model, ModelError, ModelTier};
+use maki_providers::model::{Model, ModelError};
 use maki_providers::provider::provider_for_slug;
 use maki_providers::spec::ProviderRegistry;
 use maki_providers::{AgentError, Timeouts, custom, plugin};
@@ -28,8 +28,6 @@ use crate::provider_scripts;
 const LOG_ENV: &str = "MAKI_LOG";
 const LOG_ENV_SHARED: &str = "RUST_LOG";
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::INFO;
-
-const STARTUP_TIERS: [ModelTier; 2] = [ModelTier::Strong, ModelTier::Medium];
 
 /// The model to start on, plus a warning when the saved one had to be skipped.
 /// Logging is not up this early, so the caller has to show the warning.
@@ -168,8 +166,8 @@ fn auto_detect_model(policy: &ModelPolicy) -> Option<Model> {
 fn user_provider_models() -> impl Iterator<Item = Model> {
     let plugins = plugin::specs()
         .into_iter()
-        .flat_map(|spec| STARTUP_TIERS.map(|tier| Model::from_tier_dynamic(spec.slug, tier)));
-    let custom = custom::startup_specs(&STARTUP_TIERS)
+        .map(|spec| Model::from_default(spec.slug));
+    let custom = custom::startup_specs()
         .into_iter()
         .map(|spec| Model::from_spec(&spec));
     plugins.chain(custom).filter_map(Result::ok)

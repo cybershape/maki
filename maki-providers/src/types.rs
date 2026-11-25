@@ -3108,7 +3108,7 @@ mod tests {
             id: "test-model".into(),
             name: None,
             provider: std::sync::Arc::<str>::from(spec.slug),
-            tier: crate::model::ModelTier::Medium,
+            combo: None,
             family: spec.family,
             supports_tool_examples_override: None,
             thinking_override: None,

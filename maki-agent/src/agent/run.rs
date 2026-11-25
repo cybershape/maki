@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use maki_providers::provider::Provider;
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, ImageSource, InputTransformation, Message,
-    Model, ModelTier, RequestOptions, Role, StopReason, StreamResponse, accept_sent_images,
+    Model, RequestOptions, Role, StopReason, StreamResponse, accept_sent_images,
     forgive_refused_images, model_registry, refuse_sent_images,
 };
 use maki_storage::frame::{LiveFacts, PromptFacts, ReasoningFrame};
@@ -92,10 +92,10 @@ pub async fn resolve_compaction_model(
     timeouts: maki_providers::Timeouts,
     model_policy: &ModelPolicy,
 ) -> (Arc<dyn Provider>, Model) {
-    // When the tier names the session model, the session's own copy wins,
+    // When the pick names the session model, the session's own copy wins,
     // since a rebuild would forget what it learned at runtime, like the
     // context window the server really serves.
-    if let Some(spec) = model_registry::resolve_tier(Some(&*model.provider), ModelTier::Compaction)
+    if let Some(spec) = model_registry::compaction()
         && spec != model.spec()
         && let Ok(mut m) = Model::from_spec_with_policy(&spec, model_policy).await
         && let Ok(p) = maki_providers::provider::from_model_async(&mut m, timeouts)

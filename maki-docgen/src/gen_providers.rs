@@ -1,5 +1,5 @@
 use maki_providers::Effort;
-use maki_providers::model::{ModelEntry, ModelTier};
+use maki_providers::model::ModelEntry;
 use maki_providers::spec::{AuthDoc, BASES, CatalogDoc, ProviderRegistry, ProviderSpec};
 use std::fmt::Write;
 
@@ -20,14 +20,17 @@ const PLUGIN_PROVIDER_MANIFEST: &str =
     include_str!("../../maki-lua/tests/fixtures/provider_plugin/plugin.toml");
 
 const UNKNOWN_PRICING: &str = "unknown";
-const TIER_PICKER_NOTE: &str = r#"Open the model picker with `/model` and press `!`, `@`, `#`, or `$` on any row to assign it to strong, medium, weak, or compaction. Press the same key again to remove the assignment. Your overrides are saved to `~/.local/state/maki/model-tiers` and apply across sessions."#;
+const PICKER_NOTE: &str = r#"Open the model picker with `/model` and press `$` on any model row to assign it as the compaction model. Press `$` again to remove the assignment. The pick is saved to `~/.local/state/maki/model-tiers` and applies across sessions."#;
 
-const COMPACTION_ORDER: &str = r#"Compaction uses the first model it finds:
+const COMBO_NOTE: &str = r#"## Model Combos
 
-1. Your `/model` compaction pick.
-2. A `tier = "compaction"` model of the session's provider.
-3. A `tier = "compaction"` model of any other provider, in slug order.
-4. The session model, also used when the chosen model is unavailable."#;
+A combo pairs a main model with a subagent model. Selecting a combo runs the session on its main model, and every `task` subagent that names no model runs on its subagent model.
+
+Build one in the picker: press `+` on the main model's row, move to the subagent model and press Enter. The combo lists in its own **Combos** section, named by the two model names joined with `+`. Press `-` on a combo row to delete it, and `^` to cycle the subagent's thinking effort (follow session, then `minimal` to `max`). A combo effort is your pick: it is not capped by the session's thinking level.
+
+Combos are saved to `~/.local/state/maki/model-combos`. A combo is also an ordinary model spec (`main-provider/main-id+sub-provider/sub-id[@effort]`), so the last-used model memory, per-project model memory, recents and `-m` all work with it unchanged."#;
+
+const COMPACTION_ORDER: &str = r#"Compaction uses your `/model` compaction pick, and falls back to the session model when nothing is assigned or the chosen model is unavailable."#;
 
 const AUTH_RELOADING: &str = r#"## Auth Reloading
 
@@ -89,12 +92,10 @@ Sources rank by how sure they are to describe the exact model you asked for:
 1. What the provider's own model endpoint reported this session.
 2. A curated row for that id, including its dated snapshots. `claude-sonnet-4-5-20250929` reads the `claude-sonnet-4-5` row.
 3. models.dev.
-4. A curated row for a close relative, reached by shared prefix. `glm-5.4` falls back to `glm-5` here, and takes its family and tier from it either way.
+4. A curated row for a close relative, reached by shared prefix. `glm-5.4` falls back to `glm-5` here, and takes its family from it either way.
 5. The provider's defaults, with no cost estimate.
 
-A curated row is checked against the provider's own pricing page, so it wins for the id it names. For a relative it loses to models.dev, because a rate nobody checked against the id you typed is only a guess.
-
-New models start at the **medium** tier until you assign one in the picker."#;
+A curated row is checked against the provider's own pricing page, so it wins for the id it names. For a relative it loses to models.dev, because a rate nobody checked against the id you typed is only a guess."#;
 
 fn providers_toml_section() -> String {
     let mut plan_rows = String::new();
@@ -175,7 +176,6 @@ discover_models = true         # also list models via the provider's /models end
 
 [[my-proxy.models]]
 id = "fast-v1"
-tier = "weak"
 context_window = 128000
 max_output_tokens = 16384
 pricing_input = 0.5
@@ -183,7 +183,6 @@ pricing_output = 1.5
 
 [[my-proxy.models]]
 id = "smart-v1"
-tier = "strong"
 context_window = 200000
 max_output_tokens = 32000
 supports_thinking = true
@@ -201,7 +200,7 @@ supports_vision = false
 | `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
 | `api_key` | string | Inline key (prefer the env var or `maki auth login`) |
 | `headers` | table | Extra HTTP headers for every request to this provider. Values expand `${{VAR}}` from the environment, and an unset or empty variable fails the provider. A header with the same name (case-insensitive) replaces the one maki would send, auth included, and survives key rotation. `anthropic-beta` values add to the betas maki sends |
-| `default_model` | string | Used after login when no model is saved yet. On a custom entry it is also the startup fallback when no built-in or plugin provider is available. Without it, startup picks a declared `strong` or `medium` model |
+| `default_model` | string | Used after login when no model is saved yet. On a custom entry it is also the startup fallback when no built-in or plugin provider is available. Without it, startup picks the first declared model |
 | `top_p` | f64 | Nucleus sampling probability, sent as `top_p` in the request body for OpenAI-compatible, Anthropic, Bedrock and Google providers. Claude and GPT models reject it while thinking is on, and Claude Opus 4.7, Claude 5 and later always do, so it is dropped there. Never sent to Copilot or over the OpenAI responses path. Only sent when set, so the provider's own default applies otherwise. Must be in `(0, 1]` |
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
@@ -215,7 +214,6 @@ supports_vision = false
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `id` | string | required | Model id. Spec becomes `{{slug}}/{{id}}` |
-| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction`. With `discover_models = true`, a declared tier counts only for models the server lists |
 | `context_window` | u32 | protocol default | Tokens of context |
 | `max_output_tokens` | u32 | protocol default | Max completion tokens |
 | `supports_tool_examples` | bool | protocol default | |
@@ -333,7 +331,7 @@ maki.provider.register({{
   base_url = "https://api.acme.com/v1",
   api_key_env = "ACME_API_KEY",
   models = {{
-    {{ prefixes = {{ "acme-large" }}, tier = "strong", context_window = 200000 }},
+    {{ prefixes = {{ "acme-large" }}, context_window = 200000 }},
   }},
 }})
 ```
@@ -386,7 +384,7 @@ Set exactly one of the two. `codec` picks the wire format the API speaks:
 
 `base` borrows a built-in provider's whole adapter, quirks included, such as Ollama's thinking field or Copilot's endpoint routing. Use it when porting a provider script that set `base`, or when no codec fits. A base changes whenever that provider does, so prefer a codec. Valid values: {}.
 
-Without a `list_models` hook, the provider lists what its codec or base lists, such as `GET /models` for `codec = "openai"`. A `base` also lends its model rows, so a model your `models` table leaves out keeps the base's price, limits and tier.
+Without a `list_models` hook, the provider lists what its codec or base lists, such as `GET /models` for `codec = "openai"`. A `base` also lends its model rows, so a model your `models` table leaves out keeps the base's price and limits.
 
 `family`, `accepts_arbitrary_models`, `max_output_tokens` and `context_window` apply to models without a row, and default to the provider behind the codec or base. `codec = "openai"` defaults to the `gpt` family, so set `family = "generic"` unless the API serves GPT models. Rows that leave out a limit take the provider's.
 
@@ -399,7 +397,6 @@ A row matches every model id that starts with one of its `prefixes`, and the lon
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `prefixes` | list of strings | required | The first is the canonical id |
-| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction` |
 | `context_window` | number | provider's | Tokens of context |
 | `max_output_tokens` | number | provider's | Max completion tokens |
 | `supports_thinking` | bool | unset | |
@@ -410,7 +407,7 @@ A row matches every model id that starts with one of its `prefixes`, and the lon
 | `thinking_fields` | table | unset | How this model spells each thinking mode on the wire |
 | `family` | string | provider's | `generic`, `claude`, `gpt`, `gemini`, `glm` or `synthetic` |
 | `like` | string | unset | `<slug>/<model>` to borrow capabilities from. See [Borrowing with like](#borrowing-with-like) |
-| `default` | bool | first row of its tier | The tier's default model. At most one per tier |
+| `default` | bool | first row | The provider's default model, what startup picks. At most one per provider |
 
 An unset `supports_*` flag uses the codec or base provider's answer, and `false` turns the feature off for that model.
 
@@ -537,15 +534,6 @@ Maki's tests load this plugin, so it matches the current API. It uses `codec = "
     )
 }
 
-fn tier_label(tier: ModelTier) -> &'static str {
-    match tier {
-        ModelTier::Weak => "Weak",
-        ModelTier::Medium => "Medium",
-        ModelTier::Strong => "Strong",
-        ModelTier::Compaction => "Compaction",
-    }
-}
-
 fn format_pricing(entry: &ModelEntry) -> String {
     entry.pricing.as_ref().map_or_else(
         || UNKNOWN_PRICING.into(),
@@ -565,50 +553,22 @@ fn format_context(entry: &ModelEntry) -> String {
 }
 
 fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
-    let _ = writeln!(
-        out,
-        "| Tier | Models | Pricing (in/out per 1M tokens) | Context |"
-    );
-    let _ = writeln!(
-        out,
-        "|------|--------|-------------------------------|---------|"
-    );
+    let _ = writeln!(out, "| Models | Pricing (in/out per 1M tokens) | Context |");
+    let _ = writeln!(out, "|--------|-------------------------------|---------|");
 
-    // A row per model, not per tier: prices and context sizes differ inside a
-    // tier, so one merged row would quote a single model's numbers for all.
-    for tier in [ModelTier::Weak, ModelTier::Medium, ModelTier::Strong] {
-        for entry in entries.iter().filter(|e| e.tier == tier) {
-            let names = entry.prefixes.join(", ");
-            let _ = writeln!(
-                out,
-                "| {} | {} | {} | {} |",
-                tier_label(tier),
-                if entry.default {
-                    format!("**{names}** (default)")
-                } else {
-                    names
-                },
-                format_pricing(entry),
-                format_context(entry),
-            );
-        }
-    }
-
-    let defaults: Vec<String> = entries
-        .iter()
-        .filter(|e| e.default)
-        .map(|e| {
-            format!(
-                "{} ({})",
-                e.prefixes.first().map_or("?", String::as_str),
-                tier_label(e.tier).to_lowercase(),
-            )
-        })
-        .collect();
-
-    if !defaults.is_empty() {
-        let _ = writeln!(out);
-        let _ = writeln!(out, "Defaults: {}", defaults.join(", "));
+    for entry in entries {
+        let names = entry.prefixes.join(", ");
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} |",
+            if entry.default {
+                format!("**{names}** (default)")
+            } else {
+                names
+            },
+            format_pricing(entry),
+            format_context(entry),
+        );
     }
 }
 
@@ -671,12 +631,12 @@ fn render() -> String {
     let _ = writeln!(
         out,
         "Maki talks to LLM providers over their HTTP APIs. \
-         Models are split into three tiers: **weak** (cheap and fast), \
-         **medium** (balanced), and **strong** (highest capability, highest cost). \
-         A fourth tier, **compaction**, picks the model that summarizes the conversation when it grows long.\n"
+         A **compaction** pick names the cheap model that summarizes the conversation when it grows long, \
+         and a **combo** pairs the session's main model with the model its subagents run on.\n"
     );
-    let _ = writeln!(out, "{TIER_PICKER_NOTE}\n");
+    let _ = writeln!(out, "{PICKER_NOTE}\n");
     let _ = writeln!(out, "{COMPACTION_ORDER}\n");
+    let _ = writeln!(out, "{COMBO_NOTE}\n");
     let _ = writeln!(out, "{AUTH_RELOADING}\n");
     let _ = writeln!(out, "{BASE_URL_OVERRIDES}\n");
     let _ = writeln!(out, "## Built-in Providers\n");

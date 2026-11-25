@@ -1515,38 +1515,34 @@ maki.api.create_autocmd("SessionEnd", {
 maki.agent.resolve_model({ctx}, {opts?})
 ```
 
-Look up the model that the current agent is using, or pick a cheaper one.
-You might want a cheaper model for simple subtasks (summaries, classification)
-without hard-coding a model name.
+Look up the model a subtask should run on. With no `spec`, a session on a
+model combo answers the combo's subagent model; otherwise the session's
+own model comes back.
 
-The returned table has fields: `id` (string), `tier` (string),
-`provider` (string), `spec` (string), `assigned_tier` (string?).
-`assigned_tier` is set when the user assigned this model to that tier, and
-nil for an explicit `spec`, the inherited model or a curated default. Mention
-it in your errors, since the user may have forgotten the assignment. If an
-assigned model no longer resolves, you get an error instead of another model.
+The returned table has fields: `id` (string), `provider` (string),
+`spec` (string), `combo` (boolean), `thinking` (string?).
+`combo` is true when the combo's subagent model was picked, and `thinking`
+then carries the effort the user set on it (`"minimal"` to `"max"`), nil
+when the combo follows the session. A combo effort is the user's pick: pass
+it to `session` with `thinking_unclamped = true` so the parent's thinking
+cap does not lower it.
 
 **Parameters:**
 
 - `{ctx}` (`LuaCtx`) Agent context.
 - `{opts?}` (`table?`) Optional fields:
-  - `tier` (`string?`) target tier, e.g. `"fast"`, `"mid"`, `"best"`. Clamped to
-    the parent tier so you cannot escalate. Resolved by
-    `maki.model.tier`, so a `/model` pick for the tier wins over the
-    session provider's curated default.
   - `spec` (`string?`) exact model spec or unique partial model name, e.g.
     `"proxy/codex/gpt-6.2-sol"` or `"sol"`. Resolves directly when one known
     model matches; errors with the matching choices when multiple match.
-    Takes precedence over `tier`.
 
 **Returns:** (`table?`, `string?`) Model table on success, or `(nil, err)` on failure.
 
 **Example:**
 
 ```lua
-local model, err = maki.agent.resolve_model(ctx, { tier = "fast" })
+local model, err = maki.agent.resolve_model(ctx)
 if err then error(err) end
-print(model.spec, model.tier)
+print(model.spec, model.combo)
 ```
 
 ---
@@ -1864,6 +1860,9 @@ session, so opening one fails with "session not live". The
     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
     `"max"`), or a budget integer (token count). Inherits the parent
     setting if omitted, and is capped at it otherwise.
+  - `thinking_unclamped` (`boolean?`) skip the parent thinking cap. For the
+    effort a user set on a model combo (`resolve_model`'s `thinking`),
+    which is their pick, not a model's ask. Default: `false`.
   - `fast` (`boolean?`) use fast mode. Inherits parent setting if omitted.
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
@@ -4615,40 +4614,32 @@ maki.keymap.set({ "n", "i" }, "<M-t>", function() maki.model.set({ thinking = ""
 
 ---
 
-### `maki.model.tier()` {#maki-model-tier}
+### `maki.model.pick()` {#maki-model-pick}
 
 ```lua
-maki.model.tier({name}, {provider?})
+maki.model.pick({name})
 ```
 
-The model maki uses for a tier, the same one a subagent asking for that
-tier gets. The first match wins:
-
-1. The user's pick for that tier in the `/model` picker, from any provider.
-2. The tier default within `provider`, curated or set in `providers.toml`.
-3. The tier default of any provider.
-
-`assigned` tells a pick apart from a default. Pass `provider` the way
-subagents pass the session's provider.
+The user's pick for a named model slot. The only slot is `"compaction"`:
+the cheap model that rewrites history, assigned with `$` in the `/model`
+picker.
 
 Resolving a models.dev model can wait for that catalog to download, so
 like `get`, this cannot run in a callback that must not yield.
 
 **Parameters:**
 
-- `{name}` (`string`) `"weak"`, `"medium"`, `"strong"`, or `"compaction"`.
-- `{provider?}` (`string|nil`) Provider slug to resolve within first.
+- `{name}` (`string`) `"compaction"`.
 
-**Returns:** (`table|nil`, `string|nil`) The model in the shape `info` returns, plus
-  `assigned` (boolean), true when you picked it for this tier. nil and nil
-  when no model fits the tier, nil and an error when the spec no longer
-  resolves.
+**Returns:** (`table|nil`, `string|nil`) The model in the shape `info` returns.
+  nil and nil when nothing is assigned, nil and an error when the name is
+  unknown or the spec no longer resolves.
 
 **Example:**
 
 ```lua
-local m = maki.model.tier("weak", maki.model.get().provider)
-if m then maki.model.set(m.spec) end
+local m = maki.model.pick("compaction")
+if m then print(m.spec) end
 ```
 
 ---
@@ -4659,7 +4650,7 @@ if m then maki.model.set(m.spec) end
 maki.model.info({spec})
 ```
 
-Resolve a model spec to everything maki knows about it: identity, tier,
+Resolve a model spec to everything maki knows about it: identity,
 limits, capabilities, and the price table the session would be billed by --
 including rates resolved from provider config or the bundled catalog
 (e.g. subsidised custom providers), which the provider's own /v1/models
@@ -4672,7 +4663,7 @@ works from slash commands and headless embeddings.
 - `{spec}` (`string`) `"provider/id"`, as listed by `available()`.
 
 **Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, provider_display,
-  tier, family, subsidised_by?, context_window, max_output_tokens?, free?,
+  family, subsidised_by?, context_window, max_output_tokens?, free?,
   supports_thinking, supports_vision, pricing?, sources}`, or nil and an
   error.
 
@@ -5047,7 +5038,7 @@ maki.provider.register({
   codec = "openai",
   base_url = "https://api.acme.com/v1",
   api_key_env = "ACME_API_KEY",
-  models = { { prefixes = { "acme-large" }, tier = "strong" } },
+  models = { { prefixes = { "acme-large" } } },
 })
 ```
 
@@ -5122,10 +5113,11 @@ it does for a built-in provider.
 - `family` (`string`) `"generic"`, `"claude"`, `"gpt"`, `"gemini"`,
   `"glm"` or `"synthetic"`. Applies to models without a row.
   Defaults to the provider behind `codec` or `base`.
-- `accepts_arbitrary_models` (`boolean`) Assign tiers to `list_models`
-  results. When false, tiers come only from `models`. This and
-  the next two default to the `base` provider's, or with a
-  `codec` to `true`, `16384` and `128000`.
+- `accepts_arbitrary_models` (`boolean`) Serve model ids `list_models`
+  reports even without a row in `models`. When false, only
+  `models` rows are served. This and the next two default to the
+  `base` provider's, or with a `codec` to `true`, `16384` and
+  `128000`.
 - `max_output_tokens` (`integer|false`) Output cap for rows that leave it
   out and models without a row. `false` sends no cap.
 - `context_window` (`integer`) Context window for rows that leave it out
@@ -5197,7 +5189,7 @@ it does for a built-in provider.
   catalogue only known at runtime. Without it, the provider
   lists what its codec or base lists. Rows carry `id`,
   `context_window`, `max_output_tokens`, `pricing`,
-  `supports_thinking`, `supports_vision` and `tier`, plus three
+  `supports_thinking` and `supports_vision`, plus three
   optional fields. `extra` is any JSON value, handed back to
   `build_body` as `opts.model_info`. `effort` replaces the
   `openai.thinking` levels and off switch for this model:
@@ -5240,7 +5232,7 @@ maki.provider.register({
   codec = "openai",
   base_url = "https://api.acme.com/v1",
   models = {
-    { prefixes = { "acme-large" }, tier = "strong", context_window = 200000 },
+    { prefixes = { "acme-large" }, context_window = 200000 },
   },
   auth = function(ctx)
     local creds = maki.provider.auth.get(ctx.slug) or {}

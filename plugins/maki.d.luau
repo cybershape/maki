@@ -126,7 +126,7 @@ declare maki: {
     get: @checked () -> (any, string?),
     available: @checked () -> (any, string?),
     set: @checked (opts: any) -> (any, string?),
-    tier: @checked (name: string, provider: string?) -> (any, string?),
+    pick: @checked (name: string) -> (any, string?),
     info: @checked (spec: string) -> (any, string?),
   },
   net: {

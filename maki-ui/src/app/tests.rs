@@ -59,8 +59,8 @@ use maki_lua::{
 };
 use maki_providers::provider::ProviderStatus;
 use maki_providers::{
-    ContentBlock, Effort, FastPricing, FastSupport, Message, Model, ModelTier, RequestOptions,
-    Role, THINKING_USAGE, TaskAnswer, TaskSettled, ThinkingSupport, TokenUsage,
+    ContentBlock, Effort, FastPricing, FastSupport, Message, Model, RequestOptions, Role,
+    THINKING_USAGE, TaskAnswer, TaskSettled, ThinkingSupport, TokenUsage,
 };
 use maki_storage::id::MakiId;
 use maki_storage::model::read_thinking;
@@ -212,7 +212,6 @@ fn test_permissions(yolo: bool) -> Arc<PermissionManager> {
 fn test_opus_model() -> Model {
     let mut model = test_model();
     model.id = "opus".into();
-    model.tier = ModelTier::Strong;
     model.thinking_override = Some(ThinkingSupport::Yes);
     model.supports_fast_override = Some(FastSupport::Supported);
     model.pricing.fast = Some(FastPricing {
