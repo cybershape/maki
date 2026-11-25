@@ -108,7 +108,8 @@ impl App {
             | KeyboardOwner::ThemePicker
             | KeyboardOwner::ModelPicker
             | KeyboardOwner::LoginPicker
-            | KeyboardOwner::McpPicker => picker,
+            | KeyboardOwner::McpPicker
+            | KeyboardOwner::HistoryPicker => picker,
             KeyboardOwner::Alert
             | KeyboardOwner::CompactDetail
             | KeyboardOwner::PackReview
@@ -426,6 +427,12 @@ impl App {
         }
         if self.mcp_picker.is_open() {
             record(KeyboardOwner::McpPicker, self.mcp_picker.view(frame, full));
+        }
+        if self.history_picker.is_open() {
+            record(
+                KeyboardOwner::HistoryPicker,
+                self.history_picker.view(frame, full),
+            );
         }
 
         (overlay_rect, picker_caret)

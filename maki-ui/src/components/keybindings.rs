@@ -87,6 +87,7 @@ pub mod key {
     pub const OPEN_EDITOR: Bind = ctrl_bind!("O");
     pub const PLAN_TOGGLE: Bind = ctrl_bind!("T");
     pub const MODEL_PICKER: Bind = ctrl_bind!("L");
+    pub const HISTORY_PICKER: Bind = ctrl_bind!("R");
     pub const REFRESH: Bind = ctrl_bind!("R");
     pub const SUSPEND: Bind = ctrl_bind!("Z");
     pub const DELETE: Bind = ctrl_bind!("D");
@@ -278,6 +279,7 @@ pub const KEYBINDS: &[Keybind] = &[
     single(key::OPEN_EDITOR.label, "Open plan in editor", Ctx::General),
     single(key::PLAN_TOGGLE.label, "Toggle plan panel", Ctx::General),
     single(key::MODEL_PICKER.label, "Model picker", Ctx::General),
+    single(key::HISTORY_PICKER.label, "Input history", Ctx::General),
     single(key::SUSPEND.label, "Suspend process", Ctx::General).on(Platform::UnixOnly),
     single("Enter", "Submit prompt", Ctx::Editing),
     kb(

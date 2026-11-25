@@ -533,19 +533,26 @@ impl InputBox {
         });
     }
 
-    /// `false` when there is no older entry to recall.
-    pub fn history_up(&mut self) -> bool {
-        self.follow_cursor = true;
-        let Some(Some(new_index)) = self.recall_target(true) else {
+    pub fn recall_history(&mut self, index: usize) -> bool {
+        if index >= self.history.len() {
             return false;
-        };
-        let entry = self.history_entry(new_index);
+        }
+        self.follow_cursor = true;
+        let entry = self.history_entry(index);
         let shown = self.buffer.swap_prompt(entry);
-        if self.history_index.replace(new_index).is_none() {
+        if self.history_index.replace(index).is_none() {
             self.draft = shown;
         }
         self.buffer.move_to_end();
         true
+    }
+
+    /// `false` when there is no older entry to recall.
+    pub fn history_up(&mut self) -> bool {
+        let Some(Some(new_index)) = self.recall_target(true) else {
+            return false;
+        };
+        self.recall_history(new_index)
     }
 
     /// History keeps text only, so a recalled entry comes in with no marks,

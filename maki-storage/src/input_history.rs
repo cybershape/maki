@@ -92,6 +92,10 @@ impl InputHistory {
         self.entries.get(index).map(String::as_str)
     }
 
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &str> + ExactSizeIterator {
+        self.entries.iter().map(String::as_str)
+    }
+
     pub fn max_entries(&self) -> usize {
         self.max_entries
     }

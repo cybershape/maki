@@ -9,6 +9,7 @@ use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX, L
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::{PROMPT_NEEDS, ParsedCommand, USER_ONLY_SUFFIX};
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
+use crate::components::history_picker::NO_HISTORY_MSG;
 use crate::components::keybindings::key as kb;
 use crate::components::lua_float::CURSOR_STYLE_NAME;
 use crate::components::messages::{ClickOutcome, ScrollPos};
@@ -3906,6 +3907,12 @@ fn open_mcp_field(app: &mut App) -> Style {
     picker_cursor()
 }
 
+fn open_history_field(app: &mut App) -> Style {
+    open_history(app);
+    type_ime_text(app);
+    picker_cursor()
+}
+
 fn open_login_list_field(app: &mut App) -> Style {
     open_login_provider_list(app);
     type_ime_text(app);
@@ -3966,6 +3973,7 @@ fn paints_style(cell: &Cell, style: Style) -> bool {
 #[test_case(open_rewind_field as fn(&mut App) -> Style ; "rewind_picker")]
 #[test_case(open_theme_field as fn(&mut App) -> Style ; "theme_picker")]
 #[test_case(open_mcp_field as fn(&mut App) -> Style ; "mcp_picker")]
+#[test_case(open_history_field as fn(&mut App) -> Style ; "history_picker")]
 #[test_case(open_login_list_field as fn(&mut App) -> Style ; "login_list_step")]
 #[test_case(open_login_text_field as fn(&mut App) -> Style ; "login_text_step")]
 #[test_case(open_deny_field as fn(&mut App) -> Style ; "permission_deny_field")]
@@ -3992,6 +4000,7 @@ const ZONE_FIELD_UNSELECTABLE: &str = "a picker's field has to sit in a selectab
 #[test_case(open_rewind_field as fn(&mut App) -> Style ; "rewind_picker")]
 #[test_case(open_theme_field as fn(&mut App) -> Style ; "theme_picker")]
 #[test_case(open_mcp_field as fn(&mut App) -> Style ; "mcp_picker")]
+#[test_case(open_history_field as fn(&mut App) -> Style ; "history_picker")]
 #[test_case(open_login_list_field as fn(&mut App) -> Style ; "login_list_step")]
 fn an_open_pickers_field_sits_in_its_overlay_zone(open: fn(&mut App) -> Style) {
     let mut app = test_app();
@@ -8227,6 +8236,13 @@ fn open_mcp(app: &mut App) {
     app.execute_command(cmd("/mcp"), 0);
 }
 
+fn open_history(app: &mut App) {
+    let mut history = InputHistory::default();
+    history.push("previous prompt".into());
+    app.input_box.set_history(history);
+    app.run_builtin(BuiltinAction::HistoryPicker);
+}
+
 /// A paste lands in the field the keys reach, and in nothing under it.
 #[test_case(open_search as fn(&mut App)         ; "search")]
 #[test_case(open_painted_file_picker            ; "file_picker")]
@@ -8234,6 +8250,7 @@ fn open_mcp(app: &mut App) {
 #[test_case(open_theme                          ; "theme_picker")]
 #[test_case(open_model_picker                   ; "model_picker")]
 #[test_case(open_mcp                            ; "mcp_picker")]
+#[test_case(open_history                        ; "history_picker")]
 #[test_case(open_login_provider_list            ; "login_list_step")]
 #[test_case(open_login_name_step                ; "login_text_step")]
 #[test_case(|app: &mut App| open_deny_prompt(app, IME_SCOPE) ; "permission_deny_field")]
@@ -12550,6 +12567,43 @@ fn ctrl_l_opens_model_picker() {
 }
 
 #[test]
+fn ctrl_r_flashes_when_input_history_is_empty() {
+    let mut app = test_app();
+    app.update(Msg::Key(kb::HISTORY_PICKER.to_key_event()));
+    assert!(!app.history_picker.is_open());
+    assert_eq!(app.status_bar.flash_text(), Some(NO_HISTORY_MSG));
+}
+
+#[test]
+fn ctrl_r_opens_history_picker_filters_and_recalls_keeping_draft() {
+    const OLD_PROMPT: &str = "fix parser edge case";
+    const NEW_PROMPT: &str = "add unit tests";
+    const DRAFT: &str = "wip draft";
+
+    let mut app = test_app();
+    let mut history = InputHistory::default();
+    history.push(OLD_PROMPT.into());
+    history.push(NEW_PROMPT.into());
+    app.input_box.set_history(history);
+    type_text(&mut app, DRAFT);
+
+    app.update(Msg::Key(kb::HISTORY_PICKER.to_key_event()));
+    assert!(app.history_picker.is_open());
+    assert!(!app.usage_modal.is_open());
+
+    type_text(&mut app, "parser");
+    press(&mut app, KeyCode::Enter);
+
+    assert!(!app.history_picker.is_open());
+    assert_eq!(app.input_box.buffer.value(), OLD_PROMPT);
+
+    app.input_box.history_down();
+    assert_eq!(app.input_box.buffer.value(), NEW_PROMPT);
+    app.input_box.history_down();
+    assert_eq!(app.input_box.buffer.value(), DRAFT);
+}
+
+#[test]
 fn center_rect_handles_bounds() {
     use super::view::center_rect;
     let full = Rect::new(0, 0, 200, 50);
@@ -14304,6 +14358,7 @@ fn open_owner(app: &mut App, owner: KeyboardOwner) {
         KeyboardOwner::ModelPicker => open_model_picker(app),
         KeyboardOwner::LoginPicker => open_login_provider_list(app),
         KeyboardOwner::McpPicker => open_mcp(app),
+        KeyboardOwner::HistoryPicker => open_history(app),
         KeyboardOwner::Chat => {}
     }
 }
@@ -14326,6 +14381,7 @@ fn open_owner(app: &mut App, owner: KeyboardOwner) {
 #[test_case(KeyboardOwner::ModelPicker ; "model_picker")]
 #[test_case(KeyboardOwner::LoginPicker ; "login_picker")]
 #[test_case(KeyboardOwner::McpPicker ; "mcp_picker")]
+#[test_case(KeyboardOwner::HistoryPicker ; "history_picker")]
 #[test_case(KeyboardOwner::Chat ; "chat")]
 fn each_owner_alone_holds_the_keyboard(owner: KeyboardOwner) {
     let mut app = test_app();
@@ -14368,6 +14424,7 @@ fn each_owner_alone_holds_the_keyboard(owner: KeyboardOwner) {
 #[test_case(KeyboardOwner::ThemePicker, KeyboardOwner::ModelPicker ; "theme_picker_over_model_picker")]
 #[test_case(KeyboardOwner::ModelPicker, KeyboardOwner::LoginPicker ; "model_picker_over_login_picker")]
 #[test_case(KeyboardOwner::LoginPicker, KeyboardOwner::McpPicker ; "login_picker_over_mcp_picker")]
+#[test_case(KeyboardOwner::McpPicker, KeyboardOwner::HistoryPicker ; "mcp_picker_over_history_picker")]
 fn the_earlier_owner_holds_the_keyboard_over_the_next(
     earlier: KeyboardOwner,
     later: KeyboardOwner,
@@ -14425,6 +14482,7 @@ const OWNER_LEAKED_A_KEY: &str = "a key the holder of the keyboard answers must 
 #[test_case(KeyboardOwner::ModelPicker ; "model_picker")]
 #[test_case(KeyboardOwner::LoginPicker ; "login_picker")]
 #[test_case(KeyboardOwner::McpPicker ; "mcp_picker")]
+#[test_case(KeyboardOwner::HistoryPicker ; "history_picker")]
 fn the_holder_of_the_keyboard_keeps_a_shortcut_from_the_chat(owner: KeyboardOwner) {
     let mut app = test_app();
     open_owner(&mut app, owner);

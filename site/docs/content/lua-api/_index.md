@@ -8174,6 +8174,7 @@ key:
 | `"input_raw"` | Switches the input between drawing what plugins conceal and showing the text under it, which is what gets sent | |
 | `"undo"`, `"redo"` | Undoes or redoes one input edit | nothing to undo or redo |
 | `"history_prev"`, `"history_next"` | Recalls the previous or next prompt | at either end of the history |
+| `"history_picker"` | Opens the input history picker | |
 | `"newline"` | Inserts a new line | |
 | `"background"` | Moves running calls to the background, like `Ctrl+B` | no call is running |
 

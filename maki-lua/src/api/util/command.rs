@@ -723,6 +723,7 @@ pub enum BuiltinAction {
     Redo,
     HistoryPrev,
     HistoryNext,
+    HistoryPicker,
     Newline,
     /// Moves the main chat's movable running calls to the background.
     Background,
@@ -756,6 +757,7 @@ impl BuiltinAction {
             | Self::PrevChat
             | Self::NextChat
             | Self::ModelPicker
+            | Self::HistoryPicker
             | Self::InputRaw => &[],
             Self::PopQueue => &[Permission::SessionWrite],
             Self::Undo | Self::Redo | Self::HistoryPrev | Self::HistoryNext | Self::Newline => {

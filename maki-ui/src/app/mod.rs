@@ -41,6 +41,7 @@ use crate::components::command::{CommandAction, CommandPalette, PluginAccess, SU
 use crate::components::compact_detail::CompactDetailModal;
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
+use crate::components::history_picker::{HistoryPicker, HistoryPickerAction};
 use crate::components::input::{InputAction, InputBox, Placeholder, Submission, sent_text};
 use crate::components::keybindings::key;
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
@@ -259,6 +260,7 @@ enum KeyboardOwner {
     ModelPicker,
     LoginPicker,
     McpPicker,
+    HistoryPicker,
     /// Nothing above holds the keyboard: the chat input, or the transcript of
     /// a tab with no input. It comes last because the command palette it
     /// answers is drawn under every modal above. Window bindings, global
@@ -618,6 +620,7 @@ pub struct App {
     pub(super) model_picker: ModelPicker,
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
+    pub(super) history_picker: HistoryPicker,
     pub(super) rewind_picker: RewindPicker,
     pub(super) alert_modal: AlertModal,
     pub(super) compact_detail: CompactDetailModal,
@@ -784,6 +787,7 @@ impl App {
                 .with_show_cost(ui_config.show_cost),
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
+            history_picker: HistoryPicker::new(),
             rewind_picker: RewindPicker::new(),
             alert_modal: AlertModal::new(),
             compact_detail: CompactDetailModal::new(),
@@ -1528,6 +1532,7 @@ impl App {
         try_picker!(self.rewind_picker);
         try_picker!(self.model_picker);
         try_picker!(self.file_picker);
+        try_picker!(self.history_picker);
         let zone = self.zone_at(row, column)?.zone;
         self.scroll_zone(zone, delta);
         Some(zone)
@@ -1778,6 +1783,13 @@ impl App {
                 }
                 McpPickerAction::Close => vec![],
             }),
+            KeyboardOwner::HistoryPicker => Some(match self.history_picker.handle_key(key) {
+                HistoryPickerAction::Consumed | HistoryPickerAction::Close => vec![],
+                HistoryPickerAction::Select(entry) => {
+                    self.input_action(|input| input.recall_history(entry.index));
+                    vec![]
+                }
+            }),
             KeyboardOwner::Chat => {
                 if key::PLAN_TOGGLE.matches(key) && self.plan_toggle_ready() {
                     return Some(self.run_builtin(BuiltinAction::PlanToggle));
@@ -1976,6 +1988,16 @@ impl App {
             BuiltinAction::Redo => self.input_action(InputBox::redo),
             BuiltinAction::HistoryPrev => self.input_action(InputBox::history_up),
             BuiltinAction::HistoryNext => self.input_action(InputBox::history_down),
+            BuiltinAction::HistoryPicker => {
+                if !self.chat_accepts_input() {
+                    return (false, vec![]);
+                }
+                if let Err(msg) = self.history_picker.open(self.input_box.history()) {
+                    self.flash(msg);
+                    return (false, vec![]);
+                }
+                true
+            }
             BuiltinAction::Newline => self.input_action(|input| {
                 input.newline();
                 true
@@ -2365,6 +2387,8 @@ impl App {
                 return self.run_builtin(BuiltinAction::Search);
             } else if key::FILE_PICKER.matches(key) {
                 return self.run_builtin(BuiltinAction::FilePicker);
+            } else if key::HISTORY_PICKER.matches(key) {
+                return self.run_builtin(BuiltinAction::HistoryPicker);
             } else if key::PASTE.matches(key) && self.paste_rx.is_empty() {
                 self.start_clipboard_paste();
             } else if let InputAction::Changed = self.input_box.handle_key(key, mode) {
@@ -2726,6 +2750,7 @@ impl App {
             KeyboardOwner::ModelPicker => &self.model_picker,
             KeyboardOwner::LoginPicker => &self.login_picker,
             KeyboardOwner::McpPicker => &self.mcp_picker,
+            KeyboardOwner::HistoryPicker => &self.history_picker,
             KeyboardOwner::PlanForm
             | KeyboardOwner::FocusedSplit
             | KeyboardOwner::Queue
@@ -2750,6 +2775,7 @@ impl App {
             KeyboardOwner::ModelPicker => &mut self.model_picker,
             KeyboardOwner::LoginPicker => &mut self.login_picker,
             KeyboardOwner::McpPicker => &mut self.mcp_picker,
+            KeyboardOwner::HistoryPicker => &mut self.history_picker,
             KeyboardOwner::PlanForm
             | KeyboardOwner::FocusedSplit
             | KeyboardOwner::Queue
@@ -2981,6 +3007,7 @@ impl App {
             KeyboardOwner::ModelPicker => self.model_picker.handle_paste(text),
             KeyboardOwner::LoginPicker => self.login_picker.handle_paste(text),
             KeyboardOwner::McpPicker => self.mcp_picker.handle_paste(text),
+            KeyboardOwner::HistoryPicker => self.history_picker.handle_paste(text),
             KeyboardOwner::Chat => {
                 let pressed = Pressed::Paste(text.to_owned());
                 if !self.dispatch_on_screen_windows(&pressed, turn)
