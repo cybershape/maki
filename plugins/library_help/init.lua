@@ -1,4 +1,7 @@
 local ToolView = require("maki.tool_view")
+local sandbox_engine = maki.api.declare_slot("library_help.sandbox_engine", function()
+  return "python"
+end, { capability = {} })
 
 local PY_IDENTIFIER = "^[%a_][%w_]*$"
 local PYTHON_KEYWORDS = {
@@ -189,10 +192,130 @@ local function format_python_docstring(name, desc, schema)
   return table.concat(doc_lines, "\n")
 end
 
+local JS_TYPES = {
+  string = "string",
+  integer = "number",
+  number = "number",
+  boolean = "boolean",
+  object = "object",
+  array = "any[]",
+  null = "null",
+}
+
+local function js_type(prop)
+  if not prop or type(prop) ~= "table" then
+    return "any"
+  end
+  local t = prop.type
+  local variants = prop.anyOf or prop.oneOf
+  if type(t) == "table" then
+    variants = {}
+    for _, kind in ipairs(t) do
+      table.insert(variants, { type = kind, items = prop.items })
+    end
+  end
+  if type(variants) == "table" and #variants > 0 then
+    local types = {}
+    for _, variant in ipairs(variants) do
+      table.insert(types, js_type(variant))
+    end
+    return table.concat(types, " | ")
+  end
+  if t == "array" then
+    if type(prop.items) == "table" then
+      return js_type(prop.items) .. "[]"
+    end
+    return "any[]"
+  end
+  return JS_TYPES[t] or "any"
+end
+
+local function format_js_doc(name, desc, schema)
+  schema = schema or {}
+  local props = schema.properties or {}
+  local req_set = {}
+  if schema.required and type(schema.required) == "table" then
+    for _, k in ipairs(schema.required) do
+      req_set[k] = true
+    end
+  end
+
+  local req_args = {}
+  local opt_args = {}
+  for k, v in pairs(props) do
+    if req_set[k] then
+      table.insert(req_args, { name = k, prop = v })
+    else
+      table.insert(opt_args, { name = k, prop = v })
+    end
+  end
+  table.sort(req_args, function(a, b)
+    return a.name < b.name
+  end)
+  table.sort(opt_args, function(a, b)
+    return a.name < b.name
+  end)
+
+  local sig_lines = {}
+  for _, a in ipairs(req_args) do
+    table.insert(sig_lines, string.format("  %s: %s,", a.name, js_type(a.prop)))
+  end
+  for _, a in ipairs(opt_args) do
+    local def_suffix = ""
+    if a.prop and a.prop.default ~= nil then
+      if type(a.prop.default) == "string" then
+        def_suffix = string.format(" = %q", a.prop.default)
+      else
+        def_suffix = " = " .. tostring(a.prop.default)
+      end
+    end
+    table.insert(sig_lines, string.format("  %s?: %s%s,", a.name, js_type(a.prop), def_suffix))
+  end
+
+  local sig_args_str = #sig_lines > 0 and ("{\n" .. table.concat(sig_lines, "\n") .. "\n}") or ""
+  local fn_name = identifier_alias(name) or name
+  local doc_lines = {
+    string.format("async function %s(%s): Promise<string>", fn_name, sig_args_str),
+  }
+  if desc and #desc > 0 then
+    table.insert(doc_lines, "")
+    table.insert(doc_lines, desc)
+  end
+  if #req_args > 0 or #opt_args > 0 then
+    table.insert(doc_lines, "")
+    table.insert(doc_lines, "Parameters:")
+    for _, a in ipairs(req_args) do
+      local pdesc = (a.prop and a.prop.description) or ""
+      if #pdesc > 0 then
+        table.insert(doc_lines, string.format("- %s (%s, required): %s", a.name, js_type(a.prop), pdesc))
+      else
+        table.insert(doc_lines, string.format("- %s (%s, required)", a.name, js_type(a.prop)))
+      end
+    end
+    for _, a in ipairs(opt_args) do
+      local pdesc = (a.prop and a.prop.description) or ""
+      if #pdesc > 0 then
+        table.insert(doc_lines, string.format("- %s (%s, optional): %s", a.name, js_type(a.prop), pdesc))
+      else
+        table.insert(doc_lines, string.format("- %s (%s, optional)", a.name, js_type(a.prop)))
+      end
+    end
+  end
+  return table.concat(doc_lines, "\n")
+end
+
+local PYTHON_DESC =
+  "Retrieve the Python function signature, parameter types, and docstring documentation for an external library function before calling it in code_execution."
+local JS_DESC =
+  "Retrieve the JavaScript function signature, parameter types, and documentation for an external library function before calling it in code_execution."
+
 maki.api.register_tool({
   name = "library_help",
   kind = "inspect",
-  description = "Retrieve the Python function signature, parameter types, and docstring documentation for an external library function before calling it in code_execution.",
+  description = PYTHON_DESC,
+  describe = function()
+    return sandbox_engine() == "js" and JS_DESC or PYTHON_DESC
+  end,
 
   schema = {
     type = "object",
@@ -304,7 +427,9 @@ maki.api.register_tool({
       }
     end
 
-    local doc = format_python_docstring(matched_fn_name or matched_fn.name, matched_fn.description, matched_fn.schema)
+    local doc = sandbox_engine() == "js"
+        and format_js_doc(matched_fn_name or matched_fn.name, matched_fn.description, matched_fn.schema)
+      or format_python_docstring(matched_fn_name or matched_fn.name, matched_fn.description, matched_fn.schema)
     return { llm_output = doc }
   end,
 })

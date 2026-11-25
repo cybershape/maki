@@ -7,6 +7,8 @@ local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 local partial = require("maki.partial")
 
+local ENGINE_PYTHON = "python"
+local ENGINE_JS = "js"
 local MAX_SCRIPT_LINES = 2000
 local OPEN_READ_CHECK_LINES = 1
 local READ_INPUT_SLOTS = { "tool.read.input", "tool.*.input" }
@@ -88,14 +90,28 @@ def open(file, mode='r', buffering=-1, encoding=None, errors=None, newline=None,
     return _orig_open(file, mode)
 ]]
 local TOOLS_HEADER = "\n\nAvailable tools (async Python functions, keyword args only):\n"
+local JS_TOOLS_HEADER = "\n\nAvailable tools (async JavaScript functions taking an options object):\n"
 local WORKFLOW_TOOLS_NOTE =
   "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `gather(task(...), task(...))` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
+local JS_WORKFLOW_TOOLS_NOTE =
+  "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `gather(task(...), task(...))` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `JSON.parse`).\n"
 local WORKFLOW_OFF_NOTE = "\nNot callable: %s\n"
 local CALLABLE_TOOLS_ERR = "cannot list callable tools: "
+local JS_IMPORT_HINT =
+  "\n\nHint: ES module `import` statements are not supported in script mode. Built-ins (`fs`, `path`, `process`, `env`, `gather`, `sleep`), tools, and external libraries are already pre-bound globals; use them directly without importing."
+local JS_PROMISE_ALL = "Promise.all("
 -- `alias` covers hyphens; what is left is a name no substitution can fix, like
 -- a leading digit. Binding it would raise a SyntaxError the model cannot act on.
 local PY_IDENTIFIER = "^[%a_][%w_]*$"
 local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
+local JS_TYPES = {
+  string = "string",
+  integer = "number",
+  number = "number",
+  boolean = "boolean",
+  array = "any[]",
+  object = "object",
+}
 local PYTHON_KEYWORDS = {
   ["False"] = true,
   ["None"] = true,
@@ -195,55 +211,64 @@ local function apply_param_map(tool_input, param_map)
   return tool_input
 end
 
-local function mcp_library_hint(libs, code, err)
+local function mcp_library_hint(libs, code, err, is_js)
   if not libs or #libs == 0 then
     return ""
+  end
+  local function help_call(lib_name, fn_name)
+    if is_js then
+      return string.format('library_help({ library_name: "%s", function_name: "%s" })', lib_name, fn_name)
+    end
+    return string.format('library_help(library_name="%s", function_name="%s")', lib_name, fn_name)
   end
   for _, lib in ipairs(libs) do
     local lib_name = identifier_alias(lib.name)
     if lib_name then
-      -- Check if model tried to 'import <lib_name>'
-      if code:match("import%s+" .. lib_name) or err:find("No module named '" .. lib_name .. "'", 1, true) then
+      local tried_import = code:match("import%s+" .. lib_name)
+        or err:find("No module named '" .. lib_name .. "'", 1, true)
+        or (is_js and (code:find("require('" .. lib_name .. "'", 1, true) or code:find('require("' .. lib_name .. '"', 1, true)))
+      if tried_import then
+        if is_js then
+          return string.format(
+            "\n\nHint: '%s' is an external library already injected as a global object in this sandbox. DO NOT import or require it; call its functions directly via `await %s.<function>({ ... })`. Use `%s` to inspect its available functions.",
+            lib_name,
+            lib_name,
+            help_call(lib_name, "...")
+          )
+        end
         return string.format(
-          "\n\nHint: '%s' is an external library already injected as a global object in this sandbox. DO NOT write `import %s`; call its functions directly via `await %s.<function>(...)`. Use `library_help(library_name=\"%s\", function_name=\"...\")` to inspect its available functions.",
+          "\n\nHint: '%s' is an external library already injected as a global object in this sandbox. DO NOT write `import %s`; call its functions directly via `await %s.<function>(...)`. Use `%s` to inspect its available functions.",
           lib_name,
           lib_name,
           lib_name,
-          lib_name
+          help_call(lib_name, "...")
         )
       end
+      local is_call_err = err:find(lib_name, 1, true)
+        or err:find("RuntimeError", 1, true)
+        or err:find("TypeError", 1, true)
+        or (is_js and err:find("Error:", 1, true))
       for _, fn in ipairs(lib.functions or {}) do
         local name_str = type(fn) == "table" and fn.name or fn
         local fn_name = identifier_alias(name_str) or name_str
         if fn_name then
           local wire = lib_name .. "__" .. fn_name
           local dot_call = lib_name .. "." .. fn_name
-          if
-            err:find(wire, 1, true)
-            or (
-              code:find(dot_call, 1, true)
-              and (err:find(lib_name, 1, true) or err:find("RuntimeError", 1, true) or err:find("TypeError", 1, true))
-            )
-          then
+          if err:find(wire, 1, true) or (code:find(dot_call, 1, true) and is_call_err) then
             return string.format(
-              "\n\nHint: Parameter or runtime error in external library '%s'. Please inspect its schema using `library_help(library_name=\"%s\", function_name=\"%s\")` before retrying.",
+              "\n\nHint: Parameter or runtime error in external library '%s'. Please inspect its schema using `%s` before retrying.",
               lib_name,
-              lib_name,
-              fn_name
+              help_call(lib_name, fn_name)
             )
           end
         end
       end
       local fn_call = code:match(lib_name .. "%.([%a_][%w_]*)")
-      if
-        fn_call
-        and (err:find(lib_name, 1, true) or err:find("RuntimeError", 1, true) or err:find("TypeError", 1, true))
-      then
+      if fn_call and is_call_err then
         return string.format(
-          "\n\nHint: Parameter or runtime error in external library '%s'. Please inspect its schema using `library_help(library_name=\"%s\", function_name=\"%s\")` before retrying.",
+          "\n\nHint: Parameter or runtime error in external library '%s'. Please inspect its schema using `%s` before retrying.",
           lib_name,
-          lib_name,
-          fn_call
+          help_call(lib_name, fn_call)
         )
       end
     end
@@ -252,6 +277,10 @@ local function mcp_library_hint(libs, code, err)
 end
 
 local opts = maki.api.register_options(output_limits.extend({
+  engine = {
+    default = ENGINE_PYTHON,
+    desc = 'Sandbox engine: "python" (Monty) or "js" (QuickJS-NG).',
+  },
   timeout_secs = {
     default = 30,
     min = 5,
@@ -259,6 +288,21 @@ local opts = maki.api.register_options(output_limits.extend({
   },
   max_memory_mb = { default = 50, min = 10, desc = "Memory limit for the Python sandbox (MB)." },
 }))
+
+if opts.engine ~= ENGINE_PYTHON and opts.engine ~= ENGINE_JS then
+  error(
+    string.format(
+      'plugins.code_execution.engine: unknown value "%s" (expected "%s" or "%s")',
+      tostring(opts.engine),
+      ENGINE_PYTHON,
+      ENGINE_JS
+    )
+  )
+end
+local IS_JS = opts.engine == ENGINE_JS
+maki.api.set_slot("library_help.sandbox_engine", function(_next)
+  return opts.engine
+end)
 
 local function new_view(ctx, buf)
   return ToolView.new(buf, { max_lines = ctx:tool_output_lines().code_execution or 3 })
@@ -300,7 +344,7 @@ local function build_body(ctx, code)
   end)
 
   local function highlight()
-    local highlighted = maki.ui.highlight(table.concat(lines, "\n"), "py")
+    local highlighted = maki.ui.highlight(table.concat(lines, "\n"), IS_JS and "js" or "py")
     if highlighted then
       hl = highlighted
       view:set_header(header())
@@ -360,8 +404,51 @@ Syntax & Execution Limitations (Frequent Failure Points):
 ]]):format(use_prefix, concurrency, mcp_line, single_call)
 end
 
-local description = build_description(false, nil)
-local description_batch_disabled = build_description(true, nil)
+local function build_js_description(batch_disabled, mcp_lib_names)
+  local use_prefix = batch_disabled and "Use for parallel/batch calls (the batch tool is disabled; use gather), "
+    or "Use for "
+  local concurrency = batch_disabled
+      and "- Concurrency / Batch execution: `const [a, b] = await gather(read({ path: 'a.rs', offset: 1, limit: 100 }), grep({ pattern: 'x' }))` (or `Promise.all` / `Promise.allSettled`). `gather(...)` keeps sibling results, returning `[ERROR] ...` for any failed slot. The batch tool is disabled; use code_execution with `await gather(...)` to run multiple independent tool calls concurrently (replacing batch)."
+    or "- Concurrency: `const [a, b] = await gather(read({ path: 'a.rs', offset: 1, limit: 100 }), grep({ pattern: 'x' }))` (or `Promise.all` / `Promise.allSettled`). `gather(...)` keeps sibling results, returning `[ERROR] ...` for any failed slot."
+  local single_call = batch_disabled
+      and "- NEVER use as a proxy or wrapper for a single tool call. If no code logic, chaining, or output filtering is needed, invoke the tool directly (batching 2+ independent calls via gather is allowed when batch is disabled)."
+    or "- NEVER use as a proxy or wrapper for a single tool call. If no code logic, chaining, or output filtering is needed, invoke the tool directly."
+
+  local mcp_line = ""
+  if mcp_lib_names and #mcp_lib_names > 0 then
+    mcp_line = string.format(
+      "\n- Pre-bound external libraries: %s (injected as global objects — DO NOT import or require, call directly via `await <lib>.<fn>({ ... })`).",
+      table.concat(mcp_lib_names, ", ")
+    )
+  end
+
+  return ([[Execute JavaScript in an embedded QuickJS sandbox — NOT a full Node.js runtime.
+
+Purpose:
+- %schained/dependent tool calls and filtering/processing results, e.g. filtering tool output. **DRAMATICALLY** cheaper than sequential tool calls!
+- Exclusively for orchestrating and chaining the available async tool functions listed below (such as `read`, `grep`, `bash`, `edit`).
+- For heavy data analysis, npm/Python packages, or full runtime features: DO NOT execute them here. Run scripts on the host system via the `bash` tool instead.
+
+Execution Model & Globals:
+- Write standard JavaScript with top-level `await`. Output results via `console.log(...)`, `return`, or a final expression.
+- All tools are async globals taking a single options object and returning strings: `const result = await read({ path: 'file.txt', offset: 1, limit: 100 })`.
+- Tool results are complete. Only what you print/return is capped.
+%s
+- Built-in globals (no import needed): `fs` (`readFileSync`, `writeFileSync`, `appendFileSync`, `readdirSync`, `statSync`, `existsSync`, `mkdirSync` — UTF-8 only), `path` (`join`, `resolve`, `dirname`, `basename`, `extname`, `normalize`, `relative`, `isAbsolute`), `env` / `process.env` (safe subset), `process.cwd()`, `gather`, `sleep(ms)`, `console.log` / `print`. `require('fs')` and `require('path')` also work.%s
+- Fresh sandbox each run: no state persists between executions.
+- 30s script timeout (`timeout` param); time awaiting tool calls does not count.
+%s
+- NOT a thinking scratchpad. Reason in your response text.]]):format(use_prefix, concurrency, mcp_line, single_call)
+end
+
+local function build_active_description(batch_disabled, mcp_lib_names)
+  if IS_JS then
+    return build_js_description(batch_disabled, mcp_lib_names)
+  end
+  return build_description(batch_disabled, mcp_lib_names)
+end
+
+local description = build_active_description(false, nil)
 
 local schema = {
   type = "object",
@@ -370,7 +457,9 @@ local schema = {
   properties = {
     code = {
       type = "string",
-      description = "Python code. Tools return strings, not objects, and you MUST await every call: `result = await read(path='/file', offset=1, limit=100)`.",
+      description = IS_JS
+          and "JavaScript code with top-level await. Tools return strings, take an options object, and MUST be awaited: `const result = await read({ path: '/file', offset: 1, limit: 100 })`."
+        or "Python code. Tools return strings, not objects, and you MUST await every call: `result = await read(path='/file', offset=1, limit=100)`.",
     },
     timeout = {
       type = "integer",
@@ -379,23 +468,43 @@ local schema = {
   },
 }
 
-local examples = {
-  {
-    code = [[files = (await glob(pattern='**/*.rs')).strip().split('\n')
+local examples = IS_JS
+    and {
+      {
+        code = [[const files = (await glob({ pattern: '**/*.rs' })).trim().split('\n').filter(Boolean);
+const results = await gather(files.map((f) => read({ path: f, offset: 1, limit: 0 })));
+for (let i = 0; i < files.length; i++) {
+  if (results[i].includes('fn main')) console.log(files[i]);
+}]],
+      },
+      {
+        code = [[const result = await grep({ pattern: 'TODO', include: '*.rs' });
+console.log(`${result.trim().split('\n').filter(Boolean).length} TODOs found`);]],
+      },
+      {
+        code = [[const content = await webfetch({ url: 'https://example.com/docs' });
+for (const line of content.split('\n')) {
+  if (line.toLowerCase().includes('auth')) console.log(line);
+}]],
+      },
+    }
+  or {
+    {
+      code = [[files = (await glob(pattern='**/*.rs')).strip().split('\n')
 results = await gather([read(path=f, offset=1, limit=0) for f in files if f.strip()])
 for f, c in zip(files, results):
     if 'fn main' in c: print(f)]],
-  },
-  {
-    code = [[result = await grep(pattern='TODO', include='*.rs')
+    },
+    {
+      code = [[result = await grep(pattern='TODO', include='*.rs')
 print(f"{len(result.strip().splitlines())} TODOs found")]],
-  },
-  {
-    code = [[content = await webfetch(url='https://example.com/docs')
+    },
+    {
+      code = [[content = await webfetch(url='https://example.com/docs')
 for line in content.splitlines():
     if 'auth' in line.lower(): print(line)]],
-  },
-}
+    },
+  }
 
 -- Shared predicate for describe and handler so advertised == callable.
 -- The interpreter is a calling convention, not a capability grant: a read-only
@@ -452,6 +561,14 @@ local function signature(t)
     return a < b
   end)
   local params = {}
+  if IS_JS then
+    for _, pname in ipairs(names) do
+      local ptype = JS_TYPES[schema_props[pname].type] or "any"
+      params[#params + 1] = required[pname] and (pname .. ": " .. ptype) or (pname .. "?: " .. ptype)
+    end
+    local arg_sig = #params > 0 and ("{ " .. table.concat(params, ", ") .. " }") or ""
+    return "- " .. (t.alias or t.name) .. "(" .. arg_sig .. ") -> Promise<string>"
+  end
   for _, pname in ipairs(names) do
     local py_pname = to_py_identifier(pname) or pname
     local ptype = PY_TYPES[schema_props[pname].type] or "any"
@@ -471,8 +588,8 @@ local function describe(dctx)
     end
   end
   local batch_disabled = not matches_filter("batch", dctx)
-  local base_desc = build_description(batch_disabled, mcp_lib_names)
-  local parts = { base_desc, TOOLS_HEADER }
+  local base_desc = build_active_description(batch_disabled, mcp_lib_names)
+  local parts = { base_desc, IS_JS and JS_TOOLS_HEADER or TOOLS_HEADER }
   local has_workflow_only, gated = false, {}
   -- Ask as if workflow were on, then hold back what it would unlock: those
   -- names are listed as not callable, so the model stops trying them.
@@ -487,14 +604,16 @@ local function describe(dctx)
     end
   end
   if has_workflow_only then
-    parts[#parts + 1] = WORKFLOW_TOOLS_NOTE
+    parts[#parts + 1] = IS_JS and JS_WORKFLOW_TOOLS_NOTE or WORKFLOW_TOOLS_NOTE
   end
   if #gated > 0 then
     parts[#parts + 1] = WORKFLOW_OFF_NOTE:format(table.concat(gated, ", "))
   end
   if dctx.mcp and dctx.mcp_libraries and #dctx.mcp_libraries > 0 then
     local lines = {
-      "\nExternal libraries (pre-bound global objects, callable in Python via `await <library_name>.<function_name>(...)`; DO NOT import):",
+      IS_JS
+          and "\nExternal libraries (pre-bound global objects, callable in JavaScript via `await <library_name>.<function_name>({ ... })`; DO NOT import or require):"
+        or "\nExternal libraries (pre-bound global objects, callable in Python via `await <library_name>.<function_name>(...)`; DO NOT import):",
     }
     for _, lib in ipairs(dctx.mcp_libraries) do
       local lib_name = identifier_alias(lib.name) or lib.name
@@ -513,7 +632,9 @@ local function describe(dctx)
     end
     table.insert(
       lines,
-      'Use `library_help(library_name="...", function_name="...")` to inspect parameter schemas and function documentation. Always inspect unfamiliar external library functions with library_help before calling them for the first time.\n'
+      IS_JS
+          and 'Use `library_help({ library_name: "...", function_name: "..." })` to inspect parameter schemas and function documentation. Always inspect unfamiliar external library functions with library_help before calling them for the first time.\n'
+        or 'Use `library_help(library_name="...", function_name="...")` to inspect parameter schemas and function documentation. Always inspect unfamiliar external library functions with library_help before calling them for the first time.\n'
     )
     parts[#parts + 1] = table.concat(lines, "\n")
   end
@@ -661,7 +782,9 @@ local function handler(input, ctx)
     local bind, name = t.alias or t.name, t.name
     if bind:match(PY_IDENTIFIER) then
       schemas[bind] = t.schema or {}
-      param_maps[bind] = build_param_map(t.schema)
+      if not IS_JS then
+        param_maps[bind] = build_param_map(t.schema)
+      end
       tools[bind] = function(tool_input)
         if param_maps[bind] then
           tool_input = apply_param_map(tool_input, param_maps[bind])
@@ -684,16 +807,18 @@ local function handler(input, ctx)
     end
   end
 
-  local preamble_parts = { PREAMBLE }
+  local preamble_parts = IS_JS and {} or { PREAMBLE }
   local libs = maki.agent.mcp_libraries(ctx)
   if libs and #libs > 0 then
-    local ns_lines = {
-      "class _McpNamespace:\n    pass\n",
-    }
+    local ns_lines = IS_JS and {} or { "class _McpNamespace:\n    pass\n" }
     for _, lib in ipairs(libs) do
       local lib_name = identifier_alias(lib.name)
       if lib_name then
-        table.insert(ns_lines, string.format("%s = _McpNamespace()\n", lib_name))
+        if IS_JS then
+          table.insert(ns_lines, string.format("globalThis.%s = {};\n", lib_name))
+        else
+          table.insert(ns_lines, string.format("%s = _McpNamespace()\n", lib_name))
+        end
         for _, fn in ipairs(lib.functions or {}) do
           local raw_fn_name = fn.name
           local fn_name = identifier_alias(raw_fn_name) or raw_fn_name
@@ -706,9 +831,18 @@ local function handler(input, ctx)
             if tools[wire] then
               if fn.schema then
                 schemas[wire] = fn.schema
-                param_maps[wire] = build_param_map(fn.schema)
+                if not IS_JS then
+                  param_maps[wire] = build_param_map(fn.schema)
+                end
               end
-              table.insert(ns_lines, string.format("%s.%s = %s\n", lib_name, fn_name, wire))
+              if IS_JS then
+                table.insert(ns_lines, string.format("globalThis.%s.%s = %s;\n", lib_name, fn_name, wire))
+                if raw_fn_name ~= fn_name then
+                  table.insert(ns_lines, string.format("globalThis.%s[%q] = %s;\n", lib_name, raw_fn_name, wire))
+                end
+              else
+                table.insert(ns_lines, string.format("%s.%s = %s\n", lib_name, fn_name, wire))
+              end
             end
           end
         end
@@ -718,6 +852,7 @@ local function handler(input, ctx)
   end
 
   local result, err = maki.interpreter.run(input.code, {
+    engine = opts.engine,
     timeout = timeout,
     max_memory_mb = opts.max_memory_mb,
     preamble = table.concat(preamble_parts),
@@ -739,18 +874,31 @@ local function handler(input, ctx)
     err = shell_hint(tools, err, (err:gsub(REMOVAL_BASH, REMOVAL_POWERSHELL, 1)))
     view:append_text(err)
     view:finish()
-    -- The run is already paid for, so point a script that reached for
-    -- `asyncio.gather` at the wrapper that would have kept its other results.
-    local hint = input.code:find(ASYNCIO_GATHER, 1, true) and GATHER_HINT or ""
-    local exception = err:match(EXCEPTION_LINE) or ""
-    for _, entry in ipairs(ERROR_HINTS) do
-      if exception:find(entry[1]) then
-        hint = hint .. entry[2]
-        break
+    local hint = ""
+    if IS_JS then
+      if input.code:find(JS_PROMISE_ALL, 1, true) then
+        hint = hint .. GATHER_HINT
+      end
+      if
+        err:find("SyntaxError:", 1, true)
+        and (input.code:match("^%s*import%s") or input.code:match("\n%s*import%s"))
+      then
+        hint = hint .. JS_IMPORT_HINT
+      end
+    else
+      -- The run is already paid for, so point a script that reached for
+      -- `asyncio.gather` at the wrapper that would have kept its other results.
+      hint = input.code:find(ASYNCIO_GATHER, 1, true) and GATHER_HINT or ""
+      local exception = err:match(EXCEPTION_LINE) or ""
+      for _, entry in ipairs(ERROR_HINTS) do
+        if exception:find(entry[1]) then
+          hint = hint .. entry[2]
+          break
+        end
       end
     end
-    local mcp_hint = mcp_library_hint(libs, input.code, err)
-    local mod_hint = (mcp_hint == "") and unsupported_module_hint(tools, err) or ""
+    local mcp_hint = mcp_library_hint(libs, input.code, err, IS_JS)
+    local mod_hint = (not IS_JS and mcp_hint == "") and unsupported_module_hint(tools, err) or ""
     return { llm_output = output_limits.cut_middle(err .. hint .. mcp_hint .. mod_hint, max_lines, max_bytes), is_error = true, body = buf }
   end
 

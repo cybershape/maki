@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+futures = { workspace = true }
 monty = { workspace = true }
 monty-types = { workspace = true }
+rquickjs = { workspace = true }
 serde_json = { workspace = true }
 getrandom = { workspace = true }
 thiserror = { workspace = true }

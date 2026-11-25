@@ -215,6 +215,7 @@ tree-sitter-json = "0.24"
 tree-sitter-make = "1"
 monty = "1"
 monty-types = "1"
+rquickjs = { version = "0.14", features = ["futures"] }
 notify = { version = "9.0.0-rc.8", default-features = false, features = ["macos_fsevent"] }
 notify-rust = "4"
 serde-saphyr = { version = "2", default-features = false }

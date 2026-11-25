@@ -4,12 +4,19 @@
 //! the blocked thread unwind instead of leaking.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use futures::StreamExt;
 use futures::future::join_all;
+use futures::stream::FuturesUnordered;
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::interpreter_bridge::build_tool_input;
 use maki_interpreter::error::InterpreterError;
+use maki_interpreter::js::{self, JsFileFn, JsLimits, JsOutputFn, JsRunConfig, JsToolFn};
 use maki_interpreter::runner::{self, FileFn, FileOp, ToolFn};
 use maki_interpreter::{AsyncResolver, PendingCall};
 use maki_lua_macro::{lua_fn, lua_table};
@@ -29,6 +36,8 @@ use crate::runtime::{TaskHandle, lock_cell};
 const INTERPRETER_RUN: &str = "interpreter.run";
 const BRIDGE_CLOSED: &str = "tool bridge closed (cancelled)";
 const FILE_OP_DENIED: &str = "not permitted in this sandbox";
+const ENGINE_PYTHON: &str = "python";
+const ENGINE_JS: &str = "js";
 /// A backlog of lines is ready on every recv, so the loop must yield on its
 /// own or a chatty script holds the Lua thread until the watchdog kills it.
 const LINES_PER_YIELD: usize = 256;
@@ -36,8 +45,23 @@ const LINES_PER_YIELD: usize = 256;
 type CallResults = Vec<(u32, Result<Value, String>)>;
 type FileResult = Result<String, String>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Engine {
+    Python,
+    Js,
+}
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 enum BridgeMsg {
     Line(String),
+    Call(PendingCall, oneshot::Sender<Result<Value, String>>),
     Calls(Vec<PendingCall>, oneshot::Sender<CallResults>),
     File(FileOp, oneshot::Sender<FileResult>),
 }
@@ -104,8 +128,10 @@ async fn call_lua_tool(lua: Lua, f: Option<Function>, pc: &PendingCall) -> Resul
 ///   `on_output` (function) - called with each stdout line (string) as it is
 ///     produced. Must not yield.
 /// Optional fields:
-///   `preamble` (string?) - Python source (imports, helpers) compiled ahead of
-///     {code}. Tracebacks are rebased so line 1 is {code} line 1.
+///   `engine` (string?) - Sandbox engine: `"python"` (Monty, default) or `"js"`
+///     (QuickJS-NG).
+///   `preamble` (string?) - Source (imports, helpers) evaluated ahead of {code}.
+///     Tracebacks keep line 1 at {code} line 1.
 ///   `tools` (table?) - map of `name -> function` for tools the sandbox may call.
 ///     Each function receives the tool input table and must return `(string)` or
 ///     `(nil, err)`. Tool calls are batched and dispatched concurrently.
@@ -147,6 +173,15 @@ async fn interpreter_run(
     let timeout_secs: u64 = required(&opts, INTERPRETER_RUN, "timeout")?;
     let max_memory_mb: usize = required(&opts, INTERPRETER_RUN, "max_memory_mb")?;
     let on_output: Function = required(&opts, INTERPRETER_RUN, "on_output")?;
+    let engine = match opts.opt::<String>("engine")?.as_deref() {
+        None | Some(ENGINE_PYTHON) => Engine::Python,
+        Some(ENGINE_JS) => Engine::Js,
+        Some(other) => {
+            return Err(mlua::Error::runtime(format!(
+                "{INTERPRETER_RUN}: unknown engine \"{other}\" (expected \"{ENGINE_PYTHON}\" or \"{ENGINE_JS}\")"
+            )));
+        }
+    };
     let preamble: String = opts.opt::<String>("preamble")?.unwrap_or_default();
     let tools_tbl: Option<Table> = opts.opt("tools")?;
     let files_tbl: Option<Table> = opts.opt("files")?;
@@ -176,117 +211,194 @@ async fn interpreter_run(
         .unwrap_or_else(CancelToken::none);
 
     let timeout = Duration::from_secs(timeout_secs);
-    let limits = runner::limits(timeout, max_memory_mb * 1024 * 1024);
+    let max_memory = max_memory_mb * 1024 * 1024;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_bg = Arc::clone(&cancelled);
 
     let (tx, mut rx) = unbounded_channel::<BridgeMsg>();
-    let run = spawn_blocking(move || {
-        let tools: HashMap<String, ToolFn> = names
-            .into_iter()
-            .map(|name| {
+    let run = spawn_blocking(move || match engine {
+        Engine::Python => {
+            let limits = runner::limits(timeout, max_memory);
+            let tools: HashMap<String, ToolFn> = names
+                .into_iter()
+                .map(|name| {
+                    let tx = tx.clone();
+                    let f: ToolFn = Box::new(
+                        move |fn_name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>| {
+                            let call = PendingCall {
+                                call_id: 0,
+                                name: fn_name.to_owned(),
+                                args,
+                                kwargs,
+                            };
+                            forward_calls(&tx, vec![call])
+                                .map_err(|e| e.to_string())?
+                                .pop()
+                                .map(|(_, r)| r)
+                                .unwrap_or_else(|| Err(BRIDGE_CLOSED.into()))
+                        },
+                    );
+                    (name, f)
+                })
+                .collect();
+            let resolver: AsyncResolver = {
                 let tx = tx.clone();
-                let f: ToolFn = Box::new(
-                    move |fn_name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>| {
-                        let call = PendingCall {
-                            call_id: 0,
-                            name: fn_name.to_owned(),
-                            args,
-                            kwargs,
-                        };
-                        forward_calls(&tx, vec![call])
-                            .map_err(|e| e.to_string())?
-                            .pop()
-                            .map(|(_, r)| r)
-                            .unwrap_or_else(|| Err(BRIDGE_CLOSED.into()))
-                    },
-                );
-                (name, f)
-            })
-            .collect();
-        let resolver: AsyncResolver = {
-            let tx = tx.clone();
-            Box::new(move |pending| forward_calls(&tx, pending))
-        };
-        let files: FileFn = {
-            let tx = tx.clone();
-            Box::new(move |op| {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                tx.send(BridgeMsg::File(op, reply_tx))
-                    .map_err(|_| BRIDGE_CLOSED.to_owned())?;
-                reply_rx
-                    .blocking_recv()
-                    .map_err(|_| BRIDGE_CLOSED.to_owned())?
-            })
-        };
+                Box::new(move |pending| forward_calls(&tx, pending))
+            };
+            let files: FileFn = {
+                let tx = tx.clone();
+                Box::new(move |op| {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    tx.send(BridgeMsg::File(op, reply_tx))
+                        .map_err(|_| BRIDGE_CLOSED.to_owned())?;
+                    reply_rx
+                        .blocking_recv()
+                        .map_err(|_| BRIDGE_CLOSED.to_owned())?
+                })
+            };
 
-        let mut flushed = 0usize;
-        let result = runner::run(
-            &code,
-            &preamble,
-            &tools,
-            Some(&resolver),
-            Some(&files),
-            limits,
-            &mut |chunk| {
-                flushed += chunk.len();
-                for line in chunk.lines() {
+            let mut flushed = 0usize;
+            let result = runner::run(
+                &code,
+                &preamble,
+                &tools,
+                Some(&resolver),
+                Some(&files),
+                limits,
+                &mut |chunk| {
+                    flushed += chunk.len();
+                    for line in chunk.lines() {
+                        let _ = tx.send(BridgeMsg::Line(line.to_owned()));
+                    }
+                },
+            )
+            .map_err(|e| e.to_string());
+            if let Ok(ir) = &result {
+                for line in ir.stdout[flushed..].lines() {
                     let _ = tx.send(BridgeMsg::Line(line.to_owned()));
                 }
-            },
-        )
-        .map_err(|e| e.to_string());
-        if let Ok(ir) = &result {
-            for line in ir.stdout[flushed..].lines() {
-                let _ = tx.send(BridgeMsg::Line(line.to_owned()));
             }
+            result
         }
-        result
+        Engine::Js => {
+            let call_tool: JsToolFn = {
+                let tx = tx.clone();
+                Arc::new(move |pc| {
+                    let tx = tx.clone();
+                    Box::pin(async move {
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        tx.send(BridgeMsg::Call(pc, reply_tx))
+                            .map_err(|_| BRIDGE_CLOSED.to_owned())?;
+                        reply_rx.await.map_err(|_| BRIDGE_CLOSED.to_owned())?
+                    })
+                })
+            };
+            let files: JsFileFn = {
+                let tx = tx.clone();
+                Arc::new(move |op| {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    tx.send(BridgeMsg::File(op, reply_tx))
+                        .map_err(|_| BRIDGE_CLOSED.to_owned())?;
+                    reply_rx
+                        .blocking_recv()
+                        .map_err(|_| BRIDGE_CLOSED.to_owned())?
+                })
+            };
+            let on_output: JsOutputFn = {
+                let tx = tx.clone();
+                Arc::new(move |chunk| {
+                    for line in chunk.lines() {
+                        let _ = tx.send(BridgeMsg::Line(line.to_owned()));
+                    }
+                })
+            };
+
+            js::run(
+                &code,
+                JsRunConfig {
+                    preamble,
+                    tool_names: names,
+                    call_tool,
+                    files: Some(files),
+                    limits: JsLimits {
+                        timeout,
+                        max_memory,
+                    },
+                    cancelled: cancelled_bg,
+                    on_output,
+                },
+            )
+            .map_err(|e| e.to_string())
+        }
     });
 
     let recv_loop = async {
+        let _cancel_guard = CancelOnDrop(Arc::clone(&cancelled));
         let mut lines = 0usize;
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                BridgeMsg::Line(line) => {
-                    on_output.call::<()>(line)?;
-                    lines += 1;
-                    if lines.is_multiple_of(LINES_PER_YIELD) {
-                        yield_now().await;
+        let mut in_flight: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send>>> =
+            FuturesUnordered::new();
+        let mut rx_closed = false;
+
+        while !rx_closed || !in_flight.is_empty() {
+            tokio::select! {
+                msg = rx.recv(), if !rx_closed => {
+                    let Some(msg) = msg else {
+                        rx_closed = true;
+                        continue;
+                    };
+                    match msg {
+                        BridgeMsg::Line(line) => {
+                            on_output.call::<()>(line)?;
+                            lines += 1;
+                            if lines.is_multiple_of(LINES_PER_YIELD) {
+                                yield_now().await;
+                            }
+                        }
+                        BridgeMsg::Call(pc, reply) => {
+                            let f = fns.get(&pc.name).cloned();
+                            let lua = lua.clone();
+                            in_flight.push(Box::pin(async move {
+                                let result = call_lua_tool(lua, f, &pc).await;
+                                let _ = reply.send(result.map_err(|e| format!("{}: {e}", pc.name)));
+                            }));
+                        }
+                        BridgeMsg::Calls(batch, reply) => {
+                            let futs = batch.into_iter().map(|pc| {
+                                let f = fns.get(&pc.name).cloned();
+                                let lua = lua.clone();
+                                // Name the tool on every failure: neither a traceback nor a
+                                // list of gathered results says which call broke.
+                                async move {
+                                    let result = call_lua_tool(lua, f, &pc).await;
+                                    (pc.call_id, result.map_err(|e| format!("{}: {e}", pc.name)))
+                                }
+                            });
+                            let _ = reply.send(join_all(futs).await);
+                        }
+                        BridgeMsg::File(op, reply) => {
+                            let result = match op {
+                                FileOp::Read(path) => call_lua_file_fn(read_fn.as_ref(), path)
+                                    .await
+                                    .and_then(lua_tool_result),
+                                FileOp::Write(w) => {
+                                    call_lua_file_fn(write_fn.as_ref(), (w.path, w.content, w.append))
+                                        .await
+                                        .and_then(file_ack)
+                                }
+                                FileOp::Inspect(path) => call_lua_file_fn(inspect_fn.as_ref(), path)
+                                    .await
+                                    .and_then(file_ack),
+                                FileOp::Mkdir(dir) => {
+                                    call_lua_file_fn(mkdir_fn.as_ref(), (dir.path, dir.parents))
+                                        .await
+                                        .and_then(file_ack)
+                                }
+                            };
+                            let _ = reply.send(result);
+                        }
                     }
                 }
-                BridgeMsg::Calls(batch, reply) => {
-                    let futs = batch.into_iter().map(|pc| {
-                        let f = fns.get(&pc.name).cloned();
-                        let lua = lua.clone();
-                        // Name the tool on every failure: neither a traceback nor a
-                        // list of gathered results says which call broke.
-                        async move {
-                            let result = call_lua_tool(lua, f, &pc).await;
-                            (pc.call_id, result.map_err(|e| format!("{}: {e}", pc.name)))
-                        }
-                    });
-                    let _ = reply.send(join_all(futs).await);
-                }
-                BridgeMsg::File(op, reply) => {
-                    let result = match op {
-                        FileOp::Read(path) => call_lua_file_fn(read_fn.as_ref(), path)
-                            .await
-                            .and_then(lua_tool_result),
-                        FileOp::Write(w) => {
-                            call_lua_file_fn(write_fn.as_ref(), (w.path, w.content, w.append))
-                                .await
-                                .and_then(file_ack)
-                        }
-                        FileOp::Inspect(path) => call_lua_file_fn(inspect_fn.as_ref(), path)
-                            .await
-                            .and_then(file_ack),
-                        FileOp::Mkdir(dir) => {
-                            call_lua_file_fn(mkdir_fn.as_ref(), (dir.path, dir.parents))
-                                .await
-                                .and_then(file_ack)
-                        }
-                    };
-                    let _ = reply.send(result);
-                }
+                Some(()) = in_flight.next(), if !in_flight.is_empty() => {}
             }
         }
         Ok::<(), mlua::Error>(())

@@ -1300,3 +1300,226 @@ fn library_help_formats_keyword_and_hyphen_signatures() {
     assert!(engram_help.contains("- from_ (str, required): Source path"));
     assert!(engram_help.contains("- target_branch (str, optional)"));
 }
+
+const JS_UNKNOWN_ENGINE_ERR: &str = "plugins.code_execution.engine: unknown value";
+const JS_SANDBOX_HEADER: &str = "Execute JavaScript in an embedded QuickJS sandbox";
+const JS_IMPORT_HINT_SUBSTR: &str = "ES module `import` statements are not supported";
+
+fn setup_js_with(reg: Arc<ToolRegistry>) -> (Arc<ToolRegistry>, PluginHost) {
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut opts = serde_json::Map::new();
+    opts.insert("engine".into(), serde_json::json!("js"));
+    host.load_source_with_opts("code_execution", CODE_EXECUTION_SRC, opts)
+        .expect("code_execution with js engine should load");
+    host.load_source("library_help", LIBRARY_HELP_SRC)
+        .expect("library_help should load");
+    host.load_source("policy_fixtures", &fixture_plugin())
+        .expect("fixture plugin should load");
+    (reg, host)
+}
+
+fn setup_js() -> (Arc<ToolRegistry>, PluginHost) {
+    setup_js_with(Arc::new(ToolRegistry::new()))
+}
+
+#[test]
+fn js_engine_rejects_unknown_value() {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(reg).unwrap();
+    let mut opts = serde_json::Map::new();
+    opts.insert("engine".into(), serde_json::json!("ruby"));
+    let err = host
+        .load_source_with_opts("code_execution", CODE_EXECUTION_SRC, opts)
+        .expect_err("unknown engine must fail plugin load");
+    assert!(
+        err.to_string().contains(JS_UNKNOWN_ENGINE_ERR),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn js_engine_describes_js_sandbox_and_signatures() {
+    let (reg, _host) = setup_js();
+    let desc = describe(&reg, &ToolFilter::All, ToolAudience::MAIN, false);
+    assert!(desc.contains(JS_SANDBOX_HEADER), "got: {desc}");
+    assert!(
+        desc.contains("- interp_echo({ msg: string, count?: number, flag?: boolean, items?: any[], raw?: any }) -> Promise<string>"),
+        "expected JS object signature, got: {desc}"
+    );
+    assert!(
+        !desc.contains("Monty sandbox"),
+        "JS description must not mention Monty sandbox"
+    );
+}
+
+#[test]
+fn js_engine_calls_tools_and_gathers_concurrently() {
+    let (reg, _host) = setup_js();
+    let ctx = shaped_ctx(&reg, |_| {});
+
+    let out = run_tool(
+        &reg,
+        &ctx,
+        CODE_EXECUTION,
+        serde_json::json!({
+            "code": r#"
+                const [ok, bad] = await gather(
+                    interp_echo({ msg: "alpha" }),
+                    interp_fail({})
+                );
+                console.log(ok);
+                console.log(bad);
+                return "done";
+            "#,
+        }),
+    )
+    .expect("JS gather script should succeed");
+
+    assert!(out.contains(&format!("{ECHO_PREFIX}alpha")), "got: {out}");
+    assert!(out.contains(ERROR_PREFIX), "got: {out}");
+    assert!(out.contains(FAIL_MSG), "got: {out}");
+    assert!(out.contains("return: \"done\""), "got: {out}");
+}
+
+#[test]
+fn js_engine_mcp_namespace_and_library_help() {
+    let (reg, _host) = setup_js();
+    let ctx = shaped_ctx(&reg, |ctx| {
+        ctx.mcp = Some(echo_session(&[(
+            "engram.brain-supersede",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string", "description": "Source path" },
+                    "target-branch": { "type": "string" },
+                },
+                "required": vec!["from"],
+            }),
+        )]));
+    });
+
+    let out = run_tool(
+        &reg,
+        &ctx,
+        CODE_EXECUTION,
+        serde_json::json!({
+            "code": r#"
+                const res = await engram.brain_supersede({ from: "a.md", "target-branch": "main" });
+                console.log(res);
+            "#,
+        }),
+    )
+    .expect("JS MCP call should succeed");
+
+    assert!(out.contains("\"from\":\"a.md\""), "got: {out}");
+    assert!(out.contains("\"target-branch\":\"main\""), "got: {out}");
+
+    let help = run_tool(
+        &reg,
+        &ctx,
+        "library_help",
+        serde_json::json!({
+            "library_name": "engram",
+            "function_name": "brain_supersede",
+        }),
+    )
+    .expect("library_help should format JS signature");
+
+    assert!(
+        help.contains("async function brain_supersede({"),
+        "expected JS function signature, got: {help}"
+    );
+    assert!(help.contains("from: string,"), "got: {help}");
+    assert!(help.contains("target-branch?: string,"), "got: {help}");
+}
+
+#[test]
+fn js_engine_fs_routes_through_file_tools_and_respects_hooks() {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut opts = serde_json::Map::new();
+    opts.insert("engine".into(), serde_json::json!("js"));
+    host.load_source_with_opts("code_execution", CODE_EXECUTION_SRC, opts)
+        .unwrap();
+    host.load_source("read", include_str!("../../plugins/read/init.lua"))
+        .unwrap();
+    host.load_source("write", include_str!("../../plugins/write/init.lua"))
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(OPEN_TARGET);
+    std::fs::write(&file, OPEN_ORIGINAL).unwrap();
+    let path_str = file.to_string_lossy().into_owned();
+
+    let ctx = shaped_ctx(&reg, |_| {});
+    let out = run_tool(
+        &reg,
+        &ctx,
+        CODE_EXECUTION,
+        serde_json::json!({
+            "code": format!(
+                r#"
+                const before = fs.readFileSync({path_str:?}, "utf-8");
+                fs.appendFileSync({path_str:?}, "+js");
+                const after = fs.readFileSync({path_str:?});
+                console.log(before + " -> " + after);
+                "#
+            ),
+        }),
+    )
+    .expect("JS fs read/append should succeed");
+    assert!(
+        out.contains(&format!("{OPEN_ORIGINAL} -> {OPEN_ORIGINAL}+js")),
+        "got: {out}"
+    );
+
+    host.load_source("read_blocker", BLOCKING_READ_HOOK)
+        .unwrap();
+    let err = run_tool(
+        &reg,
+        &ctx,
+        CODE_EXECUTION,
+        serde_json::json!({
+            "code": format!("fs.readFileSync({path_str:?})"),
+        }),
+    )
+    .expect_err("read hook must block fs.readFileSync");
+    assert!(
+        err.contains("cannot read while a plugin hooks the read tool"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn js_engine_error_hints_for_import_and_promise_all() {
+    let (reg, _host) = setup_js();
+    let ctx = shaped_ctx(&reg, |_| {});
+
+    let import_err = run_tool(
+        &reg,
+        &ctx,
+        CODE_EXECUTION,
+        serde_json::json!({
+            "code": "import fs from 'fs'; console.log(fs);",
+        }),
+    )
+    .expect_err("ES import should fail in script mode");
+    assert!(
+        import_err.contains(JS_IMPORT_HINT_SUBSTR),
+        "got: {import_err}"
+    );
+
+    let promise_all_err = run_tool(
+        &reg,
+        &ctx,
+        CODE_EXECUTION,
+        serde_json::json!({
+            "code": r#"await Promise.all([interp_echo({ msg: "a" }), interp_fail({})]);"#,
+        }),
+    )
+    .expect_err("Promise.all with failing tool should reject");
+    assert!(
+        promise_all_err.contains(GATHER_HINT_SUBSTR),
+        "got: {promise_all_err}"
+    );
+}

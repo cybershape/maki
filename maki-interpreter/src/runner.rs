@@ -30,18 +30,18 @@ use crate::modules;
 
 const DEFAULT_MAX_RECURSION: usize = 100;
 const SCRIPT_NAME: &str = "agent.py";
-const OS_CALLS_DENIED: &str = "OS calls are not permitted";
+pub(crate) const OS_CALLS_DENIED: &str = "OS calls are not permitted";
 const BINARY_FILES_UNSUPPORTED: &str = "binary files are not supported, open in text mode";
 const EXCLUSIVE_CREATE_UNSUPPORTED: &str = "exclusive creation is not supported, open with 'w'";
-const REMOVAL_UNSUPPORTED: &str =
+pub(crate) const REMOVAL_UNSUPPORTED: &str =
     "removing or renaming files is not supported in the sandbox, use the bash tool";
-const HOST_TIME_EXCEEDED: &str =
+pub(crate) const HOST_TIME_EXCEEDED: &str =
     "time limit exceeded: sleeps and filesystem queries may add up to the script timeout at most";
 const MAX_URANDOM_BYTES: usize = 1024 * 1024;
 const VERBATIM_PREFIX: &str = r"\\?\";
 /// Environment variables often hold secrets, and nobody approves what a script
 /// reads, so it only sees these. The rest read as unset.
-const ENV_ALLOWLIST: &[&str] = &[
+pub(crate) const ENV_ALLOWLIST: &[&str] = &[
     "HOME",
     "USER",
     "LOGNAME",

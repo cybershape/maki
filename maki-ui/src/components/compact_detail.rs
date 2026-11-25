@@ -255,7 +255,7 @@ fn tool_lines(entry: &GroupToolEntry, width: u16) -> Vec<Line<'static>> {
 
     if entry.name.as_ref() == "code_execution" {
         if let Some(code) = extract_code_execution_code(entry, detail) {
-            push_highlighted_code(&mut lines, "python", code);
+            push_highlighted_code(&mut lines, code_execution_syntax(code), code);
         } else if entry.receiving_args {
             lines.push(Line::from(Span::styled(RECEIVING, theme.tool_dim)));
         } else {
@@ -388,6 +388,21 @@ fn push_text(lines: &mut Vec<Line<'static>>, text: &str) {
     for line in text.lines() {
         lines.push(Line::from(Span::styled(line.to_owned(), style)));
     }
+}
+
+fn code_execution_syntax(code: &str) -> &'static str {
+    let looks_js = code.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("const ")
+            || trimmed.starts_with("let ")
+            || trimmed.starts_with("var ")
+            || trimmed.starts_with("function ")
+            || trimmed.starts_with("async function ")
+            || trimmed.starts_with("console.")
+    }) || code.contains("console.log(")
+        || code.contains(" => ")
+        || code.contains("Promise.");
+    if looks_js { "javascript" } else { "python" }
 }
 
 fn extract_code_execution_code<'a>(
