@@ -76,7 +76,7 @@ local schema = {
 if opts.allow_model then
   schema.properties.model = {
     type = "string",
-    description = 'Exact model spec, e.g. "ollama/glm-5.2". You tell maki the model; maki will not guess. Overrides model_tier.',
+    description = 'Exact model spec (e.g. "proxy/codex/gpt-6.2-sol") or partial model name (e.g. "sol"). If multiple models match, an error lists the options so you can ask the user. Overrides model_tier.',
   }
 end
 

@@ -395,6 +395,14 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
     let resolved = resume::resolve(&cli, &cwd_str, &storage)?;
     setup::report_session_start(resolved.start_type, Some(&resolved.id));
 
+    if cli.is_sdk_mode() || cli.print {
+        let policy = stack.config.provider.model_policy.clone();
+        let _ = maki_providers::models_cache::cached_model_specs(&policy);
+        tokio::spawn(async move {
+            maki_providers::models_cache::fetch_all_models_cached(&policy, |_, _| {}).await;
+        });
+    }
+
     if cli.is_sdk_mode() {
         let prompt_slots = stack
             .plugin_host

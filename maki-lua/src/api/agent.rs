@@ -554,7 +554,9 @@ fn unattended_answer(event: &AgentEvent) -> Option<String> {
 ///     the parent tier so you cannot escalate. Resolved by
 ///     `maki.model.tier`, so a `/model` pick for the tier wins over the
 ///     session provider's curated default.
-///   `spec` (string?) - exact model spec string, e.g. `"claude-3-5-haiku-20241022"`.
+///   `spec` (string?) - exact model spec or unique partial model name, e.g.
+///     `"proxy/codex/gpt-6.2-sol"` or `"sol"`. Resolves directly when one known
+///     model matches; errors with the matching choices when multiple match.
 ///     Takes precedence over `tier`.
 /// @return (table?, string?) Model table on success, or `(nil, err)` on failure.
 /// @example
@@ -577,7 +579,14 @@ async fn resolve_model(
 
     let (model, assigned_tier) = match spec_str {
         Some(ref spec) => (
-            try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy).await),
+            try_pair!(
+                Model::resolve_spec_or_partial(
+                    spec,
+                    &agent.model_policy,
+                    Some(&agent.model.spec()),
+                )
+                .await
+            ),
             None,
         ),
         None => try_pair!(resolve_model_from_ctx(agent, tier_str.as_deref()).await),
@@ -4067,5 +4076,47 @@ mod tests {
         lua.globals().set("id", id)?;
         lua.globals().set("last", last)?;
         lua.load(PEEK_TEXTS).eval_async().await
+    }
+
+    #[tokio::test]
+    async fn resolve_model_supports_unique_and_ambiguous_partial_names() {
+        let _guard = TIER_ASSIGNMENT_LOCK.lock().await;
+        maki_providers::model_registry::set_known_models(
+            "responses",
+            vec![
+                maki_providers::ModelInfo::id_only("codex/gpt-6.2-sol".into()),
+                maki_providers::ModelInfo::id_only("group/gemini-4-carbon".into()),
+                maki_providers::ModelInfo::id_only("group/gemini-4-hydrogen".into()),
+            ],
+        );
+        let lua = Lua::new();
+        let agent =
+            create_agent_table(&lua, Arc::from(PLUGIN), PluginPermissions::trusted()).unwrap();
+        lua.globals().set("agent", agent).unwrap();
+        let mut tool_ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        tool_ctx.model = Arc::new(Model::from_spec(SESSION_SPEC).unwrap());
+        let ctx = lua.create_userdata(LuaCtx::handler(&tool_ctx)).unwrap();
+        lua.globals().set("ctx", ctx).unwrap();
+
+        let (resolved, err): (Option<String>, Option<String>) = lua
+            .load("local m, e = agent.resolve_model(ctx, { spec = 'sol' }); return m and m.spec, e")
+            .eval_async()
+            .await
+            .unwrap();
+        assert_eq!(err, None);
+        assert_eq!(resolved.as_deref(), Some("responses/codex/gpt-6.2-sol"));
+
+        let (ambig_val, ambig_err): (Option<String>, Option<String>) = lua
+            .load(
+                "local m, e = agent.resolve_model(ctx, { spec = 'gemini' }); return m and m.spec, e",
+            )
+            .eval_async()
+            .await
+            .unwrap();
+        assert_eq!(ambig_val, None);
+        let ambig_err = ambig_err.expect("expected ambiguous error");
+        assert!(ambig_err.contains("responses/group/gemini-4-carbon"));
+        assert!(ambig_err.contains("responses/group/gemini-4-hydrogen"));
+        assert!(ambig_err.contains("Ask the user"));
     }
 }

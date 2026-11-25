@@ -1534,7 +1534,9 @@ assigned model no longer resolves, you get an error instead of another model.
     the parent tier so you cannot escalate. Resolved by
     `maki.model.tier`, so a `/model` pick for the tier wins over the
     session provider's curated default.
-  - `spec` (`string?`) exact model spec string, e.g. `"claude-3-5-haiku-20241022"`.
+  - `spec` (`string?`) exact model spec or unique partial model name, e.g.
+    `"proxy/codex/gpt-6.2-sol"` or `"sol"`. Resolves directly when one known
+    model matches; errors with the matching choices when multiple match.
     Takes precedence over `tier`.
 
 **Returns:** (`table?`, `string?`) Model table on success, or `(nil, err)` on failure.

@@ -4,6 +4,7 @@
 //! + cache reads/writes because the context window limit applies to all of them combined.
 
 use std::any::Any;
+use std::collections::BTreeSet;
 use std::ops::AddAssign;
 use std::sync::Arc;
 
@@ -30,6 +31,7 @@ use maki_config::providers::{
 use url::Url;
 
 const PER_MILLION: f64 = 1_000_000.0;
+const MAX_AMBIGUOUS_MATCHES: usize = 25;
 pub const FACT_SOURCE_CONFIG: &str = "config";
 pub const FACT_SOURCE_DISCOVERY: &str = "discovery";
 pub const FACT_SOURCE_TABLE: &str = "table";
@@ -49,6 +51,78 @@ pub enum ModelError {
     NoDefault(String, ModelTier),
     #[error("model '{0}' is not allowed by provider model policy")]
     NotAllowed(String),
+    #[error("model must not be empty")]
+    EmptySpec,
+    #[error(
+        "no available model matching '{0}' (pass an exact 'provider/model' spec or a unique partial model name)"
+    )]
+    NoMatch(String),
+    #[error("{}", format_ambiguous_matches(query, matches))]
+    AmbiguousMatch { query: String, matches: Vec<String> },
+}
+
+fn format_ambiguous_matches(query: &str, matches: &[String]) -> String {
+    let list = matches
+        .iter()
+        .take(MAX_AMBIGUOUS_MATCHES)
+        .map(|spec| format!("- {spec}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let suffix = if matches.len() > MAX_AMBIGUOUS_MATCHES {
+        format!(
+            "\n... and {} more; narrow the name or ask the user.",
+            matches.len() - MAX_AMBIGUOUS_MATCHES
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "ambiguous model '{query}' matches {} available models:\n{list}{suffix}\nAsk the user which specific model they want to use, then retry with the exact model spec.",
+        matches.len()
+    )
+}
+
+fn is_known_provider(slug: &str) -> bool {
+    ProviderRegistry::for_slug(slug).is_some() || custom::is_declared(slug)
+}
+
+fn candidate_specs(policy: &ModelPolicy, session_spec: Option<&str>) -> BTreeSet<String> {
+    let mut specs = BTreeSet::new();
+    for (provider, models) in model_registry::all_known_models() {
+        for info in models {
+            let spec = format!("{provider}/{}", info.id);
+            if policy.allows(&spec) {
+                specs.insert(spec);
+            }
+        }
+    }
+    for spec in crate::provider::available_model_specs(policy) {
+        specs.insert(spec);
+    }
+    if let Some(spec) = session_spec
+        && policy.allows(spec)
+    {
+        specs.insert(spec.to_string());
+    }
+    specs
+}
+
+fn match_candidates(candidates: &BTreeSet<String>, query: &str) -> Vec<String> {
+    let tokens: Vec<String> = query
+        .split_ascii_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    candidates
+        .iter()
+        .filter(|spec| {
+            let lower = spec.to_ascii_lowercase();
+            tokens.iter().all(|tok| lower.contains(tok.as_str()))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Also the shape of a rate in `models/<slug>.toml`. None of the four rates may
@@ -1155,6 +1229,61 @@ impl Model {
         Self::from_spec_or_warm_catalog(spec).await
     }
 
+    pub async fn resolve_spec_or_partial(
+        query: &str,
+        policy: &ModelPolicy,
+        session_spec: Option<&str>,
+    ) -> Result<Self, ModelError> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Err(ModelError::EmptySpec);
+        }
+
+        let candidates = candidate_specs(policy, session_spec);
+        if candidates.contains(trimmed) {
+            return Self::from_spec_with_policy(trimmed, policy).await;
+        }
+
+        if let Some((slug, rest)) = trimmed.split_once('/')
+            && is_known_provider(slug)
+        {
+            if rest.trim().is_empty() {
+                return Err(ModelError::InvalidFormat);
+            }
+            if !policy.allows(trimmed) {
+                return Err(ModelError::NotAllowed(trimmed.to_string()));
+            }
+            if !model_registry::discovery_complete(slug) {
+                return Self::from_spec_with_policy(trimmed, policy).await;
+            }
+            let prefix = format!("{slug}/");
+            let scoped: BTreeSet<String> = candidates
+                .iter()
+                .filter(|spec| spec.starts_with(&prefix))
+                .cloned()
+                .collect();
+            let matches = match_candidates(&scoped, rest);
+            return match matches.as_slice() {
+                [] => Self::from_spec_with_policy(trimmed, policy).await,
+                [single] => Self::from_spec_with_policy(single, policy).await,
+                _ => Err(ModelError::AmbiguousMatch {
+                    query: trimmed.to_string(),
+                    matches,
+                }),
+            };
+        }
+
+        let matches = match_candidates(&candidates, trimmed);
+        match matches.as_slice() {
+            [] => Err(ModelError::NoMatch(trimmed.to_string())),
+            [single] => Self::from_spec_with_policy(single, policy).await,
+            _ => Err(ModelError::AmbiguousMatch {
+                query: trimmed.to_string(),
+                matches,
+            }),
+        }
+    }
+
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
         let (slug, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
 
@@ -2164,5 +2293,147 @@ mod tests {
             ThinkingConfig::Off.effort_str(&effort.refine(declared), &model),
             expected
         );
+    }
+
+    static PARTIAL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    const SAMPLE_MODELS: &[&str] = &[
+        "codex/gpt-6.2-astra",
+        "codex/gpt-6.2-sol",
+        "cursor/composer-2.5",
+        "devin/swe-2",
+        "group/deepseek-flash",
+        "group/gemini-3.8-flash",
+        "group/gemini-4-carbon",
+        "group/gemini-4-hydrogen",
+        "group/gemini-4-neon",
+        "group/grok-4.7",
+        "group/opus-5.5",
+        "qoder/qwen4-max",
+    ];
+
+    #[test_case("sol", &["proxy/codex/gpt-6.2-sol"] ; "unique_partial")]
+    #[test_case("SOL", &["proxy/codex/gpt-6.2-sol"] ; "case_insensitive")]
+    #[test_case("codex/gpt-6.2-sol", &["proxy/codex/gpt-6.2-sol"] ; "partial_with_slash")]
+    #[test_case("codex sol", &["proxy/codex/gpt-6.2-sol"] ; "multi_token")]
+    #[test_case(
+        "gemini",
+        &[
+            "proxy/group/gemini-3.8-flash",
+            "proxy/group/gemini-4-carbon",
+            "proxy/group/gemini-4-hydrogen",
+            "proxy/group/gemini-4-neon",
+        ] ; "ambiguous_family"
+    )]
+    #[test_case("flash", &["proxy/group/deepseek-flash", "proxy/group/gemini-3.8-flash"] ; "ambiguous_suffix")]
+    #[test_case("nonexistent", &[] ; "no_match")]
+    #[test_case("   ", &[] ; "whitespace_only")]
+    fn match_candidates_handles_partial_names(query: &str, expected: &[&str]) {
+        let candidates: BTreeSet<String> = SAMPLE_MODELS
+            .iter()
+            .map(|id| format!("proxy/{id}"))
+            .collect();
+        let actual = match_candidates(&candidates, query);
+        let expected: Vec<String> = expected.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(actual, expected);
+    }
+
+    fn seed_responses_sample_models() {
+        model_registry::set_known_models(
+            "responses",
+            SAMPLE_MODELS
+                .iter()
+                .map(|id| ModelInfo::id_only((*id).to_string()))
+                .collect(),
+        );
+    }
+
+    #[test_case("sol", "responses/codex/gpt-6.2-sol" ; "partial_name")]
+    #[test_case("responses/sol", "responses/codex/gpt-6.2-sol" ; "provider_prefixed_partial")]
+    #[test_case("codex/gpt-6.2-sol", "responses/codex/gpt-6.2-sol" ; "partial_with_slash")]
+    #[test_case("responses/codex/gpt-6.2-sol", "responses/codex/gpt-6.2-sol" ; "exact_spec")]
+    #[test_case("responses/unlisted-snapshot", "responses/unlisted-snapshot" ; "unlisted_arbitrary_spec")]
+    #[tokio::test]
+    async fn resolve_spec_or_partial_resolves_unique_and_exact_specs(query: &str, expected: &str) {
+        let _guard = PARTIAL_LOCK.lock().await;
+        seed_responses_sample_models();
+
+        let model = Model::resolve_spec_or_partial(query, &ModelPolicy::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(model.spec(), expected);
+    }
+
+    #[test_case("gemini" ; "bare_partial")]
+    #[test_case("responses/gemini" ; "provider_prefixed_partial")]
+    #[tokio::test]
+    async fn resolve_spec_or_partial_errors_with_choices_when_ambiguous(query: &str) {
+        let _guard = PARTIAL_LOCK.lock().await;
+        seed_responses_sample_models();
+
+        let err = Model::resolve_spec_or_partial(query, &ModelPolicy::default(), None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ModelError::AmbiguousMatch { ref matches, .. } if matches.len() == 4)
+        );
+        for expected in [
+            "responses/group/gemini-3.8-flash",
+            "responses/group/gemini-4-carbon",
+            "responses/group/gemini-4-hydrogen",
+            "responses/group/gemini-4-neon",
+        ] {
+            assert!(msg.contains(expected), "missing {expected} in {msg}");
+        }
+        assert!(msg.contains("Ask the user"), "missing ask hint in {msg}");
+    }
+
+    #[tokio::test]
+    async fn resolve_spec_or_partial_respects_model_policy() {
+        let _guard = PARTIAL_LOCK.lock().await;
+        seed_responses_sample_models();
+        let restricted = policy(
+            &[],
+            &[
+                "responses/group/gemini-3.8-flash",
+                "responses/group/gemini-4-carbon",
+                "responses/group/gemini-4-neon",
+            ],
+        );
+
+        let model = Model::resolve_spec_or_partial("gemini", &restricted, None)
+            .await
+            .unwrap();
+        assert_eq!(model.spec(), "responses/group/gemini-4-hydrogen");
+
+        let err =
+            Model::resolve_spec_or_partial("responses/group/gemini-4-carbon", &restricted, None)
+                .await
+                .unwrap_err();
+        assert!(matches!(err, ModelError::NotAllowed(_)));
+    }
+
+    #[tokio::test]
+    async fn resolve_spec_or_partial_rejects_empty_and_unknown_queries() {
+        let _guard = PARTIAL_LOCK.lock().await;
+        seed_responses_sample_models();
+
+        assert!(matches!(
+            Model::resolve_spec_or_partial("  ", &ModelPolicy::default(), None)
+                .await
+                .unwrap_err(),
+            ModelError::EmptySpec
+        ));
+        assert!(matches!(
+            Model::resolve_spec_or_partial(
+                "definitely-no-such-model",
+                &ModelPolicy::default(),
+                None
+            )
+            .await
+            .unwrap_err(),
+            ModelError::NoMatch(_)
+        ));
     }
 }
