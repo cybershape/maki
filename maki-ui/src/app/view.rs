@@ -12,7 +12,7 @@ use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
 use maki_config::MaxWidth;
 use maki_lua::{CursorStyle, Split};
-use maki_providers::RequestOptions;
+use maki_providers::{RequestOptions, ThinkingConfig};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -503,6 +503,19 @@ impl App {
             thinking: self.state.thinking.shown(&self.state.model),
             fast: self.state.fast,
         });
+        let mut thinking_label = opts.thinking.status_label();
+        if render_chat == MAIN_CHAT
+            && let Some(sub) = &self.state.model.combo
+        {
+            let sub_thinking = sub
+                .effort
+                .map_or(self.state.thinking, ThinkingConfig::Effort)
+                .clamped(&sub.model)
+                .shown(&sub.model);
+            let main = thinking_label.as_deref().unwrap_or("off");
+            let sub = sub_thinking.status_label().unwrap_or("off".into());
+            thinking_label = Some(format!("{main} | {sub}").into());
+        }
         let (mode_label, mode_style) = self.mode_label();
         let picking = self
             .picking
@@ -566,7 +579,7 @@ impl App {
             },
             auto_scroll: chat.auto_scroll(),
             chat_name,
-            thinking_label: opts.thinking.status_label(),
+            thinking_label,
             fast: opts.fast,
             workflow: self.state.workflow,
             restricted: self.trust.question().is_some(),

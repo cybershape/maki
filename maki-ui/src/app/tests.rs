@@ -2331,6 +2331,19 @@ fn resumed_session_keeps_adding_to_the_restored_bill() {
     assert_eq!(app.state.cost, Some(RESTORED_COST + MAIN_COST.unwrap()));
 }
 
+#[test_case("", "[high | high]" ; "inherited")]
+#[test_case("@low", "[high | low]" ; "explicit")]
+fn status_bar_draws_combo_thinking(effort_suffix: &str, expected: &str) {
+    let mut app = test_app();
+    let spec = format!("{SONNET_SPEC}+{OPUS_SPEC}{effort_suffix}");
+    let mut model = Model::from_spec(&spec).unwrap();
+    model.thinking_override = Some(ThinkingSupport::Yes);
+    model.combo.as_mut().unwrap().model.thinking_override = Some(ThinkingSupport::Yes);
+    app.state.model = model;
+    app.state.thinking = ThinkingConfig::Effort(Effort::High);
+    assert!(rendered(&mut app).contains(expected));
+}
+
 /// The sigma the status bar draws once subagents split the bill is the session
 /// total itself, so it cannot drift from what `/usage` sums.
 #[test]
