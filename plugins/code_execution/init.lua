@@ -226,7 +226,10 @@ local function mcp_library_hint(libs, code, err, is_js)
     if lib_name then
       local tried_import = code:match("import%s+" .. lib_name)
         or err:find("No module named '" .. lib_name .. "'", 1, true)
-        or (is_js and (code:find("require('" .. lib_name .. "'", 1, true) or code:find('require("' .. lib_name .. '"', 1, true)))
+        or (
+          is_js
+          and (code:find("require('" .. lib_name .. "'", 1, true) or code:find('require("' .. lib_name .. '"', 1, true))
+        )
       if tried_import then
         if is_js then
           return string.format(
@@ -899,7 +902,11 @@ local function handler(input, ctx)
     end
     local mcp_hint = mcp_library_hint(libs, input.code, err, IS_JS)
     local mod_hint = (not IS_JS and mcp_hint == "") and unsupported_module_hint(tools, err) or ""
-    return { llm_output = output_limits.cut_middle(err .. hint .. mcp_hint .. mod_hint, max_lines, max_bytes), is_error = true, body = buf }
+    return {
+      llm_output = output_limits.cut_middle(err .. hint .. mcp_hint .. mod_hint, max_lines, max_bytes),
+      is_error = true,
+      body = buf,
+    }
   end
 
   if result.output then

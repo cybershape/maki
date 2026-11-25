@@ -165,10 +165,20 @@ local function read_file(path, offset, limit, ctx)
   local remaining_lines = total_lines - start + 1
   local warning_header = nil
 
-  if not is_full_mode and total_lines > elision_threshold and unspecified_range and remaining_lines > elision_threshold then
+  if
+    not is_full_mode
+    and total_lines > elision_threshold
+    and unspecified_range
+    and remaining_lines > elision_threshold
+  then
     if start <= 1 and maki.agent and maki.agent.call_tool then
       local index_out, index_err = maki.agent.call_tool(ctx, "index", { path = path })
-      if index_out and not index_err and not index_out:find("use the read tool instead", 1, true) and #index_out:gsub("%s+", "") > 0 then
+      if
+        index_out
+        and not index_err
+        and not index_out:find("use the read tool instead", 1, true)
+        and #index_out:gsub("%s+", "") > 0
+      then
         local warning = string.format(
           "Note: '%s' is large (%d lines) and no slice range was specified (limit=%d). Instead of reading the entire file, here is its compact structural index (skeleton) with line numbers to help you navigate:\n\n%s\n\nHint: Call `read` with `offset` and `limit` to inspect specific sections (e.g. `offset=100, limit=50`), or use `grep` to search.",
           shorten_path(path),
@@ -178,7 +188,9 @@ local function read_file(path, offset, limit, ctx)
         )
         local buf = maki.ui.buf()
         local view = ToolView.new(buf, read_view_opts(ctx))
-        view:append({ { string.format("Index skeleton of %s (%d lines):", shorten_path(path), total_lines), "section" } })
+        view:append({
+          { string.format("Index skeleton of %s (%d lines):", shorten_path(path), total_lines), "section" },
+        })
         for _, s_line in ipairs(maki.split(index_out:gsub("\n+$", ""), "\n")) do
           view:append({ { s_line } })
         end

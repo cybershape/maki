@@ -222,7 +222,8 @@ maki.api.register_tool({
       if is_err then
         local hint = ""
         if result:find("ParserError") and (input.command:find("&&") or input.command:find("||")) then
-          hint = "\nHint: Windows PowerShell 5.1 rejects `&&` and `||`. Separate statements with `;` or run one command per call."
+          hint =
+            "\nHint: Windows PowerShell 5.1 rejects `&&` and `||`. Separate statements with `;` or run one command per call."
         end
         result = (result == "" and "" or result .. "\n") .. "Exit code: " .. code .. hint
       elseif result == "" then
