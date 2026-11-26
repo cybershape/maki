@@ -399,6 +399,8 @@ maki.setup({
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `max_file_size_mb` | integer | `2` | 1 | Refuse to index files larger than this many MB. |
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 
 ### `plugins.powershell`
 
@@ -415,6 +417,7 @@ maki.setup({
 | `elision_lines` | integer | `200` | 20 | Number of lines to return when a large file read is truncated. |
 | `elision_threshold` | integer | `400` | 50 | File line threshold above which full reads are truncated. |
 | `max_line_bytes` | integer | `500` | 80 | Truncate lines the model sees at this many bytes. |
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 
 ### `plugins.skill`

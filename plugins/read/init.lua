@@ -1,8 +1,11 @@
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
+local truncate = require("maki.truncate")
 local output_limits = require("maki.output_limits")
 
 local HIGHLIGHT_CONTEXT_LINES = 200
+local INDEX_MARKER_RESERVE_BYTES = 64
+local INDEX_WRAPPER_RESERVE_LINES = 8
 
 local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed).
 
@@ -18,12 +21,11 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 - Call in parallel when reading multiple files.
 - Avoid tiny repeated slices - read a larger window if you need more context.]]
 
-local opts = maki.api.register_options({
+local opts = maki.api.register_options(output_limits.extend({
   max_line_bytes = { default = 500, min = 80, desc = "Truncate lines the model sees at this many bytes." },
-  max_output_lines = output_limits.specs.max_output_lines,
   elision_threshold = { default = 400, min = 50, desc = "File line threshold above which full reads are truncated." },
   elision_lines = { default = 200, min = 20, desc = "Number of lines to return when a large file read is truncated." },
-})
+}))
 
 local function read_view_opts(ctx)
   local tol = ctx:tool_output_lines()
@@ -144,7 +146,7 @@ local function read_file(path, offset, limit, ctx)
   if not start then
     return { llm_output = "read error: " .. tostring(start_err), is_error = true }
   end
-  local max_output_lines = output_limits.resolve(opts, ctx)
+  local max_output_lines, max_output_bytes = output_limits.resolve(opts, ctx)
   local max_lines = limit > 0 and limit or nil
   if max_output_lines then
     max_lines = math.min(max_lines or max_output_lines, max_output_lines)
@@ -172,20 +174,39 @@ local function read_file(path, offset, limit, ctx)
     and remaining_lines > elision_threshold
   then
     if start <= 1 and maki.agent and maki.agent.call_tool then
-      local index_out, index_err = maki.agent.call_tool(ctx, "index", { path = path })
+      local index_out, index_err = maki.agent.call_tool(
+        ctx,
+        "index",
+        { path = path },
+        { output_mode = ctx:output_mode() }
+      )
       if
         index_out
         and not index_err
         and not index_out:find("use the read tool instead", 1, true)
         and #index_out:gsub("%s+", "") > 0
       then
-        local warning = string.format(
-          "Note: '%s' is large (%d lines) and no slice range was specified (limit=%d). Instead of reading the entire file, here is its compact structural index (skeleton) with line numbers to help you navigate:\n\n%s\n\nHint: Call `read` with `offset` and `limit` to inspect specific sections (e.g. `offset=100, limit=50`), or use `grep` to search.",
+        local header = string.format(
+          "Note: '%s' is large (%d lines) and no slice range was specified (limit=%d). Instead of reading the entire file, here is its compact structural index (skeleton) with line numbers to help you navigate:\n\n",
           shorten_path(path),
           total_lines,
-          limit,
-          index_out:gsub("\n+$", "")
+          limit
         )
+        local footer =
+          "\n\nHint: Call `read` with `offset` and `limit` to inspect specific sections (e.g. `offset=100, limit=50`), or use `grep` to search."
+        local trimmed_index = index_out:gsub("\n+$", "")
+        if max_output_lines or max_output_bytes then
+          local body_lines = max_output_lines and math.max(max_output_lines - INDEX_WRAPPER_RESERVE_LINES, 1)
+          local body_bytes = max_output_bytes
+            and math.max(max_output_bytes - #header - #footer - INDEX_MARKER_RESERVE_BYTES, 1)
+          trimmed_index = truncate(trimmed_index, body_lines, body_bytes)
+        end
+        local warning = header .. trimmed_index .. footer
+        local over_bytes = max_output_bytes and #warning > max_output_bytes
+        local over_lines = max_output_lines and (select(2, warning:gsub("\n", "\n")) + 1) > max_output_lines
+        if over_bytes or over_lines then
+          warning = truncate(warning, max_output_lines, max_output_bytes)
+        end
         local buf = maki.ui.buf()
         local view = ToolView.new(buf, read_view_opts(ctx))
         view:append({

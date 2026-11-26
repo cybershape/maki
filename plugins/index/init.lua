@@ -2,13 +2,15 @@ local dir_listing = require("maki.dir_listing")
 local indexer = require("indexer")
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
+local truncate = require("maki.truncate")
+local output_limits = require("maki.output_limits")
 
 local TRUNCATED_SUFFIX = indexer.TRUNCATED_SUFFIX
 local TRUNCATED_INFIX = " more truncated]"
 
-local opts = maki.api.register_options({
+local opts = maki.api.register_options(output_limits.extend({
   max_file_size_mb = { default = 2, min = 1, desc = "Refuse to index files larger than this many MB." },
-})
+}))
 
 local function split_trailing_range(line)
   local pos = line:find(" %[%d[%d%-,]*%]$")
@@ -199,8 +201,9 @@ Return a compact overview of a source file: imports, type definitions, function 
       if not listing then
         return { llm_output = "error: " .. tostring(err), is_error = true }
       end
+      local max_lines, max_bytes = output_limits.resolve(opts, ctx)
       return {
-        llm_output = listing.text,
+        llm_output = truncate(listing.text, max_lines, max_bytes),
         body = dir_listing.view(listing.text, ctx),
         annotation = listing.count .. " entries",
       }
@@ -243,9 +246,10 @@ Return a compact overview of a source file: imports, type definitions, function 
       return { llm_output = "error: " .. tostring(line_meta), is_error = true }
     end
 
+    local max_lines, max_bytes = output_limits.resolve(opts, ctx)
     local ext = path:match("%.([^%.]+)$") or indexer.LANG_TO_EXT[lang] or ""
     return {
-      llm_output = skeleton:gsub("\n+$", ""),
+      llm_output = truncate(skeleton:gsub("\n+$", ""), max_lines, max_bytes),
       body = render_index(skeleton, ctx, ext, line_meta),
     }
   end,
