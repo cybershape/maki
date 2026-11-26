@@ -107,11 +107,7 @@ fn candidate_specs(policy: &ModelPolicy, session_spec: Option<&str>) -> BTreeSet
     specs
 }
 
-fn match_candidates(candidates: &BTreeSet<String>, query: &str) -> Vec<String> {
-    let tokens: Vec<String> = query
-        .split_ascii_whitespace()
-        .map(str::to_ascii_lowercase)
-        .collect();
+fn filter_by_tokens(candidates: &BTreeSet<String>, tokens: &[String]) -> Vec<String> {
     if tokens.is_empty() {
         return Vec::new();
     }
@@ -123,6 +119,23 @@ fn match_candidates(candidates: &BTreeSet<String>, query: &str) -> Vec<String> {
         })
         .cloned()
         .collect()
+}
+
+fn match_candidates(candidates: &BTreeSet<String>, query: &str) -> Vec<String> {
+    let ws_tokens: Vec<String> = query
+        .split_ascii_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let exact = filter_by_tokens(candidates, &ws_tokens);
+    if !exact.is_empty() || ws_tokens.is_empty() {
+        return exact;
+    }
+    let sep_tokens: Vec<String> = query
+        .split(|c: char| c.is_ascii_whitespace() || matches!(c, '-' | '_' | '/'))
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    filter_by_tokens(candidates, &sep_tokens)
 }
 
 /// Also the shape of a rate in `models/<slug>.toml`. None of the four rates may
@@ -2364,6 +2377,10 @@ mod tests {
     #[test_case("SOL", &["proxy/codex/gpt-6.2-sol"] ; "case_insensitive")]
     #[test_case("codex/gpt-6.2-sol", &["proxy/codex/gpt-6.2-sol"] ; "partial_with_slash")]
     #[test_case("codex sol", &["proxy/codex/gpt-6.2-sol"] ; "multi_token")]
+    #[test_case("gpt-sol-6.2", &["proxy/codex/gpt-6.2-sol"] ; "reordered_hyphen_tokens")]
+    #[test_case("gemini_4_hydrogen", &["proxy/group/gemini-4-hydrogen"] ; "underscore_tokens")]
+    #[test_case("codex/gpt-sol-6.2", &["proxy/codex/gpt-6.2-sol"] ; "slash_and_hyphen_tokens")]
+    #[test_case("---", &[] ; "delimiters_only")]
     #[test_case(
         "gemini",
         &[
@@ -2399,6 +2416,8 @@ mod tests {
     #[test_case("sol", "responses/codex/gpt-6.2-sol" ; "partial_name")]
     #[test_case("responses/sol", "responses/codex/gpt-6.2-sol" ; "provider_prefixed_partial")]
     #[test_case("codex/gpt-6.2-sol", "responses/codex/gpt-6.2-sol" ; "partial_with_slash")]
+    #[test_case("gpt-sol-6.2", "responses/codex/gpt-6.2-sol" ; "reordered_hyphen_partial")]
+    #[test_case("responses/gpt-sol-6.2", "responses/codex/gpt-6.2-sol" ; "provider_prefixed_reordered_hyphen")]
     #[test_case("responses/codex/gpt-6.2-sol", "responses/codex/gpt-6.2-sol" ; "exact_spec")]
     #[test_case("responses/unlisted-snapshot", "responses/unlisted-snapshot" ; "unlisted_arbitrary_spec")]
     #[tokio::test]
