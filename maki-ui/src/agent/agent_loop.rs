@@ -331,6 +331,7 @@ impl AgentLoop {
                 session_id: Some(self.seed.session_id.clone()),
                 background_for: BackgroundFor::None,
                 task_id: None,
+                task_name: None,
                 mailbox: Some(self.mailbox.clone()),
                 timeouts: self.seed.timeouts,
                 file_access: Arc::clone(&self.seed.file_access),

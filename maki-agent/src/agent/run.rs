@@ -134,6 +134,9 @@ pub struct AgentParams {
     /// inherit it, or a monitor could get around the block by starting one.
     pub background_for: BackgroundFor,
     pub task_id: Option<Arc<str>>,
+    /// The codename the spawning call gave this subagent. `None` in the
+    /// owning agent. See [`ToolContext::task_name`].
+    pub task_name: Option<Arc<str>>,
     pub mailbox: Option<SessionMailbox>,
     pub timeouts: maki_providers::Timeouts,
     pub file_access: Arc<FileAccess>,
@@ -197,6 +200,9 @@ pub struct Agent<'h> {
     /// The task whose tool call opened this run: `Some` only for a task
     /// child, whose hooks see it as `ctx.task_id`.
     task_id: Option<Arc<str>>,
+    /// The codename the spawning call gave this subagent, carried to its
+    /// tools' ctx so a report can name itself.
+    task_name: Option<Arc<str>>,
     mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
     file_access: Arc<FileAccess>,
@@ -249,6 +255,7 @@ impl<'h> Agent<'h> {
             session_id: params.session_id,
             background_for: params.background_for,
             task_id: params.task_id,
+            task_name: params.task_name,
             mailbox: params.mailbox,
             file_access: params.file_access,
             prompt_slots: params.prompt_slots,
@@ -1226,6 +1233,7 @@ impl<'h> Agent<'h> {
             session_id: self.session_id.clone(),
             background_for: self.background_for.clone(),
             task_id: self.task_id.clone(),
+            task_name: self.task_name.clone(),
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
             reauth: self.reauth,
@@ -1544,6 +1552,7 @@ pub(crate) mod testing {
             session_id: None,
             background_for: BackgroundFor::None,
             task_id: None,
+            task_name: None,
             mailbox: None,
             timeouts: maki_providers::Timeouts::default(),
             file_access: FileAccess::fresh(),

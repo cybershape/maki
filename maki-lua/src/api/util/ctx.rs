@@ -175,6 +175,7 @@ pub(crate) struct LuaCtx {
     /// re-rendered.
     session_id: Option<SessionRef>,
     task_id: Option<Arc<str>>,
+    task_name: Option<Arc<str>>,
     pub(crate) finish_tx: Mutex<Option<oneshot::Sender<ToolCallReply>>>,
 }
 
@@ -215,6 +216,7 @@ impl LuaCtx {
             tool_output_lines: ctx.tool_output_lines,
             session_id: ctx.session_id.clone(),
             task_id: ctx.task_id.clone(),
+            task_name: ctx.task_name.clone(),
             finish_tx: Mutex::default(),
         }
     }
@@ -250,6 +252,7 @@ impl LuaCtx {
             tool_output_lines: ctx.tool_output_lines,
             session_id: ctx.session_id,
             task_id: ctx.task_id,
+            task_name: None,
             finish_tx: Mutex::default(),
         }
     }
@@ -309,6 +312,10 @@ impl LuaCtx {
         self.task_id.as_deref().unwrap_or(MAIN_TASK_ID)
     }
 
+    fn task_name(&self) -> Option<&str> {
+        self.task_name.as_deref()
+    }
+
     fn state(&self) -> Option<&serde_json::Value> {
         match &self.caps {
             Caps::Restore { state, .. } => state.as_ref(),
@@ -362,6 +369,10 @@ impl UserData for LuaCtx {
         });
 
         methods.add_method("task_id", |_, this, ()| Ok(this.task_id().to_owned()));
+
+        methods.add_method("task_name", |_, this, ()| {
+            Ok(this.task_name().map(str::to_owned))
+        });
 
         methods.add_method("tool_use_id", |_, this, ()| {
             Ok(this.agent().and_then(|agent| agent.tool_use_id.clone()))
@@ -818,6 +829,16 @@ mod tests {
         assert_eq!(LuaCtx::handler(&ctx).task_id(), expected);
         assert_eq!(LuaCtx::start(&ctx).task_id(), expected);
         assert_eq!(LuaCtx::restore(restore_ctx(&ctx)).task_id(), expected);
+    }
+
+    #[test_case(None, None ; "session_owner")]
+    #[test_case(Some("Nyx"), Some("Nyx") ; "subagent")]
+    fn task_name_reaches_handler_and_start(task_name: Option<&str>, expected: Option<&str>) {
+        let mut ctx = populated_ctx();
+        ctx.task_name = task_name.map(Arc::from);
+        assert_eq!(LuaCtx::handler(&ctx).task_name(), expected);
+        assert_eq!(LuaCtx::start(&ctx).task_name(), expected);
+        assert_eq!(LuaCtx::restore(restore_ctx(&ctx)).task_name(), None);
     }
 
     #[test]

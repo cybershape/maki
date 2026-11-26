@@ -414,6 +414,9 @@ pub struct ToolContext {
     /// `session_id` with its parent on purpose (provider affinity, hooks,
     /// otel), so this is what tells their chats apart.
     pub task_id: Option<Arc<str>>,
+    /// The codename the spawning call gave this subagent, so a report can
+    /// name itself without asking the host. `None` in the owning agent.
+    pub task_name: Option<Arc<str>>,
     pub tool_use_id: Option<String>,
     pub user_response_rx: Option<Arc<Mutex<UnboundedReceiver<String>>>>,
     /// See [`crate::Agent::with_reauth`]. Carried here so a subagent session
@@ -717,6 +720,7 @@ pub fn interpreter_ctx(
         session_id: None,
         background_for: BackgroundFor::None,
         task_id: None,
+        task_name: None,
         tool_use_id: None,
         user_response_rx,
         reauth: false,
