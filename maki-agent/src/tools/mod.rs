@@ -33,7 +33,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 
-use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
+use ignore::{Match, WalkBuilder};
 use jiff::fmt::friendly::{Designator, Spacing, SpanPrinter};
 use maki_config::ProjectConfig;
 use serde_json::Value;
@@ -554,31 +555,52 @@ pub fn walk_builder(root: &str, patterns: &[&str]) -> Result<WalkBuilder, String
 }
 
 /// `.git` is always excluded, even when `gitignore` is false.
+/// Glob patterns are evaluated in `filter_entry` instead of `WalkBuilder::overrides`
+/// so positive patterns like `**/*` never outrank `.gitignore` or `.git` exclusions.
 pub fn walk_builder_opts(
     root: &str,
     patterns: &[&str],
     gitignore: bool,
 ) -> Result<WalkBuilder, String> {
-    let mut ob = ignore::overrides::OverrideBuilder::new(root);
-    ob.add("!.git").expect("!.git is a valid glob");
-
-    for p in patterns {
-        ob.add(p)
-            .map_err(|e| format!("invalid glob pattern: {e}"))?;
-    }
-
-    let overrides = ob
-        .build()
-        .map_err(|e| format!("invalid glob pattern: {e}"))?;
+    let filter = if patterns.is_empty() {
+        None
+    } else {
+        let mut ob = OverrideBuilder::new(root);
+        for p in patterns {
+            ob.add(p)
+                .map_err(|e| format!("invalid glob pattern: {e}"))?;
+        }
+        Some(
+            ob.build()
+                .map_err(|e| format!("invalid glob pattern: {e}"))?,
+        )
+    };
 
     let mut wb = WalkBuilder::new(root);
-    wb.hidden(false).overrides(overrides);
+    wb.hidden(false);
     if !gitignore {
         wb.ignore(false)
             .git_ignore(false)
             .git_global(false)
             .git_exclude(false);
     }
+    wb.filter_entry(move |entry| {
+        if entry.depth() > 0 && entry.file_name() == ".git" {
+            return false;
+        }
+        let Some(ref overrides) = filter else {
+            return true;
+        };
+        let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+        if entry.depth() == 0 && is_dir {
+            return true;
+        }
+        match overrides.matched(entry.path(), is_dir) {
+            Match::Ignore(_) => false,
+            Match::Whitelist(_) => true,
+            Match::None => is_dir || overrides.num_whitelists() == 0,
+        }
+    });
     Ok(wb)
 }
 
@@ -1387,6 +1409,67 @@ mod tests {
         assert!(
             !with_ignored.iter().any(|p| p.contains(".git/")),
             ".git/ must be excluded even with gitignore=false, got: {with_ignored:?}"
+        );
+    }
+
+    #[test]
+    fn walk_builder_star_glob_excludes_git_and_respects_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        fs::create_dir_all(root.join(".git/objects/ab")).unwrap();
+        fs::write(root.join(".git/objects/ab/1234"), "obj").unwrap();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::write(root.join("target/debug/bin"), "bin").unwrap();
+        fs::write(root.join(".gitignore"), "/target\n*.log\n").unwrap();
+        fs::write(root.join("app.log"), "log").unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+
+        let root_str = root.to_string_lossy();
+        let collect = |patterns: &[&str], gitignore: bool| -> Vec<String> {
+            let mut wb = walk_builder_opts(&root_str, patterns, gitignore).unwrap();
+            wb.git_global(false);
+            wb.build()
+                .flatten()
+                .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
+                .map(|e| {
+                    e.path()
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect()
+        };
+
+        let is_git_internal = |p: &String| p == ".git" || p.starts_with(".git/");
+
+        let star = collect(&["**/*"], true);
+        assert!(star.contains(&"main.rs".into()), "got: {star:?}");
+        assert!(!star.iter().any(is_git_internal), "got: {star:?}");
+        assert!(
+            !star.iter().any(|p| p.starts_with("target")),
+            "got: {star:?}"
+        );
+        assert!(!star.contains(&"app.log".into()), "got: {star:?}");
+
+        let star_unignored = collect(&["**/*"], false);
+        assert!(
+            star_unignored.contains(&"target/debug/bin".into()),
+            "got: {star_unignored:?}"
+        );
+        assert!(
+            star_unignored.contains(&"app.log".into()),
+            "got: {star_unignored:?}"
+        );
+        assert!(
+            !star_unignored.iter().any(is_git_internal),
+            "got: {star_unignored:?}"
         );
     }
 
