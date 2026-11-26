@@ -101,7 +101,32 @@ local function py_type(prop)
   return PY_TYPES[t] or "any"
 end
 
-local function format_python_docstring(name, desc, schema)
+local function returns_lines(output_schema, type_fn, indent)
+  if type(output_schema) ~= "table" then
+    return nil
+  end
+  local lines = { indent .. "Returns: " .. type_fn(output_schema) }
+  local props = output_schema.properties
+  if type(props) == "table" then
+    local names = {}
+    for k in pairs(props) do
+      names[#names + 1] = k
+    end
+    table.sort(names)
+    for _, k in ipairs(names) do
+      local prop = props[k]
+      local pdesc = type(prop) == "table" and prop.description or nil
+      if pdesc and #pdesc > 0 then
+        lines[#lines + 1] = string.format("%s- %s (%s): %s", indent, k, type_fn(prop), pdesc)
+      else
+        lines[#lines + 1] = string.format("%s- %s (%s)", indent, k, type_fn(prop))
+      end
+    end
+  end
+  return lines
+end
+
+local function format_python_docstring(name, desc, schema, output_schema)
   schema = schema or {}
   local props = schema.properties or {}
   local req_set = {}
@@ -160,8 +185,9 @@ local function format_python_docstring(name, desc, schema)
   end
 
   local fn_name = to_py_identifier(name) or name
+  local ret_type = output_schema and py_type(output_schema) or "str"
   local doc_lines = {}
-  table.insert(doc_lines, string.format("async def %s(%s) -> str:", fn_name, sig_args_str))
+  table.insert(doc_lines, string.format("async def %s(%s) -> %s:", fn_name, sig_args_str, ret_type))
   table.insert(doc_lines, '    """')
   if desc and #desc > 0 then
     table.insert(doc_lines, "    " .. desc:gsub("\n", "\n    "))
@@ -185,6 +211,14 @@ local function format_python_docstring(name, desc, schema)
       else
         table.insert(doc_lines, string.format("    - %s (%s, optional)", a.name, py_type(a.prop)))
       end
+    end
+  end
+
+  local returns = returns_lines(output_schema, py_type, "    ")
+  if returns then
+    table.insert(doc_lines, "")
+    for _, line in ipairs(returns) do
+      table.insert(doc_lines, line)
     end
   end
 
@@ -230,7 +264,7 @@ local function js_type(prop)
   return JS_TYPES[t] or "any"
 end
 
-local function format_js_doc(name, desc, schema)
+local function format_js_doc(name, desc, schema, output_schema)
   schema = schema or {}
   local props = schema.properties or {}
   local req_set = {}
@@ -274,8 +308,9 @@ local function format_js_doc(name, desc, schema)
 
   local sig_args_str = #sig_lines > 0 and ("{\n" .. table.concat(sig_lines, "\n") .. "\n}") or ""
   local fn_name = identifier_alias(name) or name
+  local ret_type = output_schema and ("Promise<" .. js_type(output_schema) .. ">") or "Promise<string>"
   local doc_lines = {
-    string.format("async function %s(%s): Promise<string>", fn_name, sig_args_str),
+    string.format("async function %s(%s): %s", fn_name, sig_args_str, ret_type),
   }
   if desc and #desc > 0 then
     table.insert(doc_lines, "")
@@ -299,6 +334,13 @@ local function format_js_doc(name, desc, schema)
       else
         table.insert(doc_lines, string.format("- %s (%s, optional)", a.name, js_type(a.prop)))
       end
+    end
+  end
+  local returns = returns_lines(output_schema, js_type, "")
+  if returns then
+    table.insert(doc_lines, "")
+    for _, line in ipairs(returns) do
+      table.insert(doc_lines, line)
     end
   end
   return table.concat(doc_lines, "\n")
@@ -428,8 +470,18 @@ maki.api.register_tool({
     end
 
     local doc = sandbox_engine() == "js"
-        and format_js_doc(matched_fn_name or matched_fn.name, matched_fn.description, matched_fn.schema)
-      or format_python_docstring(matched_fn_name or matched_fn.name, matched_fn.description, matched_fn.schema)
+        and format_js_doc(
+          matched_fn_name or matched_fn.name,
+          matched_fn.description,
+          matched_fn.schema,
+          matched_fn.output_schema
+        )
+      or format_python_docstring(
+        matched_fn_name or matched_fn.name,
+        matched_fn.description,
+        matched_fn.schema,
+        matched_fn.output_schema
+      )
     return { llm_output = doc }
   end,
 })

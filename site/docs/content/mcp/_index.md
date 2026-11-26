@@ -137,6 +137,21 @@ async def create_issue(
 
 When no MCP servers are configured, `library_help` is automatically hidden from the model.
 
+### Structured results
+
+A server can declare an `outputSchema` for a tool and return the matching data in the `structuredContent` field of a `tools/call` response. Maki uses both:
+
+- A response with `structuredContent` becomes compact JSON text, preferred over the text `content`. This also covers servers that return structured data with no text at all. Error responses still read their text.
+- `library_help` shows the declared return type and a `Returns:` section listing the top-level fields, instead of the default `str`.
+- In `code_execution`, a function with an `outputSchema` returns a native dict/list (Python) or object/array (JavaScript). The sandbox decodes the JSON for you, so you can index the result directly:
+
+```python
+issue = await github.create_issue(title="Bug fix")
+print(issue["number"])
+```
+
+If decoding fails, the function returns the raw string. Functions without an `outputSchema` keep returning strings, so parse those yourself.
+
 ## Naming and namespacing
 
 Server names are ASCII alphanumeric, hyphens ok (no dots). Tools get prefixed with their server name: a `read` tool on the `filesystem` server becomes `filesystem__read`. Because of this, `__` is reserved and names can't collide with built-in tools.

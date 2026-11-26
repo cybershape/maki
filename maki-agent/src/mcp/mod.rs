@@ -105,6 +105,7 @@ struct McpToolDef {
     raw_name: String,
     description: String,
     input_schema: Value,
+    output_schema: Option<Value>,
 }
 
 struct McpPromptDef {
@@ -196,6 +197,9 @@ impl ServerEntry {
                 raw_name: info.name.into_owned(),
                 description: info.description.unwrap_or_default().into_owned(),
                 input_schema: Value::Object(Arc::unwrap_or_clone(info.input_schema)),
+                output_schema: info
+                    .output_schema
+                    .map(|s| Value::Object(Arc::unwrap_or_clone(s))),
             })
             .collect();
         self.prompts = prompt_infos
@@ -217,6 +221,8 @@ pub struct McpFunctionInfo {
     pub name: String,
     pub description: String,
     pub schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1284,6 +1290,7 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
                     name: t.raw_name.clone(),
                     description: t.description.clone(),
                     schema: sanitized_schema.clone(),
+                    output_schema: t.output_schema.clone(),
                 });
                 descriptors.push(ToolDescriptor {
                     qualified_name: Arc::clone(&t.qualified_name),
@@ -1376,6 +1383,7 @@ pub mod test_support {
                 raw_name: raw.into(),
                 description: (*description).into(),
                 input_schema: json!({}),
+                output_schema: None,
             });
         }
         let entries = if server_map.is_empty() {
@@ -1436,6 +1444,15 @@ pub mod test_support {
     /// so a test can see exactly what reached the server. `schemas` maps each
     /// qualified name to its declared input schema.
     pub fn echo_session(tools: &[(&str, Value)]) -> McpSession {
+        echo_session_with_output(tools, None)
+    }
+
+    /// Like [`echo_session`], but every tool declares `output_schema`, so the
+    /// sandbox decodes the echoed JSON into an object.
+    pub fn echo_session_with_output(
+        tools: &[(&str, Value)],
+        output_schema: Option<Value>,
+    ) -> McpSession {
         let mut server_map: HashMap<&str, Vec<McpToolDef>> = HashMap::new();
         for (qualified, schema) in tools {
             let (server, raw) = qualified
@@ -1446,6 +1463,7 @@ pub mod test_support {
                 raw_name: raw.into(),
                 description: String::new(),
                 input_schema: schema.clone(),
+                output_schema: output_schema.clone(),
             });
         }
         let mut srv_names: Vec<_> = server_map.keys().copied().collect();
@@ -1744,6 +1762,7 @@ mod tests {
                 raw_name: "tool".into(),
                 description: String::new(),
                 input_schema: json!({}),
+                output_schema: None,
             }],
             prompts: Vec::new(),
         }
@@ -1976,12 +1995,14 @@ mod tests {
                     raw_name: "list_issues".into(),
                     description: "List issues".into(),
                     input_schema: json!({ "type": "object" }),
+                    output_schema: None,
                 },
                 McpToolDef {
                     qualified_name: Arc::from("github.create_issue"),
                     raw_name: "create_issue".into(),
                     description: "Create issue".into(),
                     input_schema: json!({ "type": "object" }),
+                    output_schema: None,
                 },
             ],
             prompts: Vec::new(),
@@ -1994,6 +2015,33 @@ mod tests {
         assert_eq!(mods[0].functions.len(), 2);
         assert_eq!(mods[0].functions[0].name, "create_issue");
         assert_eq!(mods[0].functions[1].name, "list_issues");
+    }
+
+    #[test]
+    fn modules_propagate_output_schema() {
+        let output_schema = json!({
+            "type": "object",
+            "properties": { "number": { "type": "integer" } },
+        });
+        let srv = ServerEntry {
+            name: "github".into(),
+            config: None,
+            transport_kind: "fake",
+            origin: PathBuf::new(),
+            status: McpServerStatus::Running,
+            transport: Some(FakeTransport::new()),
+            tools: vec![McpToolDef {
+                qualified_name: Arc::from("github.create_issue"),
+                raw_name: "create_issue".into(),
+                description: "Create issue".into(),
+                input_schema: json!({ "type": "object" }),
+                output_schema: Some(output_schema.clone()),
+            }],
+            prompts: Vec::new(),
+        };
+        let (_inner, handle) = setup(vec![srv]);
+        let mods = handle.modules();
+        assert_eq!(mods[0].functions[0].output_schema, Some(output_schema));
     }
 
     /// Regression: the lock-free refactor fixed a case where `call_tool` held the inner read

@@ -376,7 +376,7 @@ local function build_description(batch_disabled, mcp_lib_names)
   local mcp_line = ""
   if mcp_lib_names and #mcp_lib_names > 0 then
     mcp_line = string.format(
-      "\n- Pre-bound external libraries: %s (injected as global objects — DO NOT write `import <lib>`, call directly via `await <lib>.<fn>(...)`).",
+      "\n- Pre-bound external libraries: %s (injected as global objects — DO NOT write `import <lib>`, call directly via `await <lib>.<fn>(...)`). Functions that declare an output schema return a dict/list directly (no `json.loads` needed); others return strings.",
       table.concat(mcp_lib_names, ", ")
     )
   end
@@ -427,7 +427,7 @@ local function build_js_description(batch_disabled, mcp_lib_names)
   local mcp_line = ""
   if mcp_lib_names and #mcp_lib_names > 0 then
     mcp_line = string.format(
-      "\n- Pre-bound external libraries: %s (injected as global objects — DO NOT import or require, call directly via `await <lib>.<fn>({ ... })`).",
+      "\n- Pre-bound external libraries: %s (injected as global objects — DO NOT import or require, call directly via `await <lib>.<fn>({ ... })`). Functions that declare an output schema return an object/array directly (no `JSON.parse` needed); others return strings.",
       table.concat(mcp_lib_names, ", ")
     )
   end
@@ -886,6 +886,33 @@ local function handler(input, ctx)
                 schemas[wire] = fn.schema
                 if not IS_JS then
                   param_maps[wire] = build_param_map(fn.schema)
+                end
+              end
+              -- A declared output schema means the result is JSON: decode it in
+              -- the sandbox so scripts work with objects, not strings. The raw
+              -- tool keeps its string contract for the host.
+              if fn.output_schema then
+                local raw_alias = "_raw_" .. wire
+                if IS_JS then
+                  table.insert(ns_lines, string.format("const %s = %s;\n", raw_alias, wire))
+                  table.insert(
+                    ns_lines,
+                    string.format(
+                      "globalThis.%s = async (o) => { const s = await %s(o); try { return JSON.parse(s); } catch { return s; } };\n",
+                      wire,
+                      raw_alias
+                    )
+                  )
+                else
+                  table.insert(ns_lines, string.format("%s = %s\n", raw_alias, wire))
+                  table.insert(
+                    ns_lines,
+                    string.format(
+                      "async def %s(**kwargs):\n    out = await %s(**kwargs)\n    try:\n        return json.loads(out)\n    except Exception:\n        return out\n",
+                      wire,
+                      raw_alias
+                    )
+                  )
                 end
               end
               if IS_JS then

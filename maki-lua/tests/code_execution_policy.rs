@@ -10,7 +10,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::unbounded_channel;
 
 use maki_agent::AgentMode;
-use maki_agent::mcp::test_support::{echo_session, stub_session};
+use maki_agent::mcp::test_support::{echo_session, echo_session_with_output, stub_session};
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{
     DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry, local_tool,
@@ -813,6 +813,108 @@ fn library_help_formats_schema_types(property: serde_json::Value, expected_type:
     }
 }
 
+const OUTPUT_SCHEMA_TOOL: &str = "srv.get_data";
+const OUTPUT_SCHEMA_WIRE: &str = "srv__get_data";
+const OUTPUT_SCHEMA_FIELD: &str = "payload";
+const OUTPUT_SCHEMA_VALUE: &str = "hello";
+const RETURNS_SECTION: &str = "Returns:";
+
+fn output_schema_session() -> maki_agent::mcp::McpSession {
+    echo_session_with_output(
+        &[(
+            OUTPUT_SCHEMA_TOOL,
+            serde_json::json!({
+                "type": "object",
+                "properties": { OUTPUT_SCHEMA_FIELD: { "type": "string" } },
+            }),
+        )],
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                OUTPUT_SCHEMA_FIELD: { "type": "string", "description": "The payload" },
+            },
+        })),
+    )
+}
+
+#[test]
+fn mcp_output_schema_returns_dict_in_python_sandbox() {
+    let out = run_code_with(
+        &format!(
+            "result = await {OUTPUT_SCHEMA_WIRE}({OUTPUT_SCHEMA_FIELD}='{OUTPUT_SCHEMA_VALUE}')\nprint(result['{OUTPUT_SCHEMA_FIELD}'])"
+        ),
+        |ctx| ctx.mcp = Some(output_schema_session()),
+    )
+    .expect("structured MCP result should decode to a dict");
+    assert!(out.contains(OUTPUT_SCHEMA_VALUE), "got: {out}");
+}
+
+#[test]
+fn mcp_output_schema_module_call_returns_dict() {
+    let out = run_code_with(
+        &format!(
+            "result = await srv.get_data({OUTPUT_SCHEMA_FIELD}='{OUTPUT_SCHEMA_VALUE}')\nprint(result['{OUTPUT_SCHEMA_FIELD}'])"
+        ),
+        |ctx| ctx.mcp = Some(output_schema_session()),
+    )
+    .expect("module-style structured MCP call should decode to a dict");
+    assert!(out.contains(OUTPUT_SCHEMA_VALUE), "got: {out}");
+}
+
+#[test]
+fn mcp_without_output_schema_returns_string() {
+    let out = run_code_with(
+        &format!(
+            "result = await {OUTPUT_SCHEMA_WIRE}({OUTPUT_SCHEMA_FIELD}='{OUTPUT_SCHEMA_VALUE}')\nprint(result)"
+        ),
+        |ctx| {
+            ctx.mcp = Some(echo_session(&[(
+                OUTPUT_SCHEMA_TOOL,
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { OUTPUT_SCHEMA_FIELD: { "type": "string" } },
+                }),
+            )]))
+        },
+    )
+    .expect("MCP result without output schema stays a string");
+    assert!(out.contains(&format!("\"{OUTPUT_SCHEMA_FIELD}\"")), "got: {out}");
+}
+
+#[test]
+fn library_help_renders_output_schema_returns() {
+    let (reg, _host) = setup_global();
+    let ctx = shaped_ctx(&reg, |ctx| ctx.mcp = Some(output_schema_session()));
+    let out = run_tool(
+        &reg,
+        &ctx,
+        "library_help",
+        serde_json::json!({ "library_name": "srv", "function_name": "get_data" }),
+    )
+    .expect("library_help should render the output schema");
+    assert!(out.contains("-> dict:"), "got: {out}");
+    assert!(out.contains(RETURNS_SECTION), "got: {out}");
+    assert!(
+        out.contains(&format!("- {OUTPUT_SCHEMA_FIELD} (str): The payload")),
+        "got: {out}"
+    );
+}
+
+#[test]
+fn library_help_without_output_schema_returns_str() {
+    let (reg, _host) = setup_global();
+    let ctx = shaped_ctx(&reg, with_mcp("github.create_issue"));
+    let out = run_tool(
+        &reg,
+        &ctx,
+        "library_help",
+        serde_json::json!({ "library_name": "github", "function_name": "create_issue" }),
+    )
+    .expect("library_help should succeed");
+    assert!(out.contains("-> str:"), "got: {out}");
+    assert!(!out.contains(RETURNS_SECTION), "got: {out}");
+}
+
 #[test]
 fn library_help_errors_when_library_not_found() {
     let (reg, _host) = setup_global();
@@ -1508,6 +1610,34 @@ fn js_engine_mcp_namespace_and_library_help() {
     );
     assert!(help.contains("from: string,"), "got: {help}");
     assert!(help.contains("target-branch?: string,"), "got: {help}");
+}
+
+#[test]
+fn js_engine_mcp_output_schema_returns_object() {
+    let (reg, _host) = setup_js();
+    let ctx = shaped_ctx(&reg, |ctx| ctx.mcp = Some(output_schema_session()));
+    let out = run_tool(
+        &reg,
+        &ctx,
+        CODE_EXECUTION,
+        serde_json::json!({
+            "code": format!(
+                "const res = await srv.get_data({{ {OUTPUT_SCHEMA_FIELD}: '{OUTPUT_SCHEMA_VALUE}' }});\nconsole.log(res.{OUTPUT_SCHEMA_FIELD});"
+            ),
+        }),
+    )
+    .expect("JS structured MCP result should decode to an object");
+    assert!(out.contains(OUTPUT_SCHEMA_VALUE), "got: {out}");
+
+    let help = run_tool(
+        &reg,
+        &ctx,
+        "library_help",
+        serde_json::json!({ "library_name": "srv", "function_name": "get_data" }),
+    )
+    .expect("library_help should render the JS output schema");
+    assert!(help.contains("Promise<object>"), "got: {help}");
+    assert!(help.contains(RETURNS_SECTION), "got: {help}");
 }
 
 #[test]

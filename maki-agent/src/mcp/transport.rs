@@ -231,7 +231,12 @@ impl McpTransport for Connection {
                 params = params.with_arguments(arguments.clone());
             }
             let result = self.request(self.peer.call_tool(params)).await?;
-            let text = joined_text(&result.content);
+            let text = match &result.structured_content {
+                Some(structured) if result.is_error != Some(true) => {
+                    structured.to_string()
+                }
+                _ => joined_text(&result.content),
+            };
             if result.is_error == Some(true) {
                 return Err(McpError::RpcError {
                     server: self.name.to_string(),
@@ -679,6 +684,9 @@ mod tests {
     const LISTING_TIMEOUT: Duration = Duration::from_secs(1);
     const SESSION_ID: &str = "session-1";
     const TOOL_TEXT: &str = "hi";
+    const STRUCTURED_FIELD: &str = "answer";
+    const STRUCTURED_VALUE: u64 = 42;
+    const TOOL_ERROR_TEXT: &str = "tool failed";
     const FIRST_TOOL: &str = "first";
     const LAST_TOOL: &str = "last";
     const NEXT_CURSOR: &str = "page-2";
@@ -909,6 +917,61 @@ mod tests {
         assert_eq!(connection.list_tools().await.unwrap().len(), 1);
         let text = connection.call_tool("echo", &json!({})).await.unwrap();
         assert_eq!(text, TOOL_TEXT);
+    }
+
+    /// A server may answer with structuredContent alone, with both, or with
+    /// text alone. Structured wins when present; an error still reads text.
+    #[test_case(
+        json!({"structuredContent": {STRUCTURED_FIELD: STRUCTURED_VALUE}}),
+        json!({STRUCTURED_FIELD: STRUCTURED_VALUE}).to_string() ; "structured_only"
+    )]
+    #[test_case(
+        json!({
+            "content": [{"type": "text", "text": TOOL_TEXT}],
+            "structuredContent": {STRUCTURED_FIELD: STRUCTURED_VALUE},
+        }),
+        json!({STRUCTURED_FIELD: STRUCTURED_VALUE}).to_string() ; "structured_wins_over_text"
+    )]
+    #[test_case(
+        json!({"content": [{"type": "text", "text": TOOL_TEXT}]}),
+        TOOL_TEXT.to_string() ; "text_only"
+    )]
+    #[tokio::test]
+    async fn call_tool_prefers_structured_content(result: Value, expected: String) {
+        let base = spawn_server(move |req| {
+            if req.body["method"] == "tools/call" {
+                let id = req.body["id"].clone();
+                return rpc_result(&id, result.clone());
+            }
+            mcp_reply(req)
+        });
+        let connection = connect(&http_config(&base, &[]), None).await.unwrap();
+        let text = connection.call_tool("echo", &json!({})).await.unwrap();
+        assert_eq!(text, expected);
+    }
+
+    #[tokio::test]
+    async fn call_tool_error_uses_text_not_structured() {
+        let base = spawn_server(|req| {
+            if req.body["method"] == "tools/call" {
+                let id = req.body["id"].clone();
+                return rpc_result(
+                    &id,
+                    json!({
+                        "content": [{"type": "text", "text": TOOL_ERROR_TEXT}],
+                        "structuredContent": {STRUCTURED_FIELD: STRUCTURED_VALUE},
+                        "isError": true,
+                    }),
+                );
+            }
+            mcp_reply(req)
+        });
+        let connection = connect(&http_config(&base, &[]), None).await.unwrap();
+        let err = connection
+            .call_tool("echo", &json!({}))
+            .await
+            .expect_err("isError must surface as an error");
+        assert!(err.to_string().contains(TOOL_ERROR_TEXT), "got: {err}");
     }
 
     #[tokio::test]

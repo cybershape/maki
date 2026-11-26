@@ -1712,7 +1712,9 @@ maki.agent.mcp_libraries({ctx})
 ```
 
 Array of active external MCP modules (libraries) and their functions.
-Each entry has `{ name, description, functions = { { name, description, schema } } }`.
+Each entry has `{ name, description, functions = { { name, description, schema, output_schema? } } }`.
+`output_schema` is the JSON Schema of the structured result the server
+declares; absent when the server declares none.
 Empty when no MCP servers are running.
 
 **Parameters:**

@@ -843,7 +843,9 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 }
 
 /// Array of active external MCP modules (libraries) and their functions.
-/// Each entry has `{ name, description, functions = { { name, description, schema } } }`.
+/// Each entry has `{ name, description, functions = { { name, description, schema, output_schema? } } }`.
+/// `output_schema` is the JSON Schema of the structured result the server
+/// declares; absent when the server declares none.
 /// Empty when no MCP servers are running.
 ///
 /// @param ctx LuaCtx Agent context.
@@ -863,6 +865,9 @@ async fn mcp_libraries(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pa
                 func_tbl.set("name", f.name.as_str())?;
                 func_tbl.set("description", f.description.as_str())?;
                 func_tbl.set("schema", json_to_lua(&lua, &f.schema)?)?;
+                if let Some(output_schema) = &f.output_schema {
+                    func_tbl.set("output_schema", json_to_lua(&lua, output_schema)?)?;
+                }
                 funcs_tbl.set(j + 1, func_tbl)?;
             }
             module_tbl.set("functions", funcs_tbl)?;
