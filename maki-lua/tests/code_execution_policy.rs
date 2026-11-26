@@ -1039,7 +1039,10 @@ fn final_body_text(rx: &mut UnboundedReceiver<maki_agent::Envelope>) -> String {
 #[test]
 fn sandbox_calls_record_state_for_compact_children() {
     let (reg, _host) = setup();
-    let inv = parse_code(&reg, "ok, bad = await gather(interp_echo(msg='hi'), interp_fail())");
+    let inv = parse_code(
+        &reg,
+        "ok, bad = await gather(interp_echo(msg='hi'), interp_fail())",
+    );
     let (ctx, _rx) = event_ctx(&reg);
     let result = runtime().block_on(inv.execute(&ctx));
     let output = result.output.expect("execute ok");
@@ -1200,7 +1203,11 @@ fn restore_with_call_state_keeps_the_body() {
     let lines = restore_lines_with_state("print('x')", "out1", false, Vec::new(), Some(state));
     assert_eq!(
         lines,
-        vec!["1 print('x')".to_owned(), DIVIDER_LINE.to_owned(), "out1".to_owned()]
+        vec![
+            "1 print('x')".to_owned(),
+            DIVIDER_LINE.to_owned(),
+            "out1".to_owned()
+        ]
     );
 }
 
@@ -1591,5 +1598,41 @@ fn js_engine_error_hints_for_import_and_promise_all() {
     assert!(
         promise_all_err.contains(GATHER_HINT_SUBSTR),
         "got: {promise_all_err}"
+    );
+}
+
+#[test]
+fn js_engine_syntax_error_does_not_emit_mcp_call_hint() {
+    let (reg, _host) = setup_js();
+    let ctx = shaped_ctx(&reg, with_mcp(MCP_TOOL_QUALIFIED));
+
+    let syntax_err = run_tool(
+        &reg,
+        &ctx,
+        CODE_EXECUTION,
+        serde_json::json!({
+            "code": r#"await srv.fetch_issue({ title: "unterminated" "extra" });"#,
+        }),
+    )
+    .expect_err("broken JS syntax should fail with SyntaxError");
+    assert!(syntax_err.contains("SyntaxError:"), "got: {syntax_err}");
+    assert!(
+        !syntax_err.contains(MCP_HINT_PREFIX),
+        "syntax error must not emit MCP parameter hint: {syntax_err}"
+    );
+
+    let import_err = run_tool(
+        &reg,
+        &ctx,
+        CODE_EXECUTION,
+        serde_json::json!({
+            "code": r#"import srv from "srv"; await srv.fetch_issue({});"#,
+        }),
+    )
+    .expect_err("importing global MCP object in JS should fail");
+    assert!(
+        import_err
+            .contains("Hint: 'srv' is an external library already injected as a global object"),
+        "got: {import_err}"
     );
 }

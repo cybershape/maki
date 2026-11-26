@@ -252,32 +252,34 @@ local function mcp_library_hint(libs, code, err, is_js)
           help_call(lib_name, "...")
         )
       end
-      local is_call_err = err:find(lib_name, 1, true)
-        or err:find("RuntimeError", 1, true)
-        or err:find("TypeError", 1, true)
-        or (is_js and err:find("Error:", 1, true))
-      for _, fn in ipairs(lib.functions or {}) do
-        local name_str = type(fn) == "table" and fn.name or fn
-        local fn_name = identifier_alias(name_str) or name_str
-        if fn_name then
-          local wire = lib_name .. "__" .. fn_name
-          local dot_call = lib_name .. "." .. fn_name
-          if err:find(wire, 1, true) or (code:find(dot_call, 1, true) and is_call_err) then
-            return string.format(
-              "\n\nHint: Parameter or runtime error in external library '%s'. Please inspect its schema using `%s` before retrying.",
-              lib_name,
-              help_call(lib_name, fn_name)
-            )
+      if not err:find("^parse error:") and not err:find("SyntaxError", 1, true) then
+        local is_call_err = err:find(lib_name, 1, true)
+          or err:find("RuntimeError", 1, true)
+          or err:find("TypeError", 1, true)
+          or (is_js and err:find("Error:", 1, true))
+        for _, fn in ipairs(lib.functions or {}) do
+          local name_str = type(fn) == "table" and fn.name or fn
+          local fn_name = identifier_alias(name_str) or name_str
+          if fn_name then
+            local wire = lib_name .. "__" .. fn_name
+            local dot_call = lib_name .. "." .. fn_name
+            if err:find(wire, 1, true) or (code:find(dot_call, 1, true) and is_call_err) then
+              return string.format(
+                "\n\nHint: Parameter or runtime error in external library '%s'. Please inspect its schema using `%s` before retrying.",
+                lib_name,
+                help_call(lib_name, fn_name)
+              )
+            end
           end
         end
-      end
-      local fn_call = code:match(lib_name .. "%.([%a_][%w_]*)")
-      if fn_call and is_call_err then
-        return string.format(
-          "\n\nHint: Parameter or runtime error in external library '%s'. Please inspect its schema using `%s` before retrying.",
-          lib_name,
-          help_call(lib_name, fn_call)
-        )
+        local fn_call = code:match(lib_name .. "%.([%a_][%w_]*)")
+        if fn_call and is_call_err then
+          return string.format(
+            "\n\nHint: Parameter or runtime error in external library '%s'. Please inspect its schema using `%s` before retrying.",
+            lib_name,
+            help_call(lib_name, fn_call)
+          )
+        end
       end
     end
   end
