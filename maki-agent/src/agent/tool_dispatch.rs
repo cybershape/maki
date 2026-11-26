@@ -52,7 +52,7 @@ const INVALID_ARGUMENTS_PREFIX: &str = "invalid tool input: the arguments were n
 const MCP_SERVER_GONE: &str =
     "Its MCP server is not connected or no longer offers it, so it cannot be called now.";
 const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
-const MCP_SUMMARY_PREFIX: &str = "mcp: ";
+pub const MCP_SUMMARY_PREFIX: &str = "mcp: ";
 
 const SOURCE_NATIVE: &str = "native";
 const SOURCE_LOCAL: &str = "local";

@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use maki_agent::agent::tool_dispatch::MCP_SUMMARY_PREFIX;
+use maki_agent::mcp::{internal_tool_name, is_wire_name};
 use maki_agent::tools::BASH_TOOL_NAME;
 use maki_agent::tools::schema::TOOLCALL_REASON_FIELD;
 use maki_agent::{BufferSnapshot, SpanStyle, ToolOutput};
@@ -918,7 +920,12 @@ fn render_tool_row(
     if show_open {
         name_style = name_style.add_modifier(Modifier::UNDERLINED);
     }
-    spans.push(Span::styled(tool.name.to_string(), name_style));
+    let display_name = if is_wire_name(&tool.name) {
+        format!("{MCP_SUMMARY_PREFIX}{}", internal_tool_name(&tool.name))
+    } else {
+        tool.name.to_string()
+    };
+    spans.push(Span::styled(display_name.clone(), name_style));
 
     let count_str = if tool.count > 1 {
         format!("{MERGED_COUNT_PREFIX}{}", tool.count)
@@ -940,7 +947,7 @@ fn render_tool_row(
     let right_len = right_str.width();
     let right_style = theme.status_dim;
 
-    let left_len = rail.width() + icon_width + tool.name.width() + count_str.width();
+    let left_len = rail.width() + icon_width + display_name.width() + count_str.width();
     let summary_clean = single_line(&tool.summary);
 
     if !summary_clean.is_empty() {
@@ -2260,6 +2267,38 @@ mod tests {
         assert_eq!(children[1].status, ToolStatus::Error);
         assert_eq!(children[2].status, ToolStatus::InProgress);
         assert!(children[2].duration.is_none());
+    }
+
+    #[test]
+    fn compact_row_shows_mcp_wire_name_with_prefix_and_dot() {
+        const DISPLAY_NAME: &str = "mcp: mdserver.search_documents";
+        let entry = GroupToolEntry {
+            id: String::new(),
+            name: Arc::from("mdserver__search_documents"),
+            summary: "1 line".into(),
+            raw_input: None,
+            children: Vec::new(),
+            count: 1,
+            status: ToolStatus::Success,
+            receiving_args: false,
+            started_at: None,
+            duration: None,
+            detail: None,
+        };
+        let row = render_tool_row(
+            "",
+            &entry,
+            ("", Style::default()),
+            80,
+            &mut Vec::new(),
+            0,
+            RowHover {
+                hovered: false,
+                openable: false,
+            },
+        );
+        assert_eq!(row.spans[1].content, DISPLAY_NAME);
+        assert!(row.to_string().starts_with(&format!("✓ {DISPLAY_NAME}")));
     }
 
     fn calls_output(calls: Value) -> ToolOutput {
