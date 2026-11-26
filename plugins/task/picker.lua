@@ -65,7 +65,10 @@ local function label_spans(task, label, words, base, match_style)
   end
   local cut_at = #task.name + #DESC_SEP
   local spans = ListPicker.highlight_spans(label:sub(1, cut_at), words, base, match_style)
-  for _, span in ipairs(ListPicker.highlight_spans(label:sub(cut_at + 1), words, "dim", match_style)) do
+  -- On the selection the description wears the selection background too, or
+  -- the bar would break into a dark gap mid-row.
+  local desc_style = base == "selected" and base or "dim"
+  for _, span in ipairs(ListPicker.highlight_spans(label:sub(cut_at + 1), words, desc_style, match_style)) do
     spans[#spans + 1] = span
   end
   return spans

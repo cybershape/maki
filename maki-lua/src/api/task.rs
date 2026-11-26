@@ -603,6 +603,46 @@ mod tests {
         assert_eq!(globals.get::<u32>("list_calls").unwrap(), 2);
     }
 
+    const TASK_DESCRIPTION: &str = "find auth middleware";
+    const SELECTED_STYLE: &str = "selected";
+    const DIM_STYLE: &str = "dim";
+    /// Each span of the first row carrying {TASK_ID} as "text:style" pairs.
+    const ROW_STYLES_SCRIPT: &str = "
+        for _, line in ipairs(drawn) do
+            for _, span in ipairs(line) do
+                if span[1]:find(task_name, 1, true) then
+                    local out = {}
+                    for _, s in ipairs(line) do
+                        out[#out + 1] = s[1] .. ':' .. tostring(s[2])
+                    end
+                    return table.concat(out, '|')
+                end
+            end
+        end
+        return ''
+    ";
+
+    /// The description reads dim on a plain row, but the selection bar must
+    /// run through it too, or the row breaks into a dark gap mid-label.
+    #[test_case(&[DOWN, ESC], SELECTED_STYLE ; "selected_description_wears_the_selection")]
+    #[test_case(&[ESC], DIM_STYLE ; "unselected_description_stays_dim")]
+    fn tasks_picker_description_keeps_the_row_background(keys: &[&str], desc_style: &str) {
+        let lua = picker_lua(None, keys, &[TASK_ID], false);
+        lua.load(format!(
+            "tasks[2].description = '{TASK_DESCRIPTION}'
+             open_tasks()"
+        ))
+        .exec()
+        .unwrap();
+
+        let row: String = lua.load(ROW_STYLES_SCRIPT).eval().unwrap();
+        assert!(
+            row.contains(&format!("{TASK_DESCRIPTION}:{desc_style}")),
+            "expected description styled {desc_style}: {row}"
+        );
+        assert!(!row.contains("nil"), "every span carries a style: {row}");
+    }
+
     /// Runs `plugins/task/picker.lua` against a fake `maki` that lists the main
     /// chat, then {task_ids} in spawn order and, when {with_job}, one shared
     /// job, and presses {keys}.
