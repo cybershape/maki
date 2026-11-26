@@ -4,6 +4,7 @@
 
 mod common;
 
+use std::iter;
 use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
 use std::thread;
@@ -14,9 +15,13 @@ use common::{
 };
 use maki_agent::permissions::PermissionManager;
 use maki_agent::tools::{ToolAudience, ToolRegistry};
-use maki_agent::{AgentEvent, CancelToken, PermissionsConfig, SessionMailbox, ToolDoneEvent};
-use maki_config::ProjectConfig;
-use maki_lua::{MoveOutcome, Permission, PluginHost, PluginPermissions, UiAction};
+use maki_agent::{
+    AgentEvent, CancelToken, Envelope, EventSender, PermissionsConfig, SessionMailbox, ToolDoneEvent,
+};
+use maki_config::{ProjectConfig, ToolOutputLines};
+use maki_lua::{
+    MoveOutcome, Permission, PluginHost, PluginPermissions, RestoreItem, RestoreReason, UiAction,
+};
 use maki_providers::ContentBlock;
 use maki_storage::id::MakiId;
 use serde_json::{Value, json};
@@ -811,6 +816,111 @@ fn a_subagents_message_without_a_session_is_refused() {
     ));
 
     assert!(failed && reply.contains(NO_PARENT_SESSION), "{reply}");
+}
+
+const MESSAGE_REASON: &str = "steering the subagent";
+const SEND_ARROW: &str = "→ ";
+const PARENT_RECIPIENT: &str = "parent";
+const REASON_SEP: &str = " · ";
+const RESTORE_CALL_ID: &str = "toolu_message_restore";
+const NO_HEADER: &str = "the call never named its recipient";
+
+fn header_snapshot(events: &mut UnboundedReceiver<Envelope>) -> String {
+    next_event(events, |event| match event {
+        AgentEvent::ToolHeaderSnapshot { snapshot, .. } => Some(snapshot.text()),
+        _ => None,
+    })
+}
+
+/// The header names who the message went to, whichever handle addressed the
+/// task, and a reason replaces the message text without hiding the recipient.
+#[test_case(CODENAME, None, format!("{SEND_ARROW}{CODENAME}: {MESSAGE}") ; "by_codename")]
+#[test_case(CALL_ID, None, format!("{SEND_ARROW}{CODENAME}: {MESSAGE}") ; "by_call_id_resolves_the_codename")]
+#[test_case(CODENAME, Some(MESSAGE_REASON), format!("{SEND_ARROW}{CODENAME}{REASON_SEP}{MESSAGE_REASON}") ; "with_a_reason")]
+fn a_message_header_names_its_recipient(id: &str, reason: Option<&str>, expected: String) {
+    let mut host = Host::task(Arc::new(ToolRegistry::new()));
+    let chat = Chat::live();
+    let parked = Parked::new(RESULT);
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    ctx.provider = Arc::clone(&parked.provider);
+
+    assert!(exec(&host.reg, TASK_TOOL, task_input(), &ctx).backgrounded);
+    parked.wait_started();
+
+    let (mut msg_ctx, mut events) = call_ctx(&host.reg, chat.id, &run_token, MESSAGE_CALL_ID);
+    msg_ctx.provider = Arc::clone(&parked.provider);
+    let mut input = json!({ "id": id, "message": MESSAGE });
+    if let Some(reason) = reason {
+        input["toolcall_reason"] = json!(reason);
+    }
+    let (reply, failed) = done_text(&exec(&host.reg, MESSAGE_TOOL, input, &msg_ctx));
+    assert!(!failed, "{reply}");
+
+    assert_eq!(header_snapshot(&mut events), expected);
+
+    drop(parked);
+    host.task_done();
+}
+
+/// A report's header names the parent as the recipient.
+#[test]
+fn a_report_header_names_the_parent() {
+    let host = Host::task(Arc::new(ToolRegistry::new()));
+    let chat = Chat::live();
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, mut events) = call_ctx(&host.reg, chat.id, &run_token, SUBAGENT_TASK_ID);
+    ctx.audience = ToolAudience::GENERAL_SUB;
+    ctx.task_id = Some(Arc::from(SUBAGENT_TASK_ID));
+    ctx.task_name = Some(Arc::from(CODENAME));
+
+    let (reply, failed) = done_text(&exec(
+        &host.reg,
+        MESSAGE_TOOL,
+        json!({ "message": REPORT }),
+        &ctx,
+    ));
+    assert!(!failed, "{reply}");
+
+    assert_eq!(
+        header_snapshot(&mut events),
+        format!("{SEND_ARROW}{PARENT_RECIPIENT}: {REPORT}")
+    );
+}
+
+/// The recipient survives a restore through the state the handler saved; an
+/// old call without it falls back to the id the input still carries.
+#[test_case(Some(json!({ "name": CODENAME })), format!("{SEND_ARROW}{CODENAME}: {MESSAGE}") ; "with_saved_name")]
+#[test_case(None, format!("{SEND_ARROW}{CALL_ID}: {MESSAGE}") ; "without_state_falls_back_to_the_id")]
+fn restore_shows_the_recipient_as_the_header(state: Option<Value>, expected: String) {
+    let host = Host::task(Arc::new(ToolRegistry::new()));
+    let (tx, mut rx) = unbounded_channel();
+    let item = RestoreItem {
+        tool: Arc::from(MESSAGE_TOOL),
+        tool_use_id: RESTORE_CALL_ID.to_owned(),
+        output: QUEUED.to_owned(),
+        input: json!({ "id": CALL_ID, "message": MESSAGE }),
+        is_error: false,
+        tool_output_lines: ToolOutputLines::DEFAULT,
+        theme_gen: None,
+        clicks: Vec::new(),
+        state,
+        session_id: None,
+        task_id: None,
+        reason: RestoreReason::default(),
+    };
+
+    let handle = host.host.event_handle();
+    handle.request_restore(item, EventSender::new(tx, 0));
+    handle.wait_restore_complete_for_test();
+
+    let header = iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|env| match env.event {
+            AgentEvent::ToolHeaderSnapshot { snapshot, .. } => Some(snapshot.text()),
+            _ => None,
+        })
+        .expect(NO_HEADER);
+    assert_eq!(header, expected);
 }
 
 /// One name, two schemas: the parent keeps id and interrupt, a subagent's

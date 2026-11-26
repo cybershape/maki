@@ -147,6 +147,8 @@ A subagent calls `task_message` with only a `message` input to report to its par
 
 The name is one tool with two directions. The parent's `id` and `interrupt` inputs need background delegation, so with `allow_background = false` a subagent can still report while the parent has no steering inputs.
 
+Every `task_message` row names its recipient: `→ Nyx: message` when the parent sends, `→ parent: message` for a report. A call id resolves to the codename once the message is sent, and the name survives session restore. With a `toolcall_reason` the row reads `→ Nyx · reason`, so the recipient stays visible.
+
 ## Let the model start tasks
 
 Every `task` call carries a `name`: a short, cool, task-inspired codename (3-8 letters) drawn from mythology, sci-fi, nature, or tools, like Forge, Atlas, Nyx, or Hawk. The codename is the handle the model and the user see everywhere: the `/tasks` row, the receipt, a report line, and the `id` that `task_message` and `task_stop` take (the call id still works too). A codename must be unique among the session's live tasks; a duplicate is refused with the taken names listed so the model picks another, and the name frees up once the task closes.

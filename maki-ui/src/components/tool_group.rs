@@ -41,6 +41,8 @@ const CHILD_DURATION_STYLE: &str = "batch_duration_ms";
 const CHILD_DURATION_PREFIX: &str = " (";
 const CHILD_DURATION_SUFFIX: &str = "ms)";
 const REASON_SEP: &str = " · ";
+const MESSAGE_SEND_ARROW: &str = "→ ";
+const MESSAGE_PARENT_RECIPIENT: &str = "parent";
 const THINKING_NEWLINE_SEP: &str = " ↵ ";
 const MERGED_COUNT_PREFIX: &str = " x ";
 /// Annotation notes whose numbers are statuses or budgets, not sums.
@@ -318,6 +320,15 @@ pub fn format_compact_summary(
             } else {
                 reason.to_string()
             }
+        }
+        "task_message" => {
+            let recipient = input
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(MESSAGE_PARENT_RECIPIENT);
+            format!("{MESSAGE_SEND_ARROW}{recipient}{REASON_SEP}{reason}")
         }
         _ => reason.to_string(),
     }
@@ -2188,6 +2199,9 @@ mod tests {
     #[test_case("batch", Some(serde_json::json!({"tool_calls": [{}, {}], "toolcall_reason": "running batch"})), "fallback", "running batch · 2 tools" ; "batch_with_tool_calls")]
     #[test_case("task", Some(serde_json::json!({"description": "subtask", "toolcall_reason": "starting subtask"})), "fallback", "starting subtask" ; "task_reason_only")]
     #[test_case("websearch", Some(serde_json::json!({"query": "rust tokio", "toolcall_reason": "searching web"})), "fallback", "searching web · rust tokio" ; "websearch_with_query")]
+    #[test_case("task_message", Some(serde_json::json!({"id": "Hawk", "message": "wrap up", "toolcall_reason": "steering hawk"})), "fallback", "→ Hawk · steering hawk" ; "task_message_names_the_recipient")]
+    #[test_case("task_message", Some(serde_json::json!({"message": "IOC list stale", "toolcall_reason": "reporting risk"})), "fallback", "→ parent · reporting risk" ; "task_message_report_names_the_parent")]
+    #[test_case("task_message", Some(serde_json::json!({"id": "  ", "message": "wrap up", "toolcall_reason": "steering"})), "fallback", "→ parent · steering" ; "task_message_blank_id_falls_back_to_parent")]
     #[test_case("webfetch", Some(serde_json::json!({"url": "https://example.com", "toolcall_reason": "fetching page"})), "fallback", "fetching page" ; "webfetch_reason_only")]
     #[test_case("question", Some(serde_json::json!({"questions": [], "toolcall_reason": "asking question"})), "fallback", "asking question" ; "question_reason_only")]
     #[test_case("memory", Some(serde_json::json!({"path": "notes.md", "toolcall_reason": "saving memory"})), "fallback", "saving memory" ; "memory_reason_only")]

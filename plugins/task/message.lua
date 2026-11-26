@@ -12,12 +12,43 @@ the parent replies with a message if needed. Never report routine progress; your
 local ID_DESCRIPTION = "Parent only: task codename from its receipt (its call id also works). A batch's id reaches every subagent in it"
 local MESSAGE_DESCRIPTION = "What the subagent should know or do, or what the parent must know"
 local INTERRUPT_DESCRIPTION = "Parent only: cut the current step short"
+local REASON_DESCRIPTION = "Why you are calling this tool and what you expect."
 local QUEUED = "Message queued for %s."
 local INTERRUPTED = "Interrupted %s with the message."
 local NO_SESSION_ERR = "no parent session to report to"
 local REPORT_HEAD = "[Report from %s]"
 local DISPLAY = "%s reported: %s"
 local DELIVERED = "Report delivered to the parent agent."
+local PARENT_RECIPIENT = "parent"
+local SEND_ARROW = "→ "
+local HEADER_MESSAGE = "%s%s: %s"
+local HEADER_REASON = "%s%s · %s"
+
+-- The recipient stays visible even when a toolcall_reason takes the message
+-- text's place, matching the compact rows' `reason · detail` shape.
+local function header_line(recipient, input)
+  local reason = input.toolcall_reason
+  if reason and reason:find("%S") then
+    return HEADER_REASON:format(SEND_ARROW, recipient, reason)
+  end
+  return HEADER_MESSAGE:format(SEND_ARROW, recipient, input.message)
+end
+
+local function header_buf(recipient, input)
+  local buf = maki.ui.buf()
+  buf:line({ { header_line(recipient, input) } })
+  return buf
+end
+
+-- The handler's header is not saved with the session, so the resolved
+-- recipient also goes in the state for a restore to show.
+local function sent_reply(text, recipient, input)
+  return {
+    llm_output = text,
+    header = header_buf(recipient, input),
+    state = { name = recipient },
+  }
+end
 
 local function to_parent(input, ctx)
   local session = ctx:session_id()
@@ -34,7 +65,7 @@ local function to_parent(input, ctx)
   if not ok then
     return { llm_output = err, is_error = true }
   end
-  return DELIVERED
+  return sent_reply(DELIVERED, PARENT_RECIPIENT, input)
 end
 
 local function to_subagent(input, ctx)
@@ -43,7 +74,7 @@ local function to_subagent(input, ctx)
   if not sent then
     return { llm_output = err, is_error = true }
   end
-  return (interrupt and INTERRUPTED or QUEUED):format(sent.name)
+  return sent_reply((interrupt and INTERRUPTED or QUEUED):format(sent.name), sent.name, input)
 end
 
 maki.api.register_tool({
@@ -65,13 +96,19 @@ maki.api.register_tool({
         description = INTERRUPT_DESCRIPTION,
         needs_background = true,
       },
+      -- Declared here so the host does not lift it into the header on its
+      -- own: the recipient must stay visible even with a reason.
+      toolcall_reason = { type = "string", description = REASON_DESCRIPTION },
     },
   },
   header = function(input)
-    return input.message
+    return header_line(input.id or PARENT_RECIPIENT, input)
   end,
-  -- A restore hook that returns nothing would also drop the restored header.
-  restore = function()
+  restore = function(input, _, _, ctx)
+    local state = ctx:state()
+    if state and state.name then
+      return { header = header_buf(state.name, input) }
+    end
     return {}
   end,
   handler = function(input, ctx)
