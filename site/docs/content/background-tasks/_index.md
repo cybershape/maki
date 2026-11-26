@@ -130,7 +130,7 @@ While a message waits for the model to read it, the Inbox panel above the input 
 
 ```
 ╭ Inbox ─────────────────────────────╮
-│ Subagent toolu_01 reported         │
+│ Nyx reported: IOC list is stale    │
 │ Background bash finished: tests    │
 ╰────────────────────────────────────╯
 ```
@@ -139,11 +139,17 @@ The panel is read-only and shows at most five lines, then a `+N more` count. Onc
 
 ## Reports from a subagent
 
-A subagent calls `task_message` with only a `message` input to report to its parent mid-task: a finding that changes the plan, a blocker that needs direction, or a risk. The report arrives as an observation that starts with `[Report from subagent <id>]`, and wakes an idle parent the same way a result does. The parent answers a blocked subagent with `task_message` and that id.
+A subagent calls `task_message` with only a `message` input to report to its parent mid-task: a finding that changes the plan, a blocker that needs direction, or a risk. The report arrives as an observation that starts with `[Report from <codename>]`, and wakes an idle parent the same way a result does. The parent answers a blocked subagent with `task_message` and that codename. In the transcript the report line carries a `✉` icon, since it is incoming information rather than a finished task:
+
+```
+✉ Nyx reported: IOC list is stale
+```
 
 The name is one tool with two directions. The parent's `id` and `interrupt` inputs need background delegation, so with `allow_background = false` a subagent can still report while the parent has no steering inputs.
 
 ## Let the model start tasks
+
+Every `task` call carries a `name`: a short, cool, task-inspired codename (3-8 letters) drawn from mythology, sci-fi, nature, or tools, like Forge, Atlas, Nyx, or Hawk. The codename is the handle the model and the user see everywhere: the `/tasks` row, the receipt, a report line, and the `id` that `task_message` and `task_stop` take (the call id still works too). A codename must be unique among the session's live tasks; a duplicate is refused with the taken names listed so the model picks another, and the name frees up once the task closes.
 
 The model can ask for a background run up front with `bash(background = true)` or `task(background = true)`. Both behave like `Ctrl+B`, and the receipt sentence starts with `Started in the background as asked`. A subagent that has to wait for a free slot waits in the background.
 
@@ -159,11 +165,11 @@ maki.setup({
 
 Inside `batch`, a `background = true` call cannot move by itself. Once only such calls are still running, the whole batch moves.
 
-The batch receipt gives each running subagent its own task id. Each subagent's result names that id, including the last one, which comes back in the batch result. The table shows what each id reaches:
+The batch receipt gives each running subagent its own task id. Each subagent's result names that id, including the last one, which comes back in the batch result. A subagent's codename reaches it just like its id. The table shows what each handle reaches:
 
-| Id | `task_message` | `task_stop` |
+| Handle | `task_message` | `task_stop` |
 |----|----------------|-------------|
-| Subagent id | That subagent | That subagent |
+| Subagent codename or id | That subagent | That subagent |
 | Batch id | Every subagent still running in the batch | The whole batch |
 
 If the move fails, for example with background tasks off, the call runs in the foreground and its result starts with `[Could not start in the background (<reason>). Ran in the foreground.]`

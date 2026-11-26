@@ -236,8 +236,9 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `background` | boolean | no | Run in the background. The result arrives as a message. Default to true unless your next step needs the result. Launch all in one batch. Never sleep or poll, end your turn when idle. |
+| `background` | boolean | no | Run in the background (default). The result arrives as a message that wakes you. Set false only when your very next step needs the result inline. Launch all in one batch. Never sleep or poll, end your turn when idle. |
 | `description` | string | yes | Short (3-5 words) description of the task |
+| `name` | string | yes | Give each subagent a short, cool, task-inspired codename (3-8 letters), drawing from mythology, sci-fi, nature, or tools. Prefer evocative names like Forge, Atlas, Nyx, or Hawk over generic role labels, and avoid duplicates. |
 | `output_schema` | object | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default) or "general" (can modify files) |
@@ -245,24 +246,24 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 ### `task_stop` {#task_stop}
 
-Stop a background task by id.
+Stop a background task by codename.
 
 **Permission:** undeclared
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `id` | string | yes | Task id from its receipt |
+| `id` | string | yes | Task codename (or call id) from its receipt |
 
 ### `task_message` {#task_message}
 
-Message a running background subagent by id, e.g. a new fact, a changed scope or "wrap up now". It reads it after its current step.
+Message a running background subagent by codename, e.g. a new fact, a changed scope or "wrap up now". It reads it after its current step.
 Set interrupt only when it must act now: it cuts the current step, running tools included.
 
 **Permission:** undeclared
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `id` | string | no | Parent only: task id from its receipt. A batch's id reaches every subagent in it |
+| `id` | string | no | Parent only: task codename from its receipt (its call id also works). A batch's id reaches every subagent in it |
 | `interrupt` | boolean | no | Parent only: cut the current step short |
 | `message` | string | yes | What the subagent should know or do, or what the parent must know |
 
