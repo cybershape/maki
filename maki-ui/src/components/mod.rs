@@ -589,6 +589,9 @@ pub struct GroupToolEntry {
     pub summary: String,
     pub raw_input: Option<Value>,
     pub children: Vec<GroupToolEntry>,
+    /// How many calls this row stands for. Merged code_execution children
+    /// carry more than one; every other row is a single call.
+    pub count: usize,
     pub status: ToolStatus,
     pub receiving_args: bool,
     pub started_at: Option<Instant>,
@@ -635,6 +638,7 @@ impl PartialEq for GroupToolEntry {
             && self.summary == other.summary
             && self.raw_input == other.raw_input
             && self.children == other.children
+            && self.count == other.count
             && self.status == other.status
             && self.receiving_args == other.receiving_args
             && self.started_at == other.started_at

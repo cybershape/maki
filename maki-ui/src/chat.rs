@@ -1062,6 +1062,7 @@ pub fn history_to_display(
                                     summary,
                                     raw_input: Some(input.clone()),
                                     children,
+                                    count: 1,
                                     status,
                                     receiving_args: false,
                                     started_at: None,

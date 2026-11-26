@@ -40,6 +40,11 @@ const CHILD_DURATION_PREFIX: &str = " (";
 const CHILD_DURATION_SUFFIX: &str = "ms)";
 const REASON_SEP: &str = " · ";
 const THINKING_NEWLINE_SEP: &str = " ↵ ";
+const MERGED_COUNT_PREFIX: &str = " x ";
+/// Annotation notes whose numbers are statuses or budgets, not sums.
+const OPAQUE_NOTE_PREFIXES: [&str; 2] = ["exit ", "timeout "];
+/// Formatted token usage ("1.2k↑ 345↓") is rounded text, not a summand.
+const USAGE_NOTE_MARKERS: [char; 2] = ['↑', '↓'];
 
 const BUSY_FRAMES: [&str; 4] = ["·", "•", "●", "•"];
 const BUSY_INTERVAL_MS: u128 = 140;
@@ -437,6 +442,7 @@ pub(super) fn batch_children(
                 summary,
                 raw_input: child_input,
                 children: Vec::new(),
+                count: 1,
                 status,
                 receiving_args: false,
                 started_at: None,
@@ -449,7 +455,8 @@ pub(super) fn batch_children(
 
 /// One child per sandbox tool call, from the `state` the plugin saves with
 /// the result. Unlike batch, the calls never render into the body, so the
-/// records are the only source.
+/// records are the only source. Calls without a `toolcall_reason` merge into
+/// one row per tool (`bash x 2`), with their statistics summed.
 pub(super) fn code_execution_children(output: Option<&ToolOutput>) -> Vec<GroupToolEntry> {
     let Some(calls) = output
         .and_then(ToolOutput::state)
@@ -458,14 +465,17 @@ pub(super) fn code_execution_children(output: Option<&ToolOutput>) -> Vec<GroupT
     else {
         return Vec::new();
     };
-    calls
+    let children: Vec<GroupToolEntry> = calls
         .iter()
         .filter_map(|call| {
             let name = call.get("tool").and_then(Value::as_str)?;
             let params = call.get("params").filter(|v| v.is_object()).cloned();
             let mut summary = format_compact_summary(name, params.as_ref(), "");
             for field in ["annotation", "usage"] {
-                if let Some(extra) = call.get(field).and_then(Value::as_str).filter(|s| !s.is_empty())
+                if let Some(extra) = call
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
                 {
                     if summary.is_empty() {
                         summary = extra.to_string();
@@ -489,6 +499,7 @@ pub(super) fn code_execution_children(output: Option<&ToolOutput>) -> Vec<GroupT
                 summary,
                 raw_input: params,
                 children: Vec::new(),
+                count: 1,
                 status,
                 receiving_args: false,
                 started_at: None,
@@ -496,7 +507,126 @@ pub(super) fn code_execution_children(output: Option<&ToolOutput>) -> Vec<GroupT
                 detail: None,
             })
         })
-        .collect()
+        .collect();
+    merge_code_execution_children(children)
+}
+
+pub(super) fn child_reason(entry: &GroupToolEntry) -> Option<&str> {
+    entry
+        .raw_input
+        .as_ref()
+        .and_then(|v| v.get(TOOLCALL_REASON_FIELD))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Collapses reason-less calls of the same tool into the first row of that
+/// tool, keeping first-seen order. Rows with a reason stay separate: the
+/// reason explains one specific call.
+fn merge_code_execution_children(children: Vec<GroupToolEntry>) -> Vec<GroupToolEntry> {
+    let mut merged: Vec<GroupToolEntry> = Vec::new();
+    for child in children {
+        let target = (child_reason(&child).is_none()).then(|| {
+            merged
+                .iter_mut()
+                .find(|row| row.name == child.name && child_reason(row).is_none())
+        });
+        match target {
+            Some(Some(row)) => merge_call_into(row, child),
+            _ => merged.push(child),
+        }
+    }
+    merged
+}
+
+fn merge_call_into(row: &mut GroupToolEntry, call: GroupToolEntry) {
+    row.count += call.count;
+    row.status = match (row.status, call.status) {
+        (ToolStatus::Error, _) | (_, ToolStatus::Error) => ToolStatus::Error,
+        (ToolStatus::InProgress, _) | (_, ToolStatus::InProgress) => ToolStatus::InProgress,
+        _ => ToolStatus::Success,
+    };
+    row.duration = match (row.duration, call.duration) {
+        (Some(a), Some(b)) => Some(a + b),
+        (a, b) => a.or(b),
+    };
+    row.summary = merge_notes(&row.summary, &call.summary);
+    row.raw_input = None;
+}
+
+/// Merges the ` · `-separated annotation/usage notes of two rows: identical
+/// text is kept once, numeric notes with the same shape are summed per
+/// position ("50 lines" + "30 lines" -> "80 lines"), everything else is kept.
+fn merge_notes(a: &str, b: &str) -> String {
+    let mut notes: Vec<String> = a
+        .split(REASON_SEP)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    for note in b.split(REASON_SEP).filter(|s| !s.is_empty()) {
+        if notes.iter().any(|kept| kept == note) {
+            continue;
+        }
+        let summed = numeric_note(note).and_then(|(template, numbers)| {
+            notes.iter_mut().find_map(|kept| {
+                let (kept_template, kept_numbers) = numeric_note(kept)?;
+                (kept_template == template && kept_numbers.len() == numbers.len()).then(|| {
+                    *kept = render_numeric_note(
+                        &template,
+                        &kept_numbers
+                            .iter()
+                            .zip(&numbers)
+                            .map(|(x, y)| x + y)
+                            .collect::<Vec<_>>(),
+                    );
+                })
+            })
+        });
+        if summed.is_none() {
+            notes.push(note.to_owned());
+        }
+    }
+    notes.join(REASON_SEP)
+}
+
+/// Splits a note into digit-free gaps and the numbers between them, so two
+/// notes of the same shape can be summed per position. Notes with no digits,
+/// and status or budget notes ("exit 1", "timeout 30s"), have no shape.
+fn numeric_note(note: &str) -> Option<(Vec<String>, Vec<u64>)> {
+    if OPAQUE_NOTE_PREFIXES
+        .iter()
+        .any(|prefix| note.starts_with(prefix))
+        || note.contains(USAGE_NOTE_MARKERS)
+    {
+        return None;
+    }
+    let mut gaps = Vec::new();
+    let mut numbers = Vec::new();
+    let mut rest = note;
+    while let Some(start) = rest.find(|c: char| c.is_ascii_digit()) {
+        gaps.push(rest[..start].to_owned());
+        rest = &rest[start..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        numbers.push(rest[..end].parse().ok()?);
+        rest = &rest[end..];
+    }
+    gaps.push(rest.to_owned());
+    (!numbers.is_empty()).then_some((gaps, numbers))
+}
+
+fn render_numeric_note(gaps: &[String], numbers: &[u64]) -> String {
+    let mut out = String::new();
+    for (gap, number) in gaps.iter().zip(numbers) {
+        out.push_str(gap);
+        out.push_str(&number.to_string());
+    }
+    if let Some(last) = gaps.last() {
+        out.push_str(last);
+    }
+    out
 }
 
 pub fn question_children(
@@ -608,6 +738,7 @@ pub fn question_children(
                     summary: answer.clone(),
                     raw_input: Some(q.clone()),
                     children: Vec::new(),
+                    count: 1,
                     status: ToolStatus::Success,
                     receiving_args: false,
                     started_at: None,
@@ -642,6 +773,7 @@ pub fn question_children(
                     summary: answer.clone(),
                     raw_input: None,
                     children: Vec::new(),
+                    count: 1,
                     status: ToolStatus::Success,
                     receiving_args: false,
                     started_at: None,
@@ -788,6 +920,15 @@ fn render_tool_row(
     }
     spans.push(Span::styled(tool.name.to_string(), name_style));
 
+    let count_str = if tool.count > 1 {
+        format!("{MERGED_COUNT_PREFIX}{}", tool.count)
+    } else {
+        String::new()
+    };
+    if !count_str.is_empty() {
+        spans.push(Span::styled(count_str.clone(), theme.status_dim));
+    }
+
     let right_str = if is_in_progress || hover.hovered {
         tool.duration
             .or_else(|| tool.started_at.map(|st| st.elapsed()))
@@ -799,7 +940,7 @@ fn render_tool_row(
     let right_len = right_str.width();
     let right_style = theme.status_dim;
 
-    let left_len = rail.width() + icon_width + tool.name.width();
+    let left_len = rail.width() + icon_width + tool.name.width() + count_str.width();
     let summary_clean = single_line(&tool.summary);
 
     if !summary_clean.is_empty() {
@@ -1098,6 +1239,7 @@ mod tests {
             summary: "src/main.rs".into(),
             raw_input: None,
             children: Vec::new(),
+            count: 1,
             status: ToolStatus::Success,
             receiving_args: false,
             started_at: None,
@@ -1124,6 +1266,7 @@ mod tests {
             summary: "src/main.rs".into(),
             raw_input: None,
             children: Vec::new(),
+            count: 1,
             status,
             receiving_args: false,
             started_at: None,
@@ -1194,6 +1337,7 @@ mod tests {
             summary: "src/main.rs".into(),
             raw_input: None,
             children: Vec::new(),
+            count: 1,
             status: ToolStatus::Success,
             receiving_args: false,
             started_at: None,
@@ -1295,6 +1439,7 @@ mod tests {
                 summary: "cargo check".into(),
                 raw_input: None,
                 children: Vec::new(),
+                count: 1,
                 status: ToolStatus::Success,
                 receiving_args: false,
                 started_at: None,
@@ -1359,6 +1504,7 @@ mod tests {
                 summary: "ls".into(),
                 raw_input: None,
                 children: Vec::new(),
+                count: 1,
                 status: ToolStatus::Success,
                 receiving_args: false,
                 started_at: None,
@@ -1416,6 +1562,7 @@ mod tests {
                 summary: "cargo check".into(),
                 raw_input: None,
                 children: Vec::new(),
+                count: 1,
                 status: ToolStatus::InProgress,
                 receiving_args: false,
                 started_at: None,
@@ -1450,6 +1597,7 @@ mod tests {
                 summary: String::new(),
                 raw_input: None,
                 children: Vec::new(),
+                count: 1,
                 status: ToolStatus::InProgress,
                 receiving_args: true,
                 started_at: None,
@@ -1512,6 +1660,7 @@ mod tests {
                     summary: "foo.rs".into(),
                     raw_input: None,
                     children: Vec::new(),
+                    count: 1,
                     status: ToolStatus::Success,
                     receiving_args: false,
                     started_at: None,
@@ -1524,6 +1673,7 @@ mod tests {
                     summary: "cargo test".into(),
                     raw_input: None,
                     children: Vec::new(),
+                    count: 1,
                     status: ToolStatus::Error,
                     receiving_args: false,
                     started_at: None,
@@ -1575,6 +1725,7 @@ mod tests {
                 summary: format!("file_{i}.rs"),
                 raw_input: None,
                 children: Vec::new(),
+                count: 1,
                 status: ToolStatus::Success,
                 receiving_args: false,
                 started_at: None,
@@ -1621,6 +1772,7 @@ mod tests {
                     summary: "git status".into(),
                     raw_input: None,
                     children: Vec::new(),
+                    count: 1,
                     status: ToolStatus::Success,
                     receiving_args: false,
                     started_at: None,
@@ -1633,6 +1785,7 @@ mod tests {
                     summary: "Run compact_test".into(),
                     raw_input: None,
                     children: Vec::new(),
+                    count: 1,
                     status: ToolStatus::InProgress,
                     receiving_args: false,
                     started_at: None,
@@ -1702,6 +1855,7 @@ mod tests {
                 summary: "ls".into(),
                 raw_input: None,
                 children: Vec::new(),
+                count: 1,
                 status: ToolStatus::InProgress,
                 receiving_args: false,
                 started_at: None,
@@ -1834,6 +1988,7 @@ mod tests {
                 summary: "op 0".into(),
                 raw_input: None,
                 children: Vec::new(),
+                count: 1,
                 status: ToolStatus::Success,
                 receiving_args: false,
                 started_at: None,
@@ -1879,6 +2034,7 @@ mod tests {
                 summary: format!("op {i}"),
                 raw_input: None,
                 children: Vec::new(),
+                count: 1,
                 status: ToolStatus::Success,
                 receiving_args: false,
                 started_at: None,
@@ -1922,6 +2078,7 @@ mod tests {
                 summary: format!("op {i}"),
                 raw_input: None,
                 children: Vec::new(),
+                count: 1,
                 status: ToolStatus::Success,
                 receiving_args: false,
                 started_at: None,
@@ -2051,7 +2208,10 @@ mod tests {
     #[test_case("3 lines · 1 tools", 2, "3 lines · 2 tools" ; "replaces_previous_count")]
     #[test_case("run script · 3 lines", 2, "run script · 3 lines · 2 tools" ; "keeps_reason")]
     fn update_code_execution_summary(current: &str, count: usize, expected: &str) {
-        assert_eq!(update_code_execution_compact_summary(current, count), expected);
+        assert_eq!(
+            update_code_execution_compact_summary(current, count),
+            expected
+        );
     }
 
     #[test]
@@ -2087,6 +2247,7 @@ mod tests {
         });
         let children = code_execution_children(Some(&output));
         assert_eq!(children.len(), 3);
+        assert!(children.iter().all(|child| child.count == 1));
         assert_eq!(children[0].name.as_ref(), "read");
         assert_eq!(
             children[0].summary,
@@ -2099,6 +2260,187 @@ mod tests {
         assert_eq!(children[1].status, ToolStatus::Error);
         assert_eq!(children[2].status, ToolStatus::InProgress);
         assert!(children[2].duration.is_none());
+    }
+
+    fn calls_output(calls: Value) -> ToolOutput {
+        ToolOutput::Plain(maki_agent::TextOutput {
+            text: String::new(),
+            instructions: None,
+            state: Some(serde_json::json!({ "calls": calls })),
+            loaded_tools: Vec::new(),
+            duration_ms: None,
+        })
+    }
+
+    #[test]
+    fn code_execution_children_merge_reasonless_calls_of_same_tool() {
+        let output = calls_output(serde_json::json!([
+            {
+                "tool": "bash",
+                "params": { "command": "cargo check" },
+                "status": "success",
+                "duration_ms": 120
+            },
+            {
+                "tool": "read",
+                "params": { "path": "src/main.rs", "toolcall_reason": "reading entry point" },
+                "status": "success",
+                "duration_ms": 10
+            },
+            {
+                "tool": "bash",
+                "params": { "command": "cargo test" },
+                "status": "error",
+                "duration_ms": 30,
+                "annotation": "exit 1"
+            }
+        ]));
+        let children = code_execution_children(Some(&output));
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].name.as_ref(), "bash");
+        assert_eq!(children[0].count, 2);
+        assert_eq!(children[0].status, ToolStatus::Error);
+        assert_eq!(children[0].duration, Some(Duration::from_millis(150)));
+        assert_eq!(children[0].summary, "exit 1");
+        assert!(children[0].raw_input.is_none());
+        assert_eq!(children[1].name.as_ref(), "read");
+        assert_eq!(children[1].count, 1);
+        assert_eq!(children[1].summary, "reading entry point · src/main.rs:1");
+    }
+
+    #[test]
+    fn code_execution_children_keep_reasoned_calls_separate() {
+        let output = calls_output(serde_json::json!([
+            {
+                "tool": "read",
+                "params": { "path": "a.rs", "toolcall_reason": "first" },
+                "status": "success"
+            },
+            {
+                "tool": "read",
+                "params": { "path": "b.rs", "toolcall_reason": "second" },
+                "status": "success"
+            }
+        ]));
+        let children = code_execution_children(Some(&output));
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().all(|child| child.count == 1));
+    }
+
+    #[test]
+    fn code_execution_merged_children_sum_numeric_annotations() {
+        let output = calls_output(serde_json::json!([
+            { "tool": "read", "status": "success", "annotation": "50 lines" },
+            { "tool": "read", "status": "success", "annotation": "30 lines" },
+            { "tool": "grep", "status": "success", "annotation": "4 matches in 2 files" },
+            { "tool": "grep", "status": "success", "annotation": "3 matches in 1 files" },
+            { "tool": "grep", "status": "success", "annotation": "2 matches in 1 file" }
+        ]));
+        let children = code_execution_children(Some(&output));
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].summary, "80 lines");
+        // Same shape sums per position; a different shape (singular "file")
+        // stays a separate note.
+        assert_eq!(
+            children[1].summary,
+            "7 matches in 3 files · 2 matches in 1 file"
+        );
+    }
+
+    #[test]
+    fn code_execution_merged_children_dedupe_opaque_annotations() {
+        let output = calls_output(serde_json::json!([
+            { "tool": "bash", "status": "error", "annotation": "exit 1" },
+            { "tool": "bash", "status": "error", "annotation": "exit 2" },
+            { "tool": "bash", "status": "error", "annotation": "exit 1 · allowed by memory" }
+        ]));
+        let children = code_execution_children(Some(&output));
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].count, 3);
+        assert_eq!(children[0].summary, "exit 1 · exit 2 · allowed by memory");
+        assert!(children[0].duration.is_none());
+    }
+
+    #[test]
+    fn code_execution_merged_children_keep_usage_notes_as_text() {
+        let output = calls_output(serde_json::json!([
+            { "tool": "task", "status": "success", "usage": "1.2k↑ 300↓" },
+            { "tool": "task", "status": "success", "usage": "1.2k↑ 300↓" },
+            { "tool": "task", "status": "success", "usage": "2.0k↑ 100↓" }
+        ]));
+        let children = code_execution_children(Some(&output));
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].count, 3);
+        assert_eq!(children[0].summary, "1.2k↑ 300↓ · 2.0k↑ 100↓");
+    }
+
+    #[test_case(ToolStatus::Success, ToolStatus::Success, ToolStatus::Success ; "all_success")]
+    #[test_case(ToolStatus::Success, ToolStatus::InProgress, ToolStatus::InProgress ; "running_wins_over_success")]
+    #[test_case(ToolStatus::InProgress, ToolStatus::Error, ToolStatus::Error ; "error_wins_over_running")]
+    #[test_case(ToolStatus::Error, ToolStatus::Success, ToolStatus::Error ; "error_wins_over_success")]
+    fn code_execution_merged_status_is_most_severe(
+        first: ToolStatus,
+        second: ToolStatus,
+        expected: ToolStatus,
+    ) {
+        let status_str = |status: ToolStatus| match status {
+            ToolStatus::Success => "success",
+            ToolStatus::Error => "error",
+            ToolStatus::InProgress => "running",
+        };
+        let output = calls_output(serde_json::json!([
+            { "tool": "bash", "status": status_str(first) },
+            { "tool": "bash", "status": status_str(second) }
+        ]));
+        let children = code_execution_children(Some(&output));
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, expected);
+    }
+
+    #[test]
+    fn merged_child_row_renders_count_suffix() {
+        const MERGED_LABEL: &str = "bash x 2";
+        let parent = GroupToolEntry {
+            id: "call-1".into(),
+            name: Arc::from(CODE_EXECUTION_TOOL),
+            summary: "2 tools".into(),
+            raw_input: None,
+            children: vec![GroupToolEntry {
+                id: String::new(),
+                name: Arc::from("bash"),
+                summary: String::new(),
+                raw_input: None,
+                children: Vec::new(),
+                count: 2,
+                status: ToolStatus::Success,
+                receiving_args: false,
+                started_at: None,
+                duration: None,
+                detail: None,
+            }],
+            count: 1,
+            status: ToolStatus::Success,
+            receiving_args: false,
+            started_at: None,
+            duration: None,
+            detail: None,
+        };
+        let group = ToolGroupRole {
+            id: "group-1".into(),
+            sealed: true,
+            entries: vec![GroupEntry::Tool(Box::new(parent))],
+            started_at: None,
+            duration: None,
+            waiting_since: None,
+            expanded: false,
+        };
+        let tl = build_tool_group_lines(&group, 80, 0, DEFAULT_COMPACT_LINES, None);
+        let child_row = tl
+            .lines
+            .iter()
+            .find(|line| line.to_string().contains(MERGED_LABEL))
+            .expect("merged child row");
+        assert!(child_row.to_string().contains(MERGED_LABEL));
     }
 
     #[test_case(None ; "no_output")]
@@ -2223,6 +2565,7 @@ mod tests {
             summary: "src/main.rs".into(),
             raw_input: None,
             children: Vec::new(),
+            count: 1,
             status: ToolStatus::Success,
             receiving_args: false,
             started_at: None,
@@ -2283,6 +2626,7 @@ mod tests {
                     summary: format!("file_{i}.rs"),
                     raw_input: None,
                     children: Vec::new(),
+                    count: 1,
                     status: ToolStatus::Success,
                     receiving_args: false,
                     started_at: None,
@@ -2324,6 +2668,7 @@ mod tests {
                     summary: format!("file_{i}.rs"),
                     raw_input: None,
                     children: Vec::new(),
+                    count: 1,
                     status: ToolStatus::Success,
                     receiving_args: false,
                     started_at: None,

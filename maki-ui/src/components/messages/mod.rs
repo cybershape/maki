@@ -449,6 +449,7 @@ impl MessagesPanel {
                         summary: String::new(),
                         raw_input: None,
                         children: Vec::new(),
+                        count: 1,
                         status: ToolStatus::InProgress,
                         receiving_args: true,
                         started_at: Some(start_time),
@@ -471,6 +472,7 @@ impl MessagesPanel {
                     summary: String::new(),
                     raw_input: None,
                     children: Vec::new(),
+                    count: 1,
                     status: ToolStatus::InProgress,
                     receiving_args: true,
                     started_at: Some(Instant::now()),
@@ -657,6 +659,7 @@ impl MessagesPanel {
                     summary: summary.clone(),
                     raw_input: event.raw_input.clone(),
                     children: Vec::new(),
+                    count: 1,
                     status: ToolStatus::InProgress,
                     receiving_args: false,
                     started_at: Some(start_time),
@@ -678,6 +681,7 @@ impl MessagesPanel {
                     summary,
                     raw_input: event.raw_input.clone(),
                     children: Vec::new(),
+                    count: 1,
                     status: ToolStatus::InProgress,
                     receiving_args: false,
                     started_at: Some(Instant::now()),
@@ -847,7 +851,7 @@ impl MessagesPanel {
                             if !children.is_empty() {
                                 entry.summary = tool_group::update_code_execution_compact_summary(
                                     &entry.summary,
-                                    children.len(),
+                                    children.iter().map(|child| child.count).sum(),
                                 );
                                 entry.children = children;
                             }
@@ -2396,11 +2400,13 @@ impl MessagesPanel {
                 if entry.name.as_ref() == tool_group::CODE_EXECUTION_TOOL {
                     let output = entry.detail.as_ref().and_then(|d| d.output.as_deref());
                     let mut children = tool_group::code_execution_children(output);
-                    for (index, child) in children.iter_mut().enumerate() {
-                        let previous = entry
-                            .children
-                            .get(index)
-                            .filter(|old| old.name == child.name);
+                    for child in &mut children {
+                        // Merged rows shift indices, so match by name and
+                        // reason instead of position.
+                        let previous = entry.children.iter().find(|old| {
+                            old.name == child.name
+                                && tool_group::child_reason(old) == tool_group::child_reason(child)
+                        });
                         child.started_at = previous.and_then(|old| old.started_at);
                         if child.status == ToolStatus::InProgress {
                             child.started_at.get_or_insert_with(Instant::now);
@@ -2416,7 +2422,7 @@ impl MessagesPanel {
                     if !children.is_empty() {
                         entry.summary = tool_group::update_code_execution_compact_summary(
                             &entry.summary,
-                            children.len(),
+                            children.iter().map(|child| child.count).sum(),
                         );
                         entry.children = children;
                     }

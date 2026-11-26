@@ -469,6 +469,7 @@ mod tests {
             summary: "cargo build".into(),
             raw_input: None,
             children: Vec::new(),
+            count: 1,
             status: ToolStatus::Success,
             receiving_args: false,
             started_at: None,

@@ -3468,6 +3468,7 @@ fn panel_with_sealed_groups(tools: usize, thinking: usize, groups: usize) -> Mes
                     summary: GROUP_RESIZE_TEXT.into(),
                     raw_input: None,
                     children: Vec::new(),
+                    count: 1,
                     status: ToolStatus::Success,
                     receiving_args: false,
                     started_at: None,
@@ -3967,6 +3968,60 @@ fn compact_code_execution_children_come_from_state() {
 }
 
 #[test]
+fn compact_code_execution_merges_reasonless_children_but_counts_all_calls() {
+    const TOOL_ID: &str = "ce-merge";
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            compact_tools: true,
+            ..Default::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    let mut start_ev = start(TOOL_ID, "code_execution");
+    start_ev.summary = "run script".into();
+    panel.tool_start(start_ev);
+    let mut done_ev = done(TOOL_ID);
+    done_ev.tool = "code_execution".into();
+    done_ev.output = Arc::new(ToolOutput::Plain(maki_agent::TextOutput {
+        text: "out".into(),
+        instructions: None,
+        state: Some(serde_json::json!({
+            "calls": [
+                {
+                    "tool": "bash",
+                    "params": { "command": "cargo check" },
+                    "status": "success",
+                    "duration_ms": 100
+                },
+                {
+                    "tool": "bash",
+                    "params": { "command": "cargo test" },
+                    "status": "success",
+                    "duration_ms": 50
+                }
+            ]
+        })),
+        loaded_tools: Vec::new(),
+        duration_ms: None,
+    }));
+    panel.tool_done(done_ev);
+    panel.seal_open_group();
+    let DisplayRole::ToolGroup(group) = &panel.messages[0].role else {
+        panic!("expected ToolGroup");
+    };
+    let GroupEntry::Tool(entry) = &group.entries[0] else {
+        panic!("expected GroupEntry::Tool");
+    };
+    assert_eq!(entry.summary, "run script · 2 tools");
+    assert_eq!(entry.children.len(), 1);
+    assert_eq!(entry.children[0].count, 2);
+    assert_eq!(
+        entry.children[0].duration,
+        Some(std::time::Duration::from_millis(150))
+    );
+}
+
+#[test]
 fn compact_tools_state_text_transitions() {
     let ui_cfg = UiConfig {
         compact_tools: true,
@@ -4026,6 +4081,7 @@ fn compact_tools_state_text_transitions() {
                 summary: "a.rs".into(),
                 raw_input: None,
                 children: Vec::new(),
+                count: 1,
                 status: ToolStatus::Success,
                 receiving_args: false,
                 started_at: None,
@@ -4038,6 +4094,7 @@ fn compact_tools_state_text_transitions() {
                 summary: "test".into(),
                 raw_input: None,
                 children: Vec::new(),
+                count: 1,
                 status: ToolStatus::Success,
                 receiving_args: false,
                 started_at: None,
@@ -4382,6 +4439,7 @@ fn compact_tool_group_renders_aligned_with_panel_left_padding() {
             summary: "ls".into(),
             raw_input: None,
             children: Vec::new(),
+            count: 1,
             status: ToolStatus::Success,
             receiving_args: false,
             started_at: None,
@@ -4834,6 +4892,7 @@ fn clicking_hidden_line_in_compact_group_expands_all_entries() {
         summary: "src/main.rs".into(),
         raw_input: None,
         children: Vec::new(),
+        count: 1,
         status: ToolStatus::Success,
         receiving_args: false,
         started_at: None,
@@ -4899,6 +4958,7 @@ fn compact_lines_config_controls_visible_rows_and_click_target() {
         summary: "src/main.rs".into(),
         raw_input: None,
         children: Vec::new(),
+        count: 1,
         status: ToolStatus::Success,
         receiving_args: false,
         started_at: None,
