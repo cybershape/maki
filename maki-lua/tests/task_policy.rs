@@ -43,6 +43,8 @@ const PROBE_TOOL: &str = "probe";
 const WAIT_TOOL: &str = "wait";
 const RELEASE_TOOL: &str = "release";
 const TASK_PROMPT: &str = "do the thing";
+/// Mirrors the task plugin's `SYNC_NOTE` wording.
+const SYNC_NOTE: &str = "\n\nYou run synchronously: the parent agent is blocked waiting for your final result and cannot read mid-task messages, so you have no task_message tool. Put everything the parent needs in your final answer.";
 const PLAIN_TEXT: &str = "plain text result";
 const RECOVERED_TEXT: &str = "summary after nudge";
 /// Mirrors the task plugin's `NUDGE_SUMMARY` wording.
@@ -154,6 +156,7 @@ maki.agent.system_prompt = function(ctx, opts)
 end
 
 maki.agent.tools = function(ctx, opts)
+  recorder.tool_opts = opts
   return {}
 end
 
@@ -332,6 +335,9 @@ maki.api.register_tool({
     if recorder.resolve_opts then
       snap.resolve_opts = recorder.resolve_opts
     end
+    if recorder.tool_opts then
+      snap.tool_opts = recorder.tool_opts
+    end
     if #recorder.prompts > 0 then
       snap.prompts = recorder.prompts
     end
@@ -433,8 +439,10 @@ fn probe(reg: &ToolRegistry) -> Value {
     serde_json::from_str(&out).expect("probe returned invalid json")
 }
 
+/// Policy tests exercise the blocking path: an explicit `background = false`
+/// keeps the stub ctx (no model call scope) from attempting a move.
 fn task_input(scenario: &str, output_schema: Option<Value>) -> Value {
-    let mut input = json!({ "description": scenario, "prompt": TASK_PROMPT });
+    let mut input = json!({ "name": scenario, "description": scenario, "prompt": TASK_PROMPT, "background": false });
     if let Some(schema) = output_schema {
         input["output_schema"] = schema;
     }
@@ -705,8 +713,37 @@ fn plain_path_returns_text_without_local_tools() {
     let snap = probe(&reg);
     assert_eq!(snap["has_local_tools"], json!(false));
     assert_eq!(snap["prompt_count"], json!(1));
-    assert_eq!(snap["prompts"][0], json!(TASK_PROMPT));
+    assert_eq!(
+        snap["prompts"][0],
+        json!(format!("{TASK_PROMPT}{SYNC_NOTE}"))
+    );
     assert_eq!(snap["closed"], json!(1));
+}
+
+/// A synchronous subagent cannot report mid-task: its parent is blocked
+/// waiting for the final result. So it gets no task_message tool and its
+/// prompt says to put everything in the final answer. A background subagent
+/// keeps the tool and the plain prompt.
+#[test_case::test_case(false, true ; "synchronous_drops_task_message")]
+#[test_case::test_case(true, false ; "background_keeps_task_message")]
+fn synchronous_subagent_has_no_task_message(background: bool, drops_tool: bool) {
+    let (reg, _host) = load_background_host();
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    input["background"] = json!(background);
+    exec_tool(&reg, TASK_TOOL, input).unwrap();
+
+    let snap = probe(&reg);
+    let except = snap["tool_opts"]["except"].as_array();
+    if drops_tool {
+        assert_eq!(except, Some(&vec![json!("task_message")]));
+        assert_eq!(
+            snap["prompts"][0],
+            json!(format!("{TASK_PROMPT}{SYNC_NOTE}"))
+        );
+    } else {
+        assert!(except.is_none(), "background keeps every tool: {snap}");
+        assert_eq!(snap["prompts"][0], json!(TASK_PROMPT));
+    }
 }
 
 #[test]
@@ -905,4 +942,45 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
         _ => None,
     });
     assert!(final_body.contains(PLAIN_TEXT), "{final_body}");
+}
+
+/// A codename a live task holds is refused with the taken names listed, so
+/// the model picks another. Once the task closes the name is free again.
+#[test]
+fn a_duplicate_codename_is_refused_until_the_task_closes() {
+    let (reg, _host) = load_task_host();
+    let chat = Chat::live();
+    let (_run_trigger, run) = CancelToken::new();
+
+    let first = ModelCall::start(&reg, &chat, &run, FIRST_CALL_ID, task_input(SCENARIO_PARKED, None));
+    wait(&reg, json!({ "parked": SCENARIO_PARKED }));
+
+    let (dup_ctx, _dup_events) = call_ctx(&reg, chat.id, &run, SECOND_CALL_ID);
+    let dup = exec(&reg, TASK_TOOL, task_input(SCENARIO_PARKED, None), &dup_ctx);
+    assert!(dup.is_error);
+    let err = dup.output.as_text();
+    assert!(err.contains(SCENARIO_PARKED) && err.contains("taken"), "{err}");
+
+    release(&reg, SCENARIO_PARKED);
+    assert!(!first.finish().is_error);
+
+    let reuse = ModelCall::start(&reg, &chat, &run, SECOND_CALL_ID, task_input(SCENARIO_PARKED, None));
+    wait(&reg, json!({ "parked": SCENARIO_PARKED }));
+    release(&reg, SCENARIO_PARKED);
+    assert!(!reuse.finish().is_error, "the name is free once the task closed");
+}
+
+/// A blank, multiline or oversized codename is refused before a session opens.
+#[test]
+fn a_bad_codename_is_refused() {
+    let (reg, _host) = load_task_host();
+    let chat = Chat::live();
+    let (_run_trigger, run) = CancelToken::new();
+    for bad in ["", "   ", "has\nnewline", &"x".repeat(41)] {
+        let (ctx, _events) = call_ctx(&reg, chat.id, &run, FIRST_CALL_ID);
+        let input = json!({ "name": bad, "description": "d", "prompt": TASK_PROMPT });
+        let result = exec(&reg, TASK_TOOL, input, &ctx);
+        assert!(result.is_error, "codename {bad:?} must be refused");
+    }
+    assert_eq!(probe(&reg)["sessions"], json!(0));
 }

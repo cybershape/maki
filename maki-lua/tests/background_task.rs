@@ -36,9 +36,10 @@ const SECOND_CALL_ID: &str = "toolu_background_task_second";
 const GUARDED_CALL_ID: &str = "toolu_guarded";
 const GUARDED_TOOL: &str = "guarded";
 const NAME: &str = "find the answer";
+const CODENAME: &str = "Hawk";
 const PROMPT: &str = "Find the answer";
 const RESULT: &str = "background answer";
-const MOVED_RECEIPT: &str = "Subagent find the answer";
+const MOVED_RECEIPT: &str = "Subagent Hawk";
 const MOVER_RECEIPT: &str = "mover moved";
 const MOVER_FINAL: &str = "true: nil";
 const DEFAULT_SLOTS: u64 = 8;
@@ -46,8 +47,8 @@ const MESSAGE_TOOL: &str = "task_message";
 const STOP_TOOL: &str = "task_stop";
 const MESSAGE_CALL_ID: &str = "toolu_message";
 const MESSAGE: &str = "the user added an IOC, check it too";
-const QUEUED: &str = "Message queued for find the answer.";
-const INTERRUPTED: &str = "Interrupted find the answer with the message.";
+const QUEUED: &str = "Message queued for Hawk.";
+const INTERRUPTED: &str = "Interrupted Hawk with the message.";
 const NOT_RUNNING: &str = "no running background subagent with id";
 const INTERRUPT_OPEN: &str = "<parent-interrupt>";
 const INIT: &str = include_str!("../../plugins/task/init.lua");
@@ -56,6 +57,7 @@ const BATCH: &str = include_str!("../../plugins/batch/init.lua");
 const BATCH_PLUGIN: &str = "batch";
 const BATCH_TOOL: &str = "batch";
 const SECOND_NAME: &str = "check the logs";
+const SECOND_CODENAME: &str = "Nyx";
 const LISTED_TASK: &str = "- task (task ";
 const NAMED_SECTION: &str = "## task (task ";
 const NESTED_STOPPED: &str = "Stopped. What it did so far arrives later as the result of task ";
@@ -219,7 +221,11 @@ maki.agent.resolve_model = function() return {{}} end
 }
 
 fn task_input() -> Value {
-    json!({ "description": NAME, "prompt": PROMPT, "background": true })
+    task_input_named(CODENAME)
+}
+
+fn task_input_named(codename: &str) -> Value {
+    json!({ "name": codename, "description": NAME, "prompt": PROMPT, "background": true })
 }
 
 /// Sends {MESSAGE} to task {id} as a model call of chat {chat}.
@@ -267,6 +273,31 @@ fn a_background_task_returns_a_receipt_and_its_reply_arrives_as_the_notice() {
     assert!(notice.contains(RESULT), "{notice}");
 }
 
+/// A task with no `background` input moves by default: a foreground task
+/// holds the model's turn until it finishes, which is almost never what a
+/// delegation wants.
+#[test]
+fn a_task_without_a_background_input_moves_by_default() {
+    let mut host = Host::task(Arc::new(ToolRegistry::new()));
+    let chat = Chat::live();
+    let parked = Parked::new(RESULT);
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    ctx.provider = Arc::clone(&parked.provider);
+    let input = json!({ "name": CODENAME, "description": NAME, "prompt": PROMPT });
+
+    let result = exec(&host.reg, TASK_TOOL, input, &ctx);
+
+    assert!(result.backgrounded);
+    let (receipt, failed) = done_text(&result);
+    assert!(!failed, "{receipt}");
+    assert!(receipt.starts_with(MOVED_RECEIPT), "{receipt}");
+
+    parked.wait_started();
+    parked.release.send(()).unwrap();
+    assert_eq!(done_text(&host.task_done()), (RESULT.to_owned(), false));
+}
+
 /// The move comes before the wait for a slot, so a full house does not hold
 /// the model's turn. The second task keeps waiting in the background.
 #[test]
@@ -287,7 +318,7 @@ fn a_background_task_waiting_for_a_slot_returns_its_receipt_at_once() {
     let (receipt_tx, receipt_rx) = sync_channel(1);
     let waiter = thread::spawn(move || {
         receipt_tx
-            .send(exec(&reg, TASK_TOOL, task_input(), &second))
+            .send(exec(&reg, TASK_TOOL, task_input_named(SECOND_CODENAME), &second))
             .ok();
     });
     let result = receipt_rx
@@ -298,7 +329,7 @@ fn a_background_task_waiting_for_a_slot_returns_its_receipt_at_once() {
     assert!(result.backgrounded);
     let (receipt, failed) = done_text(&result);
     assert!(!failed, "{receipt}");
-    assert!(receipt.starts_with(MOVED_RECEIPT), "{receipt}");
+    assert!(receipt.starts_with(&format!("Subagent {SECOND_CODENAME}")), "{receipt}");
     assert!(parked.started.try_recv().is_err(), "the slot is still held");
 
     parked.release.send(()).unwrap();
@@ -514,11 +545,11 @@ fn a_message_to_a_task_waiting_for_a_slot_rides_with_its_first_prompt() {
 
     assert!(exec(&host.reg, TASK_TOOL, task_input(), &first).backgrounded);
     parked.wait_started();
-    assert!(exec(&host.reg, TASK_TOOL, task_input(), &second).backgrounded);
+    assert!(exec(&host.reg, TASK_TOOL, task_input_named(SECOND_CODENAME), &second).backgrounded);
 
     assert_eq!(
         message(&host, chat.id, SECOND_CALL_ID, false),
-        (QUEUED.to_owned(), false)
+        (format!("Message queued for {SECOND_CODENAME}."), false)
     );
     parked.release.send(()).unwrap();
     parked.wait_started();
@@ -631,7 +662,7 @@ fn a_task_moved_without_allow_background_has_no_steering_inputs_and_still_report
         exec(
             &reg,
             TASK_TOOL,
-            json!({ "description": NAME, "prompt": PROMPT }),
+            json!({ "name": CODENAME, "description": NAME, "prompt": PROMPT }),
             &ctx,
         )
     });
@@ -664,10 +695,10 @@ fn the_tasks_of_a_moved_batch_are_reached_by_the_batchs_id_or_their_own() {
     let (_run, run_token) = CancelToken::new();
     let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
     ctx.provider = Arc::clone(&parked.provider);
-    let tasks = [NAME, SECOND_NAME].map(|name| {
+    let tasks = [(NAME, CODENAME), (SECOND_NAME, SECOND_CODENAME)].map(|(desc, codename)| {
         json!({
             "tool": TASK_TOOL,
-            "parameters": { "description": name, "prompt": PROMPT, "background": true },
+            "parameters": { "name": codename, "description": desc, "prompt": PROMPT, "background": true },
         })
     });
 
@@ -689,7 +720,7 @@ fn the_tasks_of_a_moved_batch_are_reached_by_the_batchs_id_or_their_own() {
 
     let (sent, failed) = message(&host, chat.id, CALL_ID, false);
     assert!(
-        !failed && sent.contains(NAME) && sent.contains(SECOND_NAME),
+        !failed && sent.contains(CODENAME) && sent.contains(SECOND_CODENAME),
         "{sent}"
     );
     let mut agent = chat.seed.tool_context(CancelToken::none());
@@ -740,6 +771,7 @@ fn a_subagents_message_reports_to_the_parent_chat(audience: ToolAudience) {
     let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, SUBAGENT_TASK_ID);
     ctx.audience = audience;
     ctx.task_id = Some(Arc::from(SUBAGENT_TASK_ID));
+    ctx.task_name = Some(Arc::from(CODENAME));
 
     let (reply, failed) = done_text(&exec(
         &host.reg,
@@ -755,13 +787,10 @@ fn a_subagents_message_reports_to_the_parent_chat(audience: ToolAudience) {
         panic!("one report: {notices:?}");
     };
     let body = notice.first_text_content().unwrap();
-    assert!(
-        body.contains(SUBAGENT_TASK_ID) && body.contains(REPORT),
-        "{body}"
-    );
+    assert!(body.contains(CODENAME) && body.contains(REPORT), "{body}");
     assert_eq!(
         notice.display_text.as_deref(),
-        Some(format!("Subagent {SUBAGENT_TASK_ID} reported").as_str())
+        Some(format!("{CODENAME} reported: {REPORT}").as_str())
     );
 }
 
@@ -803,4 +832,46 @@ fn task_message_offers_each_audience_its_own_direction() {
     assert!(sub["properties"].get("id").is_none());
     assert!(sub["properties"].get("interrupt").is_none());
     assert!(sub["properties"].get("message").is_some());
+}
+
+/// A codename is the handle the model uses: `task_message` and `task_stop`
+/// reach a task by it just as by its call id.
+#[test]
+fn a_task_is_reached_by_its_codename() {
+    let mut host = Host::task(Arc::new(ToolRegistry::new()));
+    let chat = Chat::live();
+    let parked = Parked::new(RESULT);
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    ctx.provider = Arc::clone(&parked.provider);
+
+    assert!(exec(&host.reg, TASK_TOOL, task_input(), &ctx).backgrounded);
+    parked.wait_started();
+
+    assert_eq!(
+        message(&host, chat.id, CODENAME, false),
+        (QUEUED.to_owned(), false)
+    );
+
+    let mut agent = chat.seed.tool_context(CancelToken::none());
+    agent.mailbox = Some(chat.mailbox.clone());
+    let stopped = exec(&host.reg, STOP_TOOL, json!({ "id": CODENAME }), &agent);
+    assert!(!stopped.is_error, "{}", stopped.output.as_text());
+
+    drop(parked);
+    host.task_done();
+}
+
+/// A blank or oversized codename is refused before any session opens.
+#[test]
+fn a_bad_codename_is_refused() {
+    let host = Host::task(Arc::new(ToolRegistry::new()));
+    let chat = Chat::live();
+    let (_run, run_token) = CancelToken::new();
+    let (ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    for bad in ["", "   ", "has\nnewline", &"x".repeat(41)] {
+        let input = json!({ "name": bad, "description": NAME, "prompt": PROMPT });
+        let result = exec(&host.reg, TASK_TOOL, input, &ctx);
+        assert!(result.is_error, "codename {bad:?} must be refused");
+    }
 }

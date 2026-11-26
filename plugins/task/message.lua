@@ -3,20 +3,20 @@
 -- parent. Keeping the name leaves room for subagent-to-subagent messages.
 
 local PARENT_DESCRIPTION =
-  [[Message a running background subagent by id, e.g. a new fact, a changed scope or "wrap up now". It reads it after its current step.
+  [[Message a running background subagent by codename, e.g. a new fact, a changed scope or "wrap up now". It reads it after its current step.
 Set interrupt only when it must act now: it cuts the current step, running tools included.]]
 local SUB_DESCRIPTION =
   [[Report to the parent agent mid-task: a key finding that changes the plan, a blocker needing direction, or a risk.
 The parent reads it at its next step, or wakes to read it when idle. Keep working after reporting unless blocked;
 the parent replies with a message if needed. Never report routine progress; your final answer carries the full result.]]
-local ID_DESCRIPTION = "Parent only: task id from its receipt. A batch's id reaches every subagent in it"
+local ID_DESCRIPTION = "Parent only: task codename from its receipt (its call id also works). A batch's id reaches every subagent in it"
 local MESSAGE_DESCRIPTION = "What the subagent should know or do, or what the parent must know"
 local INTERRUPT_DESCRIPTION = "Parent only: cut the current step short"
 local QUEUED = "Message queued for %s."
 local INTERRUPTED = "Interrupted %s with the message."
 local NO_SESSION_ERR = "no parent session to report to"
-local REPORT_HEAD = "[Report from subagent %s]"
-local DISPLAY = "Subagent %s reported"
+local REPORT_HEAD = "[Report from %s]"
+local DISPLAY = "%s reported: %s"
 local DELIVERED = "Report delivered to the parent agent."
 
 local function to_parent(input, ctx)
@@ -24,11 +24,11 @@ local function to_parent(input, ctx)
   if not session then
     return { llm_output = NO_SESSION_ERR, is_error = true }
   end
-  local task = ctx:task_id()
+  local task = ctx:task_name() or ctx:task_id()
   local text = REPORT_HEAD:format(task) .. "\n" .. input.message
   local ok, err = maki.session.notify(text, {
     session = session,
-    display = DISPLAY:format(task),
+    display = DISPLAY:format(task, input.message),
     wake = true,
   })
   if not ok then
@@ -91,5 +91,5 @@ maki.api.register_prompt_hint({
 maki.api.register_prompt_hint({
   prompt = "system",
   slot = "tool_usage",
-  content = "- A `[Report from subagent <id>]` observation is a mid-task report. Absorb plan-changing facts, answer a blocked subagent with **task_message** using that id, or adjust sibling tasks. Never send acknowledgements; if nothing needs action, end your turn.",
+  content = "- A `[Report from <codename>]` observation is a mid-task report. Absorb plan-changing facts, answer a blocked subagent with **task_message** using that codename, or adjust sibling tasks. Never send acknowledgements; if nothing needs action, end your turn.",
 })

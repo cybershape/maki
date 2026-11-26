@@ -137,6 +137,13 @@ impl BackgroundTask {
         TaskLabel::new(tool, Some(&self.info.name))
     }
 
+    /// The model addresses a task by its call id or by the codename the
+    /// spawning call gave it. The id wins, so a codename that happens to look
+    /// like an id can never shadow the real one.
+    fn matches(&self, handle: &str) -> bool {
+        self.info.id == handle || self.info.name == handle
+    }
+
     /// Only a moved call holds a receipt, so a session entry has nothing to
     /// report.
     fn report_lost(&self, mailbox: &SessionMailbox) {
@@ -394,7 +401,7 @@ impl BackgroundTasks {
         let entries = self.locked();
         entries
             .iter()
-            .filter(|e| e.info.id == id)
+            .filter(|e| e.matches(id))
             .find_map(|e| e.session_for(asker))
             .cloned()
             .ok_or_else(|| subagent_not_found(&entries, asker, id))
@@ -413,7 +420,7 @@ impl BackgroundTasks {
         let targets: Vec<_> = self
             .locked()
             .iter()
-            .filter(|e| e.info.id == id || e.parent() == Some(id))
+            .filter(|e| e.matches(id) || e.parent() == Some(id))
             .filter_map(|e| Some((Arc::clone(e.session_for(asker)?), e.info.name.clone())))
             .collect();
         let mut names = Vec::with_capacity(targets.len());
@@ -467,7 +474,7 @@ impl BackgroundTasks {
         // Armed before the stop fires, so a call that ignores the stop is
         // abandoned (cancel + the same wait) only after this gives up.
         let deadline = Instant::now() + wait;
-        let (reply, mut stopped) = self.begin_model_stop(mailbox, id)?;
+        let (reply, mut stopped, real_id) = self.begin_model_stop(mailbox, id)?;
         let Some(mut reply) = reply else {
             return Ok(stopped);
         };
@@ -476,7 +483,7 @@ impl BackgroundTasks {
             .ok()
             .and_then(Result::ok);
         stopped.output = arrived.or_else(|| {
-            lock(&self.waiters).remove(id);
+            lock(&self.waiters).remove(&real_id);
             reply.try_recv().ok()
         });
         Ok(stopped)
@@ -488,18 +495,19 @@ impl BackgroundTasks {
         &self,
         mailbox: Option<MakiId>,
         id: &str,
-    ) -> Result<(Option<oneshot::Receiver<String>>, ModelStop), String> {
-        let (reply, stopped) = {
+    ) -> Result<(Option<oneshot::Receiver<String>>, ModelStop, String), String> {
+        let (reply, stopped, real_id) = {
             let entries = self.locked();
             let stoppable = || entries.iter().filter(|e| e.stoppable_by(mailbox));
-            let Some(target) = stoppable().find(|e| e.info.id == id) else {
+            let Some(target) = stoppable().find(|e| e.matches(id)) else {
                 return Err(not_found(NO_RUNNING_TASK, id, stoppable()));
             };
+            let real_id = target.info.id.clone();
             // `deliver` needs this lock too. Parking the waiter before we let
             // go means a final reply can't land in the gap and go unseen.
             let reply = target.is_call().then(|| {
                 let (waiter, reply) = oneshot::channel();
-                lock(&self.waiters).insert(id.to_owned(), waiter);
+                lock(&self.waiters).insert(real_id.clone(), waiter);
                 reply
             });
             let stopped = ModelStop {
@@ -507,10 +515,10 @@ impl BackgroundTasks {
                 name: target.info.name.clone(),
                 parent: target.parent().map(str::to_owned),
             };
-            (reply, stopped)
+            (reply, stopped, real_id)
         };
-        self.stop(id, Cutter::Parent);
-        Ok((reply, stopped))
+        self.stop(&real_id, Cutter::Parent);
+        Ok((reply, stopped, real_id))
     }
 
     /// The final reply of a moved call: settles its receipt in the run it
@@ -1294,6 +1302,27 @@ pub(crate) mod tests {
             let sent = want.contains(name).then(|| MESSAGE.to_owned());
             assert_eq!(control.texts(), Vec::from_iter(sent));
         }
+    }
+
+    /// A codename reaches the same session its call id does, and the id still
+    /// wins when a handle could be read either way.
+    #[test]
+    fn a_codename_addresses_a_task_like_its_id() {
+        let chat = MakiId::generate();
+        let _live = live(chat);
+        let (registry, _) = registry_with_call(chat);
+        let (mut agent, _token) = entry(chat, None);
+        agent.info.name = "Nyx".to_owned();
+        agent.mailbox = SessionMailbox::open(chat).ok();
+        let id = agent.info.id.clone();
+        registry.register(agent).unwrap();
+
+        assert!(registry.subagent(Some(chat), "Nyx").is_ok());
+        assert!(registry.subagent(Some(chat), &id).is_ok());
+        assert_eq!(
+            registry.send(Some(chat), "Nyx", message, Delivery::NextTurn),
+            Ok(vec!["Nyx".to_owned()])
+        );
     }
 
     enum Lookup {

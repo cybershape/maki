@@ -23,6 +23,9 @@ local NUDGE_MISSING =
 local NUDGE_SUMMARY =
   "You finished your work but did not provide a summary. Reply with a concise summary of what you did and found."
 local COMBO_MODEL_CONTEXT = "model `%s`, the subagent model of the current combo: "
+local TASK_MESSAGE_TOOL = "task_message"
+local SYNC_NOTE =
+  "\n\nYou run synchronously: the parent agent is blocked waiting for your final result and cannot read mid-task messages, so you have no task_message tool. Put everything the parent needs in your final answer."
 local INVALID_INPUT_PREFIX =
   "Input does not match the required schema. Fix the errors and call structured_output again:\n"
 
@@ -42,9 +45,13 @@ local opts = maki.api.register_options({
 
 local schema = {
   type = "object",
-  required = { "description", "prompt" },
+  required = { "name", "description", "prompt" },
   additionalProperties = false,
   properties = {
+    name = {
+      type = "string",
+      description = "Give each subagent a short, cool, task-inspired codename (3-8 letters), drawing from mythology, sci-fi, nature, or tools. Prefer evocative names like Forge, Atlas, Nyx, or Hawk over generic role labels, and avoid duplicates.",
+    },
     description = {
       type = "string",
       description = "Short (3-5 words) description of the task",
@@ -79,7 +86,7 @@ end
 if opts.allow_background then
   schema.properties.background = {
     type = "boolean",
-    description = "Run in the background. The result arrives as a message. Default to true unless your next step needs the result. Launch all in one batch. Never sleep or poll, end your turn when idle.",
+    description = "Run in the background (default). The result arrives as a message that wakes you. Set false only when your very next step needs the result inline. Launch all in one batch. Never sleep or poll, end your turn when idle.",
     needs_background = true,
   }
 end
@@ -108,7 +115,7 @@ local function bounded_errors(errors)
   return table.concat(out, "\n")
 end
 
-function Runner.prepare(input, ctx)
+function Runner.prepare(input, ctx, background)
   local subagent_type = input.subagent_type or "research"
   if subagent_type ~= "research" and subagent_type ~= "general" then
     return nil, "unknown subagent type: " .. subagent_type
@@ -145,11 +152,13 @@ function Runner.prepare(input, ctx)
 
   local audience = subagent_type == "research" and "research_sub" or "general_sub"
   local prompt_id = subagent_type == "research" and "research" or "general"
-  local tool_defs, tools_err = maki.agent.tools(ctx, {
-    audience = audience,
-    spec = model.spec,
-    mcp = true,
-  })
+  -- A synchronous subagent has no task_message: its parent is blocked waiting
+  -- for the final result and cannot read a mid-task report.
+  local tool_opts = { audience = audience, spec = model.spec, mcp = true }
+  if not background then
+    tool_opts.except = { TASK_MESSAGE_TOOL }
+  end
+  local tool_defs, tools_err = maki.agent.tools(ctx, tool_opts)
   if tools_err then
     return nil, tools_err
   end
@@ -191,11 +200,13 @@ function Runner.prepare(input, ctx)
       local_tools = local_tools,
       audience = audience,
       mcp = true,
-      name = input.description,
+      name = input.name,
       thinking = thinking,
       thinking_unclamped = not input.thinking and combo_thinking ~= nil,
     },
-    message = input.prompt .. (validator and STRUCTURED_OUTPUT_PROMPT_SUFFIX or ""),
+    message = input.prompt
+      .. (validator and STRUCTURED_OUTPUT_PROMPT_SUFFIX or "")
+      .. (not background and SYNC_NOTE or ""),
     capture = capture,
     -- The user may have built the combo long ago and logged out of its
     -- provider since. Naming it turns a bare 401 into something they can fix.

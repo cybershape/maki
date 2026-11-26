@@ -1,8 +1,8 @@
 -- task_stop lives next to the /tasks picker: both act on tasks the user can
 -- see in the task tab, and the host's maki.task.stop does the work.
 
-local DESCRIPTION = "Stop a background task by id."
-local ID_DESCRIPTION = "Task id from its receipt"
+local DESCRIPTION = "Stop a background task by codename."
+local ID_DESCRIPTION = "Task codename (or call id) from its receipt"
 -- What the model reads when the final reply is not in yet.
 local STOP_REQUESTED_REPLY = "Stop requested. Its output arrives later and will not wake you, so do not wait for it."
 -- A subagent inside a batch has no final reply of its own. The batch sends
