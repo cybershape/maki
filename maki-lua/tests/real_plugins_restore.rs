@@ -225,6 +225,8 @@ fn read_restore_keeps_nearby_comment_colors_with_large_context(ending: &str) {
 #[test_case(None, "cd src && echo hi", "in src" ; "undescribed_past_a_cd")]
 #[test_case(Some("print hi"), "cd src && echo hi", "print hi in src" ; "described_past_a_cd")]
 #[test_case(Some("echo hi"), "cd src && echo hi", "in src" ; "described_by_its_command_past_a_cd")]
+#[test_case(Some("print hi"), "cd src 2>/dev/null && echo hi", "print hi" ; "no_dir_for_a_refused_cd_hint")]
+#[test_case(Some("print hi"), r"cd C:\src && echo hi", "print hi in C:\\src" ; "windows_drive_cd_keeps_its_dir")]
 fn bash_restore_titles_a_call_and_shows_its_command(
     description: Option<&str>,
     command: &str,
@@ -274,20 +276,6 @@ fn bash_title_leaves_out_the_session_directory() {
         Vec::new(),
     );
     assert_eq!(r.header, "print hi");
-}
-
-#[test]
-fn bash_header_parses_cd_hint_with_redirection() {
-    let host = load_host();
-    let r = restore(
-        &host,
-        "bash",
-        json!({ "command": "cd maki 2>/dev/null && sed foo" }),
-        "output",
-        None,
-        Vec::new(),
-    );
-    assert!(r.header.contains("in maki"), "header was: {}", r.header);
 }
 
 const MULTILINE_COMMAND: &str = "echo one\necho two\necho three";
@@ -504,8 +492,10 @@ fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) ->
 
 const SKILL_TOOL: &str = "skill";
 const SKILL_NAME: &str = "release";
-/// Outside any home or cwd, so `shorten_path` leaves it alone.
-const SKILL_LOCATION: &str = "/srv/skills/release/SKILL.md";
+/// Outside any home or cwd, so `shorten_path` leaves it alone. Not `.md`:
+/// compiling the markdown syntax costs ~5s of CPU in a debug build, and the
+/// assertions only read plain text.
+const SKILL_LOCATION: &str = "/srv/skills/release/SKILL.txt";
 const SKILL_BODY: &str = "1 # Release\n2 Tag it.";
 
 /// Restore (session reload, batch child) must draw the skill like the live

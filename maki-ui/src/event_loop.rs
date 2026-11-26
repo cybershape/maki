@@ -76,7 +76,10 @@ use crate::agent::{
 use crate::app::mode::Mode;
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::tasks::TaskWatch;
-use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
+use crate::app::{
+    App, Attention, Msg, Notification, QueuedMessage, SubmitOutcome, session_has_content,
+    turn_response,
+};
 use crate::appearance::{self, Background};
 use crate::color_compat;
 use crate::components::input::Submission;
@@ -191,10 +194,13 @@ pub struct EventLoopParams {
     pub host_prompt: HostPrompt,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// A waiting session carries what it waits on, so the two cannot disagree,
+/// and a status diff also sees one prompt follow another with no gap between
+/// them.
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum SessionStatus {
     Working,
-    NeedsInput,
+    NeedsInput(Attention),
     Idle,
 }
 
@@ -207,7 +213,7 @@ enum PendingCompletion {
 struct RunNotificationState {
     response_candidate: Option<String>,
     pending_completion: Option<PendingCompletion>,
-    last_attention: Option<Notification>,
+    last_attention: Option<Attention>,
     outcome: Option<ProgramState>,
 }
 
@@ -266,16 +272,15 @@ impl RunNotificationState {
         )
     }
 
-    fn reconcile(
-        &mut self,
-        attention: Option<Notification>,
-        status: SessionStatus,
-    ) -> Option<Notification> {
-        let settled = attention.is_none() && status == SessionStatus::Idle;
-        let prompt = (attention != self.last_attention)
-            .then(|| attention.clone())
-            .flatten();
-        self.last_attention = attention;
+    fn reconcile(&mut self, status: &SessionStatus) -> Option<Notification> {
+        let settled = *status == SessionStatus::Idle;
+        let attention = status.attention();
+        let prompt = if attention == self.last_attention.as_ref() {
+            None
+        } else {
+            self.last_attention = attention.cloned();
+            attention.cloned().map(Notification::Attention)
+        };
 
         // A turn can end while work goes on, and queued input or a background
         // task may wake the agent again. So the completion waits until the
@@ -296,22 +301,42 @@ impl SessionStatus {
     /// Background work keeps the session working, like the status bar, so a
     /// picker never flashes finished while a result is still to come.
     fn of(app: &App) -> Self {
-        if app.awaiting_input() {
-            Self::NeedsInput
-        } else if app.is_working() {
-            Self::Working
-        } else {
-            Self::Idle
+        match app.attention() {
+            Some(attention) => Self::NeedsInput(attention),
+            None if app.is_working() => Self::Working,
+            None => Self::Idle,
         }
     }
 
-    fn as_str(self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::Working => STATUS_WORKING,
-            Self::NeedsInput => STATUS_NEEDS_INPUT,
+            Self::NeedsInput(_) => STATUS_NEEDS_INPUT,
             Self::Idle => STATUS_IDLE,
         }
     }
+
+    fn attention(&self) -> Option<&Attention> {
+        match self {
+            Self::NeedsInput(attention) => Some(attention),
+            Self::Working | Self::Idle => None,
+        }
+    }
+}
+
+/// One entry of `maki.session.live()`.
+fn live_entry(app: &App, focused: bool) -> serde_json::Value {
+    let session = &app.state.session;
+    let status = SessionStatus::of(app);
+    json!({
+        "id": session.id,
+        "title": session.title,
+        "status": status.as_str(),
+        "attention": status.attention().map(Attention::message),
+        "resumable": session_has_content(session),
+        "updated_at": session.updated_at,
+        "focused": focused,
+    })
 }
 
 fn prepend_preamble(preamble: &mut Vec<Message>, mut leading: Vec<Message>) {
@@ -336,39 +361,30 @@ fn select_notification(
     }
 }
 
-fn blocked_kind(attention: Option<&Notification>) -> BlockedKind {
+/// The OSC 7501 kinds stop at permission, question and auth, so the plan
+/// approval and package review pass as a permission.
+fn blocked_kind(attention: &Attention) -> BlockedKind {
     match attention {
-        Some(Notification::AuthenticationRequired) => BlockedKind::Auth,
-        Some(Notification::QuestionRequested) => BlockedKind::Question,
-        _ => BlockedKind::Permission,
+        Attention::Permission { .. } | Attention::PackReview | Attention::PlanReady => {
+            BlockedKind::Permission
+        }
+        Attention::Question => BlockedKind::Question,
+        Attention::Authentication => BlockedKind::Auth,
     }
 }
 
-/// The plan form parks the turn on the user without entering `NeedsInput`,
-/// so it reports blocked on its own. The protocol's `kind` list has no plan
-/// value: approval maps to `permission`.
 fn program_state_of(
-    status: SessionStatus,
-    attention: Option<&Notification>,
+    status: &SessionStatus,
     outcome: Option<ProgramState>,
 ) -> (ProgramState, Option<String>) {
-    if let Some(Notification::PlanReady) = attention {
-        return (
-            ProgramState::Blocked(BlockedKind::Permission),
-            Some(Notification::PlanReady.message()),
-        );
+    match status {
+        SessionStatus::NeedsInput(attention) => (
+            ProgramState::Blocked(blocked_kind(attention)),
+            Some(attention.message()),
+        ),
+        SessionStatus::Working => (ProgramState::Working, None),
+        SessionStatus::Idle => (outcome.unwrap_or(ProgramState::Idle), None),
     }
-    let state = match status {
-        SessionStatus::NeedsInput => {
-            return (
-                ProgramState::Blocked(blocked_kind(attention)),
-                attention.map(Notification::message),
-            );
-        }
-        SessionStatus::Working => ProgramState::Working,
-        SessionStatus::Idle => outcome.unwrap_or(ProgramState::Idle),
-    };
-    (state, None)
 }
 
 fn program_state_rank(state: ProgramState) -> u8 {
@@ -508,11 +524,7 @@ impl SessionRuntime {
     }
 
     fn program_state(&self) -> (ProgramState, Option<String>) {
-        program_state_of(
-            self.last_status,
-            self.app.attention().as_ref(),
-            self.notifications.outcome,
-        )
+        program_state_of(&self.last_status, self.notifications.outcome)
     }
 
     /// New work cancels an `exit_on_done` exit still waiting on its drain.
@@ -1693,7 +1705,8 @@ impl<'t> EventLoop<'t> {
                 Some(&rt.id()),
                 HostEvent::SessionStatusChanged {
                     title: &rt.app.state.session.title,
-                    status: status.as_str(),
+                    status: rt.last_status.as_str(),
+                    attention: rt.last_status.attention().map(Attention::message),
                     focused: i == self.focused,
                 },
             );
@@ -1772,9 +1785,7 @@ impl<'t> EventLoop<'t> {
     fn emit_notifications(&mut self) {
         let mut selected = None;
         for rt in &mut self.sessions {
-            let candidate = rt
-                .notifications
-                .reconcile(rt.app.attention(), SessionStatus::of(&rt.app));
+            let candidate = rt.notifications.reconcile(&SessionStatus::of(&rt.app));
             selected = select_notification(selected, candidate);
         }
         if let Some(notifier) = &self.notifier
@@ -1934,15 +1945,7 @@ impl<'t> EventLoop<'t> {
                     .sessions
                     .iter()
                     .enumerate()
-                    .map(|(i, rt)| {
-                        json!({
-                            "id": rt.id(),
-                            "title": rt.app.state.session.title,
-                            "status": SessionStatus::of(&rt.app).as_str(),
-                            "updated_at": rt.app.state.session.updated_at,
-                            "focused": i == self.focused,
-                        })
-                    })
+                    .map(|(i, rt)| live_entry(&rt.app, i == self.focused))
                     .collect();
                 let _ = reply_tx.send(Ok(json!(list)));
             }
@@ -3075,7 +3078,10 @@ fn sanitize_task_id(id: &str) -> String {
 mod tests {
     use super::*;
     use crate::agent::model_slots::tests::{OTHER_SPEC, STARTUP_SPEC, slots, strict_policy};
-    use crate::app::tests::{MOVED_ID, app_with_moved_call, end_turn};
+    use crate::app::tests::{
+        MOVED_ID, answer_permission, app_with_moved_call, ask_tool_permission, end_turn,
+        open_question_float, streaming_app, test_app,
+    };
     use crate::components::BackgroundOutcome;
     use maki_agent::DoneReason;
     use maki_providers::provider::BoxFuture;
@@ -3089,6 +3095,9 @@ mod tests {
     use tokio::sync::oneshot;
 
     const OBSERVATION: &str = "failed";
+    const ASKED_TOOL: &str = "bash";
+    const OTHER_TOOL: &str = "write";
+    const USER_TEXT: &str = "hello";
     const SHELL_RESULT: &str = "command finished";
 
     fn done_event() -> AgentEvent {
@@ -3131,23 +3140,24 @@ mod tests {
         assert_eq!(title, expected_title);
     }
 
-    #[test_case(SessionStatus::Idle, Some(Notification::PlanReady), None, ProgramState::Blocked(BlockedKind::Permission) ; "plan_form_blocks_idle")]
-    #[test_case(SessionStatus::Idle, Some(Notification::PlanReady), Some(ProgramState::Done), ProgramState::Blocked(BlockedKind::Permission) ; "plan_form_beats_done_outcome")]
-    #[test_case(SessionStatus::NeedsInput, Some(Notification::PermissionRequested { tool: None }), None, ProgramState::Blocked(BlockedKind::Permission) ; "permission_prompt_blocks")]
-    #[test_case(SessionStatus::NeedsInput, Some(Notification::QuestionRequested), None, ProgramState::Blocked(BlockedKind::Question) ; "question_blocks")]
-    #[test_case(SessionStatus::NeedsInput, Some(Notification::AuthenticationRequired), None, ProgramState::Blocked(BlockedKind::Auth) ; "auth_blocks")]
-    #[test_case(SessionStatus::Working, None, None, ProgramState::Working ; "working")]
-    #[test_case(SessionStatus::Idle, None, Some(ProgramState::Done), ProgramState::Done ; "done_outcome")]
-    #[test_case(SessionStatus::Idle, None, None, ProgramState::Idle ; "idle")]
+    #[test_case(SessionStatus::NeedsInput(Attention::PlanReady), None, ProgramState::Blocked(BlockedKind::Permission) ; "plan_form_blocks")]
+    #[test_case(SessionStatus::NeedsInput(Attention::PlanReady), Some(ProgramState::Done), ProgramState::Blocked(BlockedKind::Permission) ; "plan_form_beats_done_outcome")]
+    #[test_case(SessionStatus::NeedsInput(Attention::PackReview), None, ProgramState::Blocked(BlockedKind::Permission) ; "pack_review_blocks")]
+    #[test_case(SessionStatus::NeedsInput(Attention::Permission { tool: None }), None, ProgramState::Blocked(BlockedKind::Permission) ; "permission_prompt_blocks")]
+    #[test_case(SessionStatus::NeedsInput(Attention::Question), None, ProgramState::Blocked(BlockedKind::Question) ; "question_blocks")]
+    #[test_case(SessionStatus::NeedsInput(Attention::Authentication), None, ProgramState::Blocked(BlockedKind::Auth) ; "auth_blocks")]
+    #[test_case(SessionStatus::Working, None, ProgramState::Working ; "working")]
+    #[test_case(SessionStatus::Idle, Some(ProgramState::Done), ProgramState::Done ; "done_outcome")]
+    #[test_case(SessionStatus::Idle, None, ProgramState::Idle ; "idle")]
     fn program_state_cases(
         status: SessionStatus,
-        attention: Option<Notification>,
         outcome: Option<ProgramState>,
         expected: ProgramState,
     ) {
-        let (state, msg) = program_state_of(status, attention.as_ref(), outcome);
+        let expected_msg = status.attention().map(Attention::message);
+        let (state, msg) = program_state_of(&status, outcome);
         assert_eq!(state, expected);
-        assert_eq!(msg, attention.map(|n| n.message()));
+        assert_eq!(msg, expected_msg);
     }
 
     struct QuotaProvider {
@@ -3222,12 +3232,12 @@ mod tests {
 
         state.on_done(&done_event());
         assert!(state.waiting_for_drain());
-        assert_eq!(state.reconcile(None, SessionStatus::Idle), None);
+        assert_eq!(state.reconcile(&SessionStatus::Idle), None);
 
         state.on_drain();
         assert!(!state.waiting_for_drain());
         assert_eq!(
-            state.reconcile(None, SessionStatus::Idle),
+            state.reconcile(&SessionStatus::Idle),
             Some(Notification::TurnComplete {
                 response: Some("done".into())
             })
@@ -3238,33 +3248,30 @@ mod tests {
     #[test_case(true, false ; "new_work_drops_it")]
     fn due_completion_waits_while_the_session_works(new_work: bool, fires: bool) {
         let mut state = due_completion();
-        assert_eq!(state.reconcile(None, SessionStatus::Working), None);
+        assert_eq!(state.reconcile(&SessionStatus::Working), None);
 
         if new_work {
             state.on_queue_item_consumed();
         }
 
-        assert_eq!(state.reconcile(None, SessionStatus::Idle).is_some(), fires);
-        assert_eq!(state.reconcile(None, SessionStatus::Idle), None);
+        assert_eq!(state.reconcile(&SessionStatus::Idle).is_some(), fires);
+        assert_eq!(state.reconcile(&SessionStatus::Idle), None);
     }
 
     /// A background task can ask something after the turn ended. The turn
     /// still notifies once the user answers and the work is done.
     #[test]
     fn prompt_wins_over_completion_and_is_not_repeated_unchanged() {
-        let prompt = Notification::QuestionRequested;
+        let waiting = SessionStatus::NeedsInput(Attention::Question);
         let mut state = due_completion();
 
         assert_eq!(
-            state.reconcile(Some(prompt.clone()), SessionStatus::NeedsInput),
-            Some(prompt.clone())
+            state.reconcile(&waiting),
+            Some(Notification::Attention(Attention::Question))
         );
+        assert_eq!(state.reconcile(&waiting), None);
         assert_eq!(
-            state.reconcile(Some(prompt), SessionStatus::NeedsInput),
-            None
-        );
-        assert_eq!(
-            state.reconcile(None, SessionStatus::Idle),
+            state.reconcile(&SessionStatus::Idle),
             Some(Notification::TurnComplete { response: None })
         );
     }
@@ -3278,7 +3285,7 @@ mod tests {
         let completion = Notification::TurnComplete { response: None };
 
         assert_eq!(focus.allows(&completion), completion_fires);
-        assert!(focus.allows(&Notification::QuestionRequested));
+        assert!(focus.allows(&Notification::Attention(Attention::Question)));
     }
 
     fn stale_input() -> Focus {
@@ -3323,8 +3330,8 @@ mod tests {
     #[test]
     fn notification_selection_prefers_priority_then_session_order() {
         let completion = Notification::TurnComplete { response: None };
-        let first_prompt = Notification::QuestionRequested;
-        let second_prompt = Notification::AuthenticationRequired;
+        let first_prompt = Notification::Attention(Attention::Question);
+        let second_prompt = Notification::Attention(Attention::Authentication);
 
         let selected = select_notification(None, Some(completion));
         let selected = select_notification(selected, Some(first_prompt.clone()));
@@ -3441,6 +3448,55 @@ mod tests {
 
         app.end_task(MOVED_ID, BackgroundOutcome::Done);
         assert_eq!(SessionStatus::of(&app), SessionStatus::Idle);
+    }
+
+    /// The next permission prompt opens the moment one is answered, so the
+    /// session never leaves `needs_input` in between. Only a status that
+    /// names the prompt tells a plugin the session waits on something new.
+    #[test_case(OTHER_TOOL, true ; "another_tool_is_a_new_status")]
+    #[test_case(ASKED_TOOL, false ; "the_same_tool_reads_the_same")]
+    fn a_prompt_right_behind_an_answered_one(next_tool: &str, changed: bool) {
+        let mut app = test_app();
+        ask_tool_permission(&mut app, ASKED_TOOL);
+        let before = SessionStatus::of(&app);
+
+        answer_permission(&mut app);
+        ask_tool_permission(&mut app, next_tool);
+        assert_eq!(SessionStatus::of(&app) != before, changed);
+    }
+
+    /// The question tool asks mid-turn. The user has to hear about it, not
+    /// just see a spinner.
+    #[test]
+    fn a_question_outranks_the_turn_that_asks_it() {
+        let mut app = streaming_app();
+        assert_eq!(SessionStatus::of(&app), SessionStatus::Working);
+        open_question_float(&mut app);
+        assert_eq!(
+            SessionStatus::of(&app),
+            SessionStatus::NeedsInput(Attention::Question)
+        );
+    }
+
+    #[test]
+    fn a_live_entry_names_the_prompt_and_whether_the_session_resumes() {
+        let mut app = test_app();
+        let blank = live_entry(&app, true);
+        assert_eq!(blank["status"], STATUS_IDLE);
+        assert!(blank["attention"].is_null());
+        assert_eq!(blank["resumable"], false);
+
+        app.state
+            .session_mut()
+            .push_message(Message::user(USER_TEXT.into()));
+        ask_tool_permission(&mut app, ASKED_TOOL);
+        let waiting = live_entry(&app, true);
+        let asked = Attention::Permission {
+            tool: Some(ASKED_TOOL.into()),
+        };
+        assert_eq!(waiting["status"], STATUS_NEEDS_INPUT);
+        assert_eq!(waiting["attention"], asked.message());
+        assert_eq!(waiting["resumable"], true);
     }
 
     const PACK_ANSWER: &str = "prepared";

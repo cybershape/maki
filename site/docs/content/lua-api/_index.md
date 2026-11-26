@@ -968,7 +968,11 @@ name the session now running or focused. What each event adds:
 - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
   first focus at startup.
 - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
-  or `"idle"`), `data.title`, and `data.focused` (boolean). A session
+  or `"idle"`), `data.title` and `data.focused` (boolean). A
+  `"needs_input"` session also has `data.attention`, as in
+  `maki.session.live()`. It fires when `status` or `attention` changes.
+  So a permission prompt for another tool fires again with the same
+  `"needs_input"`, and a prompt that reads the same does not. A session
   stays `"working"` while a background task it waits on still runs.
 - `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
   when the title changes (rename or auto-generation).
@@ -3653,7 +3657,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{pattern}` (`string`) Regular expression to search for.
-- `{opts?}` (`table?`) `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
+- `{opts?}` (`table?`) `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`, or `"!**/tests/**"` to leave files out). `exclude` (string): regex, a match is left out when its line matches. `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
 
 **Returns:** (`table?`, `string?`, `table?`) Array of `{path, groups}` tables, or nil plus an error message. When `limit` cut results, a third value `{ groups, files }` counts the match groups left out and the files they came from.
 
@@ -3688,7 +3692,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{pattern}` (`string`) Regular expression to search for.
-- `{opts?}` (`table?`) `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`).
+- `{opts?}` (`table?`) `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`, or `"!**/tests/**"` to leave files out). `exclude` (string): regex, a match is left out when its line matches.
 
 **Returns:** (`table?`, `string?`) Array of `{path, matches}` tables for the files with a match, newest first, or nil plus an error message.
 
@@ -5503,8 +5507,13 @@ maki.session.live()
 Lists the sessions currently running in this UI. Status is "working",
 "needs_input", or "idle". Background work a turn moved out keeps the
 session "working" until its result is in, with no "idle" in between.
+A "needs_input" session has `attention`, text that says what it waits
+on, like "Permission requested: bash". The wording can change between
+releases, so show it and do not parse it. Other sessions have none.
+`resumable` is true once the session has a transcript `maki -r <id>` can
+open.
 
-**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, status, attention, resumable, updated_at, focused}`, or nil and an error.
 
 **Example:**
 
@@ -9293,8 +9302,8 @@ buf:blit(fb32, 160, 100, { format = "bgra", char = "█" })
 
 System and environment utilities, modelled after `vim.uv`.
 
-Provides access to the working directory, home directory, and environment
-variables. None of these functions throw.
+Provides access to the working directory, home directory, environment
+variables and the wall clock. None of these functions throw.
 
 Filesystem location queries (`cwd`, `os_homedir`) need `fs_read`, while
 `os_getenv` reads the process environment, where secrets live, so it needs
@@ -9381,6 +9390,26 @@ maki.uv.hrtime()
 Returns a monotonic timestamp in nanoseconds, like `vim.uv.hrtime`.
 
 **Returns:** (`integer`) Nanoseconds from an arbitrary origin, for measuring elapsed time.
+
+---
+
+### `maki.uv.gettimeofday()` {#maki-uv-gettimeofday}
+
+```lua
+maki.uv.gettimeofday()
+```
+
+Return the wall clock time since the Unix epoch. Like
+`vim.uv.gettimeofday`.
+
+**Returns:** (`integer`, `integer`) Seconds, and the microseconds within that second.
+
+**Example:**
+
+```lua
+local sec, usec = maki.uv.gettimeofday()
+local now_ms = sec * 1000 + usec // 1000
+```
 
 
 ## maki.version {#maki-version}

@@ -241,6 +241,7 @@ declare maki: {
     os_homedir: @checked () -> (string?),
     os_getenv: @checked (name: string) -> (string?),
     hrtime: @checked () -> (number),
+    gettimeofday: @checked () -> (number, number),
   },
   version: {
     parse: @checked (version: string, opts: any) -> (any, string?),

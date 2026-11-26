@@ -21,8 +21,8 @@ use rmcp::model::{
     CallToolRequestParams, ClientCapabilities, ClientConfig, ClientRequest, ConstString,
     ContentBlock, ErrorCode, ErrorData, GetPromptRequestParams, Implementation, InitializeResult,
     InitializeResultMethod, ListPromptsRequest, ListPromptsRequestMethod, ListToolsRequest,
-    ListToolsRequestMethod, PaginatedRequestParams, Prompt, ProtocolVersion, Role, ServerResult,
-    Tool,
+    ListToolsRequestMethod, PaginatedRequestParams, Prompt, ProtocolVersion, ResourceContents,
+    Role, ServerResult, Tool,
 };
 use rmcp::service::{ClientInitializeError, Peer, RunningService};
 use rmcp::transport::common::http_header::{HEADER_LAST_EVENT_ID, HEADER_SESSION_ID};
@@ -566,8 +566,14 @@ fn reparse<T: DeserializeOwned>(
 fn joined_text(content: &[ContentBlock]) -> String {
     content
         .iter()
-        .filter_map(ContentBlock::as_text)
-        .map(|t| t.text.as_str())
+        .filter_map(|block| match block {
+            ContentBlock::Text(content) => Some(content.text.as_str()),
+            ContentBlock::Resource(embedded) => match &embedded.resource {
+                ResourceContents::TextResourceContents { text, .. } => Some(text.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -685,6 +691,7 @@ mod tests {
     const STRUCTURED_FIELD: &str = "answer";
     const STRUCTURED_VALUE: u64 = 42;
     const TOOL_ERROR_TEXT: &str = "tool failed";
+    const RESOURCE_TEXT: &str = "fn main() {}";
     const FIRST_TOOL: &str = "first";
     const LAST_TOOL: &str = "last";
     const NEXT_CURSOR: &str = "page-2";
@@ -970,6 +977,14 @@ mod tests {
             .await
             .expect_err("isError must surface as an error");
         assert!(err.to_string().contains(TOOL_ERROR_TEXT), "got: {err}");
+    }
+
+    #[test_case(json!({"type": "resource", "resource": {"uri": "repo://a", "text": RESOURCE_TEXT}}), &[TOOL_TEXT, RESOURCE_TEXT] ; "embedded_text_resource")]
+    #[test_case(json!({"type": "resource", "resource": {"uri": "repo://a", "blob": "aGk="}}), &[TOOL_TEXT] ; "embedded_blob_resource")]
+    fn tool_reply_keeps_the_text_of_embedded_resources(block: Value, expected: &[&str]) {
+        let content: Vec<ContentBlock> =
+            serde_json::from_value(json!([{"type": "text", "text": TOOL_TEXT}, block])).unwrap();
+        assert_eq!(joined_text(&content), expected.join("\n"));
     }
 
     #[tokio::test]

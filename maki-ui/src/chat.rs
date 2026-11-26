@@ -167,8 +167,12 @@ impl Chat {
         self.messages_panel.task_id()
     }
 
-    pub(crate) fn request_restores(&self, items: Vec<maki_lua::RestoreItem>) {
-        self.messages_panel.request_restores(items);
+    pub(crate) fn request_restores(&mut self) {
+        self.messages_panel.request_restores();
+    }
+
+    pub(crate) fn defer_restores(&mut self) {
+        self.messages_panel.defer_restores();
     }
 
     pub(crate) fn task_id_or_main(&self) -> Arc<str> {
@@ -853,10 +857,9 @@ pub fn history_to_display(
     tool_outputs: &HashMap<String, Arc<ToolOutput>>,
     tool_output_lines: &ToolOutputLines,
     compact_tools: bool,
-) -> (Vec<DisplayMessage>, Vec<maki_lua::RestoreItem>) {
+) -> Vec<DisplayMessage> {
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
-    let mut restore_items: Vec<maki_lua::RestoreItem> = Vec::new();
 
     let seal_last_group = |display: &mut Vec<DisplayMessage>| {
         if let Some(DisplayMessage {
@@ -867,7 +870,6 @@ pub fn history_to_display(
             g.sealed = true;
         }
     };
-
     for item in display_order(messages) {
         let msg = match item {
             DisplayItem::Message(msg) => msg,
@@ -1012,33 +1014,6 @@ pub fn history_to_display(
                             {
                                 append_annotation(&mut annotation, &ta);
                             }
-                            let output = stored
-                                .map(|o| o.as_text())
-                                .or_else(|| result_text.map(str::to_owned))
-                                .unwrap_or_default();
-                            let state = stored.and_then(|o| o.state().cloned());
-                            // Structured outputs (e.g. Diff) render natively
-                            // in Rust with full fidelity; a Lua restore
-                            // snapshot would replace that with a poorer text
-                            // view.
-                            let rust_rendered =
-                                stored.is_some_and(|o| o.structured_display_text().is_some());
-                            if !rust_rendered {
-                                restore_items.push(maki_lua::RestoreItem {
-                                    tool: Arc::from(static_name),
-                                    tool_use_id: id.clone(),
-                                    output,
-                                    input: input.clone(),
-                                    is_error: status == ToolStatus::Error,
-                                    tool_output_lines: *tool_output_lines,
-                                    theme_gen: None,
-                                    clicks: Vec::new(),
-                                    state,
-                                    session_id: None,
-                                    task_id: None,
-                                    reason: maki_lua::RestoreReason::Load,
-                                });
-                            }
                             let is_bg_bash = crate::components::tool_group::is_background_bash(
                                 static_name,
                                 Some(input),
@@ -1142,7 +1117,7 @@ pub fn history_to_display(
         }
     }
     seal_last_group(&mut display);
-    (display, restore_items)
+    display
 }
 
 fn task_notice(
@@ -1170,6 +1145,8 @@ pub(crate) fn restore_item_for(
     };
     let input = msg.tool_raw_input.as_deref()?;
     let stored = msg.tool_output.as_deref()?;
+    // Rust draws structured outputs like a diff in full, and a Lua snapshot
+    // would swap that for a poorer text view.
     if stored.structured_display_text().is_some() {
         return None;
     }
@@ -1207,22 +1184,20 @@ fn build_loaded_tool(
         }
         None => {
             let result = result_text.unwrap_or("");
-            let annotation = if !result.is_empty() {
-                ToolOutput::Plain(result.into()).annotation()
-            } else {
-                None
-            };
             if result.is_empty() {
-                (summary.to_owned(), 0, None, annotation)
-            } else {
-                let tr = truncate_output(result, tool_output_lines.get(tool));
-                (
-                    format!("{}\n{}", summary, tr.kept),
-                    tr.skipped,
-                    None,
-                    annotation,
-                )
+                return (summary.to_owned(), 0, None, None);
             }
+            // Kept like `tool_done` keeps it, so a restore can be built from
+            // this message when it scrolls into view.
+            let output = Arc::new(ToolOutput::Plain(result.into()));
+            let annotation = output.annotation();
+            let tr = truncate_output(result, tool_output_lines.get(tool));
+            (
+                format!("{summary}\n{}", tr.kept),
+                tr.skipped,
+                Some(output),
+                annotation,
+            )
         }
     }
 }
@@ -1572,7 +1547,7 @@ mod tests {
             content: vec![ContentBlock::Image { source: image() }],
             ..Default::default()
         };
-        let (display, _) = history_to_display(
+        let display = history_to_display(
             &[
                 Message::user_with_images(text.into(), vec![image()]),
                 hidden,
@@ -1835,7 +1810,6 @@ mod tests {
         }];
         assert!(
             history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false)
-                .0
                 .is_empty()
         );
     }
@@ -1845,7 +1819,7 @@ mod tests {
     fn history_hides_host_messages_but_keeps_the_prompt(host: Message) {
         let msgs = vec![host, Message::user(USER_TEXT.into())];
         let display =
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false).0;
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false);
         let shown: Vec<(DisplayRole, &str)> = display
             .iter()
             .map(|d| (d.role.clone(), d.text.as_str()))
@@ -1873,8 +1847,7 @@ mod tests {
             &empty_outputs(),
             &ToolOutputLines::default(),
             false,
-        )
-        .0;
+        );
 
         let shown: Vec<(DisplayRole, &str)> = display
             .iter()
@@ -1908,8 +1881,7 @@ mod tests {
             &empty_outputs(),
             &ToolOutputLines::default(),
             false,
-        )
-        .0;
+        );
 
         assert_eq!(
             display[0]
@@ -1951,7 +1923,7 @@ mod tests {
             is_error,
         );
         let display =
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false).0;
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false);
         assert_eq!(display.len(), 1);
         assert!(matches!(&display[0].role, DisplayRole::Tool(t) if t.status == expected));
     }
@@ -1984,7 +1956,7 @@ mod tests {
             },
         ];
         let display =
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false).0;
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false);
         assert_eq!(display.len(), 4);
         assert_eq!(display[0].role, DisplayRole::User);
         assert_eq!(display[1].role, DisplayRole::Assistant);
@@ -2032,7 +2004,7 @@ mod tests {
             let discriminant = std::mem::discriminant(&output);
             let msgs = tool_use_pair(tool_name, input_json, "ok", false);
             let outputs = HashMap::from([("t1".into(), Arc::new(output))]);
-            let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), false).0;
+            let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), false);
             assert_eq!(
                 std::mem::discriminant(display[0].tool_output.as_deref().unwrap()),
                 discriminant,
@@ -2055,7 +2027,7 @@ mod tests {
             false,
         );
         let outputs = HashMap::from([("t1".into(), Arc::new(write_output))]);
-        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), false).0;
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), false);
         assert!(display[0].annotation.is_some());
     }
 
@@ -2070,7 +2042,7 @@ mod tests {
             false,
         );
         let display =
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false).0;
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false);
         let line_count = display[0].text.lines().count();
         assert!(
             line_count < long_output.len(),
@@ -2087,8 +2059,11 @@ mod tests {
             false,
         );
         let display =
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false).0;
-        assert!(display[0].tool_output.is_none());
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false);
+        assert!(matches!(
+            display[0].tool_output.as_deref(),
+            Some(ToolOutput::Plain(_))
+        ));
         assert!(display[0].text.contains("fn main"));
     }
 
@@ -2111,7 +2086,7 @@ mod tests {
             ..Default::default()
         }];
         let display =
-            history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default(), false).0;
+            history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default(), false);
         assert_eq!(display.len(), 2);
         assert_eq!(display[0].role, DisplayRole::Thinking);
         assert_eq!(display[0].text, "reasoning");
@@ -2163,12 +2138,23 @@ mod tests {
             false,
         );
         let outputs = HashMap::from([("t1".to_owned(), Arc::new(edit_output("a")))]);
-        let (_, items) = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), false);
-        assert!(items.is_empty(), "Rust owns Diff rendering on restore");
-
-        let (_, items) =
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), false);
-        assert_eq!(items.len(), 1, "text-only history still restores via Lua");
+        let tol = ToolOutputLines::default();
+        let restorable = |outputs| {
+            history_to_display(&msgs, outputs, &tol, false)
+                .iter()
+                .filter_map(|msg| restore_item_for(msg, tol, RESTORE_THEME_GEN))
+                .count()
+        };
+        assert_eq!(
+            restorable(&outputs),
+            0,
+            "Rust owns Diff rendering on restore"
+        );
+        assert_eq!(
+            restorable(&empty_outputs()),
+            1,
+            "text-only history still restores via Lua"
+        );
     }
 
     #[test]
@@ -2227,7 +2213,7 @@ mod tests {
             ("t1".to_owned(), Arc::new(out1)),
             ("t2".to_owned(), Arc::new(out2)),
         ]);
-        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true).0;
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true);
         assert_eq!(display.len(), 3);
         assert_eq!(display[0].role, DisplayRole::User);
         let DisplayRole::ToolGroup(g) = &display[1].role else {
@@ -2316,7 +2302,7 @@ mod tests {
             },
         ];
         let outputs = HashMap::new();
-        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true).0;
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true);
         assert_eq!(display.len(), 5);
         assert_eq!(display[0].role, DisplayRole::User);
 
@@ -2370,7 +2356,7 @@ mod tests {
             },
         ];
         let outputs = HashMap::new();
-        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true).0;
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true);
         assert_eq!(display.len(), 2);
         let DisplayRole::ToolGroup(g) = &display[1].role else {
             panic!("expected ToolGroup in display[1]");
@@ -2411,7 +2397,7 @@ mod tests {
             },
         ];
         let outputs = HashMap::new();
-        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true).0;
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true);
         let DisplayRole::ToolGroup(g) = &display[1].role else {
             panic!("expected ToolGroup in display[1]");
         };
@@ -2465,7 +2451,7 @@ mod tests {
                 duration_ms: None,
             })),
         );
-        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true).0;
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), true);
         let DisplayRole::ToolGroup(g) = &display[1].role else {
             panic!("expected ToolGroup in display[1]");
         };

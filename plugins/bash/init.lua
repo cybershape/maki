@@ -77,6 +77,8 @@ local FILE_TOOLS = {
       ["-l"] = true,
       ["-g"] = true,
       ["--glob"] = true,
+      ["-t"] = true,
+      ["--type"] = true,
     },
   },
   find = {
@@ -86,6 +88,10 @@ local FILE_TOOLS = {
   },
   ls = { tool = "list_dir", flags = { ["-a"] = true, ["-A"] = true, ["-1"] = true } },
 }
+-- `rg x | head -20` is a search with a limit, which these tools take
+-- themselves.
+local TOOLS_WITH_LIMIT = { read = true, grep = true }
+local HEAD_SINK_PATTERNS = { "^head$", "^head%s+%-n%s*%d+$", "^head%s+%-%d+$" }
 local FLAG_PATTERN = "%s(%-%-?%w[%w%-]*)"
 local SHORT_FLAGS_PATTERN = "^%-(%w+)$"
 local WRITES_FILE_PATTERN = ">>?%s*[^&%s]"
@@ -97,57 +103,30 @@ local FILE_TOOL_ITEM = "the %s tool instead of %s"
 local rtk_available
 local fallback_log_seq = 0
 
-local function unquote(s)
-  local q = s:sub(1, 1)
-  if (q == '"' or q == "'") and s:sub(-1) == q then
-    return s:sub(2, -2)
-  end
-  return s
-end
+-- A leading `cd` names a workdir only when the argument is a plain word.
+-- Redirects (`cd x 2>/dev/null && y` used to yield a cwd of `x 2>/dev/null`),
+-- globs, quotes or substitution say more than "a path", so the hint steps
+-- aside and bash runs the raw command. A quoted path loses the hint, which
+-- costs only the title's directory. The command itself still runs correctly.
+local CD_PLAIN_DIR = "^cd%s+([^<>&|;$`()*?%[%]{}\\%s\"']+)%s+&&%s+(.+)$"
 
-local function clean_dir(raw)
-  if not raw or raw == "" then
-    return nil
-  end
-  local s = raw:match("^%s*(.-)%s*$")
-  s = s:gsub("^%-[PL]%s+", "")
-  s = s:gsub("^%-%-%s+", "")
-  if s == "-" or s == "" then
-    return nil
-  end
-  local q = s:sub(1, 1)
-  if q == '"' or q == "'" then
-    local end_q = s:find(q, 2, true)
-    if end_q then
-      return s:sub(2, end_q - 1)
-    end
-  end
-  s = s:gsub("%s+[%d&]*>%s*[^%s;&]+", "")
-  s = s:gsub("%s+[%d&]*>&%d+", "")
-  s = s:match("^%s*(.-)%s*$")
-  if s == "" or s == "-" then
-    return nil
-  end
-  return unquote(s)
-end
+-- A Windows drive path is the one argument whose unquoted backslashes are
+-- literal: the prompt shows the cwd as `C:\...` and models copy it verbatim,
+-- while git-bash eats the backslashes and cmd.exe's `cd` does not cross
+-- drives, so this form must stay a hint instead of reaching a shell.
+local CD_DRIVE_DIR = "^cd%s+([%a]:\\[^<>&|;$`()*?%[%]{}%s\"']*)%s+&&%s+(.+)$"
 
 local function parse_cd_hint(input)
   if input.workdir then
     return input.command, input.workdir
   end
   local cmd = input.command or ""
-  local rest = cmd:match("^%s*cd%s+(.+)$")
-  if rest then
-    local dir, tail = rest:match("^(.-)%s+&&%s+(.+)$")
-    if not dir then
-      dir, tail = rest:match("^(.-)%s*;%s*(.+)$")
-    end
-    if dir and dir ~= "" and tail and tail ~= "" then
-      local cleaned = clean_dir(dir)
-      if cleaned then
-        return tail, cleaned
-      end
-    end
+  local dir, tail = cmd:match(CD_PLAIN_DIR)
+  if not dir then
+    dir, tail = cmd:match(CD_DRIVE_DIR)
+  end
+  if dir then
+    return tail, dir
   end
   return cmd, nil
 end
@@ -429,24 +408,54 @@ local function file_tool_for(name, text)
   return spec.tool
 end
 
+local function file_tool_use(command, source)
+  local name_node = command:field("name")[1]
+  local name = name_node and node_text(name_node, source)
+  local tool = name and file_tool_for(name, node_text(command, source))
+  return tool and { tool = tool, command = name }
+end
+
+local function head_limited_command(pipeline, source)
+  local commands = {}
+  for child in pipeline:iter_children() do
+    if child:named() then
+      commands[#commands + 1] = child
+    end
+  end
+  if #commands ~= 2 or commands[1]:type() ~= "command" or commands[2]:type() ~= "command" then
+    return nil
+  end
+  local sink = node_text(commands[2], source)
+  for _, pattern in ipairs(HEAD_SINK_PATTERNS) do
+    if sink:match(pattern) then
+      return commands[1]
+    end
+  end
+  return nil
+end
+
 -- Only a plain command that reads files counts. In a pipe the other side
--- does work no tool takes over (`cargo test | tail`, `cat f | jq .`), and
--- block forms and substitutions are scripting.
+-- does work no tool takes over (`cargo test | tail`, `cat f | jq .`), bar a
+-- `head` that only cuts the output. Block forms and substitutions are
+-- scripting.
 local function collect_file_tool_uses(node, source, uses)
   if redirect_rules_out_file_tool(node, source) then
     return
   end
   local kind = node:type()
   if kind == "command" then
-    local name_node = node:field("name")[1]
-    local name = name_node and node_text(name_node, source)
-    local tool = name and file_tool_for(name, node_text(node, source))
-    if tool then
-      uses[#uses + 1] = { tool = tool, command = name }
+    uses[#uses + 1] = file_tool_use(node, source)
+    return
+  end
+  if kind == "pipeline" then
+    local limited = head_limited_command(node, source)
+    local use = limited and file_tool_use(limited, source)
+    if use and TOOLS_WITH_LIMIT[use.tool] then
+      uses[#uses + 1] = use
     end
     return
   end
-  if kind == "pipeline" or not WALK_THROUGH_TYPES[kind] then
+  if not WALK_THROUGH_TYPES[kind] then
     return
   end
   for child in node:iter_children() do
