@@ -761,6 +761,10 @@ impl fmt::Display for StoredThinking {
 pub struct StoredSubagent {
     pub tool_use_id: String,
     pub name: String,
+    /// The task's short description beside its codename. Absent on subagents
+    /// written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Absent on subagents written before this was recorded, and the one flag
@@ -3024,6 +3028,7 @@ mod tests {
             StoredSubagent {
                 tool_use_id: id.into(),
                 name: "sub".into(),
+                description: None,
                 model: None,
                 thinking: None,
                 fast: false,

@@ -122,7 +122,9 @@ local function handler(input, ctx)
   local run_in_background = Runner.allow_background and input.background ~= false
   local prepared, prepare_err = Runner.prepare(input, ctx, run_in_background)
   if prepare_err then
-    if sid then release_codename(sid, name) end
+    if sid then
+      release_codename(sid, name)
+    end
     return { llm_output = prepare_err, is_error = true }
   end
 
@@ -130,7 +132,9 @@ local function handler(input, ctx)
   -- already take messages: they ride with its first prompt.
   local sess, sess_err = maki.agent.session(ctx, prepared.options)
   if sess_err then
-    if sid then release_codename(sid, name) end
+    if sid then
+      release_codename(sid, name)
+    end
     return { llm_output = prepared.error_context .. sess_err, is_error = true }
   end
   local function receipt()
@@ -173,7 +177,9 @@ local function handler(input, ctx)
   end)
 
   sess:close(ok and out or { llm_output = tostring(out), is_error = true })
-  if sid then release_codename(sid, name) end
+  if sid then
+    release_codename(sid, name)
+  end
   if permit then
     permit:release()
   end
@@ -190,7 +196,14 @@ local function handler(input, ctx)
 end
 
 local function header(input)
-  return input.name
+  local buf = maki.ui.buf()
+  local desc = input.description
+  if desc and desc ~= "" then
+    buf:line({ { input.name }, { ": " .. desc:gsub("%s+", " "), "dim" } })
+  else
+    buf:line({ { input.name } })
+  end
+  return buf
 end
 
 local function restore(_input, output, is_error, ctx)

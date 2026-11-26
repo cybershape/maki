@@ -8320,6 +8320,7 @@ fn a_ui_roundtrip_on_a_headless_host_fails_fast() {
 }
 
 const BACKGROUND_NAME: &str = "ci-monitor";
+const BACKGROUND_DESC: &str = "watch the CI runs";
 const BACKGROUND_PLUGIN: &str = "background_monitor";
 const OPTS_RECORDER: &str = "recorded the request options";
 const CANCELLED_MSG: &str = "cancelled";
@@ -8345,7 +8346,7 @@ maki.api.register_tool({{
         local opened = gate:acquire()
         local err
         maki.async.spawn(function()
-            sess, err = maki.agent.session({{ session = "{sid}", name = "{BACKGROUND_NAME}" }})
+            sess, err = maki.agent.session({{ session = "{sid}", name = "{BACKGROUND_NAME}", description = "{BACKGROUND_DESC}" }})
             opened:release()
             if sess then maki.async.sleep(1000000000) end
         end)
@@ -8374,6 +8375,15 @@ maki.api.register_tool({{
     handler = function()
         local _, err = sess:prompt("check")
         return tostring(err)
+    end,
+}})
+maki.api.register_tool({{
+    name = "background_description",
+    description = "reports the open background session's description",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        return maki.agent.list({{ session = "{sid}" }})[1].description or "nil"
     end,
 }})
 maki.api.register_tool({{
@@ -9219,6 +9229,10 @@ fn background_session_is_listed_until_its_chat_session_ends() {
     assert_eq!(
         exec_tool(&reg, "list_background", json!({})).unwrap(),
         format!("{BACKGROUND_PLUGIN}:{BACKGROUND_NAME}:idle:true")
+    );
+    assert_eq!(
+        exec_tool(&reg, "background_description", json!({})).unwrap(),
+        BACKGROUND_DESC
     );
 
     end_session(&host, session, SessionEndReason::Shutdown);

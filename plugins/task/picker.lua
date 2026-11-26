@@ -35,6 +35,7 @@ local FOOTER_KEYS =
 local HINT_KEY = "Ctrl+X"
 -- One level in, for a subagent listed under the task that started it.
 local NESTED_INDENT = "  "
+local DESC_SEP = ": "
 -- The main chat has no status, so it falls through to MAIN.
 local ICONS = {
   working = { RUNNING_ICON, "accent", true },
@@ -52,6 +53,22 @@ local function dispw(s)
     return maki.ui.display_width(s)
   end
   return utf8.len(s) or #s
+end
+
+-- The codename keeps the row style and the filter highlights; the description
+-- after it reads dim, so a long one fades rather than shouting. Splitting the
+-- combined label at the separator keeps the highlight ranges aligned.
+local function label_spans(task, label, words, base, match_style)
+  local desc = task and task.description
+  if not desc or desc == "" then
+    return ListPicker.highlight_spans(label, words, base, match_style)
+  end
+  local cut_at = #task.name + #DESC_SEP
+  local spans = ListPicker.highlight_spans(label:sub(1, cut_at), words, base, match_style)
+  for _, span in ipairs(ListPicker.highlight_spans(label:sub(cut_at + 1), words, "dim", match_style)) do
+    spans[#spans + 1] = span
+  end
+  return spans
 end
 
 -- The input area advertises the picker key while subagents are still working,
@@ -165,7 +182,7 @@ local function render()
     local fixed = 2 + dispw(indent) + dispw(icon) + dispw(hint)
     local owner = task and Rows.trailer(task, board.drawn_at, 0, maki.ui.humantime, columns, dispw) or ""
     local match_style = selected and "match_selected" or "match"
-    local spans = ListPicker.highlight_spans(name, words, base, match_style)
+    local spans = label_spans(task, name, words, base, match_style)
     local name_width = 0
     for _, span in ipairs(ListPicker.clamp_parts(spans, board.width - fixed - dispw(owner))) do
       line[#line + 1] = span

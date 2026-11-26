@@ -62,6 +62,7 @@ const KIND_KEY: &str = "kind";
 const CREATED_AT_KEY: &str = "created_at";
 const NR_KEY: &str = "nr";
 const NAME_KEY: &str = "name";
+const DESCRIPTION_KEY: &str = "description";
 const FALLBACK_SUBAGENT_NAME: &str = "subagent";
 const CWD_KEY: &str = "cwd";
 const PROMPT_KEY: &str = "prompt";
@@ -624,7 +625,8 @@ async fn windows(
 ///   id,       -- the `tool_use` id that spawned it, unique in the session
 ///   nr,       -- 1-based number in the stored subagent list. Can skip
 ///             -- numbers and repeat across windows, so key on `id`
-///   name,     -- the task description that spawned it, or "subagent"
+///   name,     -- the task codename, or "subagent"
+///   description, -- the task's short description, nil when it had none
 ///   messages, -- same shape as `maki.session.messages`
 /// }
 /// ```
@@ -850,6 +852,7 @@ async fn subagents_table(
                 &subagent.tool_use_id,
                 position + 1,
                 &subagent.name,
+                subagent.description.as_deref(),
                 messages,
             )
             .await?,
@@ -873,6 +876,7 @@ async fn subagents_table(
                 id,
                 meta.len() + position + 1,
                 FALLBACK_SUBAGENT_NAME,
+                None,
                 messages,
             )
             .await?,
@@ -888,12 +892,14 @@ async fn subagent_table(
     id: &str,
     nr: usize,
     name: &str,
+    description: Option<&str>,
     messages: &[Message],
 ) -> LuaResult<Table> {
-    let table = lua.create_table_with_capacity(0, 4)?;
+    let table = lua.create_table_with_capacity(0, 5)?;
     table.set(ID_KEY, id)?;
     table.set(NR_KEY, nr)?;
     table.set(NAME_KEY, name)?;
+    table.set(DESCRIPTION_KEY, description)?;
     table.set(MESSAGES_KEY, messages_table(lua, messages).await?)?;
     Ok(table)
 }
@@ -1354,6 +1360,7 @@ mod tests {
     const SESSION_DELETE: &str = "delete";
     const TOOL_ID: &str = "toolu_1";
     const TOOL_ID_2: &str = "toolu_2";
+    const SUB_DESCRIPTION: &str = "find the auth middleware";
     const PLUGIN_ID: &str = "plugin-1";
     const TOOL_NAME: &str = "read";
     const TOOL_PATH: &str = "src/main.rs";
@@ -2025,6 +2032,7 @@ mod tests {
         StoredSubagent {
             tool_use_id: id.into(),
             name: name.into(),
+            description: None,
             model: None,
             thinking: None,
             fast: false,
@@ -2078,6 +2086,20 @@ mod tests {
             json!({}),
         )])]);
         store_new(with_subagent(session, TOOL_ID, "worker"), &storage(lua)).unwrap()
+    }
+
+    fn stored_with_described_subagent(lua: &Lua) -> MakiId {
+        let mut session = StoredSession::new(MODEL, FACTS_CWD);
+        session.replace_messages(vec![assistant(vec![ContentBlock::tool_use(
+            TOOL_ID,
+            TOOL_NAME,
+            json!({}),
+        )])]);
+        let mut session = with_subagent(session, TOOL_ID, "worker");
+        let mut subagents = session.subagents().to_vec();
+        subagents[0].description = Some(SUB_DESCRIPTION.into());
+        session.set_subagents(subagents);
+        store_new(session, &storage(lua)).unwrap()
     }
 
     /// The subagent's parent `tool_use` is in the first window, which a
@@ -2444,6 +2466,25 @@ mod tests {
         assert_eq!(
             json_of(&lua, messages),
             serde_json::to_value([Message::user("worker task".into())]).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn subagents_carry_the_description_they_were_saved_with() {
+        let (lua, _dir) = headless();
+        let id = stored_with_described_subagent(&lua);
+
+        let subagents: Table = eval(
+            &lua,
+            &format!("return session.subagents({{ session = '{id}' }})"),
+        )
+        .await;
+
+        let subagent: Table = subagents.get(1).unwrap();
+        assert_eq!(subagent.get::<String>("name").unwrap(), "worker");
+        assert_eq!(
+            subagent.get::<String>(DESCRIPTION_KEY).unwrap(),
+            SUB_DESCRIPTION
         );
     }
 

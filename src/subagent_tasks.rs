@@ -289,6 +289,7 @@ mod tests {
             subagent: Some(SubagentInfo {
                 parent_tool_use_id: id.into(),
                 name: DESCRIPTION.into(),
+                description: None,
                 prompt: Some(PROMPT.into()),
                 model: None,
                 opts: None,

@@ -342,6 +342,16 @@ case("a_job_with_no_name_and_no_command_is_skipped", function()
   eq(built.sections.jobs, 0)
 end)
 
+case("the_filter_matches_a_task_description_and_the_label_reads_name_then_description", function()
+  local described = { id = "toolu_20", name = "Hawk", description = "find auth middleware", status = "working" }
+  local plain = { id = "toolu_21", name = "Nyx", status = "working" }
+  local all = { MAIN, described, plain }
+  eq(ids(Rows.build(all, {}, "middleware").rows), described.id, "a description word matches the task")
+  eq(ids(Rows.build(all, {}, "hawk").rows), described.id, "the codename still matches")
+  eq(Rows.row_name({ task = described }), "Hawk: find auth middleware")
+  eq(Rows.row_name({ task = plain }), "Nyx", "no description leaves the bare codename")
+end)
+
 case("the_filter_matches_job_names_and_commands", function()
   local by_name = Rows.build({ MAIN }, { TESTS, SERVER }, "serve")
   eq(ids(by_name.rows), "2")

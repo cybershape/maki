@@ -10,6 +10,7 @@ local JOBS_SECTION = "Jobs"
 local FINISHED_SECTION = "Finished"
 local COST_FMT = "$%.3f"
 local COL_GAP = "  "
+local DESC_SEP = ": "
 
 local M = {}
 
@@ -43,6 +44,15 @@ local function job_label(job)
   return job.name or job.command
 end
 
+-- A task's codename with its short description after it, the way the tool
+-- header reads. The description is what the filter and the eye run over.
+local function task_label(task)
+  if task.description and task.description ~= "" then
+    return task.name .. DESC_SEP .. task.description
+  end
+  return task.name
+end
+
 -- The main chat comes first and has no status. The other tasks follow, live
 -- ones above finished ones so a long job never gets buried under the ones
 -- that already returned. The session's jobs sit between the two, running ones
@@ -64,7 +74,7 @@ function M.build(tasks, jobs, query, opts)
   local running_only = opts and opts.running_only
   local by_id = index_by_id(tasks)
   local function matches(task)
-    return ListPicker.matches(task.name, words)
+    return ListPicker.matches(task_label(task), words)
   end
 
   local children = {}
@@ -148,8 +158,10 @@ function M.row_id(row)
 end
 
 function M.row_name(row)
-  return row.task and row.task.name or job_label(row.job)
+  return row.task and task_label(row.task) or job_label(row.job)
 end
+
+M.task_label = task_label
 
 -- Counts what runs the way the quit flash does. A child under a listed parent
 -- is part of that parent's row, so it is not counted again.

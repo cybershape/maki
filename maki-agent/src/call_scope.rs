@@ -31,6 +31,7 @@ pub struct SessionStub {
     pub ui_id: String,
     pub plugin: Arc<str>,
     pub name: String,
+    pub description: Option<String>,
     pub control: Arc<SessionControl>,
     /// Set at the session's first prompt, when the UI first hears of it.
     pub info: Arc<OnceLock<SubagentInfo>>,

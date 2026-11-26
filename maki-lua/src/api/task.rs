@@ -46,8 +46,10 @@ async fn roundtrip(
 /// [maki.agent.session](#maki-agent-session) has its session id and a
 /// `plugin` field.
 ///
-/// @return (table|nil, string|nil) Array of `{id, session, name, focused, status?, plugin?,
-///   tool?, parent?, part?, wrapper?, started_at?, ended_at?, cost?}`, or nil and an error.
+/// @return (table|nil, string|nil) Array of `{id, session, name, description?, focused, status?,
+///   plugin?, tool?, parent?, part?, wrapper?, started_at?, ended_at?, cost?}`, or nil and an error.
+///   `description` is the task's short description beside its codename, absent
+///   when the task had none.
 ///   `status` is `"working"`, `"idle"` (a plugin task between prompts), `"done"`,
 ///   `"error"` or `"cancelled"`. `session` is the chat session that `stop()` asks for.
 ///   `tool` is the tool whose call the task runs, like `"task"` or `"bash"`, and is

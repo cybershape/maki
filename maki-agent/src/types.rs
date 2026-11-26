@@ -1413,6 +1413,10 @@ pub struct SubagentInfo {
     pub parent_tool_use_id: String,
     #[serde(rename = "parent_name")]
     pub name: String,
+    /// The task's short description, shown beside its codename. Absent on
+    /// subagents opened without one and on restores predating it.
+    #[serde(rename = "parent_description", skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(rename = "parent_prompt", skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
     #[serde(rename = "parent_model", skip_serializing_if = "Option::is_none")]

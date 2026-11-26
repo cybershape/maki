@@ -313,7 +313,9 @@ pub(crate) fn adopt_session(
     stub: SessionStub,
 ) {
     if stub.ui_id == home.id {
-        registry.update(&home.id, |entry| entry.attach(stub.control));
+        registry.update(&home.id, |entry| {
+            entry.attach(stub.control, stub.name, stub.description);
+        });
         return;
     }
     let entry = BackgroundTask {
@@ -321,6 +323,7 @@ pub(crate) fn adopt_session(
             id: stub.ui_id,
             plugin: Arc::clone(&stub.plugin),
             name: stub.name,
+            description: stub.description,
             kind: Kind::Nested {
                 parent: home.id.clone(),
             },
@@ -1095,6 +1098,8 @@ async fn dispatch_child(
 ///     call it, the same way `maki.api.register_tool` does. The default is the
 ///     model alone, so a script cannot reach it through `code_execution`.
 ///   `name` (string?) - display name for logs and UI.
+///   `description` (string?) - short task description shown beside the name in
+///     `/tasks` and `maki.task.list()`, and saved with the transcript.
 ///   `audience` (string?) - tool audience for capability gating. Default: `"general_sub"`.
 ///   `mcp` (boolean?) - give the session MCP tools. Their definitions are
 ///     injected each turn (deferred behind `tool_search`), so do not put MCP
@@ -1155,6 +1160,7 @@ async fn session(
     let tools_val: Option<LuaValue> = opts.opt("tools")?;
     let local_tools_tbl: Option<Table> = opts.opt("local_tools")?;
     let name: Option<String> = opts.opt("name")?;
+    let description: Option<String> = opts.opt("description")?;
     let thinking_val: Option<LuaValue> = opts.opt("thinking")?;
     let thinking_unclamped: bool = opts.opt::<bool>("thinking_unclamped")?.unwrap_or(false);
     let audience = match opts.opt::<String>("audience")? {
@@ -1339,6 +1345,7 @@ async fn session(
             ui_id: ui_id.clone(),
             plugin: Arc::clone(&plugin),
             name: name.clone(),
+            description: description.clone(),
             control: Arc::clone(&control),
             info: Arc::clone(&subagent_info),
         };
@@ -1372,6 +1379,7 @@ async fn session(
                     id: cancellation.ui_id.clone(),
                     plugin,
                     name: name.clone(),
+                    description: description.clone(),
                     kind: Kind::Agent,
                     started_at: now_epoch(),
                     cost: None,
@@ -1458,6 +1466,7 @@ async fn session(
         subagent_info,
         local_tools: Arc::new(local_map),
         name,
+        description,
         dones: RunDones::new(done_rx),
         background,
     };
@@ -1466,6 +1475,7 @@ async fn session(
         let info = SubagentInfo {
             parent_tool_use_id: state.cancellation.ui_id.clone(),
             name: state.name.clone(),
+            description: state.description.clone(),
             prompt: None,
             model: Some(state.params.model.spec()),
             opts: Some(state.opts),
@@ -1492,6 +1502,7 @@ async fn session(
 ///   `session` (string) Chat session it belongs to.
 ///   `plugin` (string) Plugin that opened it.
 ///   `name` (string) Name given at open.
+///   `description` (string?) Short task description given at open, nil when none.
 ///   `status` (string) `"working"` while a `:prompt()` runs a turn or waits
 ///     on calls moved to the background, otherwise `"idle"`.
 ///   `started_at` (integer) Unix seconds.
@@ -1520,6 +1531,7 @@ fn list(lua: &Lua, opts: Table) -> LuaResult<Pair<Table>> {
         t.set("session", session.to_string())?;
         t.set("plugin", &*entry.plugin)?;
         t.set("name", entry.name)?;
+        t.set("description", entry.description)?;
         t.set("started_at", entry.started_at)?;
         t.set("cost", entry.cost)?;
         out.push(t)?;
@@ -1715,6 +1727,7 @@ struct SessionState {
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     local_tools: LocalTools,
     name: String,
+    description: Option<String>,
     dones: RunDones,
     background: Option<Background>,
 }
@@ -2099,6 +2112,7 @@ async fn prompt(
         let _ = s.subagent_info.set(SubagentInfo {
             parent_tool_use_id: cancellation.ui_id.clone(),
             name: s.name.clone(),
+            description: s.description.clone(),
             prompt: Some(message.clone()),
             model: Some(s.params.model.spec()),
             opts: Some(s.opts),
@@ -3090,6 +3104,7 @@ mod tests {
         info.set(SubagentInfo {
             parent_tool_use_id: PARENT_ID.into(),
             name: "research".into(),
+            description: None,
             prompt: None,
             model: None,
             opts: None,
@@ -3526,6 +3541,7 @@ mod tests {
                 id: call_id.into(),
                 plugin: Arc::from(PLUGIN),
                 name: String::new(),
+                description: None,
                 kind: Kind::Call {
                     tool: Arc::from(CALL_TOOL),
                 },

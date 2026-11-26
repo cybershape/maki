@@ -201,6 +201,7 @@ function Runner.prepare(input, ctx, background)
       audience = audience,
       mcp = true,
       name = input.name,
+      description = input.description,
       thinking = thinking,
       thinking_unclamped = not input.thinking and combo_thinking ~= nil,
     },

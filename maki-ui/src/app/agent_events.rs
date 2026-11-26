@@ -71,6 +71,9 @@ fn fill_missing_subagent_info(chat: &mut Chat, info: &SubagentInfo) {
     if chat.model_id.is_none() {
         chat.model_id.clone_from(&info.model);
     }
+    if chat.description.is_none() {
+        chat.description.clone_from(&info.description);
+    }
     chat.opts = chat.opts.or(info.opts);
 }
 

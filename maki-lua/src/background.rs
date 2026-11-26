@@ -126,10 +126,20 @@ impl BackgroundTask {
 
     /// The session a moved call runs under its own id, opened before or after
     /// the move. A stop that came first ends it too.
-    pub(crate) fn attach(&mut self, control: Arc<SessionControl>) {
+    pub(crate) fn attach(
+        &mut self,
+        control: Arc<SessionControl>,
+        name: String,
+        description: Option<String>,
+    ) {
         if let Some(by) = self.stopped {
             control.end(EndReason::Stopped(by));
         }
+        // The session knows its own codename; the move named this entry after
+        // the header, which now appends the description. Addressing by codename
+        // needs the bare name back.
+        self.info.name = name;
+        self.info.description = description;
         self.control = Some(control);
     }
 
@@ -232,6 +242,8 @@ pub(crate) struct BackgroundInfo {
     pub(crate) plugin: Arc<str>,
     /// A moved call's start summary.
     pub(crate) name: String,
+    /// The task's short description beside its name, when the opener gave one.
+    pub(crate) description: Option<String>,
     pub(crate) kind: Kind,
     pub(crate) started_at: u64,
     pub(crate) cost: Option<f64>,
@@ -824,6 +836,7 @@ pub(crate) mod tests {
                 id: MakiId::generate().to_string(),
                 plugin: Arc::from(PLUGIN),
                 name: String::new(),
+                description: None,
                 kind: Kind::Agent,
                 started_at: 0,
                 cost: None,
@@ -1226,7 +1239,7 @@ pub(crate) mod tests {
         let (mut call, _token) = call_entry(chat, CALL_ID);
         let control = Arc::new(SessionControl::default());
         if !matches!(target, Target::NoSession) {
-            call.attach(Arc::clone(&control));
+            call.attach(Arc::clone(&control), String::new(), None);
         }
         if matches!(target, Target::Ended) {
             control.end(EndReason::Closed);
@@ -1389,7 +1402,11 @@ pub(crate) mod tests {
         let _live = live(session);
         let (registry, _token) = registry_with_call(session);
         let control = Arc::new(SessionControl::default());
-        let attach = || registry.update(CALL_ID, |e| e.attach(Arc::clone(&control)));
+        let attach = || {
+            registry.update(CALL_ID, |e| {
+                e.attach(Arc::clone(&control), String::new(), None);
+            });
+        };
         if attached_first {
             attach();
         }

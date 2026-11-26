@@ -1871,6 +1871,8 @@ session, so opening one fails with "session not live". The
     call it, the same way `maki.api.register_tool` does. The default is the
     model alone, so a script cannot reach it through `code_execution`.
   - `name` (`string?`) display name for logs and UI.
+  - `description` (`string?`) short task description shown beside the name in
+    `/tasks` and `maki.task.list()`, and saved with the transcript.
   - `audience` (`string?`) tool audience for capability gating. Default: `"general_sub"`.
   - `mcp` (`boolean?`) give the session MCP tools. Their definitions are
     injected each turn (deferred behind `tool_search`), so do not put MCP
@@ -1919,6 +1921,7 @@ Each entry has these fields:
 - `session` (`string`) Chat session it belongs to.
 - `plugin` (`string`) Plugin that opened it.
 - `name` (`string`) Name given at open.
+- `description` (`string?`) Short task description given at open, nil when none.
 - `status` (`string`) `"working"` while a `:prompt()` runs a turn or waits
   on calls moved to the background, otherwise `"idle"`.
 - `started_at` (`integer`) Unix seconds.
@@ -5749,7 +5752,8 @@ Each entry is:
   id,       -- the `tool_use` id that spawned it, unique in the session
   nr,       -- 1-based number in the stored subagent list. Can skip
             -- numbers and repeat across windows, so key on `id`
-  name,     -- the task description that spawned it, or "subagent"
+  name,     -- the task codename, or "subagent"
+  description, -- the task's short description, nil when it had none
   messages, -- same shape as `maki.session.messages`
 }
 ```
@@ -6140,8 +6144,10 @@ tool spawned has its tool call's id, one a plugin opened with
 [maki.agent.session](#maki-agent-session) has its session id and a
 `plugin` field.
 
-**Returns:** (`table|nil`, `string|nil`) Array of `{id, session, name, focused, status?, plugin?,
-  tool?, parent?, part?, wrapper?, started_at?, ended_at?, cost?}`, or nil and an error.
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, session, name, description?, focused, status?,
+  plugin?, tool?, parent?, part?, wrapper?, started_at?, ended_at?, cost?}`, or nil and an error.
+  `description` is the task's short description beside its codename, absent
+  when the task had none.
   `status` is `"working"`, `"idle"` (a plugin task between prompts), `"done"`,
   `"error"` or `"cancelled"`. `session` is the chat session that `stop()` asks for.
   `tool` is the tool whose call the task runs, like `"task"` or `"bash"`, and is

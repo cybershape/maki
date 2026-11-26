@@ -1956,6 +1956,7 @@ mod tests {
             subagent: Some(SubagentInfo {
                 parent_tool_use_id: id.into(),
                 name: id.into(),
+                description: None,
                 prompt: None,
                 model: None,
                 opts: None,

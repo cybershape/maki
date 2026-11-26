@@ -261,6 +261,7 @@ impl App {
                 Some(StoredSubagent {
                     tool_use_id: chat.task_id()?.to_string(),
                     name: chat.name.clone(),
+                    description: chat.description.clone(),
                     model: chat.model_id.clone(),
                     thinking: chat.opts.map(|o| o.thinking.into()),
                     fast: chat.opts.is_some_and(|o| o.fast),
@@ -387,6 +388,7 @@ impl App {
                 self.lua_event_handle.clone(),
             );
             chat.set_restore_channel(self.restore_event_tx.clone());
+            chat.description = sa.description;
             chat.plugin = sa.plugin;
             chat.cost = sa.cost;
             chat.model_id = sa.model;

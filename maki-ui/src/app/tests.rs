@@ -427,6 +427,7 @@ fn subagent_info_with_tx(
     SubagentInfo {
         parent_tool_use_id: parent_id.into(),
         name: name.into(),
+        description: None,
         prompt: None,
         model: None,
         opts: None,
@@ -2515,6 +2516,7 @@ const MONITOR_TURN: StoredTokenUsage = StoredTokenUsage {
 pub(crate) const MONITOR_PLUGIN: &str = "ci";
 pub(crate) const MONITOR_ID: &str = "session-01";
 const MONITOR_NAME: &str = "ci-monitor";
+const MONITOR_DESC: &str = "watch the CI runs";
 const MONITOR_PROMPT: &str = "Check CI now.";
 const SECOND_PROMPT: &str = "Check again.";
 
@@ -2585,6 +2587,29 @@ fn plugin_task_opens_a_chat_by_id_with_its_first_prompt() {
     let tasks = serde_json::to_value(app.tasks()).unwrap();
     assert_eq!(tasks[1]["plugin"], MONITOR_PLUGIN);
     assert_eq!(tasks[0].get("plugin"), None);
+}
+
+/// The description rides with the codename into the chat and the task list,
+/// the two places `/tasks` reads it from.
+#[test]
+fn a_task_description_reaches_the_chat_and_the_list() {
+    let mut app = test_app();
+    let mut info = subagent_info(MONITOR_ID, MONITOR_NAME);
+    info.description = Some(MONITOR_DESC.into());
+    info.prompt = Some(MONITOR_PROMPT.into());
+    app.deliver(
+        Envelope {
+            event: AgentEvent::TextDelta { text: "x".into() },
+            subagent: Some(info),
+            run_id: 0,
+        },
+        Some(Arc::from(MONITOR_PLUGIN)),
+    );
+
+    assert_eq!(app.chats[1].description.as_deref(), Some(MONITOR_DESC));
+    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    assert_eq!(tasks[1]["description"], MONITOR_DESC);
+    assert_eq!(tasks[0].get("description"), None);
 }
 
 /// A plugin session that never prompted has nothing to show, and must not
@@ -13291,6 +13316,7 @@ fn a_restored_receipt_nobody_answered_reads_lost() {
     session.set_subagents(vec![StoredSubagent {
         tool_use_id: RECEIPT_TURN_ID.into(),
         name: RESEARCH_NAME.into(),
+        description: None,
         model: None,
         thinking: None,
         fast: false,
@@ -13307,6 +13333,32 @@ fn a_restored_receipt_nobody_answered_reads_lost() {
     let chat = &app.chats[app.chat_of_task(RECEIPT_TURN_ID).unwrap()];
     assert_eq!(chat.task_status(), TaskStatus::Error);
     assert_eq!(chat.last_message_text(), LOST_TEXT);
+}
+
+/// A description saved with the transcript comes back on the restored chat,
+/// so `/tasks` shows it after a reload just as it did live.
+#[test]
+fn a_restored_subagent_keeps_its_description() {
+    let mut app = build_rewind_app();
+    let session = app.state.session_mut();
+    session.set_subagents(vec![StoredSubagent {
+        tool_use_id: RECEIPT_TURN_ID.into(),
+        name: RESEARCH_NAME.into(),
+        description: Some(MONITOR_DESC.into()),
+        model: None,
+        thinking: None,
+        fast: false,
+        plugin: Some(Arc::from(SLOW_TOOL)),
+        cost: None,
+        started_at: None,
+        ended_at: None,
+    }]);
+    session.set_subagent_messages(RECEIPT_TURN_ID.into(), vec![], |_: &Message| Vec::new());
+
+    app.restore_resumed_session();
+
+    let chat = &app.chats[app.chat_of_task(RECEIPT_TURN_ID).unwrap()];
+    assert_eq!(chat.description.as_deref(), Some(MONITOR_DESC));
 }
 
 const MOVED_SUMMARY: &str = "Long background task";

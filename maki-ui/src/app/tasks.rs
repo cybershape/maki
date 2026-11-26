@@ -219,6 +219,8 @@ pub(crate) struct TaskInfo {
     session: MakiId,
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<TaskStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     plugin: Option<Arc<str>>,
@@ -706,6 +708,7 @@ impl App {
                 id: chat.task_id_or_main(),
                 session: self.state.session.id,
                 name: chat.name.clone(),
+                description: chat.description.clone(),
                 status: chat.task_id().map(|_| chat.task_status()),
                 plugin: chat.plugin.clone(),
                 tool: chat

@@ -1264,6 +1264,7 @@ impl LiveTask {
                 id: self.id.clone(),
                 plugin: Arc::clone(&self.plugin),
                 name: summary,
+                description: None,
                 kind: Kind::Call {
                     tool: Arc::clone(&self.tool),
                 },

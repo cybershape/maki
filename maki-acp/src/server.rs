@@ -2355,6 +2355,7 @@ mod tests {
         SubagentInfo {
             parent_tool_use_id: PARENT_TOOL_USE_ID.to_owned(),
             name: SUBAGENT_NAME.to_owned(),
+            description: None,
             prompt: None,
             model: None,
             opts: None,

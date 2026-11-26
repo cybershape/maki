@@ -70,6 +70,8 @@ pub(crate) struct RunningCall {
 
 pub struct Chat {
     pub name: String,
+    /// The task's short description beside its codename, when it had one.
+    pub description: Option<String>,
     /// The plugin that opened this task with `maki.agent.session`. A tool task
     /// has none: it lives for one turn of the main chat and is swept with it,
     /// while a plugin task answers only to its plugin and to Esc in its tab.
@@ -133,6 +135,7 @@ impl Chat {
         messages_panel.set_chat(session_id, task_id.map(Arc::from));
         Self {
             name,
+            description: None,
             plugin: None,
             idle: false,
             auth_parked: false,
