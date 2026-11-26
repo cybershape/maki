@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `2b6aaeeb71a4ce81d3f2176fccd6677ea5da91e3`
-  - **Commit date**: `Tue Nov 24 20:51:29 2026 +0100`
-  - **Commit author**: `Luca Barbato <lu_zero@gentoo.org>`
-  - **Commit message**: `feat(lua): job events, plugin chat items and status bar segments`
+  - **Commit SHA**: `2d84258235167ec7b731e523eac7d431396fa314`
+  - **Commit date**: `Fri Nov 27 00:07:03 2026 +0200`
+  - **Commit author**: `Tony Solomonik <tony.solomonik@gmail.com>`
+  - **Commit message**: `test(lua): skip the markdown compile in the skill restore test`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `2b6aaeeb`.
+> `upstream/main` has been successfully merged through commit `2d842582`.
 
 ---
 
@@ -253,6 +253,25 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `912784b8` | `feat(ui): show sandbox tool calls as compact children of code_execution` | Show sandbox tool calls as compact children of `code_execution` |
 | `7778d5ba` | `fix(ui): keep code_execution compact children hover-only, not clickable` | Keep `code_execution` compact children hover-only and non-clickable |
 | `89f5760a` | `Merge remote-tracking branch 'upstream/main'` | Merge upstream through `2b6aaeeb`, including bracketed tool notes, schema shorthand aliases/hints (`accept_single`, `value_alias`), malformed tool JSON error reporting (adapted to Responses provider), `read` default `offset=1` (preserving fork elision), dropping `block_anchor` edit fallback and approximate-span warnings, and Lua job events / `maki.ui.chat_item` / `maki.ui.status_segment`, while preserving core fork customizations |
+| `2512d1f0` | `docs: update upstream tracking record to 2b6aaeeb` | Update the upstream tracking record to `2b6aaeeb` |
+| `f923a569` | `fix(build): enable rquickjs bindgen feature on android` | Enable rquickjs bindgen feature on Android targets |
+| `2b925fa6` | `feat(ui): merge reasonless code_execution children per tool in compact mode` | Merge reasonless `code_execution` children per tool in compact mode |
+| `b7365067` | `fix(tools): keep .git and .gitignore exclusions under **/* globs` | Keep `.git` and `.gitignore` exclusions under `**/*` globs |
+| `8c0003fb` | `fix(plugins): ignore parse and SyntaxError in mcp_library_hint` | Ignore parse and `SyntaxError` in `mcp_library_hint` |
+| `f646a7d3` | `fix(plugins): enforce output_limits on index and read index fallback` | Enforce `output_limits` on `index` and `read` index fallback |
+| `8384305e` | `fix(providers): split model partial-match queries on delimiters` | Split model partial-match queries on delimiters |
+| `7f4a686e` | `feat(mcp): use outputSchema and structuredContent for typed sandbox results` | Use `outputSchema` and `structuredContent` for typed sandbox results |
+| `333ebd79` | `feat(task): bidirectional task_message and Inbox panel for waiting notices` | Add bidirectional `task_message` and Inbox panel for waiting notices |
+| `90874e4e` | `feat(ui): show mcp: dotted names for MCP tools in compact rows` | Show `mcp:` dotted names for MCP tools in compact rows |
+| `7fe01358` | `style(mcp): rustfmt leftovers from structuredContent change` | Format `structuredContent` leftovers with rustfmt |
+| `96c7f04e` | `feat(ui): mark mid-task report notices with a ✉ icon` | Mark mid-task report notices with a `✉` icon |
+| `8b8b7bfe` | `feat(agent): carry the subagent codename to its tools as task_name` | Carry subagent codename to its tools as `task_name` |
+| `e7860357` | `feat(task): require a unique codename per subagent and address tasks by it` | Require a unique codename per subagent and address tasks by codename |
+| `b8507abd` | `docs: document task codenames, background-by-default and the report icon` | Document task codenames, background-by-default, and the report icon |
+| `86b9c981` | `feat(task): show the task description beside its codename` | Show task description beside its codename |
+| `a940ed0f` | `feat(task): name the recipient on every task_message row` | Name the recipient on every `task_message` row |
+| `78e338e5` | `fix(task): keep the selection bar continuous through the description` | Keep selection bar continuous through the description |
+| `c1a90852` | `Merge remote-tracking branch 'upstream/main'` | Merge upstream through `2d842582`, including lazy viewport-based session call restore with foreground/background highlight lanes, `grep` `exclude` regex, `edit_lines` last-line reporting, `bash` plain-word `cd` hint and `head`/`rg --type` file tool hints, `compact.prepare` `is_error` flags, missing required tool param enumeration, MCP embedded text resource preservation, `maki.uv.gettimeofday`, and waiting session `attention`/`resumable` status, while preserving core fork customizations (`compact_tools`, `PlanReady => BlockedKind::Permission`, `maki.uv.hrtime`, `structuredContent`, `highlight` unwind guard) |
 
 ---
 
