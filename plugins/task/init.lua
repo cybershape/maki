@@ -9,11 +9,9 @@ require("picker")
 require("stop")
 
 local Runner = require("runner")
--- Steering is for parents that chose background delegation, the rest should
--- not pay for the tool's definition.
-if Runner.allow_background then
-  require("message")
-end
+-- The parent's steering needs background delegation; a subagent's report
+-- does not, so the tool loads either way and id/interrupt stay gated.
+require("message")
 
 local DEFAULT_OUTPUT_LINES = 3
 local WAITING_FOR_SLOT = "waiting for a free subagent slot"

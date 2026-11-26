@@ -819,6 +819,8 @@ enum Wake {
     /// for the chat input.
     Decor,
     Agent(usize, Box<maki_agent::Envelope>),
+    /// A session's mailbox changed: a notice arrived or a run read one.
+    Mailbox(usize),
     Shell(usize, ShellEvent),
     Warn(String),
     Pack(Box<PackPreparation>),
@@ -867,12 +869,13 @@ async fn answered<T>(task: &mut Option<AbortOnDropHandle<T>>) -> Option<T> {
     answer
 }
 
-/// The first agent envelope or shell event from any session.
+/// The first agent envelope, shell event or mailbox change from any session.
 async fn session_wake(sessions: &mut [SessionRuntime]) -> Wake {
     let waits: Vec<LocalBoxFuture<'_, Wake>> = sessions
         .iter_mut()
         .enumerate()
         .flat_map(|(i, rt)| {
+            let mailbox = rt.handles.mailbox().clone();
             let (agent_rx, shell_rx) = (&mut rt.handles.agent_rx, &mut rt.shell_rx);
             [
                 Box::pin(async move { Wake::Agent(i, Box::new(next_or_pending(agent_rx).await)) })
@@ -882,6 +885,10 @@ async fn session_wake(sessions: &mut [SessionRuntime]) -> Wake {
                         Some(event) => Wake::Shell(i, event),
                         None => pending().await,
                     }
+                }),
+                Box::pin(async move {
+                    mailbox.changed().await;
+                    Wake::Mailbox(i)
                 }),
             ]
         })
@@ -1302,6 +1309,10 @@ impl<'t> EventLoop<'t> {
                 self.handle_agent(i, envelope);
                 Dirty::YES
             }
+            Wake::Mailbox(i) => {
+                self.sessions[i].app.refresh_inbox();
+                Dirty::YES
+            }
             Wake::Shell(i, event) => {
                 self.sessions[i].app.handle_shell_event(event);
                 Dirty::YES
@@ -1430,6 +1441,7 @@ impl<'t> EventLoop<'t> {
             _ => {}
         }
         self.sessions[idx].app.update(Msg::Agent(envelope));
+        self.sessions[idx].app.refresh_inbox();
     }
 
     async fn drain_channels(&mut self) -> Result<Dirty> {
@@ -1851,6 +1863,7 @@ impl<'t> EventLoop<'t> {
             let actions = self.sessions[index].app.start_woken_run();
             dirty |= Dirty::from(!actions.is_empty());
             self.dispatch(index, actions);
+            self.sessions[index].app.refresh_inbox();
         }
         dirty
     }

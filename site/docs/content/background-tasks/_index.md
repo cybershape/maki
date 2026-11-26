@@ -126,6 +126,23 @@ A finished task reaches the model as a message that starts with `Background bash
 
 An idle chat wakes up when the message arrives. A working model gets it after the current round of tool results, so a build result can change its next step without an extra request.
 
+While a message waits for the model to read it, the Inbox panel above the input box lists it, one line per message:
+
+```
+╭ Inbox ─────────────────────────────╮
+│ Subagent toolu_01 reported         │
+│ Background bash finished: tests    │
+╰────────────────────────────────────╯
+```
+
+The panel is read-only and shows at most five lines, then a `+N more` count. Once a run reads a message, it leaves the panel and draws in the transcript as a notice line that a click unfolds.
+
+## Reports from a subagent
+
+A subagent calls `task_message` with only a `message` input to report to its parent mid-task: a finding that changes the plan, a blocker that needs direction, or a risk. The report arrives as an observation that starts with `[Report from subagent <id>]`, and wakes an idle parent the same way a result does. The parent answers a blocked subagent with `task_message` and that id.
+
+The name is one tool with two directions. The parent's `id` and `interrupt` inputs need background delegation, so with `allow_background = false` a subagent can still report while the parent has no steering inputs.
+
 ## Let the model start tasks
 
 The model can ask for a background run up front with `bash(background = true)` or `task(background = true)`. Both behave like `Ctrl+B`, and the receipt sentence starts with `Started in the background as asked`. A subagent that has to wait for a free slot waits in the background.

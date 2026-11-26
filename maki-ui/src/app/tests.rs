@@ -5332,6 +5332,47 @@ fn a_pending_wake_is_work_only_while_it_may_run(
     assert_eq!(!app.start_woken_run().is_empty(), starts_run);
 }
 
+const INBOX_BODY: &str = "the IOC list is stale";
+const INBOX_LABEL: &str = "Subagent toolu_01 reported";
+
+/// The Inbox panel shows a waiting notice and empties when a run takes it,
+/// without consuming anything itself.
+#[test]
+fn refresh_inbox_shows_waiting_notices_until_a_run_reads_them() {
+    let mut app = test_app();
+    let mailbox = hold_mailbox(&mut app);
+    SessionMailbox::notify(
+        app.state.session.id,
+        INBOX_BODY.into(),
+        Some(INBOX_LABEL),
+        true,
+    )
+    .unwrap();
+
+    app.refresh_inbox();
+    assert_eq!(app.active_inbox().len(), 1);
+    assert_eq!(app.active_inbox()[0].display.as_deref(), Some(INBOX_LABEL));
+    assert_eq!(mailbox.peek().len(), 1, "the panel must not consume");
+
+    mailbox.claim_wake();
+    app.refresh_inbox();
+    assert!(app.active_inbox().is_empty());
+}
+
+/// A subagent tab keeps its own queue panel; the session's waiting notices
+/// belong to the main chat alone.
+#[test]
+fn active_inbox_is_empty_outside_the_main_chat() {
+    let mut app = test_app();
+    hold_mailbox(&mut app);
+    SessionMailbox::notify(app.state.session.id, INBOX_BODY.into(), None, false).unwrap();
+    app.refresh_inbox();
+    assert_eq!(app.active_inbox().len(), 1);
+    app.active_chat = app.chats.len();
+
+    assert!(app.active_inbox().is_empty());
+}
+
 /// Receipts the stored session left unanswered come back as lost notices,
 /// once however often it is installed, and the meta keeps them until a run
 /// takes them.

@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crate::app::tasks::TaskStatus;
 use crate::components::Overlay;
+use crate::components::inbox_panel;
 use crate::components::input::BORDER_ROWS;
 use crate::components::queue_panel;
 use crate::components::scrollbar::Thumbs;
@@ -71,6 +72,7 @@ struct ViewLayout {
     bottom_area: Rect,
     status_area: Rect,
     queue_area: Rect,
+    inbox_area: Rect,
     panel_windows: Vec<(usize, Rect)>,
     input_area: Rect,
     splits: SplitLayout,
@@ -223,6 +225,7 @@ impl App {
         } else if self.chat_accepts_input() {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
             queue_panel::height(self.active_queue_len())
+                + inbox_panel::height(self.active_inbox().len())
                 + panel_h
                 + self.input_box.height(inner.width).min(max_bottom)
         } else {
@@ -246,8 +249,16 @@ impl App {
         } else {
             queue_panel::height(self.active_queue_len())
         };
+        let inbox_height = if bottom_takeover {
+            0
+        } else {
+            inbox_panel::height(self.active_inbox().len())
+        };
 
-        let mut constraints = vec![Constraint::Length(queue_height)];
+        let mut constraints = vec![
+            Constraint::Length(queue_height),
+            Constraint::Length(inbox_height),
+        ];
         for &(_, h) in &panel_reqs {
             constraints.push(Constraint::Length(h));
         }
@@ -255,10 +266,11 @@ impl App {
 
         let areas = Layout::vertical(constraints).split(bottom_area);
         let queue_area = areas[0];
+        let inbox_area = areas[1];
         let panel_windows: Vec<(usize, Rect)> = panel_reqs
             .iter()
             .enumerate()
-            .map(|(i, &(idx, _))| (idx, areas[1 + i]))
+            .map(|(i, &(idx, _))| (idx, areas[2 + i]))
             .collect();
         let input_area = areas[areas.len() - 1];
 
@@ -268,6 +280,7 @@ impl App {
             bottom_area,
             status_area,
             queue_area,
+            inbox_area,
             panel_windows,
             input_area,
             splits,
@@ -340,6 +353,7 @@ impl App {
             let queue_entries = self.active_queue_entries();
             let focus = self.queue.focus().filter(|_| self.is_main_chat());
             queue_panel::view(frame, layout.queue_area, &queue_entries, focus);
+            inbox_panel::view(frame, layout.inbox_area, self.active_inbox());
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }

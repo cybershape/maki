@@ -6,7 +6,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use maki_agent::{
-    AgentInput, AgentMode, CompactReason, Delivery, ImageSource, InputSource, SessionMailbox,
+    AgentInput, AgentMode, CompactReason, Delivery, ImageSource, InputSource, MailboxPreview,
+    SessionMailbox,
 };
 use maki_lua::agent_autocmd::HostEvent;
 use maki_storage::model::{persist_project_model, persist_project_model_thinking};
@@ -222,6 +223,26 @@ impl App {
             .control
             .as_ref()
             .map_or(0, |control| control.len())
+    }
+
+    /// Re-reads the mailbox's waiting messages for the Inbox panel. Called on
+    /// every mailbox change and agent event, so a message shows while it waits
+    /// and leaves the frame a run reads it.
+    pub(crate) fn refresh_inbox(&mut self) {
+        self.inbox = self
+            .live_mailbox()
+            .map(SessionMailbox::peek)
+            .unwrap_or_default();
+    }
+
+    /// The Inbox panel shows the session's waiting messages, main chat only:
+    /// a subagent tab has its own queue panel for what the user typed there.
+    pub(super) fn active_inbox(&self) -> &[MailboxPreview] {
+        if self.is_main_chat() {
+            &self.inbox
+        } else {
+            &[]
+        }
     }
 
     pub(super) fn active_queue_entries(&self) -> Vec<QueueEntry<'static>> {

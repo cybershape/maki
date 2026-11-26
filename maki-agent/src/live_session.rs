@@ -78,6 +78,14 @@ pub struct CompactRequest {
     pub instructions: Option<String>,
 }
 
+/// One queued message as a frontend shows it before a run reads it: the
+/// one-line label when it has one, else the body's first line stands in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxPreview {
+    pub display: Option<String>,
+    pub body: String,
+}
+
 /// How a notice names a task: its tool, plus the call's summary when that
 /// says more than the tool name. The summary is squeezed onto one line, so
 /// the head of a notice never wraps. That is how [`notice_body`] finds where
@@ -479,15 +487,32 @@ impl SessionMailbox {
     }
 
     pub fn drain(&self) -> Vec<Message> {
-        lock(&self.live.mailbox).take()
+        self.change(Mailbox::take)
+    }
+
+    /// What waits in the mailbox, for a frontend to show before a run reads
+    /// it. A copy: nothing is consumed, no wake is claimed.
+    pub fn peek(&self) -> Vec<MailboxPreview> {
+        lock(&self.live.mailbox)
+            .pending
+            .iter()
+            .map(|message| MailboxPreview {
+                display: message.display_text.clone(),
+                body: message.first_text_content().unwrap_or_default().to_owned(),
+            })
+            .collect()
+    }
+
+    /// Waits for the next change to the mailbox without consuming anything,
+    /// unlike [`Self::next_wake`]. A peeker re-reads with [`Self::peek`].
+    /// The future registers its waiter on first poll, so poll it before the
+    /// change it must not miss.
+    pub fn changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.live.changed.notified()
     }
 
     pub fn claim_wake(&self) -> Vec<Message> {
-        let mut mailbox = lock(&self.live.mailbox);
-        if !mailbox.wake {
-            return Vec::new();
-        }
-        mailbox.take()
+        self.change(|state| if state.wake { state.take() } else { Vec::new() })
     }
 
     /// The model holds a receipt for `id` and waits for its result. `false`
@@ -879,6 +904,54 @@ mod tests {
 
         assert!(mailbox.claim_wake().is_empty());
         assert_eq!(mailbox.drain().len(), 1);
+    }
+
+    #[test]
+    fn peek_shows_pending_messages_without_consuming_them() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::notify(id, NOTICE_BODY.into(), Some(LABEL_HEAD), true).unwrap();
+        SessionMailbox::notify(id, "quiet".into(), None, false).unwrap();
+
+        let previews = mailbox.peek();
+        assert_eq!(
+            previews,
+            [
+                MailboxPreview {
+                    display: Some(LABEL_HEAD.to_owned()),
+                    body: NOTICE_BODY.to_owned(),
+                },
+                MailboxPreview {
+                    display: None,
+                    body: "quiet".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(mailbox.peek(), previews);
+        assert_eq!(mailbox.claim_wake().len(), 2);
+        assert!(mailbox.peek().is_empty());
+    }
+
+    #[tokio::test]
+    async fn changed_fires_on_notify_and_drain_without_consuming() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let waiter = mailbox.changed();
+        tokio::pin!(waiter);
+        // Register the waiter before the change, as the event loop's select
+        // does on its first poll.
+        assert!(futures::poll!(&mut waiter).is_pending());
+
+        SessionMailbox::notify(id, NOTICE_BODY.into(), None, false).unwrap();
+        (&mut waiter).await;
+        assert_eq!(mailbox.peek().len(), 1);
+
+        let waiter = mailbox.changed();
+        tokio::pin!(waiter);
+        assert!(futures::poll!(&mut waiter).is_pending());
+        mailbox.drain();
+        (&mut waiter).await;
+        assert!(mailbox.peek().is_empty());
     }
 
     #[test]

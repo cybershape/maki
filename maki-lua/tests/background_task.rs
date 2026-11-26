@@ -13,7 +13,7 @@ use common::{
     request_move,
 };
 use maki_agent::permissions::PermissionManager;
-use maki_agent::tools::ToolRegistry;
+use maki_agent::tools::{ToolAudience, ToolRegistry};
 use maki_agent::{AgentEvent, CancelToken, PermissionsConfig, SessionMailbox, ToolDoneEvent};
 use maki_config::ProjectConfig;
 use maki_lua::{MoveOutcome, Permission, PluginHost, PluginPermissions, UiAction};
@@ -599,12 +599,27 @@ fn a_message_is_refused_by_tasks_the_caller_cannot_reach() {
     assert_refused(&host, chat.id, CALL_ID);
 }
 
-/// Ctrl+B still moves a blocking task with `allow_background` off, where
-/// `task_message` is not offered.
+/// Ctrl+B still moves a blocking task with `allow_background` off. The
+/// parent's steering inputs stay hidden, while a subagent's report needs
+/// no background delegation, so the name stays registered.
 #[test]
-fn a_task_moved_without_allow_background_has_no_message_tool_and_still_reports() {
+fn a_task_moved_without_allow_background_has_no_steering_inputs_and_still_reports() {
     let mut host = Host::task_with_opts(Arc::new(ToolRegistry::new()), false, DEFAULT_SLOTS);
-    assert!(host.reg.get(MESSAGE_TOOL).is_none());
+    let entry = host
+        .reg
+        .get(MESSAGE_TOOL)
+        .expect("task_message stays registered");
+    let gated = entry
+        .tool
+        .offered_schema(false)
+        .expect("a subagent still sees the tool");
+    for param in ["id", "interrupt"] {
+        assert!(
+            gated["properties"].get(param).is_none(),
+            "{param} must stay gated"
+        );
+    }
+    assert!(gated["properties"].get("message").is_some());
     let chat = Chat::live();
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
@@ -708,4 +723,84 @@ fn the_tasks_of_a_moved_batch_are_reached_by_the_batchs_id_or_their_own() {
         last.contains(&format!("{NAMED_SECTION}{first})")),
         "the last subagent's section names its id: {last}"
     );
+}
+
+const REPORT: &str = "the IOC list is stale, need a fresh source";
+const REPORT_DELIVERED: &str = "Report delivered to the parent agent.";
+const NO_PARENT_SESSION: &str = "no parent session to report to";
+
+/// A subagent's task_message goes the other way: the report lands in the
+/// parent chat's mailbox as a waking observation named by the subagent's id.
+#[test_case(ToolAudience::RESEARCH_SUB ; "research_sub")]
+#[test_case(ToolAudience::GENERAL_SUB ; "general_sub")]
+fn a_subagents_message_reports_to_the_parent_chat(audience: ToolAudience) {
+    let host = Host::task(Arc::new(ToolRegistry::new()));
+    let chat = Chat::live();
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, SUBAGENT_TASK_ID);
+    ctx.audience = audience;
+    ctx.task_id = Some(Arc::from(SUBAGENT_TASK_ID));
+
+    let (reply, failed) = done_text(&exec(
+        &host.reg,
+        MESSAGE_TOOL,
+        json!({ "message": REPORT }),
+        &ctx,
+    ));
+
+    assert!(!failed, "{reply}");
+    assert_eq!(reply, REPORT_DELIVERED);
+    let notices = chat.mailbox.claim_wake();
+    let [notice] = &notices[..] else {
+        panic!("one report: {notices:?}");
+    };
+    let body = notice.first_text_content().unwrap();
+    assert!(
+        body.contains(SUBAGENT_TASK_ID) && body.contains(REPORT),
+        "{body}"
+    );
+    assert_eq!(
+        notice.display_text.as_deref(),
+        Some(format!("Subagent {SUBAGENT_TASK_ID} reported").as_str())
+    );
+}
+
+/// Without a session there is no parent to report to.
+#[test]
+fn a_subagents_message_without_a_session_is_refused() {
+    let host = Host::task(Arc::new(ToolRegistry::new()));
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, _events) = call_ctx(&host.reg, MakiId::generate(), &run_token, SUBAGENT_TASK_ID);
+    ctx.audience = ToolAudience::GENERAL_SUB;
+    ctx.session_id = None;
+
+    let (reply, failed) = done_text(&exec(
+        &host.reg,
+        MESSAGE_TOOL,
+        json!({ "message": REPORT }),
+        &ctx,
+    ));
+
+    assert!(failed && reply.contains(NO_PARENT_SESSION), "{reply}");
+}
+
+/// One name, two schemas: the parent keeps id and interrupt, a subagent's
+/// array offers only the message, and each audience reads its own description.
+#[test]
+fn task_message_offers_each_audience_its_own_direction() {
+    let host = Host::task(Arc::new(ToolRegistry::new()));
+    let entry = host.reg.get(MESSAGE_TOOL).expect("task_message registered");
+    let parent = entry
+        .tool
+        .offered_schema(true)
+        .expect("the parent sees the tool");
+    assert!(parent["properties"].get("id").is_some());
+    assert!(parent["properties"].get("interrupt").is_some());
+    let sub = entry
+        .tool
+        .offered_schema(false)
+        .expect("a subagent sees the tool");
+    assert!(sub["properties"].get("id").is_none());
+    assert!(sub["properties"].get("interrupt").is_none());
+    assert!(sub["properties"].get("message").is_some());
 }

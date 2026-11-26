@@ -236,6 +236,8 @@ With `background = true` the tool answers right away and the parent keeps workin
 
 The receipt names the task id. The parent can pass it to `task_message` to tell a running task something new, like a fresh lead or "wrap up now". The task reads it after its current step as a message from its parent, not the user, and a task still waiting for a slot reads it with its first prompt. Only the chat that started a task can reach it, and a stopped or finished task refuses.
 
+A subagent calls the same `task_message` name to report back mid-task, with only a `message` input. The report reaches the parent as an observation named by the subagent's id, and wakes an idle parent. The parent answers a blocked subagent with `task_message` and that id. See [Background Tasks](/docs/background-tasks/#reports-from-a-subagent).
+
 Tasks started in one `batch` move together. The batch id reaches all of them at once, and each task also has an id of its own. See [Background Tasks](/docs/background-tasks/#let-the-model-start-tasks).
 
 To stop a task, open `/tasks`, select it, and press Ctrl+S. The parent still gets the result on its next turn, but the notice does not wake it.

@@ -262,9 +262,9 @@ Set interrupt only when it must act now: it cuts the current step, running tools
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `id` | string | yes | Task id from its receipt. A batch's id reaches every subagent in it |
-| `interrupt` | boolean | no | Cut the current step short |
-| `message` | string | yes | What the subagent should know or do |
+| `id` | string | no | Parent only: task id from its receipt. A batch's id reaches every subagent in it |
+| `interrupt` | boolean | no | Parent only: cut the current step short |
+| `message` | string | yes | What the subagent should know or do, or what the parent must know |
 
 ### `todo_write` {#todo_write}
 

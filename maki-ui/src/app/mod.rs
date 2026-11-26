@@ -644,6 +644,9 @@ pub struct App {
     background_deadline: Option<Instant>,
     pub(crate) queue: MessageQueue,
     recoverable_queue: Vec<String>,
+    /// The mailbox's waiting messages, refreshed on every mailbox change and
+    /// agent event. Shown until a run reads them and they draw as notices.
+    pub(super) inbox: Vec<maki_agent::MailboxPreview>,
     pub answer_tx: Option<UnboundedSender<String>>,
     /// Bumped whenever the host opens a prompt, see [`Self::open_prompt`].
     /// The plugin windows that need input count their own, see
@@ -809,6 +812,7 @@ impl App {
             background_deadline: None,
             queue: MessageQueue::default(),
             recoverable_queue: Vec::new(),
+            inbox: Vec::new(),
             answer_tx: None,
             prompts_opened: 0,
             run_id: 0,
