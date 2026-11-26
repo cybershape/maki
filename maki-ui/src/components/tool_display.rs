@@ -36,6 +36,8 @@ pub struct RenderCtx<'a> {
 
 pub const TOOL_INDICATOR: &str = "● ";
 pub const BACKGROUND_INDICATOR: &str = "↗ ";
+/// A mid-task report from a subagent: incoming information, not a finished task.
+pub const REPORT_INDICATOR: &str = "✉ ";
 pub const MOVABLE_HINT: &str = "ctrl+b background";
 const BACKGROUND_LABEL: &str = "background";
 const BACKGROUND_CLICK_HINT: &str = "click to open";

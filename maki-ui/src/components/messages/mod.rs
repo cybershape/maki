@@ -13,7 +13,7 @@ use self::segment::{Segment, SegmentCache, body_width};
 
 use super::compact_detail::CompactTarget;
 use super::tool_display::{
-    BLANK_MARKER, MOVABLE_HINT, RenderCtx, RoleStyle, ToolLines, append_annotation,
+    BLANK_MARKER, MOVABLE_HINT, REPORT_INDICATOR, RenderCtx, RoleStyle, ToolLines, append_annotation,
     append_right_info, assistant_style, build_instructions_lines, build_tool_lines, done_style,
     error_style, format_timestamp_now, hint_columns, instructions_search_text, notice_style,
     outcome_glyph, replace_header, search_text_for, thinking_style, truncate_to_header, user_style,
@@ -2954,6 +2954,13 @@ fn message_gutter(msg: &DisplayMessage, style: &RoleStyle) -> Option<Span<'stati
         None
     } else if let Some(end) = msg.task_end {
         Some(outcome_glyph(end))
+    } else if matches!(msg.role, DisplayRole::Notice) && msg.detail.is_some() {
+        // A report carries a body but settles no task: mark it as incoming
+        // information rather than leaving the gutter blank.
+        Some(Span::styled(
+            REPORT_INDICATOR,
+            theme::current().tool_dim,
+        ))
     } else {
         Some(style.gutter())
     }

@@ -92,7 +92,7 @@ mod tests {
     use test_case::test_case;
 
     const BODY: &str = "the IOC list is stale";
-    const LABEL: &str = "Subagent toolu_01 reported";
+    const LABEL: &str = "Task toolu_01 reported: the IOC list is stale";
 
     fn preview(display: Option<&str>, body: &str) -> MailboxPreview {
         MailboxPreview {
@@ -121,20 +121,24 @@ mod tests {
 
     #[test]
     fn view_renders_the_label_and_an_overflow_count() {
-        let backend = ratatui::backend::TestBackend::new(40, 8);
+        const WIDTH: u16 = 40;
+        const BORDERS: usize = 2;
+        let backend = ratatui::backend::TestBackend::new(WIDTH, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let previews: Vec<_> = (0..MAX_ROWS + 2)
             .map(|i| preview(Some(LABEL), &format!("{BODY} {i}")))
             .collect();
 
         terminal
-            .draw(|f| view(f, Rect::new(0, 0, 40, 8), &previews))
+            .draw(|f| view(f, Rect::new(0, 0, WIDTH, 8), &previews))
             .unwrap();
 
         let buffer = terminal.backend().buffer().clone();
         let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
         assert!(content.contains("Inbox"));
-        assert!(content.contains(LABEL));
+        let content_width = WIDTH as usize - BORDERS;
+        let fits = &LABEL[..LABEL.floor_char_boundary(content_width - ELLIPSIS.len())];
+        assert!(content.contains(fits), "{content}");
         assert!(content.contains("+2 more"));
     }
 

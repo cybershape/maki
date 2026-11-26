@@ -2,7 +2,7 @@ use super::segment::{self, GUTTER_COLS};
 use super::*;
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::scrollbar::SCROLLBAR_THUMB;
-use crate::components::tool_display::{BACKGROUND_INDICATOR, TOOL_INDICATOR};
+use crate::components::tool_display::{BACKGROUND_INDICATOR, REPORT_INDICATOR, TOOL_INDICATOR};
 use crate::markdown::{EXPAND_HINT, TRUNCATION_PREFIX};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{DocPos, Selection, SelectionZone};
@@ -5054,6 +5054,18 @@ fn a_task_notice_opens_with_its_ending_dot(
         .filter(|gutter| gutter.content == TOOL_INDICATOR)
         .map(|gutter| gutter.style);
     assert_eq!(dot, style.map(|style| style(&theme::current())));
+}
+
+/// A mid-task report settles no task but carries a body, so it draws the
+/// report icon instead of a blank gutter.
+#[test]
+fn a_report_notice_shows_the_report_icon() {
+    let mut panel = notice_panel(Some(NOTICE_DETAIL));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    let gutter = panel.cache.get(0).unwrap().gutter.clone().unwrap();
+    assert_eq!(gutter.content, REPORT_INDICATOR);
+    assert_eq!(gutter.style, theme::current().tool_dim);
 }
 
 /// Shell output is not markdown: a diff's `-` lines would turn into bullets.

@@ -5333,7 +5333,7 @@ fn a_pending_wake_is_work_only_while_it_may_run(
 }
 
 const INBOX_BODY: &str = "the IOC list is stale";
-const INBOX_LABEL: &str = "Subagent toolu_01 reported";
+const INBOX_LABEL: &str = "Task toolu_01 reported: the IOC list is stale";
 
 /// The Inbox panel shows a waiting notice and empties when a run takes it,
 /// without consuming anything itself.
