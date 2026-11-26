@@ -232,9 +232,7 @@ impl McpTransport for Connection {
             }
             let result = self.request(self.peer.call_tool(params)).await?;
             let text = match &result.structured_content {
-                Some(structured) if result.is_error != Some(true) => {
-                    structured.to_string()
-                }
+                Some(structured) if result.is_error != Some(true) => structured.to_string(),
                 _ => joined_text(&result.content),
             };
             if result.is_error == Some(true) {

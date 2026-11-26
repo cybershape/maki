@@ -878,7 +878,10 @@ fn mcp_without_output_schema_returns_string() {
         },
     )
     .expect("MCP result without output schema stays a string");
-    assert!(out.contains(&format!("\"{OUTPUT_SCHEMA_FIELD}\"")), "got: {out}");
+    assert!(
+        out.contains(&format!("\"{OUTPUT_SCHEMA_FIELD}\"")),
+        "got: {out}"
+    );
 }
 
 #[test]
