@@ -14,6 +14,14 @@ local function glob_view_opts(ctx)
   return { max_lines = (tol and tol.grep) or 3, keep = "head" }
 end
 
+local function build_glob_view(lines, ctx)
+  local shortened = {}
+  for i, line in ipairs(lines) do
+    shortened[i] = shorten_path(line)
+  end
+  return ToolView.restore_lines(shortened, glob_view_opts(ctx))
+end
+
 maki.api.register_tool({
   name = "glob",
   permission = "fs_read",
@@ -43,8 +51,11 @@ maki.api.register_tool({
     return buf
   end,
 
-  restore = function(_input, output, _is_error, ctx)
-    return ToolView.restore(output, glob_view_opts(ctx))
+  restore = function(_input, output, is_error, ctx)
+    if is_error or output == NO_FILES_FOUND then
+      return ToolView.restore(output, glob_view_opts(ctx))
+    end
+    return build_glob_view(maki.split(output, "\n"), ctx)
   end,
 
   handler = function(input, ctx)
@@ -70,26 +81,12 @@ maki.api.register_tool({
       return { llm_output = NO_FILES_FOUND }
     end
 
-    local lines = {}
-    for i, f in ipairs(files) do
-      lines[i] = shorten_path(f)
-    end
-    local text = table.concat(lines, "\n")
+    local text = table.concat(files, "\n")
     local llm_output = truncate(text, max_lines, max_bytes)
-
-    local buf = maki.ui.buf()
-    local view = ToolView.new(buf, glob_view_opts(ctx))
-    for _, line in ipairs(lines) do
-      view:append(line)
-    end
-    view:finish()
-    buf:on("click", function()
-      view:toggle()
-    end)
 
     return {
       llm_output = llm_output,
-      body = buf,
+      body = build_glob_view(files, ctx),
     }
   end,
 })

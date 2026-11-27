@@ -797,3 +797,38 @@ fn header_only_tool_emits_header_snapshot_on_restore() {
     assert!(r.body.is_empty());
     assert_eq!(r.header, IMAGE_PATH);
 }
+
+#[test]
+fn glob_returns_absolute_paths_and_restores_shortened_view() {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let input = json!({ "pattern": "src/lib.rs", "path": manifest_dir });
+
+    let live = exec_live(&host, &reg, "glob", input.clone());
+    let restored = restore(&host, "glob", input, &live.output, None, Vec::new());
+
+    let line = live.output.trim();
+    assert!(
+        Path::new(line).is_absolute(),
+        "glob llm_output must be absolute, got: {line}"
+    );
+    assert!(
+        line.ends_with("maki-lua/src/lib.rs"),
+        "unexpected glob match: {line}"
+    );
+    let cwd = current_dir().unwrap();
+    let expected_body = Path::new(line)
+        .strip_prefix(&cwd)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        live.body, expected_body,
+        "live UI body should remain shortened"
+    );
+    assert_eq!(
+        restored.body, live.body,
+        "restored glob view must match the live shortened view"
+    );
+}

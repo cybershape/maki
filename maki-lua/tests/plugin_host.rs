@@ -9930,3 +9930,36 @@ fn bash_note_names_only_tools_the_model_can_call(
     });
     assert_eq!(file_tool_note(&reply), expected, "got: {reply}");
 }
+
+#[test]
+fn index_normalizes_relative_and_tilde_paths_via_abspath() {
+    let (reg, _host) = builtins_host();
+    let cwd = std::env::current_dir().unwrap();
+    let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let rel = target
+        .strip_prefix(&cwd)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| target.to_string_lossy().into_owned());
+
+    let rel_out = exec_tool(&reg, "index", json!({ "path": rel }))
+        .expect("relative path to existing file should index");
+    assert!(
+        rel_out.contains("PluginHost"),
+        "expected skeleton output, got: {rel_out}"
+    );
+
+    let tilde_err = exec_tool(
+        &reg,
+        "index",
+        json!({ "path": "~/definitely-missing-maki-index-test.rs" }),
+    )
+    .expect_err("missing tilde path should fail");
+    assert!(
+        tilde_err.starts_with("error: path not found: "),
+        "unexpected error: {tilde_err}"
+    );
+    assert!(
+        !tilde_err.contains("~/"),
+        "index should report expanded path from abspath, got: {tilde_err}"
+    );
+}

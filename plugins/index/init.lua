@@ -179,19 +179,21 @@ Return a compact overview of a source file: imports, type definitions, function 
     if is_error then
       return nil
     end
-    local meta = input.path and maki.fs.metadata(input.path :: string)
+    local path: string? = input.path and maki.fs.abspath(input.path :: string)
+    local meta = path and maki.fs.metadata(path)
     if meta and meta.is_dir then
       return dir_listing.view(output, ctx)
     end
-    local ext = input.path:match("%.([^%.]+)$") or ""
+    local ext = (path or ""):match("%.([^%.]+)$") or ""
     return render_index(output, ctx, ext)
   end,
   handler = function(input, ctx)
-    local path: string? = input.path
-    if not path then
+    local raw: string? = input.path
+    if not raw then
       return { llm_output = "error: path is required", is_error = true }
     end
 
+    local path = maki.fs.abspath(raw)
     local meta = maki.fs.metadata(path)
     if not meta then
       return { llm_output = "error: path not found: " .. path, is_error = true }
@@ -209,7 +211,7 @@ Return a compact overview of a source file: imports, type definitions, function 
       }
     end
 
-    local filename = path:match("([^/]+)$")
+    local filename = maki.fs.basename(path) or path
     local lang = indexer.FILENAME_TO_LANG[filename]
 
     if not lang then
