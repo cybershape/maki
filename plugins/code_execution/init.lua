@@ -49,8 +49,11 @@ local COMPOUND_STMT_HINT =
   "\n\nHint: In Python, compound statements (`for`, `if`, `while`, `def`, `try`, `with`) cannot follow another statement on the same line after a semicolon (`;`). Write standard multi-line Python with newlines and proper indentation:\n\n# Put each statement on its own line:\nx = await gather(...)\nfor item in x:\n    print(item)"
 local POSITIONAL_ARG_HINT =
   "\n\nHint: All tool arguments in the sandbox must use keywords. Never place a positional argument after a keyword argument, e.g. use `read(path='...', offset=1, limit=10)`."
+local MISSING_MODULE_HINT =
+  "\n\nHint: the sandbox has only part of the stdlib, and what is there can lack arguments. For more, run Python through bash."
 local ERROR_HINTS = {
   { "^ModuleNotFoundError: No module named 'tools'", TOOLS_MODULE_HINT },
+  { "^ModuleNotFoundError: No module named", MISSING_MODULE_HINT },
   { "^NameError: name 'tools' is not defined", TOOLS_MODULE_HINT },
   { "^AttributeError: module 'asyncio' has no attribute", ASYNCIO_HINT },
   { "^ImportError: cannot import name '[^']*' from 'asyncio'", ASYNCIO_HINT },

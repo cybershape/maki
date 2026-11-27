@@ -30,6 +30,7 @@ const TOOLS_MODULE_HINT_SUBSTR: &str = "There is no `tools` module";
 const ASYNCIO_HINT_SUBSTR: &str = "asyncio here has only";
 const COMPOUND_STMT_HINT_SUBSTR: &str = "compound statements";
 const POSITIONAL_ARG_HINT_SUBSTR: &str = "All tool arguments in the sandbox must use keywords";
+const MISSING_MODULE_HINT_SUBSTR: &str = "only part of the stdlib";
 const PATHLIB_NAME: &str = "leaf.txt";
 const TASK_PREFIX: &str = "task:";
 const WORKFLOW_NOTE_SUBSTR: &str = "Workflow mode: orchestrate subagents";
@@ -592,18 +593,22 @@ fn failed_call_error_names_the_tool_and_hints_only_for_asyncio_gather(code: &str
 #[test_case::test_case("await tools.interp_echo(msg='hi')", TOOLS_MODULE_HINT_SUBSTR ; "tools_attribute")]
 #[test_case::test_case("await asyncio.wait_for(interp_echo(msg='hi'), 1)", ASYNCIO_HINT_SUBSTR ; "missing_asyncio_api")]
 #[test_case::test_case("from asyncio import wait_for", ASYNCIO_HINT_SUBSTR ; "from_asyncio_import")]
+#[test_case::test_case("import html", MISSING_MODULE_HINT_SUBSTR ; "missing_stdlib_module")]
 #[test_case::test_case("asyncio.wait_for(\"No module named 'tools'\")", ASYNCIO_HINT_SUBSTR ; "source_preview_does_not_match")]
 #[test_case::test_case("x = 1; for i in [1]: print(i)", COMPOUND_STMT_HINT_SUBSTR ; "compound_statement_on_same_line")]
 #[test_case::test_case("interp_echo(msg='hi', 1)", POSITIONAL_ARG_HINT_SUBSTR ; "positional_arg_after_keyword")]
 fn a_known_sandbox_mistake_gets_its_hint(code: &str, hint: &str) {
     let err = run_code(code).expect_err("the mistake must raise");
     assert!(err.contains(hint), "got: {err}");
-    let other = if hint == TOOLS_MODULE_HINT_SUBSTR {
-        ASYNCIO_HINT_SUBSTR
-    } else {
-        TOOLS_MODULE_HINT_SUBSTR
-    };
-    assert!(!err.contains(other), "got: {err}");
+    for other in [
+        TOOLS_MODULE_HINT_SUBSTR,
+        ASYNCIO_HINT_SUBSTR,
+        MISSING_MODULE_HINT_SUBSTR,
+        COMPOUND_STMT_HINT_SUBSTR,
+        POSITIONAL_ARG_HINT_SUBSTR,
+    ] {
+        assert_eq!(err.contains(other), other == hint, "got: {err}");
+    }
 }
 
 #[test_case::test_case("raise ValueError(\"boom\\nNameError: name 'tools' is not defined\")" ; "tools_name_error")]

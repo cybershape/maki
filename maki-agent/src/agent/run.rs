@@ -1250,6 +1250,7 @@ impl<'h> Agent<'h> {
             background_for: self.background_for.clone(),
             task_id: self.task_id.clone(),
             task_name: self.task_name.clone(),
+            context_size: self.gauge.size(),
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
             reauth: self.reauth,
@@ -5034,6 +5035,17 @@ mod tests {
             .expect("valid session id");
         agent.session_id = Some(session.clone());
         assert_eq!(agent.tool_context(Arc::default()).session_id, Some(session));
+    }
+
+    /// The dispatch hands the run's own gauge to the tool ctx, so a tool
+    /// reports its agent's room: a subagent never reads the parent's.
+    #[test]
+    fn tool_context_carries_the_gauge() {
+        const USED: u32 = 12_345;
+        let mut history = History::new(Vec::new());
+        let (agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        agent.gauge.record(USED);
+        assert_eq!(agent.tool_context(Arc::default()).context_size, USED);
     }
 
     fn answer_only(

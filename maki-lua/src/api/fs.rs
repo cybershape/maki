@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, FileType};
+use std::fs::{File, FileType, ReadDir};
 use std::io::{
     BufRead, BufReader, Error as IoError, ErrorKind, Read, Result as IoResult, Seek, SeekFrom,
 };
@@ -72,16 +72,12 @@ fn filetype_str(ft: &FileType) -> &'static str {
 
 fn collect_dir_entries(
     base: &Path,
-    dir: &Path,
+    entries: ReadDir,
     depth: u32,
     max_depth: u32,
     visited: &mut HashSet<PathBuf>,
     out: &mut Vec<(String, &'static str)>,
 ) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
     for entry in entries.flatten() {
         let path = entry.path();
         let name = match path.strip_prefix(base).ok().and_then(|p| p.to_str()) {
@@ -102,8 +98,10 @@ fn collect_dir_entries(
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            if visited.insert(canonical) {
-                collect_dir_entries(base, &path, depth + 1, max_depth, visited, out);
+            if visited.insert(canonical)
+                && let Ok(children) = std::fs::read_dir(&path)
+            {
+                collect_dir_entries(base, children, depth + 1, max_depth, visited, out);
             }
         }
     }
@@ -357,6 +355,22 @@ fn next_line(
     }
 }
 
+/// A line of a page that `max_line_bytes` cut.
+#[derive(Debug, PartialEq)]
+struct CutLine {
+    /// 1-based, in the file.
+    line: u64,
+    /// Its length before the cut.
+    bytes: u64,
+}
+
+#[derive(Debug)]
+struct LinePage {
+    lines: Vec<String>,
+    cut: Vec<CutLine>,
+    total: Option<u64>,
+}
+
 struct PageQuery {
     /// 1-based, so `0` also starts at the first line.
     offset: u64,
@@ -394,15 +408,16 @@ impl PageQuery {
 /// Returns the page and, when the query counts, the total lines in the file.
 /// Both come from one pass, so they always agree even on a log that grows
 /// while we read it. Only the page itself is ever held in memory.
-fn read_line_page(
-    mut reader: impl BufRead,
-    query: &PageQuery,
-) -> IoResult<(Vec<String>, Option<u64>)> {
+fn read_line_page(mut reader: impl BufRead, query: &PageQuery) -> IoResult<LinePage> {
     let skipped = skip_lines(&mut reader, query.offset.saturating_sub(1))?;
     let mut lines = Vec::new();
+    let mut cut = Vec::new();
     let mut bytes = 0;
     while query.limit.is_none_or(|l| (lines.len() as u64) < l)
-        && let Some(Line { text: line, .. }) = next_line(&mut reader, query.max_line_bytes, false)?
+        && let Some(Line {
+            text: line,
+            bytes: full_bytes,
+        }) = next_line(&mut reader, query.max_line_bytes, false)?
     {
         // A line costs its `String` here and a string and a table slot in Lua,
         // so even a file of empty lines has to run into the limit.
@@ -411,13 +426,22 @@ fn read_line_page(
             return Err(too_large());
         }
         lines.push(line);
+        if query
+            .max_line_bytes
+            .is_some_and(|max| full_bytes > max.min(MAX_READ_BYTES))
+        {
+            cut.push(CutLine {
+                line: skipped + lines.len() as u64,
+                bytes: full_bytes,
+            });
+        }
     }
     let total = if query.count {
         Some(skipped + lines.len() as u64 + skip_lines(&mut reader, u64::MAX)?)
     } else {
         None
     };
-    Ok((lines, total))
+    Ok(LinePage { lines, cut, total })
 }
 
 /// Read a window of lines from the file at `path`.
@@ -518,8 +542,8 @@ async fn read_bytes(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
 /// UTF-8.
 ///
 /// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
-/// @param opts table? `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines (at most 64 MiB) at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `count = false` stops reading after the page and leaves `total` nil.
-/// @return (table?, string?) `{ lines = string[], total = integer? }`, or nil plus an error message.
+/// @param opts table? `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines (at most 64 MiB) at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `cut` lists every line it cut as `{ line, bytes }`: its number in the file and its full length. `count = false` stops reading after the page and leaves `total` nil.
+/// @return (table?, string?) `{ lines = string[], cut = table[], total = integer? }`, or nil plus an error message.
 /// @example
 /// local page, err = maki.fs.read_lines("server.log", { offset = 101, limit = 100, max_line_bytes = 500 })
 /// if err then return end
@@ -528,7 +552,7 @@ async fn read_bytes(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
 async fn read_lines(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
     let abs = try_pair!(make_absolute(&path));
     let query = PageQuery::from_opts(opts.as_ref())?;
-    let (lines, total) = try_pair!(
+    let page = try_pair!(
         spawn_blocking(move || {
             let reader = BufReader::with_capacity(SCAN_CHUNK, File::open(abs)?);
             read_line_page(reader, &query)
@@ -536,9 +560,17 @@ async fn read_lines(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
         .await
         .map_err(mlua::Error::external)?
     );
+    let cut = lua.create_table()?;
+    for entry in page.cut {
+        let tbl = lua.create_table()?;
+        tbl.set("line", entry.line)?;
+        tbl.set("bytes", entry.bytes)?;
+        cut.push(tbl)?;
+    }
     let tbl = lua.create_table()?;
-    tbl.set("lines", lua.create_sequence_from(lines)?)?;
-    tbl.set("total", total)?;
+    tbl.set("lines", lua.create_sequence_from(page.lines)?)?;
+    tbl.set("cut", cut)?;
+    tbl.set("total", page.total)?;
     Ok((Some(tbl), None))
 }
 
@@ -780,7 +812,8 @@ fn ext(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
 /// Each entry is a two-element array `{name, type}` where type is one of
 /// `"file"`, `"directory"`, `"link"`, or `"unknown"`. Follows symlinks.
 /// `name` is relative to {path}, so nested entries (`depth` > 1) keep their
-/// directory, as in `"tests/lib.rs"`.
+/// directory, as in `"tests/lib.rs"`. A nested directory that cannot be read
+/// is listed without its contents; an unreadable {path} is an error.
 ///
 /// @param path string Directory path.
 /// @param opts table? `depth` (integer, default 1): how many levels deep to recurse.
@@ -800,15 +833,11 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
     };
 
     let result = spawn_blocking(move || -> Result<Vec<(String, &'static str)>, String> {
-        if !abs.exists() {
-            return Err(format!("dir: path does not exist: {}", abs.display()));
-        }
-        if !abs.is_dir() {
-            return Err(format!("dir: not a directory: {}", abs.display()));
-        }
+        let entries = std::fs::read_dir(&abs)
+            .map_err(|e| format!("dir: cannot read {}: {e}", abs.display()))?;
         let mut out = Vec::new();
         let mut visited = HashSet::new();
-        collect_dir_entries(&abs, &abs, 1, max_depth, &mut visited, &mut out);
+        collect_dir_entries(&abs, entries, 1, max_depth, &mut visited, &mut out);
         Ok(out)
     })
     .await
@@ -1193,7 +1222,8 @@ async fn grep_counts(
 /// grouped by file, similar to ripgrep output.
 ///
 /// Each result entry has a `path` and a list of `groups`. Each group contains
-/// `lines`, where every line has `line_nr`, `text`, and `is_match`.
+/// `lines`, where every line has `line_nr`, `text`, and `is_match`. A line
+/// `max_line_bytes` cut also has `cut = true`, and its `text` ends in `...`.
 ///
 /// @param pattern string Regular expression to search for.
 /// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`, or `"!**/tests/**"` to leave files out). `exclude` (string): regex, a match is left out when its line matches. `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
@@ -1265,6 +1295,9 @@ async fn grep(
                 ltbl.set("line_nr", line.line_nr)?;
                 ltbl.set("text", line.text.as_str())?;
                 ltbl.set("is_match", line.is_match)?;
+                if line.cut {
+                    ltbl.set("cut", true)?;
+                }
                 lines_tbl.set(li + 1, ltbl)?;
             }
             gtbl.set("lines", lines_tbl)?;
@@ -1605,6 +1638,8 @@ mod tests {
     const READ_LIMIT_ERROR: &str = "file exceeds the 67108864-byte read limit";
     const TEST_READ_LIMIT: u64 = 4;
     const TEST_PLUGIN: &str = "test";
+    #[cfg(unix)]
+    const PERMISSION_DENIED: &str = "Permission denied";
 
     const OUTPUT_LIMITS_SRC: &str = include_str!("../../../plugins/lib/maki/output_limits.lua");
 
@@ -1728,7 +1763,7 @@ mod tests {
     #[test_case("caf\u{e9}!", &["caf\u{e9}..."]; "cut_after_a_multibyte_char")]
     #[test_case("ab\u{1f389}", &["ab..."]; "cut_inside_a_multibyte_char")]
     fn read_line_page_splits_and_cuts_lines(content: &str, expected: &[&str]) {
-        let (lines, total) =
+        let LinePage { lines, total, .. } =
             read_line_page(small_reader(content.as_bytes()), &cut_query()).unwrap();
         assert_eq!(lines, expected);
         assert_eq!(total, Some(expected.len() as u64));
@@ -1748,7 +1783,8 @@ mod tests {
             limit,
             ..PageQuery::default()
         };
-        let (lines, total) = read_line_page(small_reader(PAGE_LOG.as_bytes()), &query).unwrap();
+        let LinePage { lines, total, .. } =
+            read_line_page(small_reader(PAGE_LOG.as_bytes()), &query).unwrap();
         assert_eq!(lines, expected);
         assert_eq!(total, Some(PAGE_LOG_LINES));
     }
@@ -1762,7 +1798,7 @@ mod tests {
             count: false,
             ..PageQuery::default()
         };
-        let (lines, total) = read_line_page(&mut reader, &query).unwrap();
+        let LinePage { lines, total, .. } = read_line_page(&mut reader, &query).unwrap();
         assert_eq!(lines, ["l2"]);
         assert_eq!(total, None);
         let next = next_line(&mut reader, None, false)
@@ -1840,8 +1876,15 @@ mod tests {
     fn read_line_page_cuts_a_line_bigger_than_the_read_limit() {
         let huge_line = || BufReader::new(repeat(b'x').take(MAX_READ_BYTES * 2));
 
-        let (lines, total) = read_line_page(huge_line(), &cut_query()).unwrap();
+        let LinePage { lines, cut, total } = read_line_page(huge_line(), &cut_query()).unwrap();
         assert_eq!(lines, ["x".repeat(CUT as usize) + LINE_CUT_MARKER]);
+        assert_eq!(
+            cut,
+            [CutLine {
+                line: 1,
+                bytes: MAX_READ_BYTES * 2
+            }]
+        );
         assert_eq!(total, Some(1));
 
         let err = read_line_page(huge_line(), &PageQuery::default()).unwrap_err();
@@ -2179,6 +2222,43 @@ mod tests {
         assert!(
             matches!(err, mlua::Value::String(_)),
             "dir should return error for nonexistent path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test_case("dir" ; "dir")]
+    #[test_case("glob" ; "glob")]
+    #[tokio::test]
+    async fn unreadable_root_is_an_error(function: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads a directory whatever its mode.
+        if std::fs::read_dir(&locked).is_ok() {
+            return;
+        }
+        let path = locked.to_str().unwrap();
+
+        let lua = Lua::new();
+        let tbl =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let call: mlua::Function = tbl.get(function).unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("path", path).unwrap();
+        let args = match function {
+            "dir" => (path, opts),
+            _ => ("**/*", opts),
+        };
+        let (val, err): (mlua::Value, String) = call.call_async(args).await.unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(val, mlua::Value::Nil);
+        assert!(
+            err.contains(path) && err.contains(PERMISSION_DENIED),
+            "error should name the path and the cause, got {err:?}"
         );
     }
 

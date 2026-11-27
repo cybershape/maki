@@ -100,7 +100,7 @@ pub(crate) use crate::agent::QueuedMessage;
 use image_paste::PastedContent;
 #[cfg(test)]
 use image_paste::READING_CLIPBOARD_MSG;
-pub(crate) use mode::{Mode, PlanState, PlanTrigger};
+pub(crate) use mode::{Mode, PlanState};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
 #[cfg(test)]
@@ -1034,7 +1034,7 @@ impl App {
     }
 
     fn plan_form_open(&self) -> bool {
-        self.state.mode == Mode::Plan && self.plan_form.is_visible()
+        self.plan_toggle_ready() && self.plan_form.is_visible()
     }
 
     fn plan_form_active(&self) -> bool {
@@ -1622,9 +1622,9 @@ impl App {
 
     /// The first holder of the keyboard, in [`KeyboardOwner`] order, answers
     /// the key. The plan form passes `<Tab>` on to the next holder. The chat
-    /// answers `<C-t>` on a ready plan, and the keys its command palette takes
-    /// when no other owner holds the keyboard. For every other key this
-    /// returns `None`, leaving it to the rest of [`Self::handle_key`].
+    /// answers `<C-t>` in plan mode between turns, and the keys its command
+    /// palette takes when no other owner holds the keyboard. For every other
+    /// key this returns `None`, leaving it to the rest of [`Self::handle_key`].
     fn dispatch_overlay(
         &mut self,
         key: KeyEvent,
@@ -1919,8 +1919,10 @@ impl App {
         }
     }
 
+    /// While a turn runs the plan can still change under the form, and the
+    /// form would take the keys the user is typing for the agent.
     fn plan_toggle_ready(&self) -> bool {
-        self.state.mode == Mode::Plan && self.state.plan.is_ready()
+        self.state.mode == Mode::Plan && self.status != Status::Streaming
     }
 
     /// [`Self::run_action`] for a default key, which has no one to answer.
@@ -1981,8 +1983,14 @@ impl App {
                 let ready = self.plan_toggle_ready();
                 if ready && self.plan_form.is_visible() {
                     self.plan_form.hide();
-                } else if ready {
-                    self.open_prompt(|app| app.plan_form.toggle());
+                } else if ready && !self.offer_plan_revision() {
+                    // Nothing new on disk, so bring back the form for the plan
+                    // the user already saw.
+                    if self.state.plan.is_ready() {
+                        self.open_prompt(|app| app.plan_form.toggle());
+                    } else {
+                        self.flash(FLASH_NO_PLAN.into());
+                    }
                 }
                 ready
             }
@@ -2065,7 +2073,7 @@ impl App {
     /// 2. [`Self::dispatch_overlay`]: the holder of the keyboard, in
     ///    [`KeyboardOwner`] order, which includes the focused window,
     ///    [`Self::dispatch_focused_window`], and for the chat the `/` command
-    ///    list and `<C-t>` on a ready plan.
+    ///    list and `<C-t>` in plan mode between turns.
     /// 3. Windows on screen, front first, [`Self::dispatch_on_screen_windows`].
     /// 4. `<Esc>` while the agent runs, which [`Self::reserved_by_host`] keeps
     ///    from the global bindings, so it reaches the cancel in step 6.
@@ -2694,9 +2702,6 @@ impl App {
                 self.flash(crate::app::queue::EMPTY_PROMPT_ERR.into());
                 return vec![];
             }
-            if self.state.mode == Mode::Plan {
-                self.transition_plan(PlanTrigger::InteractivePrompt);
-            }
             if self.is_main_chat() {
                 if self.steer_and_notify(sub.into()) {
                     vec![]
@@ -2843,7 +2848,7 @@ impl App {
         if self.pack_review.is_open() {
             return Some(Attention::PackReview);
         }
-        if self.status != Status::Streaming && self.plan_form_open() {
+        if self.plan_form_open() {
             return Some(Attention::PlanReady);
         }
         self.float_mgr.needs_input().then_some(Attention::Question)

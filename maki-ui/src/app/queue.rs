@@ -12,7 +12,6 @@ use maki_agent::{
 use maki_lua::agent_autocmd::HostEvent;
 use maki_storage::model::{persist_project_model, persist_project_model_thinking};
 
-use super::mode::{Mode, PlanTrigger};
 use super::{Action, App, InputWriter, Status};
 
 use crate::agent::shared_queue::{Compaction, QueueItem, QueueSender, QueuedInput};
@@ -147,9 +146,6 @@ impl App {
     pub(crate) fn submit_prompt(&mut self, msg: QueuedMessage) -> SubmitOutcome {
         if msg.text.trim().is_empty() && msg.images.is_empty() {
             return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR);
-        }
-        if self.state.mode == Mode::Plan {
-            self.transition_plan(PlanTrigger::InteractivePrompt);
         }
         if self.status == Status::Streaming {
             if self.queue_and_notify(msg) {
@@ -384,6 +380,7 @@ impl App {
     /// learns the agent is busy. Immediate-dispatch items skip this event,
     /// so no dedup needed.
     pub(super) fn on_queue_item_consumed(&mut self, text: String, images: Vec<ImageSource>) {
+        self.plan_answers.yield_to_run();
         self.status = Status::Streaming;
         self.turn_started_at = Some(Instant::now());
         self.main_chat().show_user_message(text, images);
@@ -419,6 +416,7 @@ impl App {
     /// `Action::SendMessage` must go through here so `run_id` bumps exactly
     /// once per run.
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
+        self.plan_answers.yield_to_run();
         self.run_id += 1;
         self.clear_exit_request();
         // New work supersedes text held for recovery after an agent error.

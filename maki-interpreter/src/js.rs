@@ -931,6 +931,9 @@ fn format_caught_error<'js>(ctx: &Ctx<'js>, err: JsError) -> String {
                 .get::<_, String>("name")
                 .unwrap_or_else(|_| "Error".to_owned());
             let message = ex.message().unwrap_or_default();
+            if name == "InternalError" && message == "out of memory" {
+                return MEMORY_LIMIT_EXCEEDED.to_owned();
+            }
             let header = if message.is_empty() {
                 name
             } else {

@@ -219,6 +219,8 @@ maki.api.register_tool({
 const MINIMAL_SCHEMA: &str =
     r#"{ type = "object", properties = {}, additionalProperties = false }"#;
 
+const SHORTHAND_VALUE: &str = "Red";
+
 const STRING_FIELD_SCHEMA: &str = r#"{
     type = "object",
     properties = { url = { type = "string" } },
@@ -971,10 +973,12 @@ fn handler_state_flows_to_tool_output_and_serde() {
     assert_eq!(parsed.state(), Some(&expected), "state must survive serde");
 }
 
-/// Restores `tool` from `src` and returns the snapshot's concatenated text.
+/// Restores `tool` from `src` and returns the text of its body and header
+/// snapshots, joined.
 fn restore_snapshot_text(
     src: &str,
     tool: &str,
+    input: Value,
     clicks: Vec<usize>,
     state: Option<serde_json::Value>,
 ) -> String {
@@ -988,7 +992,7 @@ fn restore_snapshot_text(
             tool: Arc::from(tool),
             tool_use_id: "restore_id".to_owned(),
             output: "ok".to_owned(),
-            input: serde_json::json!({}),
+            input,
             is_error: false,
             tool_output_lines: ToolOutputLines::default(),
             theme_gen: None,
@@ -1004,7 +1008,9 @@ fn restore_snapshot_text(
 
     let mut text = String::new();
     for env in iter::from_fn(|| rx.try_recv().ok()) {
-        if let maki_agent::AgentEvent::ToolSnapshot { snapshot, .. } = env.event {
+        if let maki_agent::AgentEvent::ToolSnapshot { snapshot, .. }
+        | maki_agent::AgentEvent::ToolHeaderSnapshot { snapshot, .. } = env.event
+        {
             for line in snapshot.lines.iter() {
                 for span in &line.spans {
                     text.push_str(&span.text);
@@ -1037,8 +1043,51 @@ fn restore_reads_persisted_state(with_state: bool, expected: &str) {
             end
         }})"#,
     );
-    let text = restore_snapshot_text(&src, "state_restore", Vec::new(), state);
+    let text = restore_snapshot_text(&src, "state_restore", json!({}), Vec::new(), state);
     assert!(text.contains(expected), "expected {expected:?} in: {text}");
+}
+
+/// The stored call keeps the shorthand the model sent. Restore and header
+/// must still see the clean shape the live handler got.
+#[test_case::test_case(
+    r#"{ type = "object", required = { "target" },
+         properties = { target = { type = "string", alias = "file_path" } } }"#,
+    json!({ "file_path": SHORTHAND_VALUE }),
+    "input.target"
+    ; "alias"
+)]
+#[test_case::test_case(
+    r#"{ type = "object", required = { "items" }, properties = { items = {
+         type = "array", accept_single = true,
+         items = { type = "object", required = { "label" },
+                   properties = { label = { type = "string" } } } } } }"#,
+    json!({ "label": SHORTHAND_VALUE }),
+    "input.items[1].label"
+    ; "accept_single"
+)]
+fn restore_sees_canonical_input_from_shorthand(schema: &str, input: Value, probe: &str) {
+    let src = format!(
+        r#"local function probe(input) return {probe} end
+        maki.api.register_tool({{
+            name = "shorthand_restore",
+            description = "t",
+            schema = {schema},
+            handler = function() return "ok" end,
+            header = function(input) return "header=" .. probe(input) end,
+            restore = function(input)
+                local buf = maki.ui.buf()
+                buf:line("body=" .. probe(input))
+                return buf
+            end
+        }})"#,
+    );
+    let text = restore_snapshot_text(&src, "shorthand_restore", input, Vec::new(), None);
+    for expected in [
+        format!("header={SHORTHAND_VALUE}"),
+        format!("body={SHORTHAND_VALUE}"),
+    ] {
+        assert!(text.contains(&expected), "expected {expected:?} in: {text}");
+    }
 }
 
 #[test]
@@ -1070,6 +1119,7 @@ fn restore_ctx_is_userdata_with_gated_capabilities() {
     let text = restore_snapshot_text(
         &src,
         "ctx_restore",
+        json!({}),
         Vec::new(),
         Some(serde_json::json!({ "tag": "hi" })),
     );
@@ -1212,7 +1262,7 @@ fn restore_snapshot_contains_async_run_content(clicks: Vec<usize>, expected: &st
             end
         }})"#,
     );
-    let text = restore_snapshot_text(&src, "async_restore", clicks, None);
+    let text = restore_snapshot_text(&src, "async_restore", json!({}), clicks, None);
     assert!(text.contains("sync line"), "sync content missing: {text}");
     assert!(
         text.contains(expected),
@@ -7639,6 +7689,7 @@ mod read_tool_params {
         const HEAD: &str = "first\nsecond\n";
         const OVER_LUA_HEAP: u64 = 600 * 1024 * 1024;
         const DEFAULT_MAX_LINE_BYTES: usize = 500;
+        const DEFAULT_MAX_SINGLE_LINE_BYTES: usize = 8192;
         let (reg, _host) = builtins_host();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("huge.log");
@@ -7656,7 +7707,29 @@ mod read_tool_params {
             serde_json::json!({ "path": path.to_str().unwrap(), "offset": 2, "limit": 2 }),
         );
         let huge_line_cut = "\0".repeat(DEFAULT_MAX_LINE_BYTES);
-        assert_eq!(out, Ok(format!("2: second\n3: {huge_line_cut}...")));
+        let huge_line_bytes = OVER_LUA_HEAP - HEAD.len() as u64;
+        assert_eq!(
+            out,
+            Ok(format!(
+                "2: second\n3: {huge_line_cut}...\n\nLines cut at {DEFAULT_MAX_LINE_BYTES} bytes, the `...` at their end is not in the file: 3 ({huge_line_bytes} bytes). Read one alone (limit=1) for up to {DEFAULT_MAX_SINGLE_LINE_BYTES} bytes of it."
+            ))
+        );
+    }
+
+    #[test_case::test_case(2000, 2000, "" ; "comes_whole")]
+    #[test_case::test_case(9000, 8192, "...\n\nLines cut at 8192 bytes, the `...` at their end is not in the file: 2 (9000 bytes)." ; "is_cut_at_its_own_limit")]
+    fn a_line_read_alone(line_bytes: usize, kept_bytes: usize, tail: &str) {
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.txt");
+        std::fs::write(&path, format!("short\n{}\n", "x".repeat(line_bytes))).unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({ "path": path.to_str().unwrap(), "offset": 2, "limit": 1 }),
+        );
+        assert_eq!(out, Ok(format!("2: {}{tail}", "x".repeat(kept_bytes))));
     }
 
     #[test]
@@ -9879,6 +9952,10 @@ fn file_tool_note(reply: &str) -> Option<&str> {
 #[test_case::test_case("echo \"$(cat /dev/null)\"", None ; "command_substitution")]
 #[test_case::test_case("for f in /dev/null; do cat \"$f\"; done", None ; "loop_body")]
 #[test_case::test_case("git grep -c zzz-no-match -- /dev/null", None ; "subcommand_named_grep")]
+#[test_case::test_case("V=/dev\ncd \"$V\"; cat null; echo ---; cat null", Some("the read tool instead of cat") ; "reads_held_together_by_glue")]
+#[test_case::test_case("ls /dev/null; stat /dev/null", None ; "beside_a_command_no_tool_covers")]
+#[test_case::test_case("ls /dev/null; for d in /dev/null; do rg zzz-no-match \"$d\"; done", None ; "beside_a_loop")]
+#[test_case::test_case("cat /dev/null && cat /dev/null | wc -l", None ; "beside_a_pipe")]
 fn bash_names_the_file_tool_a_command_stands_in_for(command: &str, expected: Option<&str>) {
     let reply = bash_reply(command, |_| {});
     assert_eq!(file_tool_note(&reply), expected, "got: {reply}");

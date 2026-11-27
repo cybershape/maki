@@ -22,6 +22,7 @@ use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::permissions::{LayerAnswer, LayerVerdict, PluginRuleStore};
 use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
 use maki_agent::tools::hook::Verdict;
+use maki_agent::tools::schema::{ParamSchema, validate};
 use maki_agent::tools::{
     HeaderResult, MovedCall, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry,
     ToolSource,
@@ -3809,6 +3810,7 @@ async fn drain_barrier(
 }
 
 struct ToolKeys {
+    schema: &'static ParamSchema,
     handler: RegistryKey,
     header: Option<RegistryKey>,
     restore: Option<RegistryKey>,
@@ -3820,6 +3822,7 @@ struct ToolKeys {
 impl ToolKeys {
     fn release(self, lua: &Lua, plugin: &str) {
         let Self {
+            schema: _,
             handler,
             header,
             restore,
@@ -4455,6 +4458,7 @@ impl LuaRuntime {
                 (
                     t.meta.name,
                     ToolKeys {
+                        schema: t.meta.schema,
                         handler: t.handler_key,
                         header: t.header_key,
                         restore: t.restore_key,
@@ -4846,7 +4850,7 @@ async fn compute_header(
 }
 
 async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Option<RestoreReply> {
-    let (func, plugin_name, has_header) = {
+    let (func, plugin_name, has_header, schema) = {
         let plugins = plugins.borrow();
         let (pname, tk) = plugins.iter().find_map(|(pname, owner)| {
             owner
@@ -4858,8 +4862,13 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
             .restore
             .as_ref()
             .and_then(|key| lua.registry_value::<Function>(key).ok());
-        (func, pname, tk.header.is_some())
+        (func, pname, tk.header.is_some(), tk.schema)
     };
+    // The stored call keeps the shorthand the model sent, like an alias or a
+    // single item without its list. Validating gives Lua the same shape the
+    // live handler got. Input that never validated, like a call that errored,
+    // goes through as it is.
+    let input = validate(schema, item.input.clone()).unwrap_or(item.input);
     let Some(func) = func else {
         if !has_header {
             return None;
@@ -4867,13 +4876,13 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
         return Some(RestoreReply {
             body: None,
             header: Some(
-                compute_header(lua, plugins, &plugin_name, &item.tool, item.input)
+                compute_header(lua, plugins, &plugin_name, &item.tool, input)
                     .await
                     .into_snapshot(),
             ),
         });
     };
-    let input_lua = json_to_lua(lua, &item.input).ok()?;
+    let input_lua = json_to_lua(lua, &input).ok()?;
 
     let (dummy_tx, _) = unbounded_channel();
     let mut cell = TaskCell::new(
@@ -4936,7 +4945,7 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
         let mut reply = extract_restore_reply(&ret)?;
         if reply.header.is_none() {
             reply.header = Some(
-                compute_header(lua, plugins, &plugin_name, &item.tool, item.input)
+                compute_header(lua, plugins, &plugin_name, &item.tool, input)
                     .await
                     .into_snapshot(),
             );
@@ -8094,6 +8103,7 @@ mod tests {
             lua.create_registry_value(func).unwrap()
         };
         let keys = ToolKeys {
+            schema: &ParamSchema::Any { description: "" },
             handler: key(),
             header: Some(key()),
             restore: Some(key()),

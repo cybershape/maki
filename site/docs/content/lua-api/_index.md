@@ -481,6 +481,11 @@ Invalid UTF-8 in the returned text becomes U+FFFD.
 "full" when code such as `code_execution` made the call. Apply output limits
 only in compact mode.
 
+`ctx:context_usage()` returns `{ size, window }`: the tokens the calling agent's
+context holds and that agent's own window, snapshotted when its run built
+the call's context. A subagent sees its own numbers, never the parent
+session's. `(nil, err)` outside a handler ctx, as in `start` and restore.
+
 **Parameters:**
 
 - `{spec}` (`table`) Tool specification:
@@ -962,9 +967,10 @@ name the session now running or focused. What each event adds:
 - `"CompactionDone"`: `data.context_size_before`,
   `data.context_size_after`, `data.context_window`, and `data.summary`,
   the text that replaced the history.
-- `"PlanReady"`: `data.path`, the absolute path of the plan file the
-  agent just wrote. Fires once per draft. Plan state is per session, so
-  pass `data.session_id` to `maki.plan.read`.
+- `"PlanReady"`: `data.path`, the absolute path of the plan file shown
+  for review. Fires each time a changed plan is shown, see
+  `maki.plan.read`. Plan state is per session, so pass `data.session_id`
+  to `maki.plan.read`.
 - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
   first focus at startup.
 - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
@@ -1428,9 +1434,12 @@ maki.plan.read({opts?})
 Read the current plan state. Returns `{ mode, path, content, ready }`:
 - `mode` is `"plan"` or `"build"`.
 - `path` is the absolute plan path once the session has one, else `nil`.
-- `ready` is `true` once the agent has written the plan file.
+- `ready` is `true` once the user has been shown the plan for review. That
+  happens when the agent is done and the plan changed since it was last
+  shown, or on `<C-t>`. It stays `true` while later turns refine the plan.
 - `content` is the file contents, `nil` when the plan is not ready or the
-  read failed.
+  read failed. While a turn runs it may be half edited. Implementing uses
+  the file as it is at that moment, and shows it again first if it changed.
 
 Requires the `session_read` [plugin permission](#plugin-permissions).
 
@@ -3153,9 +3162,9 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Absolute or relative file path. `~/` is expanded to the home directory.
-- `{opts?}` (`table?`) `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines (at most 64 MiB) at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `count = false` stops reading after the page and leaves `total` nil.
+- `{opts?}` (`table?`) `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines (at most 64 MiB) at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `cut` lists every line it cut as `{ line, bytes }`: its number in the file and its full length. `count = false` stops reading after the page and leaves `total` nil.
 
-**Returns:** (`table?`, `string?`) `{ lines = string[], total = integer? }`, or nil plus an error message.
+**Returns:** (`table?`, `string?`) `{ lines = string[], cut = table[], total = integer? }`, or nil plus an error message.
 
 **Example:**
 
@@ -3418,7 +3427,8 @@ List the contents of the directory at {path}.
 Each entry is a two-element array `{name, type}` where type is one of
 `"file"`, `"directory"`, `"link"`, or `"unknown"`. Follows symlinks.
 `name` is relative to {path}, so nested entries (`depth` > 1) keep their
-directory, as in `"tests/lib.rs"`.
+directory, as in `"tests/lib.rs"`. A nested directory that cannot be read
+is listed without its contents; an unreadable {path} is an error.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
 
@@ -3651,7 +3661,8 @@ Search file contents for a regex {pattern}. Returns structured matches
 grouped by file, similar to ripgrep output.
 
 Each result entry has a `path` and a list of `groups`. Each group contains
-`lines`, where every line has `line_nr`, `text`, and `is_match`.
+`lines`, where every line has `line_nr`, `text`, and `is_match`. A line
+`max_line_bytes` cut also has `cut = true`, and its `text` ends in `...`.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
 

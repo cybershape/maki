@@ -643,13 +643,11 @@ function Batch:background_if_due()
     return
   end
   self.move_tried = true
-  maki.async.run(function()
-    local moved, err = self.ctx:background()
-    -- Everything finished in the meantime, so there is nothing to explain.
-    if not moved and err ~= NOTHING_RUNNING then
-      self.foreground_reason = err
-    end
-  end)
+  local moved, err = self.ctx:background()
+  -- Everything finished in the meantime, so there is nothing to explain.
+  if not moved and err ~= NOTHING_RUNNING then
+    self.foreground_reason = err
+  end
 end
 
 -- A moved batch's reply becomes a notice, and the transcript can only draw

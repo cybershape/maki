@@ -2,13 +2,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_agent::{AgentEvent, Envelope, SubagentInfo, ToolDoneEvent};
-use maki_lua::agent_autocmd::HostEvent;
 use maki_providers::{TokenUsage, add_cost};
 use maki_storage::sessions::StoredTokenUsage;
 
 use super::{
     AUTH_EXPIRED_MSG, App, ERROR_BUBBLE_MAX_CHARS, ExitOnDone, MAIN_CHAT, MISSING_TOOL_COMPLETION,
-    Mode, PlanTrigger, RESTORE_RUN_ID,
+    RESTORE_RUN_ID,
 };
 use crate::app::tasks::{TaskClock, TaskOutcome, TaskParent};
 use crate::chat::{Chat, ChatEventResult, DONE_TEXT, ERROR_TEXT};
@@ -231,12 +230,7 @@ impl App {
             return;
         };
 
-        let plan_path = if self.state.mode == Mode::Plan {
-            self.state.plan.path()
-        } else {
-            None
-        };
-        let result = self.chats[chat_idx].handle_event(event, plan_path);
+        let result = self.chats[chat_idx].handle_event(event);
 
         if is_plugin_task {
             self.end_plugin_prompt(chat_idx, result);
@@ -328,11 +322,6 @@ impl App {
     }
 
     fn record_tool_done(&mut self, chat_idx: usize, done: &ToolDoneEvent) {
-        if self.state.mode == Mode::Plan
-            && self.state.plan.path().is_some_and(|pp| done.wrote_to(pp))
-        {
-            self.transition_plan(PlanTrigger::WriteDone);
-        }
         self.state
             .session_mut()
             .insert_tool_output(done.id.clone(), done.output.clone());
@@ -481,14 +470,6 @@ impl App {
                 self.chat_index.clear();
                 self.status = Status::Idle;
                 self.turn_started_at = None;
-                if self.state.mode == Mode::Plan && self.plan_answers.pending_offer {
-                    self.plan_answers.pending_offer = false;
-                    let path = self.state.plan.path().map(|p| p.display().to_string());
-                    self.offer_plan_form(path.as_deref());
-                    if let Some(path) = path {
-                        self.fire_session_event(HostEvent::PlanReady { path: &path });
-                    }
-                }
                 if let Some(ExitOnDone { background_wait }) = self.exit_on_done {
                     self.exit_request = ExitRequest::Success;
                     self.background_deadline = self

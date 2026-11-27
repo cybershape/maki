@@ -29,6 +29,7 @@ use tokio::sync::mpsc::unbounded_channel;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
@@ -418,6 +419,10 @@ pub struct ToolContext {
     /// name itself without asking the host. `None` in the owning agent.
     pub task_name: Option<Arc<str>>,
     pub tool_use_id: Option<String>,
+    /// Tokens the calling agent's context holds at the moment the dispatch
+    /// built this context, taken from that run's own gauge. `0` where no run
+    /// backs the context: the interpreter, CLI one-shots, a background seed.
+    pub context_size: u32,
     pub user_response_rx: Option<Arc<Mutex<UnboundedReceiver<String>>>>,
     /// See [`crate::Agent::with_reauth`]. Carried here so a subagent session
     /// offers a re-login only where its parent does.
@@ -560,11 +565,18 @@ pub fn walk_builder(root: &str, patterns: &[&str]) -> Result<WalkBuilder, String
 /// `.git` is always excluded, even when `gitignore` is false.
 /// Glob patterns are evaluated in `filter_entry` instead of `WalkBuilder::overrides`
 /// so positive patterns like `**/*` never outrank `.gitignore` or `.git` exclusions.
+/// A root that cannot be read is an error here, because the walk itself would
+/// drop it and come back empty.
 pub fn walk_builder_opts(
     root: &str,
     patterns: &[&str],
     gitignore: bool,
 ) -> Result<WalkBuilder, String> {
+    if let Err(error) = fs::read_dir(root)
+        && error.kind() == ErrorKind::PermissionDenied
+    {
+        return Err(format!("cannot read {root}: {error}"));
+    }
     let filter = if patterns.is_empty() {
         None
     } else {
@@ -722,6 +734,7 @@ pub fn interpreter_ctx(
         task_id: None,
         task_name: None,
         tool_use_id: None,
+        context_size: 0,
         user_response_rx,
         reauth: false,
         loaded_instructions: LoadedInstructions::new(),
@@ -1364,6 +1377,24 @@ mod tests {
         }
         #[cfg(not(windows))]
         assert_eq!(resolve_path("/etc/hosts").unwrap(), "/etc/hosts");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_builder_reports_an_unreadable_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads a directory whatever its mode.
+        if fs::read_dir(tmp.path()).is_ok() {
+            return;
+        }
+        let root = tmp.path().to_string_lossy();
+        let err = walk_builder(&root, &[]).unwrap_err();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(err.contains(root.as_ref()), "got: {err}");
     }
 
     #[test]

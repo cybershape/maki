@@ -1657,8 +1657,7 @@ mod tests {
     use super::*;
     use crate::tools::schema::TOOLCALL_REASON_FIELD;
     use config::{
-        DEFAULT_STARTUP_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, RawHttpFields, RawServerConfig,
-        RawStdioFields, RawTransport,
+        DEFAULT_TIMEOUT_MS, RawHttpFields, RawServerConfig, RawStdioFields, RawTransport,
     };
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1679,7 +1678,7 @@ mod tests {
             enabled: true,
             description: None,
             timeout: DEFAULT_TIMEOUT_MS,
-            startup_timeout: DEFAULT_STARTUP_TIMEOUT_MS,
+            startup_timeout: None,
             always_load: false,
             transport: RawTransport::Stdio(RawStdioFields {
                 command: cmd.iter().map(|s| s.to_string()).collect(),

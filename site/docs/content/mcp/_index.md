@@ -79,7 +79,7 @@ Maki checks certificates against the operating system's trust store, so a CA tha
 | `ca_file` | path | | HTTP only. PEM bundle that replaces the default CAs for this server and its OAuth |
 | `description` | string | | Summary of the server capabilities shown to the model |
 | `timeout` | u64 | 30000 | Milliseconds to wait per request (that is, for each tool call to complete). Not capped |
-| `startup_timeout` | u64 | 30000 | Milliseconds to wait at startup, both to connect and to list tools and prompts. Not capped |
+| `startup_timeout` | u64 | `timeout` | Milliseconds to wait at startup, both to connect and to list tools and prompts. Not capped |
 | `enabled` | bool | true | |
 
 Set `command` for stdio, `url` for HTTP. Pick one.
