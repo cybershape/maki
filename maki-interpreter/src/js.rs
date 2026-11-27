@@ -47,6 +47,8 @@ const OBJECT_ARGS_HINT: &str =
     "pass arguments as an object (e.g. read({ path: '/file', offset: 1, limit: 100 }))";
 const TOO_DEEP_ERR: &str = "value nesting exceeds maximum depth";
 const SCAN_LIMIT_ERR: &str = "directory listing exceeded sandbox limit";
+const NULL_BYTE_ERR_PREFIX: &str = "source contains raw NUL byte (0x00)";
+const NULL_BYTE_HINT: &str = "likely from an unescaped \\u0000 in JSON; escape backticks as \\` inside template literals, use normal quotes/concatenation, or write \\\\u0000 / \\\\x00 inside a JS string literal";
 
 const JS_BOOTSTRAP: &str = r#"
 (function () {
@@ -436,7 +438,25 @@ impl<F: Future> Future for TimedFuture<F> {
     }
 }
 
+fn check_no_nul_bytes(src: &str, filename: &str) -> Result<(), InterpreterError> {
+    let Some(pos) = src.as_bytes().iter().position(|&b| b == 0) else {
+        return Ok(());
+    };
+    let prefix = &src[..pos];
+    let line = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
+    let line_start = prefix.rfind('\n').map_or(0, |i| i + 1);
+    let col = prefix[line_start..].chars().count() + 1;
+    Err(InterpreterError::Parse(format!(
+        "{NULL_BYTE_ERR_PREFIX} at {filename}:{line}:{col} ({NULL_BYTE_HINT})"
+    )))
+}
+
 pub fn run(code: &str, config: JsRunConfig) -> Result<InterpreterResult, InterpreterError> {
+    check_no_nul_bytes(code, JS_SCRIPT_NAME)?;
+    if !config.preamble.trim().is_empty() {
+        check_no_nul_bytes(&config.preamble, PREAMBLE_NAME)?;
+    }
+
     let cwd = current_dir()
         .map(|d| d.to_string_lossy().into_owned())
         .map_err(|e| InterpreterError::Runtime(format!("cannot resolve cwd: {e}")))?;
@@ -1379,5 +1399,23 @@ mod tests {
     fn fs_removal_is_denied_with_shared_message() {
         let err = run_simple("fs.unlinkSync('/tmp/anything')").expect_err("unlink should fail");
         assert!(err.to_string().contains(REMOVAL_UNSUPPORTED), "got: {err}");
+    }
+
+    #[test_case("const s = `\0`;", "agent.js:1:12" ; "single_line")]
+    #[test_case("const a = '中文';\nconst b = `前缀\0后缀`;", "agent.js:2:14" ; "multiline_utf8")]
+    fn raw_nul_byte_reports_location_and_hint(code: &str, expected_loc: &str) {
+        let err = run_simple(code).expect_err("raw NUL byte should fail before eval");
+        assert!(matches!(err, InterpreterError::Parse(_)), "got: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains(NULL_BYTE_ERR_PREFIX), "got: {msg}");
+        assert!(msg.contains(expected_loc), "got: {msg}");
+        assert!(msg.contains(NULL_BYTE_HINT), "got: {msg}");
+    }
+
+    #[test]
+    fn escaped_nul_in_js_string_literal_still_succeeds() {
+        let res = run_simple(r#"`a\u0000b`.replaceAll('\x00', '`')"#)
+            .expect("escaped NUL sequences should succeed");
+        assert_eq!(res.output, Some(json!("a`b")));
     }
 }
