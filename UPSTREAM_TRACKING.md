@@ -10,16 +10,16 @@ This document records the synchronization point between this repository (`origin
 - **Upstream tracking branch**: `upstream/main`
 - **Current local branch**: `main` (tracking `origin/main`: `git@github.com:cybershape/maki.git`)
 - **Latest synchronized upstream commit**:
-  - **Commit SHA**: `2d84258235167ec7b731e523eac7d431396fa314`
-  - **Commit date**: `Fri Nov 27 00:07:03 2026 +0200`
-  - **Commit author**: `Tony Solomonik <tony.solomonik@gmail.com>`
-  - **Commit message**: `test(lua): skip the markdown compile in the skill restore test`
+  - **Commit SHA**: `aa6c1f5564938e11a25c5ca8e38a451722821e92`
+  - **Commit date**: `Sat Nov 14 16:39:35 2026 +0200`
+  - **Commit author**: `Piotr Karbowski <git.throwaway941@simplelogin.com>`
+  - **Commit message**: `fix(ui): drop a picked plan row's outcome when a run starts`
 - **Initial fork point (Initial Merge Base)**:
   - **Commit SHA**: `70348ec0a50b84544003cb119550778652e0d7d8`
   - **Commit date**: `Sun Oct 25 11:34:26 2026 +0100`
   - **Commit message**: `chore(deps): move monty to crates.io 1.x`
 
-> `upstream/main` has been successfully merged through commit `2d842582`.
+> `upstream/main` has been successfully merged through commit `aa6c1f55`.
 
 ---
 
@@ -272,6 +272,13 @@ The current branch includes the following commits since fork point `70348ec0a50b
 | `a940ed0f` | `feat(task): name the recipient on every task_message row` | Name the recipient on every `task_message` row |
 | `78e338e5` | `fix(task): keep the selection bar continuous through the description` | Keep selection bar continuous through the description |
 | `c1a90852` | `Merge remote-tracking branch 'upstream/main'` | Merge upstream through `2d842582`, including lazy viewport-based session call restore with foreground/background highlight lanes, `grep` `exclude` regex, `edit_lines` last-line reporting, `bash` plain-word `cd` hint and `head`/`rg --type` file tool hints, `compact.prepare` `is_error` flags, missing required tool param enumeration, MCP embedded text resource preservation, `maki.uv.gettimeofday`, and waiting session `attention`/`resumable` status, while preserving core fork customizations (`compact_tools`, `PlanReady => BlockedKind::Permission`, `maki.uv.hrtime`, `structuredContent`, `highlight` unwind guard) |
+| `b1054afc` | `docs: update upstream tracking record to 2d842582` | Update the upstream tracking record to `2d842582` |
+| `5c8e531f` | `fix(plugins): enforce max_output_bytes on read slices and head elision` | Enforce `max_output_bytes` on `read` slices and head elision |
+| `c04408af` | `fix(plugins): return absolute paths from glob and normalize index paths` | Return absolute paths from `glob` and normalize `index` paths |
+| `e2c9be86` | `fix(interpreter): report raw NUL bytes in JS source with location and hint` | Report raw NUL bytes in JS source with location and hint |
+| `ae69173a` | `fix(tasks): make subagent messaging and inbox delivery reliable` | Make subagent messaging and inbox delivery reliable |
+| `ad7e5a22` | `fix(agent): scope tool stall nudges to the current run` | Scope tool stall nudges to the current run |
+| `a3a23d8e` | `Merge remote-tracking branch 'upstream/main' into main` | Merge upstream through `aa6c1f55` (v0.7.4), including `mcp` `startup_timeout` fallback to `timeout`, `edit` bare `...` `expect` match fix, restore schema validation, unreadable dir errors in `list_dir`/`glob`/`grep`, `code_execution` missing stdlib hint, `bash` `file_tool_note` tightening, `read` cut-line note and `max_single_line_bytes`, `grep` cut-line note, `ctx:context_usage()`, subagent gauge isolation, and draining-turn plan offering (`on_queue_drained`), while preserving core fork customizations (`list_dir`, `read` elision & `max_output_bytes`, `code_execution` JS/Python hints, `task_name`, `toolcall_reason`, `compact_tools`, `PlanReady => BlockedKind::Permission`, `batch` eager move for `task_message` delivery) |
 
 ---
 
