@@ -1204,7 +1204,9 @@ impl<'h> Agent<'h> {
         let nudges = self.history.recent_nudges();
         let nudge = !self.moved_last_round
             && nudges < MAX_NUDGES
-            && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
+            && self
+                .history
+                .has_recent_tool_results(self.rollback_len, RECENT_TOOL_WINDOW);
         self.history.push(Message::empty_marker());
         if !nudge {
             return Ok(false);
@@ -4881,20 +4883,64 @@ mod tests {
         );
     }
 
-    /// Pins the regression where a stale nudge counter made a follow-up
-    /// "continue" end instantly: the budget lives in the history tail, and
-    /// the new user message breaks the streak.
+    #[tokio::test]
+    async fn inbox_wake_does_not_nudge_for_previous_run_tools() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let mock = MockProvider::new(vec![
+            tool_call_response("glob", "t1"),
+            text_response(StopReason::EndTurn),
+            empty_response(),
+            text_response(StopReason::EndTurn),
+        ]);
+        let requests = Arc::clone(&mock.requests);
+        let mut history = History::new(Vec::new());
+        let (mut agent, mut event_rx) = make_agent(mock, &mut history);
+        agent.mailbox = Some(mailbox);
+
+        assert_eq!(
+            agent.run(default_input()).await.unwrap(),
+            DoneReason::EndTurn
+        );
+        SessionMailbox::notify(id, NOTICE_BODY.into(), Some(NOTICE_LINE), true).unwrap();
+        let mut wake = default_input();
+        wake.message.clear();
+        assert_eq!(agent.run(wake).await.unwrap(), DoneReason::EndTurn);
+
+        let events = drain_events(&mut event_rx);
+        assert!(!has_event(&events, |event| matches!(
+            event,
+            AgentEvent::Nudge
+        )));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let notice: Message =
+            serde_json::from_value(requests[2].messages.last().unwrap().clone()).unwrap();
+        assert!(notice.is_observation());
+        assert_eq!(notice.first_text_content(), Some(NOTICE_BODY));
+    }
+
     #[tokio::test]
     async fn nudge_budget_resets_on_new_run() {
         let responses = [tool_call_response("glob", "t1")]
             .into_iter()
             .chain((0..=MAX_NUDGES).map(|_| empty_response()))
-            .chain([empty_response(), text_response(StopReason::EndTurn)])
+            .chain([
+                tool_call_response("glob", "t2"),
+                empty_response(),
+                text_response(StopReason::EndTurn),
+            ])
             .collect();
         let mut history = History::new(Vec::new());
         let (mut agent, mut event_rx) = make_agent(MockProvider::new(responses), &mut history);
-        let _ = agent.run(default_input()).await;
-        let _ = agent.run(default_input()).await;
+        assert_eq!(
+            agent.run(default_input()).await.unwrap(),
+            DoneReason::EndTurn
+        );
+        assert_eq!(
+            agent.run(default_input()).await.unwrap(),
+            DoneReason::EndTurn
+        );
         drop(agent);
         let events = drain_events(&mut event_rx);
 

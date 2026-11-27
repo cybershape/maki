@@ -349,8 +349,8 @@ impl History {
 
     /// Skips system padding so repeated nudges cannot push tool results
     /// out of the window.
-    pub fn has_recent_tool_results(&self, depth: usize) -> bool {
-        self.as_slice()
+    pub fn has_recent_tool_results(&self, since: usize, depth: usize) -> bool {
+        self.as_slice()[since..]
             .iter()
             .rev()
             .filter(|m| !is_system_padding(m))
@@ -1155,12 +1155,7 @@ mod tests {
     )]
     fn has_recent_tool_results(messages: Vec<Message>, depth: usize) {
         let history = History::new(messages);
-        let result = if depth == 0 {
-            history.has_recent_tool_results(0)
-        } else {
-            history.has_recent_tool_results(depth)
-        };
-        assert_eq!(result, depth > 0);
+        assert_eq!(history.has_recent_tool_results(0, depth), depth > 0);
     }
 
     #[test_case(vec![], 0 ; "empty_history")]
