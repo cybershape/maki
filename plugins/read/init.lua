@@ -141,6 +141,55 @@ local function first_line(path, offset, ctx)
   return math.max(page.total + offset + 1, 1)
 end
 
+local function format_warning_header(path, total_lines, limit, start, shown)
+  return string.format(
+    "Note: '%s' is large (%d lines) and no slice range was specified (limit=%d). Showing only lines %d-%d to prevent context bloat.\nHint: Call `read` with `offset` and `limit` to inspect subsequent sections, or use `grep` to search for patterns.\n\n",
+    shorten_path(path),
+    total_lines,
+    limit,
+    start,
+    start + shown - 1
+  )
+end
+
+local function format_trunc_footer(trunc_start, total_lines)
+  return string.format(
+    "\n\n...\n\nTruncated lines: %d-%d. Use offset=%d to read further.",
+    trunc_start,
+    total_lines,
+    trunc_start
+  )
+end
+
+local function cap_lines_to_bytes(lines, start, total_lines, max_output_bytes, header_fn)
+  if not max_output_bytes or #lines == 0 then
+    return lines
+  end
+  local nr_fmt = ToolView.line_nr_fmt(start + #lines - 1) .. ": %s"
+  local body_bytes = 0
+  local kept = 0
+  for i, line in ipairs(lines) do
+    local formatted_len = #string.format(nr_fmt, start + i - 1, line)
+    body_bytes = body_bytes + formatted_len + (i > 1 and 1 or 0)
+    local header_bytes = header_fn and #header_fn(i) or 0
+    if body_bytes + header_bytes > max_output_bytes then
+      break
+    end
+    local footer_bytes = (start + i <= total_lines) and #format_trunc_footer(start + i, total_lines) or 0
+    if body_bytes + header_bytes + footer_bytes <= max_output_bytes then
+      kept = i
+    end
+  end
+  -- Keep at least one line so `offset` advances and avoids an infinite retry loop.
+  if kept == 0 then
+    kept = 1
+  end
+  if kept < #lines then
+    return table.move(lines, 1, kept, 1, {})
+  end
+  return lines
+end
+
 local function read_file(path, offset, limit, ctx)
   local start, start_err = first_line(path, offset, ctx)
   if not start then
@@ -165,7 +214,7 @@ local function read_file(path, offset, limit, ctx)
   local is_full_mode = ctx:output_mode() == "full"
   local unspecified_range = (limit == 0 or limit > elision_threshold)
   local remaining_lines = total_lines - start + 1
-  local warning_header = nil
+  local header_fn = nil
 
   if
     not is_full_mode
@@ -234,15 +283,13 @@ local function read_file(path, offset, limit, ctx)
     if #lines > elision_lines then
       lines = table.move(lines, 1, elision_lines, 1, {})
     end
-    warning_header = string.format(
-      "Note: '%s' is large (%d lines) and no slice range was specified (limit=%d). Showing only lines %d-%d to prevent context bloat.\nHint: Call `read` with `offset` and `limit` to inspect subsequent sections, or use `grep` to search for patterns.\n\n",
-      shorten_path(path),
-      total_lines,
-      limit,
-      start,
-      start + #lines - 1
-    )
+    header_fn = function(shown)
+      return format_warning_header(path, total_lines, limit, start, shown)
+    end
   end
+
+  lines = cap_lines_to_bytes(lines, start, total_lines, max_output_bytes, header_fn)
+  local warning_header = header_fn and #lines > 0 and header_fn(#lines) or nil
 
   local parts = {}
   local nr_fmt = ToolView.line_nr_fmt(start + #lines - 1) .. ": %s"
@@ -257,13 +304,7 @@ local function read_file(path, offset, limit, ctx)
 
   local trunc_start = start + #lines
   if trunc_start <= total_lines then
-    llm_output = llm_output
-      .. string.format(
-        "\n\n...\n\nTruncated lines: %d-%d. Use offset=%d to read further.",
-        trunc_start,
-        total_lines,
-        trunc_start
-      )
+    llm_output = llm_output .. format_trunc_footer(trunc_start, total_lines)
   end
 
   local shown = #lines

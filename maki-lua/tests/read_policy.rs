@@ -6,8 +6,8 @@ use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{ToolContext, ToolOutputMode, ToolRegistry};
 use maki_agent::{AgentMode, ToolOutput};
 use maki_config::PluginsConfig;
-use maki_lua::PluginHost;
 use maki_lua::test_support::runtime;
+use maki_lua::PluginHost;
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -278,4 +278,144 @@ fn builtin_index_and_read_cap_oversized_skeleton_in_compact_mode() {
     );
     assert!(read_compact.contains("[truncated "));
     assert!(read_compact.contains("Hint: Call `read` with `offset` and `limit`"));
+}
+
+fn parse_trunc_next_offset(output: &str, expected_end: usize) -> usize {
+    let marker = "Truncated lines: ";
+    let idx = output
+        .rfind(marker)
+        .unwrap_or_else(|| panic!("missing `{marker}` in output"));
+    let rest = &output[idx + marker.len()..];
+    let (range, _) = rest.split_once('.').expect("missing `.` after range");
+    let (start_str, end_str) = range.split_once('-').expect("missing `-` in range");
+    assert_eq!(
+        end_str.parse::<usize>().unwrap(),
+        expected_end,
+        "unexpected truncation end in `{range}`"
+    );
+    let next_offset = start_str.parse::<usize>().unwrap();
+    assert!(
+        output.contains(&format!("Use offset={next_offset} to read further.")),
+        "missing continuation hint for offset={next_offset}"
+    );
+    next_offset
+}
+
+#[test]
+fn targeted_slice_with_dense_cjk_caps_bytes_and_advances_offset() {
+    let (reg, _host) = setup("");
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("cjk.md");
+    let cjk_chunk = "测试中文内容".repeat(14);
+    let mut content = String::new();
+    for i in 1..=400 {
+        content.push_str(&format!("第{i}行 {cjk_chunk}\n"));
+    }
+    fs::write(&file_path, &content).unwrap();
+
+    let mut seen_lines = 0usize;
+    let mut page_count = 0usize;
+    let mut offset = 1usize;
+    loop {
+        let page = exec_read(&reg, &file_path, offset as i64, 400, |_| {}).unwrap();
+        page_count += 1;
+        assert!(
+            page.len() <= COMPACT_BYTE_LIMIT,
+            "page {page_count} exceeded byte cap: {}",
+            page.len()
+        );
+        assert!(
+            page.contains(&format!("{offset}: 第{offset}行")),
+            "page {page_count} did not start at expected line {offset}"
+        );
+        if page.contains("Truncated lines:") {
+            let next_offset = parse_trunc_next_offset(&page, 400);
+            assert!(next_offset > offset && next_offset <= 400);
+            let last_shown = next_offset - 1;
+            assert!(page.contains(&format!("{last_shown}: 第{last_shown}行")));
+            assert!(!page.contains(&format!("{next_offset}: 第{next_offset}行")));
+            seen_lines += next_offset - offset;
+            offset = next_offset;
+        } else {
+            assert!(page.contains("400: 第400行"));
+            seen_lines += 400 - offset + 1;
+            break;
+        }
+    }
+    assert!(page_count >= 2, "expected multiple pages, got {page_count}");
+    assert_eq!(seen_lines, 400);
+
+    let full_page = exec_read(&reg, &file_path, 1, 400, |ctx| {
+        ctx.output_mode = ToolOutputMode::Full;
+    })
+    .unwrap();
+    assert!(
+        full_page.len() > COMPACT_BYTE_LIMIT,
+        "full mode should not be capped at 50KB, got {}",
+        full_page.len()
+    );
+    assert!(full_page.contains("400: 第400行"));
+}
+
+#[test]
+fn head_elision_with_dense_cjk_caps_bytes_and_aligns_header_and_footer() {
+    let index_handler = r#"function()
+        return { llm_output = "Unsupported file type: .txt. Use the read tool instead.", is_error = true }
+    end"#;
+    let (reg, _host) = setup(index_handler);
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("dense.txt");
+    let cjk_chunk = "中文长行测试内容".repeat(18);
+    let mut content = String::new();
+    for i in 1..=500 {
+        content.push_str(&format!("行{i} {cjk_chunk}\n"));
+    }
+    fs::write(&file_path, &content).unwrap();
+
+    let out = exec_read(&reg, &file_path, 1, 0, |_| {}).unwrap();
+    assert!(
+        out.len() <= COMPACT_BYTE_LIMIT,
+        "head elision exceeded byte cap: {}",
+        out.len()
+    );
+    let next_offset = parse_trunc_next_offset(&out, 500);
+    let shown_end = next_offset - 1;
+    assert!(
+        out.contains(&format!(
+            "Showing only lines 1-{shown_end} to prevent context bloat."
+        )),
+        "header range did not match truncated body: {out}"
+    );
+    assert!(out.contains(&format!("{shown_end}: 行{shown_end}")));
+    assert!(!out.contains(&format!("{next_offset}: 行{next_offset}")));
+}
+
+#[test]
+fn near_limit_exact_fit_does_not_falsely_truncate() {
+    const BYTE_CAP: usize = 2048;
+    let (reg, _host) = setup("");
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("boundary.txt");
+    let mut content = String::new();
+    for _ in 1..=9 {
+        content.push_str(&"x".repeat(217));
+        content.push('\n');
+    }
+    content.push_str("end\n");
+    fs::write(&file_path, &content).unwrap();
+
+    let out = exec_read(&reg, &file_path, 1, 10, |ctx| {
+        ctx.config.max_output_bytes = BYTE_CAP;
+    })
+    .unwrap();
+    assert!(
+        out.len() <= BYTE_CAP,
+        "output exceeded cap: {} > {BYTE_CAP}",
+        out.len()
+    );
+    assert!(out.contains("10: end"), "last line should fit: {out}");
+    assert!(
+        !out.contains("Truncated lines:"),
+        "exact fit should not emit truncation footer: {out}"
+    );
 }
