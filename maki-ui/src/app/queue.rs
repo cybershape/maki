@@ -397,17 +397,10 @@ impl App {
     }
 
     pub(crate) fn start_woken_run(&mut self) -> Vec<Action> {
-        if !self.takes_wake() {
+        if !self.takes_wake() || !self.live_mailbox().is_some_and(SessionMailbox::has_wake) {
             return Vec::new();
         }
-        let preamble = self
-            .live_mailbox()
-            .map(SessionMailbox::claim_wake)
-            .unwrap_or_default();
-        if preamble.is_empty() {
-            return Vec::new();
-        }
-        self.start_mailbox_run(preamble)
+        self.start_mailbox_run(Vec::new())
     }
 
     pub(super) fn start_mailbox_run(

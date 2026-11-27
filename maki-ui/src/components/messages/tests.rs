@@ -5119,6 +5119,40 @@ fn a_report_notice_shows_the_report_icon() {
     assert_eq!(gutter.style, theme::current().tool_dim);
 }
 
+#[test]
+fn long_report_stays_on_one_line_and_keeps_its_expand_arrow() {
+    const NARROW_WIDTH: u16 = 24;
+    let mut panel = notice_panel(Some(NOTICE_DETAIL));
+    panel.messages[0].text = GROUP_RESIZE_TEXT.into();
+
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let narrow = buffer_text(&render(&mut panel, NARROW_WIDTH, VIEW_HEIGHT));
+    let rows: Vec<_> = narrow
+        .lines()
+        .map(str::trim_end)
+        .filter(|row| !row.is_empty())
+        .collect();
+    let [preview] = rows.as_slice() else {
+        panic!("the collapsed report should fit on one row: {rows:?}");
+    };
+    assert!(preview.trim_start().starts_with(REPORT_INDICATOR), "{preview}");
+    assert!(preview.ends_with(NOTICE_COLLAPSED_MARK), "{preview}");
+
+    let area = Rect::new(0, 0, NARROW_WIDTH, VIEW_HEIGHT);
+    assert_eq!(panel.handle_click(0, 0, area), ClickOutcome::Handled);
+    let expanded = buffer_text(&render(&mut panel, NARROW_WIDTH, VIEW_HEIGHT));
+    assert!(
+        expanded
+            .lines()
+            .next()
+            .unwrap()
+            .trim_end()
+            .ends_with(NOTICE_EXPANDED_MARK)
+    );
+    let detail: String = expanded.lines().skip(1).map(str::trim).collect();
+    assert_eq!(detail, NOTICE_DETAIL);
+}
+
 /// Shell output is not markdown: a diff's `-` lines would turn into bullets.
 #[test_case(false, "- removed line", "- removed line" ; "plain_output_stays_as_written")]
 #[test_case(true, "```\nlet answer = 42;\n```", &format!("{CODE_BAR}let answer = 42;") ; "markdown_reply_renders_its_code_block")]

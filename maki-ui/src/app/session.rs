@@ -167,8 +167,19 @@ impl App {
 
     pub(super) fn checkpoint_with(&mut self, soft_delay: Duration) {
         self.sync_subagents();
+        let mut meta = self.build_meta();
+        // Read the mailbox first: a receipt removed by the agent already has
+        // its answer in the mirror. An answer published between these reads
+        // can appear in both views, so prefer the answer in that snapshot.
         let snapshot = self.shared_history.as_ref().map(|h| h.load_full());
-        let meta = self.build_meta();
+        if !meta.pending_background.is_empty() {
+            let messages = snapshot
+                .as_ref()
+                .map_or_else(|| self.state.session.messages(), |h| h.messages.as_slice());
+            for settled in messages.iter().filter_map(Message::settles) {
+                meta.pending_background.retain(|id| id != &settled.task);
+            }
+        }
         AppSession::checkpoint(
             &mut self.state.session,
             snapshot.as_deref(),
@@ -707,10 +718,12 @@ impl App {
     pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
         let messages = self.state.session.messages();
         if let Some(mailbox) = self.live_mailbox() {
-            for id in mailbox.unsettled() {
-                if drops_receipt(messages, entry.turn_index, &id) {
-                    mailbox.forget(&id);
-                }
+            for id in messages[entry.turn_index.min(messages.len())..]
+                .iter()
+                .flat_map(Message::tool_uses)
+                .map(|(id, _, _)| id)
+            {
+                mailbox.forget(id);
             }
         }
         let dropped: HashSet<Arc<str>> = self

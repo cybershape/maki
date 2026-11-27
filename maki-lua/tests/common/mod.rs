@@ -21,8 +21,8 @@ use maki_lua::test_support::{runtime, wait_next, wait_reply};
 use maki_lua::{EventHandle, MoveOutcome, PluginHost, SessionEndReason, UiAction};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
-    StopReason, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, Effort, Message, Model, ModelInfo, ProviderEvent, RequestOptions,
+    Role, StopReason, StreamResponse, TokenUsage,
 };
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
@@ -208,6 +208,8 @@ impl Drop for Gate {
 struct ParkedProvider {
     started: Sender<()>,
     user_turns: Sender<Vec<String>>,
+    requests: Sender<(String, Value)>,
+    request_options: Sender<RequestOptions>,
     release: AsyncMutex<UnboundedReceiver<()>>,
     answer: &'static str,
     first_turn: Mutex<Option<ContentBlock>>,
@@ -218,14 +220,16 @@ impl Provider for ParkedProvider {
         &'a self,
         _: &'a Model,
         messages: &'a [Message],
-        _: &'a str,
-        _: &'a Value,
+        system: &'a str,
+        tools: &'a Value,
         _: &'a UnboundedSender<ProviderEvent>,
-        _: RequestOptions,
+        opts: RequestOptions,
         _: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let _ = self.user_turns.send(closing_user_texts(messages));
+            let _ = self.requests.send((system.to_owned(), tools.clone()));
+            let _ = self.request_options.send(opts);
             let _ = self.started.send(());
             let _ = self.release.lock().await.recv().await;
             let first_turn = self.first_turn.lock().unwrap().take();
@@ -251,6 +255,10 @@ impl Provider for ParkedProvider {
         })
     }
 
+    fn configuration_effort(&self, _: &Model, opts: RequestOptions) -> Option<Effort> {
+        opts.thinking.is_enabled().then_some(Effort::High)
+    }
+
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
@@ -273,6 +281,8 @@ pub struct Parked {
     pub started: Receiver<()>,
     /// What each request's closing user turn says.
     pub user_turns: Receiver<Vec<String>>,
+    pub requests: Receiver<(String, Value)>,
+    pub request_options: Receiver<RequestOptions>,
     pub release: UnboundedSender<()>,
 }
 
@@ -286,16 +296,22 @@ impl Parked {
         let (started_tx, started) = channel();
         let (release, release_rx) = unbounded_channel();
         let (user_turns_tx, user_turns) = channel();
+        let (requests_tx, requests) = channel();
+        let (request_options_tx, request_options) = channel();
         Self {
             provider: Arc::new(ParkedProvider {
                 started: started_tx,
                 user_turns: user_turns_tx,
+                requests: requests_tx,
+                request_options: request_options_tx,
                 release: AsyncMutex::new(release_rx),
                 answer,
                 first_turn: Mutex::new(first_turn),
             }),
             started,
             user_turns,
+            requests,
+            request_options,
             release,
         }
     }

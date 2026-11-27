@@ -64,6 +64,7 @@ const IDLE_STATUS: &str = "idle";
 const TASK_SCOPE: &str = "task";
 const SESSION_SCOPE: &str = "session";
 const NO_REGISTRY_ERR: &str = "tool registry not available";
+const SESSION_ALREADY_PROMPTED_ERR: &str = "session prompt and tools are already set";
 const TOOLS_ARRAY_ERR: &str = "tools must be an array";
 pub const UNPAID_REACH_ERR: &str = "this plugin does not hold what these tools reach";
 pub const UNDECLARED_REACH: &str = "declare no permission and need";
@@ -1412,8 +1413,6 @@ async fn session(
     // inside its sandbox.
     let tools = RequestTools::assembled(JsonValue::Array(tools_json), &agent_ctx.config, &model);
     let system = system.unwrap_or_default();
-    let context: RunContextBuilder =
-        Arc::new(move |_, _| Box::pin(ready(RunContext::fixed(system.clone(), tools.clone()))));
 
     let state = SessionState {
         params: AgentParams {
@@ -1444,7 +1443,8 @@ async fn session(
             audience,
             model_policy: Arc::clone(&agent_ctx.model_policy),
         },
-        context,
+        context: fixed_context(system, tools.clone()),
+        tools,
         opts,
         mcp: agent_ctx
             .mcp
@@ -1488,6 +1488,7 @@ async fn session(
     }
 
     let sess = lua.create_userdata(LuaSession {
+        permissions: perms.now(&lua),
         inner: Arc::new(AsyncMutex::new(state)),
         cancellation,
     })?;
@@ -1696,10 +1697,14 @@ async fn dispatch_racing_live(
     }
 }
 
+fn fixed_context(system: String, tools: RequestTools) -> RunContextBuilder {
+    Arc::new(move |_, _| Box::pin(ready(RunContext::fixed(system.clone(), tools.clone()))))
+}
+
 struct SessionState {
     params: AgentParams,
-    /// The caller's prompt and tools, fixed for the session's life.
     context: RunContextBuilder,
+    tools: RequestTools,
     /// Already reconciled against `params.model`, so every reader agrees.
     opts: RequestOptions,
     /// Fresh per session so `tool_search` loads never leak between a
@@ -1916,6 +1921,7 @@ impl TurnHost for PromptHost<'_> {
 }
 
 struct LuaSession {
+    permissions: PluginPermissions,
     inner: Arc<AsyncMutex<SessionState>>,
     /// Kept outside the lock, which a running prompt holds for the whole run,
     /// so `send` and `close` still reach the session.
@@ -2042,6 +2048,7 @@ pub(crate) fn delivery(opts: Option<&Table>) -> Delivery {
 /// session, or the end of the task that opened it, stops such calls.
 ///
 /// @param message string User message to send.
+/// @param setup table? First-prompt system and tool definitions.
 /// @return (table?, string?) Result table on success, or `(nil, err)` on
 /// failure. A run cut short after streaming some text hands you both: the
 /// error and a `{ text = <what it streamed> }` table. `"cancelled"` means the
@@ -2059,7 +2066,9 @@ async fn prompt(
     lua: Lua,
     this: mlua::UserDataRef<LuaSession>,
     message: String,
+    setup: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
+    let perms = this.permissions.now(&lua);
     // The session's own token fires only when the task that opened it ends.
     // Esc on a tool handler fires that handler's token, and the handler may not
     // be the opener. So a background prompt races the caller's token, from the
@@ -2085,6 +2094,33 @@ async fn prompt(
     let control = &cancellation.control;
     if let Some(reason) = control.ended() {
         return Ok(err_pair(reason));
+    }
+    if let Some(setup) = setup {
+        if s.subagent_info.get().is_some() || !s.history.as_slice().is_empty() {
+            return Ok(err_pair(SESSION_ALREADY_PROMPTED_ERR));
+        }
+        let system: String = setup.get("system")?;
+        let defs = lua_to_json(&lua, &setup.get::<LuaValue>("tools")?)?;
+        let JsonValue::Array(mut defs) = defs else {
+            return Err(mlua::Error::runtime(TOOLS_ARRAY_ERR));
+        };
+        try_pair!(delegated_reach(&lua, &perms, &defs, s.mcp.is_some()));
+        defs.extend(
+            s.tools
+                .definitions()
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|def| {
+                    def["name"]
+                        .as_str()
+                        .is_some_and(|name| s.local_tools.contains_key(name))
+                })
+                .cloned(),
+        );
+        s.tools =
+            RequestTools::assembled(JsonValue::Array(defs), &s.params.config, &s.params.model);
+        s.context = fixed_context(system, s.tools.clone());
     }
     // The user can lower the effort while a monitor sits idle, so we ask the
     // seed again on every prompt. Plan mode is left out on purpose. Each write
@@ -2581,7 +2617,7 @@ mod tests {
         timeout(SESSION_TIMEOUT, async {
                 let sess = native_session(&lua, &ctx).await;
                 let (result, ()) = futures::future::join(
-                    prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into()),
+                    prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into(), None),
                     async {
                         started_rx.recv().await.unwrap();
                         if dispose {
@@ -2606,7 +2642,7 @@ mod tests {
                 );
                 if !dispose {
                     let (_, error) =
-                        prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into())
+                        prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into(), None)
                             .await
                             .unwrap();
                     assert_eq!(error.as_ref(), Some(&closed));
@@ -2761,9 +2797,14 @@ mod tests {
         .unwrap();
         assert!(error.is_none(), "{error:?}");
         let sess = sess.unwrap();
-        let (_, error) = prompt(lua.clone(), sess.borrow().unwrap(), CHILD_REQUEST.into())
-            .await
-            .unwrap();
+        let (_, error) = prompt(
+            lua.clone(),
+            sess.borrow().unwrap(),
+            CHILD_REQUEST.into(),
+            None,
+        )
+        .await
+        .unwrap();
         close(lua.clone(), sess.borrow().unwrap(), None)
             .await
             .unwrap();
@@ -2855,7 +2896,12 @@ mod tests {
                 nudge(&sess);
             }
             let (result, requests_seen) = futures::future::join(
-                prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into()),
+                prompt(
+                    lua.clone(),
+                    sess.borrow().unwrap(),
+                    SESSION_PROMPT.into(),
+                    None,
+                ),
                 async {
                     let mut seen = vec![requests.recv().await.unwrap()];
                     if mid_prompt {
@@ -2879,7 +2925,14 @@ mod tests {
                 };
                 assert!(interrupt.starts_with(INTERRUPT_OPEN) && interrupt.contains(NUDGE));
             } else {
-                assert_eq!(requests_seen, [[NUDGE, SESSION_PROMPT]]);
+                let [parent_message, prompt] = requests_seen[0].as_slice() else {
+                    panic!("the parent message should precede the prompt: {requests_seen:?}");
+                };
+                assert_eq!(requests_seen.len(), 1);
+                assert_eq!(prompt, SESSION_PROMPT);
+                assert!(
+                    parent_message.starts_with(INTERRUPT_OPEN) && parent_message.contains(NUDGE)
+                );
             }
         };
         timeout(SESSION_TIMEOUT, run)
@@ -3874,9 +3927,14 @@ mod tests {
     }
 
     async fn prompt_text(lua: &Lua, sess: &AnyUserData) -> (Option<String>, Option<String>) {
-        let (tbl, error) = prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into())
-            .await
-            .unwrap();
+        let (tbl, error) = prompt(
+            lua.clone(),
+            sess.borrow().unwrap(),
+            SESSION_PROMPT.into(),
+            None,
+        )
+        .await
+        .unwrap();
         (tbl.map(|tbl| tbl.get("text").unwrap()), error)
     }
 

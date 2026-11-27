@@ -61,7 +61,7 @@ use maki_lua::{
 use maki_providers::provider::ProviderStatus;
 use maki_providers::{
     ContentBlock, Effort, FastPricing, FastSupport, Message, Model, RequestOptions, Role,
-    THINKING_USAGE, TaskAnswer, TaskSettled, ThinkingSupport, TokenUsage,
+    THINKING_USAGE, TaskAnswer, TaskEnd, TaskSettled, ThinkingSupport, TokenUsage,
 };
 use maki_storage::id::MakiId;
 use maki_storage::model::read_thinking;
@@ -532,15 +532,15 @@ fn typing_and_submit() {
 #[test]
 fn mailbox_wake_starts_without_an_empty_user_bubble() {
     let mut app = test_app();
-    let actions = app.start_mailbox_run(vec![Message::observation("failed".into())]);
+    let mailbox = hold_mailbox(&mut app);
+    SessionMailbox::notify(app.state.session.id, NOTICE_BODY.into(), None, true).unwrap();
+    let actions = app.start_woken_run();
 
     assert!(matches!(
         &actions[..],
-        [Action::SendMessage(input)]
-            if input.message.is_empty()
-                && input.preamble.len() == 1
-                && input.preamble[0].is_observation()
+        [Action::SendMessage(input)] if input.message.is_empty() && input.preamble.is_empty()
     ));
+    assert_eq!(mailbox.peek()[0].body, NOTICE_BODY);
     assert_eq!(app.status, Status::Streaming);
     assert!(app.main_chat().segment_search_texts().is_empty());
 }
@@ -13430,6 +13430,40 @@ fn moved_call_history(receipt: bool, notice: Option<(bool, bool)>) -> Vec<Messag
     }
     messages.push(Message::user("second prompt".into()));
     messages
+}
+
+#[test_case(false ; "pending_at_checkpoint")]
+#[test_case(true ; "history_already_has_the_answer")]
+fn checkpoint_saves_an_inbox_answer_or_its_receipt(landed: bool) {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let mailbox = hold_mailbox(&mut app);
+    mailbox.track(MOVED_ID);
+    let history = moved_call_history(true, landed.then_some((false, false)));
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(
+        maki_agent::HistorySnapshot::new(history),
+    )));
+    app.checkpoint_now();
+    let stored_id = app.state.session.id;
+    drain_writer(app, writer);
+    let stored = AppSession::load(stored_id, &dir).unwrap();
+    let recovered = SessionMailbox::register(MakiId::generate());
+    recovered.restore_lost(&stored.meta.pending_background, stored.messages());
+    let expected = if landed {
+        TaskEnd::Finished
+    } else {
+        TaskEnd::Lost
+    };
+    assert_eq!(recovered.task_end(MOVED_ID, false), Some(expected));
+    assert_eq!(recovered.peek().len(), usize::from(!landed));
+    assert_eq!(stored.meta.pending_background.len(), usize::from(!landed));
+    assert_eq!(
+        stored
+            .messages()
+            .iter()
+            .filter_map(Message::settles)
+            .count(),
+        usize::from(landed)
+    );
 }
 
 /// A restored history draws every receipt as a success, so each moved row

@@ -201,8 +201,9 @@ fn asker(ctx: &LuaCtx, method: &str) -> Result<Option<MakiId>, String> {
 /// @param opts table? Optional fields:
 ///   `interrupt` (boolean?) - cut its current turn short. Default: `false`.
 /// @return (table|nil, string|nil) `{name}`, the task's name in `/tasks`
-///   (comma-separated when it reached several), or nil and
-///   `"no running background subagent with id <id>; running: ..."`.
+///   (comma-separated when it reached several), or nil and an error. A
+///   recently ended task reports its final status. An unknown target reports
+///   which subagents the caller can still reach.
 /// @example
 /// local sent, err = maki.task.send(ctx, input.id, input.message)
 /// if not sent then return { llm_output = err, is_error = true } end

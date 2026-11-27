@@ -120,7 +120,7 @@ local function handler(input, ctx)
   -- impossible (nested call, no live chat, background off) the task runs
   -- blocking with a note, the same as an explicit ask that failed.
   local run_in_background = Runner.allow_background and input.background ~= false
-  local prepared, prepare_err = Runner.prepare(input, ctx, run_in_background)
+  local prepared, prepare_err = Runner.prepare(input, ctx)
   if prepare_err then
     if sid then
       release_codename(sid, name)
@@ -173,7 +173,7 @@ local function handler(input, ctx)
     if not run_in_background then
       ctx:on_background(receipt)
     end
-    return Runner.run(sess, prepared)
+    return Runner.run(sess, prepared, ctx)
   end)
 
   sess:close(ok and out or { llm_output = tostring(out), is_error = true })
@@ -189,7 +189,7 @@ local function handler(input, ctx)
   if waiting then
     out.body = result_body(out.llm_output, out.is_error, ctx)
   end
-  if foreground_note then
+  if foreground_note and not ctx:backgrounded() then
     out.llm_output = foreground_note .. "\n\n" .. out.llm_output
   end
   return out

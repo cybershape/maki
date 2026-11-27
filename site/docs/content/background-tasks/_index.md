@@ -135,17 +135,17 @@ While a message waits for the model to read it, the Inbox panel above the input 
 ╰────────────────────────────────────╯
 ```
 
-The panel is read-only and shows at most five lines, then a `+N more` count. Once a run reads a message, it leaves the panel and draws in the transcript as a notice line that a click unfolds.
+The panel is read-only and shows at most five lines, then a `+N more` count. A message moves to the transcript when a run records it. If you cancel before then, it stays in the Inbox for the next run. Click the notice in the transcript to read the full message.
 
 ## Reports from a subagent
 
-A subagent calls `task_message` with only a `message` input to report to its parent mid-task: a finding that changes the plan, a blocker that needs direction, or a risk. The report arrives as an observation that starts with `[Report from <codename>]`, and wakes an idle parent the same way a result does. The parent answers a blocked subagent with `task_message` and that codename. In the transcript the report line carries a `✉` icon, since it is incoming information rather than a finished task:
+A subagent calls `task_message` with only a `message` input to report to its parent mid-task: a finding that changes the plan, a blocker that needs direction, or a risk. The report arrives as an observation that starts with `[Report from <codename>]`, and wakes an idle parent the same way a result does. The parent answers a blocked subagent with `task_message` and that codename. The transcript shows a single-line preview with a `✉` icon. Click the line to expand the full report.
 
 ```
-✉ Nyx reported: IOC list is stale
+✉ Nyx reported: IOC list is stale ▸
 ```
 
-The name is one tool with two directions. The parent's `id` and `interrupt` inputs need background delegation, so with `allow_background = false` a subagent can still report while the parent has no steering inputs.
+The tool confirms that it queued the report. If the blocker is still unresolved at the end of the task, the subagent includes it in its final answer. A foreground subagent puts reports in its final answer. The `id` and `interrupt` inputs for the parent need background delegation. With `allow_background = false`, a task moved manually can still report.
 
 Every `task_message` row names its recipient: `→ Nyx: message` when the parent sends, `→ parent: message` for a report. A call id resolves to the codename once the message is sent, and the name survives session restore. With a `toolcall_reason` the row reads `→ Nyx · reason`, so the recipient stays visible.
 

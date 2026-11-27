@@ -1433,11 +1433,16 @@ pub mod test_support {
         )
     }
 
-    pub fn pending_stub_session(tools: &[(&str, &str)]) -> (McpSession, watch::Sender<()>) {
+    pub fn pending_stub_handle(tools: &[(&str, &str)]) -> (McpHandle, watch::Sender<()>) {
         let (ready_tx, ready_rx) = watch::channel(());
-        let mut session = stub_session(tools);
-        session.handle.ready_rx = ready_rx;
-        (session, ready_tx)
+        let mut handle = stub_session(tools).handle;
+        handle.ready_rx = ready_rx;
+        (handle, ready_tx)
+    }
+
+    pub fn pending_stub_session(tools: &[(&str, &str)]) -> (McpSession, watch::Sender<()>) {
+        let (handle, ready_tx) = pending_stub_handle(tools);
+        (McpSession::new(handle, &[]), ready_tx)
     }
 
     /// A session whose tools answer with the JSON of the args they received,

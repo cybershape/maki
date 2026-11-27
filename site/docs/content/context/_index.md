@@ -234,7 +234,7 @@ maki.setup({
 
 With `background = true` the tool answers right away and the parent keeps working. To wait, the parent ends its turn. When the subagent is done, its result arrives as a notice that wakes the parent. Structured output and the partial output of an interrupted run come back the same way.
 
-The receipt names the task id. The parent can pass it to `task_message` to tell a running task something new, like a fresh lead or "wrap up now". The task reads it after its current step as a message from its parent, not the user, and a task still waiting for a slot reads it with its first prompt. Only the chat that started a task can reach it, and a stopped or finished task refuses.
+The receipt names the task ID. The parent can pass it to `task_message` to tell a running task something new, like a fresh lead or "wrap up now". The subagent reads it as a parent message after its current step or with its first prompt if it is waiting for a slot. It keeps its current thinking setting. Only the chat that started the task can reach it. A send to a recently ended task returns its final status.
 
 A subagent calls the same `task_message` name to report back mid-task, with only a `message` input. The report reaches the parent as an observation named by the subagent's id, and wakes an idle parent. The parent answers a blocked subagent with `task_message` and that id. See [Background Tasks](/docs/background-tasks/#reports-from-a-subagent).
 

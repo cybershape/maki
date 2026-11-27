@@ -1,9 +1,11 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
 use maki_config::ModelPolicy;
-use maki_providers::{Message, RequestOptions, TaskAnswer, TaskEnd, TaskSettled, Timeouts};
+use maki_providers::{
+    AgentError, Message, RequestOptions, TaskAnswer, TaskEnd, TaskSettled, Timeouts,
+};
 use maki_storage::id::{MakiId, SessionRef};
 use thiserror::Error;
 use tokio::sync::Notify;
@@ -20,6 +22,7 @@ use crate::{AgentConfig, AgentMode, EventSender, ModelSlot, ToolOutputLines};
 pub const BACKGROUND_PLAN_WRITE_DENIED: &str =
     "the chat is in plan mode, so background sessions can't change files";
 const MAILBOX_CAPACITY: usize = 100;
+const TASK_END_CAPACITY: usize = 100;
 const NOTICE_DISPLAY_MAX_BYTES: usize = 256;
 const NOTICE_HEAD: &str = "Background";
 const NOTICE_BODY_SEP: &str = ":\n\n";
@@ -68,6 +71,7 @@ struct Mailbox {
     /// Compaction a plugin queued. Notice drains leave it alone.
     compact: Option<CompactRequest>,
     outstanding: Vec<String>,
+    task_ends: VecDeque<(String, String, TaskEnd)>,
     /// No run reads it again, so it takes no new receipts.
     closed: bool,
 }
@@ -146,6 +150,15 @@ pub struct BackgroundNotice<'a> {
 }
 
 impl Mailbox {
+    fn remember_task_end(&mut self, id: &str, name: &str, end: TaskEnd) {
+        self.task_ends.retain(|(known, _, _)| known != id);
+        if self.task_ends.len() == TASK_END_CAPACITY {
+            self.task_ends.pop_front();
+        }
+        self.task_ends
+            .push_back((id.to_owned(), name.to_owned(), end));
+    }
+
     /// A full mailbox drops its oldest notice that answers no receipt. One
     /// that answers a receipt, even in part, is never dropped: the model waits
     /// for it, and nothing would tell it the result was lost. Each one comes
@@ -511,6 +524,36 @@ impl SessionMailbox {
         self.live.changed.notified()
     }
 
+    pub fn has_wake(&self) -> bool {
+        lock(&self.live.mailbox).wake
+    }
+
+    pub fn cancel_wake(&self, cancel: impl FnOnce()) {
+        self.change(|state| {
+            cancel();
+            state.wake = false;
+        });
+    }
+
+    /// Publishes each message under the lock used by checkpoint readers. If
+    /// publication fails, the unsent tail stays in the mailbox.
+    pub(crate) fn land(
+        &self,
+        cancel: &CancelToken,
+        mut publish: impl FnMut(Message) -> Result<(), AgentError>,
+    ) -> Result<(), AgentError> {
+        self.change(|state| {
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
+            while let Some(message) = state.pending.pop_front() {
+                state.wake &= !state.pending.is_empty();
+                publish(message)?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn claim_wake(&self) -> Vec<Message> {
         self.change(|state| if state.wake { state.take() } else { Vec::new() })
     }
@@ -572,6 +615,7 @@ impl SessionMailbox {
     pub fn forget(&self, id: &str) {
         self.change(|state| {
             state.untrack(id);
+            state.task_ends.retain(|(known, _, _)| known != id);
             state
                 .pending
                 .retain(|notice| notice.answered().is_none_or(|settled| settled.task != id));
@@ -593,6 +637,33 @@ impl SessionMailbox {
             .filter_map(Message::settles)
             .find(|settled| settled.task == id)
             .map(|settled| settled.end)
+    }
+
+    pub fn remember_task_end(&self, id: &str, receipt: &str, name: &str, end: TaskEnd) {
+        let mut mailbox = lock(&self.live.mailbox);
+        if mailbox.tracks(receipt) {
+            mailbox.remember_task_end(id, name, end);
+        }
+    }
+
+    pub fn task_end(&self, handle: &str, by_name: bool) -> Option<TaskEnd> {
+        let end = lock(&self.live.mailbox)
+            .task_ends
+            .iter()
+            .rev()
+            .find(|(id, name, _)| {
+                if by_name {
+                    name == handle
+                } else {
+                    id == handle
+                }
+            })
+            .map(|(_, _, end)| *end);
+        if by_name {
+            end
+        } else {
+            end.or_else(|| self.queued_end(handle))
+        }
     }
 
     /// Background work still running for this mailbox's receipts.
@@ -623,12 +694,30 @@ impl SessionMailbox {
     /// goes away first answers with the tool name, so no task waits on a dead
     /// host.
     pub fn restore_lost(&self, ids: &[String], history: &[Message]) {
+        let names = history
+            .iter()
+            .flat_map(Message::tool_uses)
+            .filter(|(_, tool, _)| *tool == LOST_TOOL)
+            .filter_map(|(id, _, input)| Some((id, input.get("name")?.as_str()?.trim())))
+            .collect::<HashMap<_, _>>();
+        let name = |id| names.get(id).copied().unwrap_or_default();
+        let completed: HashSet<_> = history
+            .iter()
+            .filter_map(Message::settles)
+            .map(|settled| settled.task.as_str())
+            .collect();
         let late = self.change(|state| {
+            for settled in history.iter().filter_map(Message::settles) {
+                state.remember_task_end(&settled.task, name(settled.task.as_str()), settled.end);
+            }
             let mut late = Vec::new();
             for id in ids {
-                if state.unsettled().any(|unsettled| unsettled == id) {
+                if completed.contains(id.as_str())
+                    || state.unsettled().any(|unsettled| unsettled == id)
+                {
                     continue;
                 }
+                state.remember_task_end(id, name(id.as_str()), TaskEnd::Lost);
                 let (label, header) = TaskLabel::of_receipt(history, id);
                 state.push_lost(id, &label);
                 if let Some(header) = header {
@@ -835,6 +924,53 @@ mod tests {
         thinking: ThinkingConfig::Adaptive,
         fast: true,
     };
+    #[test]
+    fn inbox_cancel_quiets_waiting_notices_but_allows_a_new_wake() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        let notify = || {
+            SessionMailbox::notify(mailbox.session_id(), NOTICE_BODY.into(), None, true).unwrap()
+        };
+        notify();
+        let (trigger, cancel) = CancelToken::new();
+        mailbox.cancel_wake(|| drop(trigger));
+        assert!(!mailbox.has_wake());
+        assert!(matches!(
+            mailbox.land(&cancel, |_| unreachable!()),
+            Err(AgentError::Cancelled)
+        ));
+        assert_eq!(mailbox.peek().len(), 1);
+        notify();
+        assert!(mailbox.has_wake());
+        assert_eq!(mailbox.peek().len(), 2);
+    }
+
+    #[test]
+    fn inbox_keeps_the_unpublished_tail_on_event_failure() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        for _ in 0..2 {
+            SessionMailbox::notify(mailbox.session_id(), NOTICE_BODY.into(), None, true).unwrap();
+        }
+        let (_trigger, cancel) = CancelToken::new();
+        let mut history = Vec::new();
+        assert!(matches!(
+            mailbox.land(&cancel, |message| {
+                history.push(message);
+                Err(AgentError::Channel)
+            }),
+            Err(AgentError::Channel)
+        ));
+        assert_eq!(history.len(), 1);
+        assert_eq!(mailbox.peek().len(), 1);
+        mailbox
+            .land(&cancel, |message| {
+                history.push(message);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(mailbox.peek().is_empty());
+    }
+
     const PLAN_FILE: &str = "/tmp/plan.md";
     const EDITED_FILE: &str = "foo.rs";
     const NOTICE_BODY: &str = "child finished";

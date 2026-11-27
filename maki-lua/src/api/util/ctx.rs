@@ -561,6 +561,12 @@ impl UserData for LuaCtx {
             Ok((Some(true), None))
         });
 
+        methods.add_method("task_backgrounded", |_, this, ()| {
+            Ok(this.agent().is_some_and(|agent| {
+                agent.task_id.is_some() && agent.background_for.chat().is_some()
+            }))
+        });
+
         methods.add_method("backgrounded", |_, this, ()| {
             Ok(this
                 .agent()

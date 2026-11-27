@@ -115,7 +115,7 @@ local function bounded_errors(errors)
   return table.concat(out, "\n")
 end
 
-function Runner.prepare(input, ctx, background)
+function Runner.prepare(input, ctx)
   local subagent_type = input.subagent_type or "research"
   if subagent_type ~= "research" and subagent_type ~= "general" then
     return nil, "unknown subagent type: " .. subagent_type
@@ -152,26 +152,6 @@ function Runner.prepare(input, ctx, background)
 
   local audience = subagent_type == "research" and "research_sub" or "general_sub"
   local prompt_id = subagent_type == "research" and "research" or "general"
-  -- A synchronous subagent has no task_message: its parent is blocked waiting
-  -- for the final result and cannot read a mid-task report.
-  local tool_opts = { audience = audience, spec = model.spec, mcp = true }
-  if not background then
-    tool_opts.except = { TASK_MESSAGE_TOOL }
-  end
-  local tool_defs, tools_err = maki.agent.tools(ctx, tool_opts)
-  if tools_err then
-    return nil, tools_err
-  end
-
-  local system, system_err = maki.agent.system_prompt(ctx, {
-    prompt_id = prompt_id,
-    instructions = true,
-    tools = tool_defs,
-  })
-  if system_err then
-    return nil, system_err
-  end
-
   local capture = validator and {} or nil
   local local_tools
   if validator then
@@ -195,8 +175,6 @@ function Runner.prepare(input, ctx, background)
   return {
     options = {
       model_spec = model.spec,
-      system = system,
-      tools = tool_defs,
       local_tools = local_tools,
       audience = audience,
       mcp = true,
@@ -205,9 +183,8 @@ function Runner.prepare(input, ctx, background)
       thinking = thinking,
       thinking_unclamped = not input.thinking and combo_thinking ~= nil,
     },
-    message = input.prompt
-      .. (validator and STRUCTURED_OUTPUT_PROMPT_SUFFIX or "")
-      .. (not background and SYNC_NOTE or ""),
+    message = input.prompt .. (validator and STRUCTURED_OUTPUT_PROMPT_SUFFIX or ""),
+    prompt_id = prompt_id,
     capture = capture,
     -- The user may have built the combo long ago and logged out of its
     -- provider since. Naming it turns a bare 401 into something they can fix.
@@ -215,9 +192,34 @@ function Runner.prepare(input, ctx, background)
   }
 end
 
-function Runner.run(sess, prepared)
+function Runner.run(sess, prepared, ctx)
+  local background, tool_defs, system
+  repeat
+    background = ctx:backgrounded()
+    local tool_opts = { audience = prepared.options.audience, spec = prepared.options.model_spec, mcp = true }
+    if not background then
+      tool_opts.except = { TASK_MESSAGE_TOOL }
+    end
+    local err
+    tool_defs, err = maki.agent.tools(ctx, tool_opts)
+    if err then
+      return { llm_output = err, is_error = true }
+    end
+    system, err = maki.agent.system_prompt(ctx, {
+      prompt_id = prepared.prompt_id,
+      instructions = true,
+      tools = tool_defs,
+    })
+    if err then
+      return { llm_output = err, is_error = true }
+    end
+  until background or not ctx:backgrounded()
+
   local capture = prepared.capture
-  local result, err = sess:prompt(prepared.message)
+  local result, err = sess:prompt(prepared.message .. (background and "" or SYNC_NOTE), {
+    system = system,
+    tools = tool_defs,
+  })
   local retries = 0
   while not err and retries < MAX_NUDGES do
     if capture and not capture.value then

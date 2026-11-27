@@ -10,12 +10,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use maki_agent::mcp::test_support::pending_stub_handle;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, InputSource, ModelSlot,
-    ToolDoneEvent, ToolOutputLines,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, BackgroundNotice, DoneReason, InputSource,
+    McpHandle, ModelSlot, SessionMailbox, ToolDoneEvent, ToolOutputLines,
 };
 use maki_config::project::{self, TrustMode};
 use maki_config::{PermissionsConfig, PluginsConfig};
@@ -24,15 +25,15 @@ use maki_lua::{MoveOutcome, PluginHost, UiAction};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
-    StopReason, StreamResponse, ThinkingConfig, TokenUsage,
+    StopReason, StreamResponse, TaskEnd, ThinkingConfig, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 use tokio::runtime::EnterGuard;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::agent::AgentHandles;
 use crate::agent::shared_queue::{QueueItem, QueuedInput};
+use crate::agent::{AgentDeps, AgentHandles};
 use crate::app::tests::enter_runtime;
 
 use super::{push_prompt, test_deps};
@@ -329,6 +330,10 @@ struct World {
 
 impl World {
     fn start(steps: Vec<Step>) -> Self {
+        Self::start_with_mcp(steps, None)
+    }
+
+    fn start_with_mcp(steps: Vec<Step>, mcp_handle: Option<McpHandle>) -> Self {
         let serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         let runtime = enter_runtime();
         let mut host = PluginHost::new(Arc::clone(ToolRegistry::global_arc())).expect(HOST_STARTS);
@@ -359,7 +364,10 @@ impl World {
             ToolOutputLines::default(),
             &permissions,
             host.event_handle(),
-            test_deps(),
+            AgentDeps {
+                mcp_handle,
+                ..test_deps()
+            },
         );
         Self {
             handles,
@@ -376,21 +384,14 @@ impl World {
         push_prompt(&self.handles, run_id, text);
     }
 
-    /// What the event loop does for an idle chat whose mailbox holds a wake:
-    /// claim it and start a run with the notices as its preamble.
-    fn claim_wake(&self) -> Vec<Message> {
-        self.handles.mailbox().claim_wake()
-    }
-
-    fn start_wake_run(&self, run_id: u64, preamble: Vec<Message>) {
-        assert!(!preamble.is_empty(), "{NO_WAKE}");
+    fn start_wake_run(&self, run_id: u64, displayed: bool) {
         self.handles.queue.push(QueueItem::Message(QueuedInput {
             text: String::new(),
             input: AgentInput {
                 message: String::new(),
                 mode: AgentMode::default(),
                 images: Vec::new(),
-                preamble,
+                preamble: Vec::new(),
                 earlier: Vec::new(),
                 thinking: ThinkingConfig::default(),
                 fast: false,
@@ -399,7 +400,7 @@ impl World {
                 source: InputSource::Tui,
             },
             run_id,
-            displayed: true,
+            displayed,
         }));
     }
 
@@ -540,7 +541,7 @@ impl World {
 
     #[track_caller]
     fn assert_no_wake_left(&self) {
-        assert!(self.claim_wake().is_empty());
+        assert!(!self.handles.mailbox().has_wake());
     }
 }
 
@@ -563,15 +564,17 @@ fn a_moved_call_whose_turn_ends_wakes_the_chat_with_its_result() {
 
     world.finish_moved_call();
     assert_eq!(world.task_done().output.as_text(), FINAL_REPLY);
-    let preamble = world.claim_wake();
+    let mailbox = world.handles.mailbox();
+    assert!(mailbox.has_wake(), "{NO_WAKE}");
+    let preamble = mailbox.peek();
     assert_eq!(preamble.len(), 1);
     let notice = &preamble[0];
     let text = expected_text(FINAL_REPLY);
     let display = expected_display(FINISHED);
-    assert_eq!(notice.first_text_content(), Some(text.as_str()));
-    assert_eq!(notice.display_text.as_deref(), Some(display.as_str()));
+    assert_eq!(notice.body, text);
+    assert_eq!(notice.display.as_deref(), Some(display.as_str()));
 
-    world.start_wake_run(SECOND_RUN, preamble);
+    world.start_wake_run(SECOND_RUN, true);
     let wake_request = world.next_request();
     world.wait_idle();
 
@@ -589,6 +592,75 @@ fn a_moved_call_whose_turn_ends_wakes_the_chat_with_its_result() {
         [DoneReason::EndTurn, DoneReason::EndTurn]
     );
     assert!(world.errors().is_empty(), "{:?}", world.errors());
+    world.assert_no_more_requests();
+}
+
+#[test]
+fn a_wake_cancelled_while_mcp_initializes_leaves_the_notice_for_the_next_prompt() {
+    let (mcp, ready) = pending_stub_handle(&[]);
+    let mut world = World::start_with_mcp(vec![Step::new(answer(PASSED_TEXT))], Some(mcp.clone()));
+    let mailbox = world.handles.mailbox().clone();
+    SessionMailbox::notify(
+        mailbox.session_id(),
+        FINAL_REPLY.into(),
+        Some(FINAL_OUTPUT),
+        true,
+    )
+    .unwrap();
+    world.start_wake_run(FIRST_RUN, false);
+    world.wait_for(|event| matches!(event, AgentEvent::QueueItemConsumed { .. }));
+    assert!(futures::FutureExt::now_or_never(mcp.ready()).is_none());
+    world.handles.cancel_run(FIRST_RUN);
+    world.wait_idle();
+    assert!(!mailbox.has_wake());
+    assert_eq!(mailbox.peek()[0].body, FINAL_REPLY);
+    world.assert_no_more_requests();
+
+    drop(ready);
+    world.prompt(SECOND_RUN, NEXT_PROMPT);
+    let request = world.next_request();
+    world.wait_idle();
+    assert_eq!(request.observations().len(), 1);
+    assert!(mailbox.peek().is_empty());
+    world.assert_no_more_requests();
+}
+
+#[test]
+fn a_cancelled_queued_wake_leaves_one_result_for_the_next_prompt() {
+    let (release_model, model_gate) = unbounded_channel::<()>();
+    let mut world = World::start(vec![
+        Step::new(answer(WAITING_TEXT)).held(model_gate),
+        Step::new(answer(PASSED_TEXT)),
+    ]);
+    world.prompt(FIRST_RUN, BUILD_PROMPT);
+    world.next_request();
+    let mailbox = world.handles.mailbox().clone();
+    assert!(mailbox.track(PARK_ID));
+    mailbox.settle(
+        PARK_ID,
+        Some(BackgroundNotice {
+            text: FINAL_REPLY.into(),
+            display: Some(FINAL_OUTPUT),
+            wake: true,
+            end: TaskEnd::Finished,
+            markdown: false,
+        }),
+    );
+    world.start_wake_run(SECOND_RUN, true);
+    world.handles.cancel_run(SECOND_RUN);
+    assert!(!mailbox.has_wake());
+    assert_eq!(mailbox.unsettled(), [PARK_ID]);
+    assert_eq!(mailbox.peek()[0].body, FINAL_REPLY);
+    drop(release_model);
+    world.wait_idle();
+    world.assert_no_more_requests();
+
+    world.prompt(SECOND_RUN + 1, NEXT_PROMPT);
+    let request = world.next_request();
+    world.wait_idle();
+    assert_eq!(request.observations().len(), 1);
+    assert!(mailbox.unsettled().is_empty());
+    assert!(mailbox.peek().is_empty());
     world.assert_no_more_requests();
 }
 
@@ -738,9 +810,11 @@ fn esc_leaves_moved_work_running() {
 
     world.finish_moved_call();
     assert_eq!(world.task_done().output.as_text(), FINAL_REPLY);
-    let preamble = world.claim_wake();
+    let mailbox = world.handles.mailbox();
+    assert!(mailbox.has_wake(), "{NO_WAKE}");
+    let preamble = mailbox.peek();
     assert_eq!(preamble.len(), 1);
     let text = expected_text(FINAL_REPLY);
-    assert_eq!(preamble[0].first_text_content(), Some(text.as_str()));
+    assert_eq!(preamble[0].body, text);
     world.assert_no_more_requests();
 }

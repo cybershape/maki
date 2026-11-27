@@ -150,7 +150,7 @@ impl AgentHandles {
 
     /// Esc: stops {run_id} and everything queued behind it.
     pub(crate) fn cancel_run(&self, run_id: u64) {
-        self.cancels.cancel(run_id);
+        self.mailbox.cancel_wake(|| self.cancels.cancel(run_id));
     }
 
     pub(crate) fn cancel_subagent(&self, tool_use_id: String) {

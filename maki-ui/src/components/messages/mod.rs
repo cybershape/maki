@@ -13,10 +13,11 @@ use self::segment::{Segment, SegmentCache, body_width};
 
 use super::compact_detail::CompactTarget;
 use super::tool_display::{
-    BLANK_MARKER, MOVABLE_HINT, REPORT_INDICATOR, RenderCtx, RoleStyle, ToolLines, append_annotation,
-    append_right_info, assistant_style, build_instructions_lines, build_tool_lines, done_style,
-    error_style, format_timestamp_now, hint_columns, instructions_search_text, notice_style,
-    outcome_glyph, replace_header, search_text_for, thinking_style, truncate_to_header, user_style,
+    BLANK_MARKER, MOVABLE_HINT, REPORT_INDICATOR, RenderCtx, RoleStyle, ToolLines,
+    append_annotation, append_right_info, assistant_style, build_instructions_lines,
+    build_tool_lines, done_style, error_style, format_timestamp_now, hint_columns,
+    instructions_search_text, notice_style, outcome_glyph, replace_header, search_text_for,
+    thinking_style, truncate_to_header, user_style,
 };
 use super::{
     BackgroundBadge, BackgroundOutcome, CompactDetail, DisplayMessage, DisplayRole, GroupEntry,
@@ -39,6 +40,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::scrollbar::{self, render_vertical_scrollbar};
@@ -53,6 +55,7 @@ use maki_lua::{ChatItem, ChatItemStatus, EventHandle, LuaCommandInfo, WARM_TOOL_
 use maki_storage::id::{MakiId, SessionRef};
 
 use ratatui::Frame;
+use ratatui::buffer::CellWidth;
 use ratatui::layout::Rect;
 
 use crate::repaint::{Cadence, Dirty};
@@ -3004,10 +3007,7 @@ fn message_gutter(msg: &DisplayMessage, style: &RoleStyle) -> Option<Span<'stati
     } else if matches!(msg.role, DisplayRole::Notice) && msg.detail.is_some() {
         // A report carries a body but settles no task: mark it as incoming
         // information rather than leaving the gutter blank.
-        Some(Span::styled(
-            REPORT_INDICATOR,
-            theme::current().tool_dim,
-        ))
+        Some(Span::styled(REPORT_INDICATOR, theme::current().tool_dim))
     } else {
         Some(style.gutter())
     }
@@ -3079,7 +3079,29 @@ fn message_view(
             collapsed: true,
         };
     }
-    let mut lines = build_message_lines(msg, &style, clock_format, body, width);
+    let mut lines = if matches!(msg.role, DisplayRole::Notice)
+        && msg.detail.is_some()
+        && msg.task_end.is_none()
+    {
+        let mut remaining = body.saturating_sub(NOTICE_COLLAPSED_MARK.cell_width());
+        let preview_end = msg
+            .text
+            .grapheme_indices(true)
+            .take_while(|(_, grapheme)| {
+                let cells = grapheme.cell_width();
+                if grapheme.contains(['\r', '\n']) || cells > remaining {
+                    return false;
+                }
+                remaining -= cells;
+                true
+            })
+            .last()
+            .map_or(0, |(index, grapheme)| index + grapheme.len());
+        let preview = msg.text[..preview_end].trim_end().to_owned();
+        vec![Line::styled(preview, style.text_style)]
+    } else {
+        build_message_lines(msg, &style, clock_format, body, width)
+    };
     if matches!(msg.role, DisplayRole::Notice)
         && let Some(detail) = &msg.detail
     {

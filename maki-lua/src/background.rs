@@ -204,8 +204,24 @@ impl BackgroundTask {
             }
     }
 
-    /// The notice text the model reads, the line the transcript shows, and
-    /// how the task ended.
+    fn remember_end(&self, end: TaskEnd) {
+        if let Some(mailbox) = &self.mailbox {
+            let id = &self.info.id;
+            mailbox.remember_task_end(id, self.parent().unwrap_or(id), &self.info.name, end);
+        }
+    }
+
+    fn session_end(&self) -> Option<TaskEnd> {
+        if self.stopped.is_some() {
+            return Some(TaskEnd::Cancelled);
+        }
+        let control = self.control.as_ref()?;
+        match control.ended()? {
+            EndReason::Stopped(_) | EndReason::Cancelled => Some(TaskEnd::Cancelled),
+            EndReason::Closed => control.result_end(),
+        }
+    }
+
     fn notice(&self, done: &ToolDoneEvent, output: &str) -> (String, String, TaskEnd) {
         let tool = match &self.info.kind {
             Kind::Call { tool } => tool,
@@ -346,6 +362,16 @@ fn subagent_not_found(entries: &[BackgroundTask], asker: Option<MakiId>, id: &st
     not_found(NO_RUNNING_SUBAGENT, id, running)
 }
 
+fn ended_subagent(id: &str, end: TaskEnd) -> String {
+    let hint = match end {
+        TaskEnd::Finished => "finished. See its background result.",
+        TaskEnd::Failed => "failed. See its background result for the error.",
+        TaskEnd::Cancelled => "was cancelled. See its stop reply or background result.",
+        TaskEnd::Lost => "was lost. See the loss notice for its receipt.",
+    };
+    format!("Background task {id} {hint}")
+}
+
 impl BackgroundTasks {
     pub(crate) fn of(lua: &Lua) -> Self {
         if let Some(registry) = lua.app_data_ref::<Self>() {
@@ -429,28 +455,97 @@ impl BackgroundTasks {
         input: impl Fn() -> AgentInput,
         delivery: Delivery,
     ) -> Result<Vec<String>, String> {
-        let targets: Vec<_> = self
-            .locked()
-            .iter()
-            .filter(|e| e.matches(id) || e.parent() == Some(id))
-            .filter_map(|e| Some((Arc::clone(e.session_for(asker)?), e.info.name.clone())))
-            .collect();
+        let mailbox = asker.and_then(|asker| SessionMailbox::open(asker).ok());
+        let exact_end = |id| {
+            mailbox
+                .as_ref()
+                .and_then(|mailbox| mailbox.task_end(id, false))
+        };
+        let targets: Vec<_> = {
+            let entries = self.locked();
+            let scoped = || entries.iter().filter(|entry| entry.answers(asker));
+            let exact = scoped().find(|entry| entry.info.id == id);
+            let children = || scoped().filter(|entry| entry.parent() == Some(id));
+            let known_end = exact_end(id);
+            let exact_address =
+                exact.is_some() || children().next().is_some() || known_end.is_some();
+            let matches = || {
+                scoped().filter(|entry| {
+                    if exact_address {
+                        entry.info.id == id || entry.parent() == Some(id)
+                    } else {
+                        entry.info.name == id
+                    }
+                })
+            };
+            let targets: Vec<_> = matches()
+                .filter_map(|entry| {
+                    Some((
+                        Arc::clone(entry.live_session()?),
+                        entry.info.id.clone(),
+                        entry.info.name.clone(),
+                    ))
+                })
+                .collect();
+            if targets.is_empty() {
+                let end = known_end
+                    .or_else(|| exact.and_then(BackgroundTask::session_end))
+                    .or_else(|| {
+                        if exact_address {
+                            None
+                        } else {
+                            matches()
+                                .find_map(BackgroundTask::session_end)
+                                .or_else(|| mailbox.as_ref()?.task_end(id, true))
+                        }
+                    });
+                return Err(end.map_or_else(
+                    || subagent_not_found(&entries, asker, id),
+                    |end| ended_subagent(id, end),
+                ));
+            }
+            targets
+        };
         let mut names = Vec::with_capacity(targets.len());
-        for (control, name) in targets {
+        let mut refused = Vec::new();
+        for (control, target, name) in targets {
             if control.send(input(), delivery).is_ok() {
                 names.push(name);
+            } else {
+                refused.push(target);
             }
         }
         if names.is_empty() {
             // Each target may have ended between the lookup and the send, so
             // list again to show what still runs.
-            return Err(subagent_not_found(&self.locked(), asker, id));
+            let entries = self.locked();
+            let end = exact_end(id).or_else(|| {
+                refused.iter().find_map(|target| {
+                    exact_end(target).or_else(|| {
+                        entries
+                            .iter()
+                            .find(|entry| entry.info.id == *target && entry.answers(asker))?
+                            .session_end()
+                    })
+                })
+            });
+            return Err(end.map_or_else(
+                || subagent_not_found(&entries, asker, id),
+                |end| ended_subagent(id, end),
+            ));
         }
         Ok(names)
     }
 
     pub(crate) fn remove(&self, id: &str) {
-        self.extract(|e| e.info.id == id);
+        self.extract(
+            |e| e.info.id == id,
+            |entry| {
+                if let Some(end) = entry.session_end() {
+                    entry.remember_end(end);
+                }
+            },
+        );
     }
 
     /// The stop is recorded before the work is cut short, so the work sees
@@ -508,12 +603,21 @@ impl BackgroundTasks {
         mailbox: Option<MakiId>,
         id: &str,
     ) -> Result<(Option<oneshot::Receiver<String>>, ModelStop, String), String> {
-        let (reply, stopped, real_id) = {
-            let entries = self.locked();
+        let (reply, stopped, real_id, fired) = {
+            let mut entries = self.locked();
             let stoppable = || entries.iter().filter(|e| e.stoppable_by(mailbox));
-            let Some(target) = stoppable().find(|e| e.matches(id)) else {
+            let target = entries
+                .iter()
+                .position(|entry| entry.info.id == id && entry.stoppable_by(mailbox))
+                .or_else(|| {
+                    entries
+                        .iter()
+                        .position(|entry| entry.info.name == id && entry.stoppable_by(mailbox))
+                });
+            let Some(target) = target else {
                 return Err(not_found(NO_RUNNING_TASK, id, stoppable()));
             };
+            let target = &mut entries[target];
             let real_id = target.info.id.clone();
             // `deliver` needs this lock too. Parking the waiter before we let
             // go means a final reply can't land in the gap and go unseen.
@@ -527,9 +631,13 @@ impl BackgroundTasks {
                 name: target.info.name.clone(),
                 parent: target.parent().map(str::to_owned),
             };
-            (reply, stopped, real_id)
+            target.stop(Cutter::Parent);
+            let fired = target.is_call().then(|| target.cancel.disarm());
+            (reply, stopped, real_id, fired)
         };
-        self.stop(&real_id, Cutter::Parent);
+        if fired.is_none() {
+            self.remove(&real_id);
+        }
         Ok((reply, stopped, real_id))
     }
 
@@ -545,7 +653,16 @@ impl BackgroundTasks {
         done: ToolDoneEvent,
         ui: Option<UnboundedSender<UiAction>>,
     ) {
-        let Some(task) = self.take(id) else {
+        let end = |task: &BackgroundTask| {
+            if task.stopped.is_some() {
+                TaskEnd::Cancelled
+            } else if done.is_error {
+                TaskEnd::Failed
+            } else {
+                TaskEnd::Finished
+            }
+        };
+        let Some(task) = self.take(id, |task| task.remember_end(end(task))) else {
             tracing::debug!(id, "final reply of a background task that already settled");
             return;
         };
@@ -642,9 +759,10 @@ impl BackgroundTasks {
 
     /// Takes the entry out whole, so whoever gets it is the one that settles
     /// it.
-    fn take(&self, id: &str) -> Option<BackgroundTask> {
+    fn take(&self, id: &str, settle: impl FnOnce(&BackgroundTask)) -> Option<BackgroundTask> {
         let mut entries = self.locked();
         let at = entries.iter().position(|e| e.info.id == id)?;
+        settle(&entries[at]);
         Some(entries.remove(at))
     }
 
@@ -663,6 +781,7 @@ impl BackgroundTasks {
     pub(crate) fn abandon(&self, id: &str) {
         self.settle_unanswered(
             |e| e.info.id == id,
+            None,
             |task, mailbox| {
                 mailbox.forget(&task.info.id);
             },
@@ -673,8 +792,12 @@ impl BackgroundTasks {
     /// gone with the host or a panic. Returns its chat session, or `None`
     /// when something else settled it first.
     pub(crate) fn lose(&self, id: &str) -> Option<MakiId> {
-        self.settle_unanswered(|e| e.info.id == id, BackgroundTask::report_lost)
-            .pop()
+        self.settle_unanswered(
+            |e| e.info.id == id,
+            Some(TaskEnd::Lost),
+            BackgroundTask::report_lost,
+        )
+        .pop()
     }
 
     pub(crate) fn end_session(&self, session: MakiId) {
@@ -704,24 +827,33 @@ impl BackgroundTasks {
     /// otherwise wait on it for the rest of the process. A call whose final
     /// reply already exists is left to [`Self::deliver`].
     pub(crate) fn lose_all(&self) {
-        self.settle_unanswered(|e| !e.has_final(), BackgroundTask::report_lost);
+        self.settle_unanswered(
+            |e| !e.has_final(),
+            Some(TaskEnd::Lost),
+            BackgroundTask::report_lost,
+        );
     }
 
     /// Returns the chat sessions of the entries it settled.
     fn settle_unanswered(
         &self,
         doomed: impl Fn(&BackgroundTask) -> bool,
+        end: Option<TaskEnd>,
         settle: impl Fn(&BackgroundTask, &SessionMailbox),
     ) -> Vec<MakiId> {
-        self.extract(doomed)
-            .into_iter()
-            .map(|task| {
-                if let Some(mailbox) = &task.mailbox {
-                    settle(&task, mailbox);
-                }
-                task.session
-            })
-            .collect()
+        self.extract(doomed, |entry| {
+            if let Some(end) = end {
+                entry.remember_end(end);
+            }
+        })
+        .into_iter()
+        .map(|task| {
+            if let Some(mailbox) = &task.mailbox {
+                settle(&task, mailbox);
+            }
+            task.session
+        })
+        .collect()
     }
 
     /// Hands out a copy, because building Lua tables can run the GC, and a
@@ -767,8 +899,21 @@ impl BackgroundTasks {
         self.drop_waiters(&retired);
     }
 
-    fn extract(&self, doomed: impl Fn(&BackgroundTask) -> bool) -> Vec<BackgroundTask> {
-        let extracted: Vec<_> = self.locked().extract_if(.., |e| doomed(e)).collect();
+    fn extract(
+        &self,
+        doomed: impl Fn(&BackgroundTask) -> bool,
+        settle: impl Fn(&BackgroundTask),
+    ) -> Vec<BackgroundTask> {
+        let extracted: Vec<_> = self
+            .locked()
+            .extract_if(.., |e| {
+                if !doomed(e) {
+                    return false;
+                }
+                settle(e);
+                true
+            })
+            .collect();
         self.drop_waiters(&extracted);
         extracted
     }
@@ -1336,6 +1481,97 @@ pub(crate) mod tests {
             registry.send(Some(chat), "Nyx", message, Delivery::NextTurn),
             Ok(vec!["Nyx".to_owned()])
         );
+    }
+
+    #[test_case(TaskEnd::Finished ; "finished")]
+    #[test_case(TaskEnd::Failed ; "failed")]
+    #[test_case(TaskEnd::Cancelled ; "cancelled")]
+    #[test_case(TaskEnd::Lost ; "lost")]
+    fn send_resolves_terminal_during_send_and_after_drain(end: TaskEnd) {
+        let chat = MakiId::generate();
+        let (mailbox, _seed) = live(chat);
+        let (other, _other_seed) = live(MakiId::generate());
+        let (registry, _) = registry_with_call(chat);
+        let control = Arc::new(SessionControl::default());
+        registry.update(CALL_ID, |entry| {
+            entry.attach(Arc::clone(&control), SUMMARY.to_owned(), None)
+        });
+        let finish = || {
+            control.end(EndReason::Closed);
+            if end == TaskEnd::Lost {
+                registry.lose(CALL_ID);
+            } else {
+                if end == TaskEnd::Cancelled {
+                    registry.stop(CALL_ID, Cutter::Parent);
+                }
+                registry.deliver(CALL_ID, done(OUTPUT, end == TaskEnd::Failed), None);
+            }
+            message()
+        };
+        assert_eq!(
+            registry.send(Some(chat), SUMMARY, finish, Delivery::NextTurn),
+            Err(ended_subagent(SUMMARY, end))
+        );
+        assert_eq!(mailbox.drain().len(), 1);
+        let later_control = Arc::new(SessionControl::default());
+        let (mut later, _) = call_entry(chat, OTHER_CALL_ID);
+        later.attach(Arc::clone(&later_control), SUMMARY.to_owned(), None);
+        registry.register(later).unwrap();
+        assert_eq!(
+            registry.send(Some(chat), CALL_ID, message, Delivery::NextTurn),
+            Err(ended_subagent(CALL_ID, end))
+        );
+        assert_eq!(
+            registry.send(Some(chat), SUMMARY, message, Delivery::NextTurn),
+            Ok(vec![SUMMARY.to_owned()])
+        );
+        assert_eq!(later_control.texts(), [MESSAGE]);
+        for asker in [Some(other.session_id()), None] {
+            assert_eq!(
+                registry.send(asker, CALL_ID, message, Delivery::NextTurn),
+                Err(format!("{NO_RUNNING_SUBAGENT} {CALL_ID}; {NONE_RUNNING}"))
+            );
+        }
+    }
+
+    #[test]
+    fn batch_reaches_its_remaining_member_after_another_finishes() {
+        let chat = MakiId::generate();
+        let _live = live(chat);
+        let (registry, [finished, running]) = registry_with_nested(chat);
+        finished.report(Err(OUTPUT.to_owned()));
+        finished.end(EndReason::Closed);
+        registry.remove(NESTED_ID);
+
+        assert_eq!(
+            registry.send(Some(chat), NESTED_ID, message, Delivery::NextTurn),
+            Err(ended_subagent(NESTED_ID, TaskEnd::Failed))
+        );
+        assert_eq!(
+            registry.send(Some(chat), CALL_ID, message, Delivery::NextTurn),
+            Ok(vec![OTHER_NESTED_ID.to_owned()])
+        );
+        assert_eq!(running.texts(), [MESSAGE]);
+    }
+
+    #[test]
+    fn terminal_addresses_are_bounded_per_mailbox() {
+        let (mailbox, _seed) = live(MakiId::generate());
+        let (other, _other_seed) = live(MakiId::generate());
+        mailbox.track(CALL_ID);
+        other.track(CALL_ID);
+        mailbox.remember_task_end(CALL_ID, CALL_ID, SUMMARY, TaskEnd::Finished);
+        other.remember_task_end(CALL_ID, CALL_ID, SUMMARY, TaskEnd::Failed);
+        const TASKS: usize = 101;
+        for number in 0..TASKS {
+            let id = number.to_string();
+            mailbox.track(&id);
+            mailbox.remember_task_end(&id, &id, SUMMARY, TaskEnd::Cancelled);
+        }
+
+        assert_eq!(mailbox.task_end(CALL_ID, false), None);
+        assert_eq!(mailbox.task_end(SUMMARY, true), Some(TaskEnd::Cancelled));
+        assert_eq!(other.task_end(CALL_ID, false), Some(TaskEnd::Failed));
     }
 
     enum Lookup {

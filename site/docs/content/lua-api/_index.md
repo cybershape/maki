@@ -1966,7 +1966,7 @@ idle, so a session you only drop can stay open for the rest of the run.
 ### `Session:prompt()` {#Session-prompt}
 
 ```lua
-Session:prompt({message})
+Session:prompt({message}, {setup?})
 ```
 
 Send a message to the subagent and wait for its full response. The agent
@@ -1986,6 +1986,7 @@ session, or the end of the task that opened it, stops such calls.
 **Parameters:**
 
 - `{message}` (`string`) User message to send.
+- `{setup?}` (`table?`) First-prompt system and tool definitions.
 
 **Returns:** (`table?`, `string?`) Result table on success, or `(nil, err)` on
 failure. A run cut short after streaming some text hands you both: the
@@ -6310,8 +6311,9 @@ still running in it.
   - `interrupt` (`boolean?`) cut its current turn short. Default: `false`.
 
 **Returns:** (`table|nil`, `string|nil`) `{name}`, the task's name in `/tasks`
-  (comma-separated when it reached several), or nil and
-  `"no running background subagent with id <id>; running: ..."`.
+  (comma-separated when it reached several), or nil and an error. A
+  recently ended task reports its final status. An unknown target reports
+  which subagents the caller can still reach.
 
 **Example:**
 

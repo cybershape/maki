@@ -724,17 +724,33 @@ fn plain_path_returns_text_without_local_tools() {
 /// waiting for the final result. So it gets no task_message tool and its
 /// prompt says to put everything in the final answer. A background subagent
 /// keeps the tool and the plain prompt.
-#[test_case::test_case(false, true ; "synchronous_drops_task_message")]
-#[test_case::test_case(true, false ; "background_keeps_task_message")]
-fn synchronous_subagent_has_no_task_message(background: bool, drops_tool: bool) {
-    let (reg, _host) = load_background_host();
+#[test_case::test_case(false, false ; "synchronous")]
+#[test_case::test_case(true, false ; "no_live_chat")]
+#[test_case::test_case(true, true ; "moved")]
+fn first_prompt_matches_execution_mode(background: bool, moved: bool) {
+    let (reg, mut host) = load_background_host();
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["background"] = json!(background);
-    exec_tool(&reg, TASK_TOOL, input).unwrap();
+    if moved {
+        let mut ui = host.take_ui_action_rx().unwrap();
+        let chat = Chat::live();
+        let (_trigger, token) = CancelToken::new();
+        assert!(
+            ModelCall::start(&reg, &chat, &token, FIRST_CALL_ID, input)
+                .finish()
+                .backgrounded
+        );
+        assert_eq!(
+            done_text(&next_task_done(&mut ui)),
+            (PLAIN_TEXT.to_owned(), false)
+        );
+    } else {
+        exec_tool(&reg, TASK_TOOL, input).unwrap();
+    }
 
     let snap = probe(&reg);
     let except = snap["tool_opts"]["except"].as_array();
-    if drops_tool {
+    if !moved {
         assert_eq!(except, Some(&vec![json!("task_message")]));
         assert_eq!(
             snap["prompts"][0],
@@ -952,22 +968,40 @@ fn a_duplicate_codename_is_refused_until_the_task_closes() {
     let chat = Chat::live();
     let (_run_trigger, run) = CancelToken::new();
 
-    let first = ModelCall::start(&reg, &chat, &run, FIRST_CALL_ID, task_input(SCENARIO_PARKED, None));
+    let first = ModelCall::start(
+        &reg,
+        &chat,
+        &run,
+        FIRST_CALL_ID,
+        task_input(SCENARIO_PARKED, None),
+    );
     wait(&reg, json!({ "parked": SCENARIO_PARKED }));
 
     let (dup_ctx, _dup_events) = call_ctx(&reg, chat.id, &run, SECOND_CALL_ID);
     let dup = exec(&reg, TASK_TOOL, task_input(SCENARIO_PARKED, None), &dup_ctx);
     assert!(dup.is_error);
     let err = dup.output.as_text();
-    assert!(err.contains(SCENARIO_PARKED) && err.contains("taken"), "{err}");
+    assert!(
+        err.contains(SCENARIO_PARKED) && err.contains("taken"),
+        "{err}"
+    );
 
     release(&reg, SCENARIO_PARKED);
     assert!(!first.finish().is_error);
 
-    let reuse = ModelCall::start(&reg, &chat, &run, SECOND_CALL_ID, task_input(SCENARIO_PARKED, None));
+    let reuse = ModelCall::start(
+        &reg,
+        &chat,
+        &run,
+        SECOND_CALL_ID,
+        task_input(SCENARIO_PARKED, None),
+    );
     wait(&reg, json!({ "parked": SCENARIO_PARKED }));
     release(&reg, SCENARIO_PARKED);
-    assert!(!reuse.finish().is_error, "the name is free once the task closed");
+    assert!(
+        !reuse.finish().is_error,
+        "the name is free once the task closed"
+    );
 }
 
 /// A blank, multiline or oversized codename is refused before a session opens.

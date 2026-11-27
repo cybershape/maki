@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
+use maki_providers::TaskEnd;
 use thiserror::Error;
 use tokio::sync::Notify;
 
@@ -177,6 +178,13 @@ impl SessionControl {
 
     pub fn result(&self) -> Option<Result<String, String>> {
         self.lock().result.clone()
+    }
+
+    pub fn result_end(&self) -> Option<TaskEnd> {
+        self.lock().result.as_ref().map(|result| match result {
+            Ok(_) => TaskEnd::Finished,
+            Err(_) => TaskEnd::Failed,
+        })
     }
 
     pub fn ended(&self) -> Option<EndReason> {

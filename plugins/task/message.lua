@@ -8,8 +8,9 @@ Set interrupt only when it must act now: it cuts the current step, running tools
 local SUB_DESCRIPTION =
   [[Report to the parent agent mid-task: a key finding that changes the plan, a blocker needing direction, or a risk.
 The parent reads it at its next step, or wakes to read it when idle. Keep working after reporting unless blocked;
-the parent replies with a message if needed. Never report routine progress; your final answer carries the full result.]]
-local ID_DESCRIPTION = "Parent only: task codename from its receipt (its call id also works). A batch's id reaches every subagent in it"
+the parent replies with a message if needed. Include any unresolved blocker in your final answer. Never report routine progress.]]
+local ID_DESCRIPTION =
+  "Parent only: task codename from its receipt (its call id also works). A batch's id reaches every subagent in it"
 local MESSAGE_DESCRIPTION = "What the subagent should know or do, or what the parent must know"
 local INTERRUPT_DESCRIPTION = "Parent only: cut the current step short"
 local REASON_DESCRIPTION = "Why you are calling this tool and what you expect."
@@ -18,7 +19,8 @@ local INTERRUPTED = "Interrupted %s with the message."
 local NO_SESSION_ERR = "no parent session to report to"
 local REPORT_HEAD = "[Report from %s]"
 local DISPLAY = "%s reported: %s"
-local DELIVERED = "Report delivered to the parent agent."
+local REPORT_QUEUED = "Report queued for the parent agent."
+local REPORT_REQUIRES_BACKGROUND = "The parent is waiting for your final result. Put the report in your final answer."
 local PARENT_RECIPIENT = "parent"
 local SEND_ARROW = "→ "
 local HEADER_MESSAGE = "%s%s: %s"
@@ -55,6 +57,9 @@ local function to_parent(input, ctx)
   if not session then
     return { llm_output = NO_SESSION_ERR, is_error = true }
   end
+  if not ctx:task_backgrounded() then
+    return { llm_output = REPORT_REQUIRES_BACKGROUND, is_error = true }
+  end
   local task = ctx:task_name() or ctx:task_id()
   local text = REPORT_HEAD:format(task) .. "\n" .. input.message
   local ok, err = maki.session.notify(text, {
@@ -65,7 +70,7 @@ local function to_parent(input, ctx)
   if not ok then
     return { llm_output = err, is_error = true }
   end
-  return sent_reply(DELIVERED, PARENT_RECIPIENT, input)
+  return sent_reply(REPORT_QUEUED, PARENT_RECIPIENT, input)
 end
 
 local function to_subagent(input, ctx)
@@ -122,7 +127,7 @@ maki.api.register_tool({
 maki.api.register_prompt_hint({
   prompt = { "research", "general" },
   slot = "tool_usage",
-  content = "- Use **task_message** only for what changes the parent's work: a plan-changing finding, a blocker needing direction, or a risk. Never for routine progress. Keep working after reporting unless blocked.",
+  content = "- Use **task_message** only for what changes the parent's work: a plan-changing finding, a blocker needing direction, or a risk. Never for routine progress. Keep working after reporting unless blocked. Include unresolved blockers in your final answer.",
 })
 
 maki.api.register_prompt_hint({

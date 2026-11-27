@@ -14,15 +14,16 @@ use common::{
     request_move,
 };
 use maki_agent::permissions::PermissionManager;
-use maki_agent::tools::{ToolAudience, ToolRegistry};
+use maki_agent::tools::{BackgroundFor, ToolAudience, ToolRegistry};
 use maki_agent::{
-    AgentEvent, CancelToken, Envelope, EventSender, PermissionsConfig, SessionMailbox, ToolDoneEvent,
+    AgentEvent, CallScope, CancelToken, Envelope, EventSender, PermissionsConfig, SessionMailbox,
+    TaskHome, ToolDoneEvent,
 };
 use maki_config::{ProjectConfig, ToolOutputLines};
 use maki_lua::{
     MoveOutcome, Permission, PluginHost, PluginPermissions, RestoreItem, RestoreReason, UiAction,
 };
-use maki_providers::ContentBlock;
+use maki_providers::{ContentBlock, Effort, Model, ThinkingConfig};
 use maki_storage::id::MakiId;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -56,6 +57,10 @@ const QUEUED: &str = "Message queued for Hawk.";
 const INTERRUPTED: &str = "Interrupted Hawk with the message.";
 const NOT_RUNNING: &str = "no running background subagent with id";
 const INTERRUPT_OPEN: &str = "<parent-interrupt>";
+const STEERING_MODEL: &str = "responses/gpt-6.2-sol";
+const STEERING_THINKING: ThinkingConfig = ThinkingConfig::Effort(Effort::High);
+const FINISHED_TASK: &str = "finished. See its background result.";
+const CANCELLED_TASK: &str = "was cancelled.";
 const INIT: &str = include_str!("../../plugins/task/init.lua");
 const RUNNER: &str = include_str!("../../plugins/task/runner.lua");
 const BATCH: &str = include_str!("../../plugins/batch/init.lua");
@@ -250,6 +255,14 @@ fn assert_refused(host: &Host, chat: MakiId, id: &str) {
     assert!(failed && output.starts_with(NOT_RUNNING), "{output}");
 }
 
+fn assert_ended(host: &Host, chat: MakiId, id: &str, hint: &str) {
+    let (output, failed) = message(host, chat, id, false);
+    assert!(
+        failed && output.contains(&format!("{id} {hint}")),
+        "{output}"
+    );
+}
+
 /// The provider stays parked until released, so the receipt coming back at
 /// all means the call did not wait for its subagent.
 #[test]
@@ -323,7 +336,12 @@ fn a_background_task_waiting_for_a_slot_returns_its_receipt_at_once() {
     let (receipt_tx, receipt_rx) = sync_channel(1);
     let waiter = thread::spawn(move || {
         receipt_tx
-            .send(exec(&reg, TASK_TOOL, task_input_named(SECOND_CODENAME), &second))
+            .send(exec(
+                &reg,
+                TASK_TOOL,
+                task_input_named(SECOND_CODENAME),
+                &second,
+            ))
             .ok();
     });
     let result = receipt_rx
@@ -334,7 +352,10 @@ fn a_background_task_waiting_for_a_slot_returns_its_receipt_at_once() {
     assert!(result.backgrounded);
     let (receipt, failed) = done_text(&result);
     assert!(!failed, "{receipt}");
-    assert!(receipt.starts_with(&format!("Subagent {SECOND_CODENAME}")), "{receipt}");
+    assert!(
+        receipt.starts_with(&format!("Subagent {SECOND_CODENAME}")),
+        "{receipt}"
+    );
     assert!(parked.started.try_recv().is_err(), "the slot is still held");
 
     parked.release.send(()).unwrap();
@@ -510,6 +531,8 @@ fn a_message_reaches_a_running_background_task_at_its_next_turn() {
     let (_run, run_token) = CancelToken::new();
     let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
     ctx.provider = Arc::clone(&parked.provider);
+    ctx.model = Arc::new(Model::from_spec(STEERING_MODEL).unwrap());
+    ctx.opts.thinking = STEERING_THINKING;
 
     let (receipt, _) = done_text(&exec(&host.reg, TASK_TOOL, task_input(), &ctx));
     assert!(receipt.contains(CALL_ID), "{receipt}");
@@ -531,7 +554,13 @@ fn a_message_reaches_a_running_background_task_at_its_next_turn() {
     );
     parked.release.send(()).unwrap();
     assert_eq!(done_text(&host.task_done()), (RESULT.to_owned(), false));
-    assert_refused(&host, chat.id, CALL_ID);
+    let thinking: Vec<_> = parked
+        .request_options
+        .try_iter()
+        .map(|opts| opts.thinking)
+        .collect();
+    assert_eq!(thinking, [STEERING_THINKING; 2]);
+    assert_ended(&host, chat.id, CALL_ID, FINISHED_TASK);
 }
 
 /// A task still waiting for a slot has opened its session but not prompted
@@ -550,7 +579,15 @@ fn a_message_to_a_task_waiting_for_a_slot_rides_with_its_first_prompt() {
 
     assert!(exec(&host.reg, TASK_TOOL, task_input(), &first).backgrounded);
     parked.wait_started();
-    assert!(exec(&host.reg, TASK_TOOL, task_input_named(SECOND_CODENAME), &second).backgrounded);
+    assert!(
+        exec(
+            &host.reg,
+            TASK_TOOL,
+            task_input_named(SECOND_CODENAME),
+            &second
+        )
+        .backgrounded
+    );
 
     assert_eq!(
         message(&host, chat.id, SECOND_CALL_ID, false),
@@ -560,7 +597,15 @@ fn a_message_to_a_task_waiting_for_a_slot_rides_with_its_first_prompt() {
     parked.wait_started();
     parked.release.send(()).unwrap();
     let turns: Vec<_> = parked.user_turns.try_iter().collect();
-    assert_eq!(turns, [vec![PROMPT], vec![MESSAGE, PROMPT]]);
+    let [first, second] = turns.as_slice() else {
+        panic!("one request per subagent: {turns:?}");
+    };
+    assert_eq!(first, &[PROMPT]);
+    let [interrupt, prompt] = second.as_slice() else {
+        panic!("the queued message should precede the task prompt: {second:?}");
+    };
+    assert!(interrupt.starts_with(INTERRUPT_OPEN) && interrupt.contains(MESSAGE));
+    assert_eq!(prompt, PROMPT);
     host.task_dones(&[CALL_ID, SECOND_CALL_ID]);
 }
 
@@ -609,7 +654,7 @@ fn a_message_is_refused_by_a_task_the_user_just_stopped() {
     parked.wait_started();
 
     host.host.event_handle().cancel_plugin_session(CALL_ID);
-    assert_refused(&host, chat.id, CALL_ID);
+    assert_ended(&host, chat.id, CALL_ID, CANCELLED_TASK);
     host.task_done();
 }
 
@@ -632,7 +677,7 @@ fn a_message_is_refused_by_tasks_the_caller_cannot_reach() {
     let mut agent = chat.seed.tool_context(CancelToken::none());
     agent.mailbox = Some(chat.mailbox.clone());
     exec(&host.reg, STOP_TOOL, json!({ "id": CALL_ID }), &agent);
-    assert_refused(&host, chat.id, CALL_ID);
+    assert_ended(&host, chat.id, CALL_ID, CANCELLED_TASK);
 }
 
 /// Ctrl+B still moves a blocking task with `allow_background` off. The
@@ -734,7 +779,7 @@ fn the_tasks_of_a_moved_batch_are_reached_by_the_batchs_id_or_their_own() {
         done_text(&exec(&host.reg, STOP_TOOL, json!({ "id": second }), &agent)),
         (format!("{NESTED_STOPPED}{second}."), false)
     );
-    assert_refused(&host, chat.id, second);
+    assert_ended(&host, chat.id, second, CANCELLED_TASK);
     let notices = poll_until("the stopped subagent never reported", || {
         Some(chat.mailbox.claim_wake()).filter(|notices| !notices.is_empty())
     });
@@ -762,8 +807,94 @@ fn the_tasks_of_a_moved_batch_are_reached_by_the_batchs_id_or_their_own() {
 }
 
 const REPORT: &str = "the IOC list is stale, need a fresh source";
-const REPORT_DELIVERED: &str = "Report delivered to the parent agent.";
+const REPORT_QUEUED: &str = "Report queued for the parent agent.";
 const NO_PARENT_SESSION: &str = "no parent session to report to";
+const SYNC_PROMPT_NOTE: &str = "You run synchronously";
+const REPORT_REQUIRES_BACKGROUND: &str =
+    "The parent is waiting for your final result. Put the report in your final answer.";
+
+#[test_case(false, false, true, None ; "synchronous")]
+#[test_case(true, true, true, None ; "moved_batch")]
+#[test_case(true, false, true, None ; "foreground_batch")]
+#[test_case(false, true, false, Some(BACKGROUND_OFF) ; "background_disabled")]
+#[test_case(false, true, false, Some(NO_LIVE_CHAT) ; "no_live_chat")]
+#[test_case(false, true, true, None ; "moved_task")]
+fn the_first_subagent_request_uses_its_actual_execution_mode(
+    batch: bool,
+    requested: bool,
+    live: bool,
+    fallback: Option<&str>,
+) {
+    let mut host = Host::task(Arc::clone(ToolRegistry::global_arc()));
+    host.host
+        .load_source_with_permissions(BATCH_PLUGIN, BATCH, PluginPermissions::trusted())
+        .unwrap();
+    let chat = Chat::live();
+    let id = if live { chat.id } else { MakiId::generate() };
+    let _blocking_mailbox =
+        (fallback == Some(BACKGROUND_OFF)).then(|| SessionMailbox::register(id));
+    let moved = requested && live;
+    let report = batch && moved;
+    let parked = Parked::with_first_turn(
+        RESULT,
+        report.then(|| {
+            ContentBlock::tool_use(MESSAGE_CALL_ID, MESSAGE_TOOL, json!({ "message": REPORT }))
+        }),
+    );
+    let (_run, run) = CancelToken::new();
+    let (mut ctx, _events) = call_ctx(&host.reg, id, &run, CALL_ID);
+    ctx.provider = Arc::clone(&parked.provider);
+    let mut input = task_input();
+    input["background"] = json!(requested);
+    let (tool, input) = if batch {
+        (
+            BATCH_TOOL,
+            json!({ "tool_calls": [{ "tool": TASK_TOOL, "parameters": input }] }),
+        )
+    } else {
+        (TASK_TOOL, input)
+    };
+    let reg = Arc::clone(&host.reg);
+    let call = thread::spawn(move || exec(&reg, tool, input, &ctx));
+    parked.wait_started();
+    let (_, tools) = parked.requests.recv_timeout(WAIT).unwrap();
+    let prompts = parked.user_turns.recv_timeout(WAIT).unwrap();
+    assert_eq!(
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == MESSAGE_TOOL),
+        moved,
+        "{tools}"
+    );
+    assert_eq!(
+        prompts
+            .iter()
+            .any(|prompt| prompt.contains(SYNC_PROMPT_NOTE)),
+        !moved,
+        "{prompts:?}"
+    );
+    if report {
+        parked.release.send(()).unwrap();
+        parked.wait_started();
+        let notices = chat.mailbox.claim_wake();
+        assert!(notices.iter().any(|notice| {
+            notice
+                .first_text_content()
+                .is_some_and(|text| text.contains(REPORT))
+        }));
+    }
+    drop(parked);
+    let result = call.join().unwrap();
+    assert_eq!(result.backgrounded, moved);
+    let done = if moved { host.task_done() } else { result };
+    let (text, failed) = done_text(&done);
+    assert!(!failed && text.contains(RESULT), "{text}");
+    if let Some(reason) = fallback {
+        assert!(text.contains(reason), "{text}");
+    }
+}
 
 /// A subagent's task_message goes the other way: the report lands in the
 /// parent chat's mailbox as a waking observation named by the subagent's id.
@@ -777,6 +908,27 @@ fn a_subagents_message_reports_to_the_parent_chat(audience: ToolAudience) {
     ctx.audience = audience;
     ctx.task_id = Some(Arc::from(SUBAGENT_TASK_ID));
     ctx.task_name = Some(Arc::from(CODENAME));
+    let owner = Arc::new(CallScope::new(CALL_ID.to_owned(), &run_token));
+    ctx.background_for = BackgroundFor::Call(Arc::clone(&owner));
+    let (reply, failed) = done_text(&exec(
+        &host.reg,
+        MESSAGE_TOOL,
+        json!({ "message": REPORT }),
+        &ctx,
+    ));
+    assert_eq!(
+        (reply, failed),
+        (REPORT_REQUIRES_BACKGROUND.to_owned(), true)
+    );
+    assert!(chat.mailbox.claim_wake().is_empty());
+    let _moved = owner
+        .move_to(TaskHome {
+            chat: chat.id,
+            id: CALL_ID.to_owned(),
+            plugin: Arc::from(PLUGIN),
+        })
+        .unwrap();
+    ctx.background_for = BackgroundFor::Call(owner);
 
     let (reply, failed) = done_text(&exec(
         &host.reg,
@@ -786,7 +938,7 @@ fn a_subagents_message_reports_to_the_parent_chat(audience: ToolAudience) {
     ));
 
     assert!(!failed, "{reply}");
-    assert_eq!(reply, REPORT_DELIVERED);
+    assert_eq!(reply, REPORT_QUEUED);
     let notices = chat.mailbox.claim_wake();
     let [notice] = &notices[..] else {
         panic!("one report: {notices:?}");
@@ -873,6 +1025,15 @@ fn a_report_header_names_the_parent() {
     ctx.audience = ToolAudience::GENERAL_SUB;
     ctx.task_id = Some(Arc::from(SUBAGENT_TASK_ID));
     ctx.task_name = Some(Arc::from(CODENAME));
+    let owner = Arc::new(CallScope::new(CALL_ID.to_owned(), &run_token));
+    let _moved = owner
+        .move_to(TaskHome {
+            chat: chat.id,
+            id: CALL_ID.to_owned(),
+            plugin: Arc::from(PLUGIN),
+        })
+        .unwrap();
+    ctx.background_for = BackgroundFor::Call(owner);
 
     let (reply, failed) = done_text(&exec(
         &host.reg,

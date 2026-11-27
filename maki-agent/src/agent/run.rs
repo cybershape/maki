@@ -62,7 +62,8 @@ const USER_INTERRUPT_TAG: &str = "user-interrupt";
 const USER_INTERRUPT_NOTE: &str =
     "The user sent a new message while you were working. Address it and continue.";
 const PARENT_INTERRUPT_TAG: &str = "parent-interrupt";
-const PARENT_INTERRUPT_NOTE: &str = "Your parent agent or a plugin sent this while you were working, not the user. Address it and continue.";
+const PARENT_INTERRUPT_NOTE: &str =
+    "Your parent agent or a plugin sent this message. Address it as part of your task.";
 /// A layer that always answers "continue" would never let the run end, and
 /// the user would pay for every turn of it. So `agent.stop` gets this many in
 /// a row, and the count starts over whenever the user speaks.
@@ -343,10 +344,10 @@ impl<'h> Agent<'h> {
         // enough for the run to go on.
         let burst = earlier
             .into_iter()
-            .map(|e| (e.message, e.images, e.preamble))
-            .chain([(message, images, preamble)]);
+            .map(|e| (e.message, e.images, e.preamble, e.source, true))
+            .chain([(message, images, preamble, source, false)]);
         let mut prompt = None;
-        for (message, images, preamble) in burst {
+        for (message, images, preamble, source, earlier) in burst {
             let kept = match self
                 .filter_user_message(&message, images.len(), source)
                 .await
@@ -371,12 +372,19 @@ impl<'h> Agent<'h> {
             let kept = kept.map(|text| {
                 self.history.offer_title_source(&message, &text);
                 prompt = Some(text.clone());
-                Message::user_with_images(text, images)
+                if earlier && source == InputSource::Plugin {
+                    interrupt_message(text, images, source)
+                } else {
+                    Message::user_with_images(text, images)
+                }
             });
             let mailbox_wake = kept
                 .as_ref()
                 .is_some_and(|message| message.content.is_empty());
-            self.land_input(preamble, kept, true, mailbox_wake)?;
+            match self.land_input(preamble, kept, true, mailbox_wake) {
+                Err(AgentError::Cancelled) => return self.finish(Err(AgentError::Cancelled)),
+                landed => landed?,
+            }
         }
         let Some(message) = prompt else {
             self.emit_done(DoneReason::Dropped)?;
@@ -398,6 +406,9 @@ impl<'h> Agent<'h> {
                 maki_otel::set_session_id(session.as_str());
             }
             maki_otel::emit::user_prompt(&message);
+        }
+        if message.is_empty() && self.history.len() == self.rollback_len {
+            return self.finish(Ok(DoneReason::Dropped));
         }
         self.drive().await
     }
@@ -523,7 +534,7 @@ impl<'h> Agent<'h> {
             return Ok(());
         };
         if drain_mailbox {
-            self.land_mailbox()?;
+            self.land_mailbox(wake)?;
         }
         self.tell_changes();
         if !message.content.is_empty() {
@@ -562,14 +573,17 @@ impl<'h> Agent<'h> {
         }
     }
 
-    fn land_mailbox(&mut self) -> Result<(), AgentError> {
-        let Some(mailbox) = &self.mailbox else {
+    fn land_mailbox(&mut self, mut wake: bool) -> Result<(), AgentError> {
+        let Some(mailbox) = self.mailbox.clone() else {
             return Ok(());
         };
-        for message in mailbox.drain() {
-            self.land_observation(message)?;
-        }
-        Ok(())
+        mailbox.land(&self.cancel.clone(), |mut message| {
+            if wake && message.first_text_content().is_some() {
+                self.apply_reasoning_effort(&mut message);
+                wake = false;
+            }
+            self.land_observation(message)
+        })
     }
 
     /// The line follows the observation into history, so frontends draw it
@@ -900,7 +914,7 @@ impl<'h> Agent<'h> {
         // The request is going out anyway, so a notice rides along behind the
         // tool results. After a final answer it stays queued: that is the wake.
         if has_tools {
-            self.land_mailbox()?;
+            self.land_mailbox(false)?;
             return Ok(TurnOutcome::Continue);
         }
         let reason = stop_reason.into();
@@ -1442,7 +1456,8 @@ impl<'h> Agent<'h> {
                 let last = inputs.len().saturating_sub(1);
                 let opts = RequestOptions {
                     thinking: inputs
-                        .last()
+                        .iter()
+                        .rfind(|input| input.source != InputSource::Plugin)
                         .map_or(self.opts.thinking, |input| input.thinking),
                     ..self.opts
                 };
@@ -2414,6 +2429,7 @@ mod tests {
                     message: String::new(),
                     images: Vec::new(),
                     preamble: mailbox.claim_wake(),
+                    source: InputSource::Tui,
                 }];
             }
             NoticePath::PromptPreamble => input.preamble = mailbox.drain(),
@@ -3774,6 +3790,7 @@ mod tests {
                 message: BLOCKED.into(),
                 images: Vec::new(),
                 preamble: vec![Message::observation(SHELL_RESULT.into())],
+                source: InputSource::Tui,
             }],
             ..default_input()
         };
@@ -5174,6 +5191,7 @@ mod tests {
                 message: first.into(),
                 images: Vec::new(),
                 preamble: vec![Message::observation(SHELL_RESULT.into())],
+                source: InputSource::Tui,
             }],
             ..default_input()
         };

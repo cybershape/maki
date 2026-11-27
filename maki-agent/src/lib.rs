@@ -139,6 +139,7 @@ pub struct EarlierInput {
     pub message: String,
     pub images: Vec<ImageSource>,
     pub preamble: Vec<Message>,
+    pub source: InputSource,
 }
 
 impl From<AgentInput> for EarlierInput {
@@ -147,6 +148,7 @@ impl From<AgentInput> for EarlierInput {
             message: input.message,
             images: input.images,
             preamble: input.preamble,
+            source: input.source,
         }
     }
 }
