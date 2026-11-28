@@ -1432,6 +1432,8 @@ fn task_schema_and_prompts_document_lifecycle_and_after() {
     let task_desc = task_entry.tool.description(&main_dctx);
     assert!(task_desc.contains("run-to-completion"), "got: {task_desc}");
     assert!(task_desc.contains("after"), "got: {task_desc}");
+    assert!(task_desc.contains("main loop"), "got: {task_desc}");
+    assert!(task_desc.contains("do not use `sleep`"), "got: {task_desc}");
 
     let msg_entry = host.reg.get(MESSAGE_TOOL).expect("task_message registered");
     let sub_desc = runtime()
