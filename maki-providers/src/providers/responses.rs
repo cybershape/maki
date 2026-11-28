@@ -32,6 +32,7 @@ const NANO_AIU_PER_USD: f64 = 100_000_000_000.0;
 const SERVICE_TIER_FAST: &str = "fast";
 const GPT_6_2_FRAGMENT: &[u8] = b"gpt-6.2";
 const CONFIGURATION_UPDATE: &str = "configuration_update";
+const SSE_DONE_SENTINEL: &str = "[DONE]";
 
 fn is_gpt_6_2(model_id: &str) -> bool {
     model_id
@@ -910,6 +911,9 @@ pub(crate) async fn parse_sse(
             return Err(AgentError::api(500, message));
         }
 
+        if data == SSE_DONE_SENTINEL {
+            break;
+        }
         let Ok(parsed) = serde_json::from_str::<Value>(data) else {
             continue;
         };
@@ -1110,6 +1114,7 @@ pub(crate) async fn parse_sse(
                     "incomplete" => StopReason::MaxTokens,
                     _ => StopReason::EndTurn,
                 });
+                break;
             }
 
             "response.incomplete" => {
@@ -1117,6 +1122,7 @@ pub(crate) async fn parse_sse(
                     usage = parsed_usage;
                 }
                 stop_reason = Some(StopReason::MaxTokens);
+                break;
             }
 
             "response.failed" => {
@@ -1193,11 +1199,14 @@ fn parse_usage(event: &Value) -> Option<TokenUsage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::{FutureExt, StreamExt, stream};
     use serde_json::json;
+    use std::io::Cursor;
     use std::iter;
     use test_case::test_case;
     use tokio::sync::mpsc::unbounded_channel;
 
+    use crate::providers::sse_events;
     use crate::test_support::{Canned, serve, sse_body, sse_event};
 
     const OVERLOAD_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
@@ -1414,6 +1423,39 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
         assert!(
             matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "partial")
         );
+    }
+
+    #[test_case(
+        "event: response.output_text.delta\ndata: {\"delta\":\"done\"}\n\nevent: response.completed\ndata: {\"response\":{\"status\":\"completed\"}}\n\n",
+        Some(StopReason::EndTurn)
+        ; "response_completed_returns_without_eof"
+    )]
+    #[test_case(
+        "event: response.output_text.delta\ndata: {\"delta\":\"done\"}\n\nevent: response.incomplete\ndata: {\"response\":{\"status\":\"incomplete\"}}\n\n",
+        Some(StopReason::MaxTokens)
+        ; "response_incomplete_returns_without_eof"
+    )]
+    #[test_case(
+        "event: response.output_text.delta\ndata: {\"delta\":\"done\"}\n\ndata: [DONE]\n\n",
+        None
+        ; "done_sentinel_returns_without_eof"
+    )]
+    #[tokio::test]
+    async fn parse_sse_returns_on_terminal_frame_without_waiting_for_eof(
+        sse: &str,
+        expected_stop_reason: Option<StopReason>,
+    ) {
+        let (tx, _rx) = unbounded_channel();
+        let chunks =
+            stream::iter([Ok(Cursor::new(sse.as_bytes().to_vec()))]).chain(stream::pending());
+        let events = sse_events(chunks, Duration::from_secs(60));
+
+        let resp = parse_sse(events, &tx)
+            .now_or_never()
+            .expect("terminal SSE event must not wait for stream EOF")
+            .unwrap();
+        assert_eq!(resp.stop_reason, expected_stop_reason);
+        assert!(matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "done"));
     }
 
     #[test_case("gpt-6.2", true ; "exact")]
