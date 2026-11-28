@@ -237,7 +237,8 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `background` | boolean | no | Run in the background (default). The result arrives as a message that wakes you. Set false only when your very next step needs the result inline. Launch all in one batch. Never sleep or poll, end your turn when idle. |
+| `after` | array | no | Task codenames that must finish successfully before this subagent starts (can name tasks launched in the same turn or batch). Their final outputs are prepended to this task's prompt; if any fails or is stopped, this task fails without running. |
+| `background` | boolean | no | Run in the background (default). The result arrives as a message that wakes you. Set false only when your very next step needs the result inline. Launch all in one batch (use `after` for dependencies). Never sleep or poll, end your turn when idle. |
 | `description` | string | yes | Short (3-5 words) description of the task |
 | `name` | string | yes | Give each subagent a short, cool, task-inspired codename (3-8 letters), drawing from mythology, sci-fi, nature, or tools. Prefer evocative names like Forge, Atlas, Nyx, or Hawk over generic role labels, and avoid duplicates. |
 | `output_schema` | object | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |

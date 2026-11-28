@@ -71,6 +71,11 @@ local schema = {
       type = "object",
       description = "JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string.",
     },
+    after = {
+      type = "array",
+      items = { type = "string" },
+      description = "Task codenames that must finish successfully before this subagent starts (can name tasks launched in the same turn or batch). Their final outputs are prepended to this task's prompt; if any fails or is stopped, this task fails without running.",
+    },
   },
 }
 
@@ -86,7 +91,7 @@ end
 if opts.allow_background then
   schema.properties.background = {
     type = "boolean",
-    description = "Run in the background (default). The result arrives as a message that wakes you. Set false only when your very next step needs the result inline. Launch all in one batch. Never sleep or poll, end your turn when idle.",
+    description = "Run in the background (default). The result arrives as a message that wakes you. Set false only when your very next step needs the result inline. Launch all in one batch (use `after` for dependencies). Never sleep or poll, end your turn when idle.",
     needs_background = true,
   }
 end

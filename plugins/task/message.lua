@@ -7,8 +7,8 @@ local PARENT_DESCRIPTION =
 Set interrupt only when it must act now: it cuts the current step, running tools included.]]
 local SUB_DESCRIPTION =
   [[Report to the parent agent mid-task: a key finding that changes the plan, a blocker needing direction, or a risk.
-The parent reads it at its next step, or wakes to read it when idle. Keep working after reporting unless blocked;
-the parent replies with a message if needed. Include any unresolved blocker in your final answer. Never report routine progress.]]
+The parent reads it at its next step, or wakes to read it when idle. You are run-to-completion: once you stop calling tools, your task closes and your final answer goes to the parent (you cannot wait idle for a reply).
+Keep working on independent work after reporting. If you are blocked with no local work left, NEVER sleep or poll: put the blocker and completed artifacts in your final answer and finish so the parent can dispatch a follow-up. Never report routine progress.]]
 local ID_DESCRIPTION =
   "Parent only: task codename from its receipt (its call id also works). A batch's id reaches every subagent in it"
 local MESSAGE_DESCRIPTION = "What the subagent should know or do, or what the parent must know"
@@ -127,11 +127,11 @@ maki.api.register_tool({
 maki.api.register_prompt_hint({
   prompt = { "research", "general" },
   slot = "tool_usage",
-  content = "- Use **task_message** only for what changes the parent's work: a plan-changing finding, a blocker needing direction, or a risk. Never for routine progress. Keep working after reporting unless blocked. Include unresolved blockers in your final answer.",
+  content = "- You are a run-to-completion subagent: you exit as soon as you end your turn without tool calls, and cannot idle-wait for the parent or siblings. Use **task_message** mid-task only for what changes the parent's work (a plan-changing finding, blocker, or risk) while you continue other work. NEVER call `sleep` to wait for the parent or another task; if blocked with no remaining work, summarize what is ready and what is blocking in your final answer and finish.",
 })
 
 maki.api.register_prompt_hint({
   prompt = "system",
   slot = "tool_usage",
-  content = "- A `[Report from <codename>]` observation is a mid-task report. Absorb plan-changing facts, answer a blocked subagent with **task_message** using that codename, or adjust sibling tasks. Never send acknowledgements; if nothing needs action, end your turn.",
+  content = "- Subagents are run-to-completion and cannot idle-wait for replies; use **after** on **task** for task dependencies instead of telling a subagent to wait. A `[Report from <codename>]` observation is a mid-task report: absorb plan-changing facts, steer a running subagent with **task_message** using that codename, or launch follow-up work once blockers clear. Never send acknowledgements; if nothing needs action, end your turn.",
 })

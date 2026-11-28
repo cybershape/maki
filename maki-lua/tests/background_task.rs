@@ -10,16 +10,20 @@ use std::sync::mpsc::sync_channel;
 use std::thread;
 
 use common::{
-    Chat, Parked, WAIT, call_ctx, done_text, exec, next_event, next_task_event, poll_until,
-    request_move,
+    Chat, Parked, WAIT, call_ctx, done_text, exec, next_event, next_task_done, next_task_event,
+    poll_until, request_move,
 };
 use maki_agent::permissions::PermissionManager;
-use maki_agent::tools::{BackgroundFor, ToolAudience, ToolRegistry};
+use maki_agent::prompt::{PromptId, assemble};
+use maki_agent::tools::{
+    BackgroundFor, DescriptionContext, ToolAudience, ToolFilter, ToolRegistry,
+};
 use maki_agent::{
     AgentEvent, CallScope, CancelToken, Envelope, EventSender, PermissionsConfig, SessionMailbox,
     TaskHome, ToolDoneEvent,
 };
 use maki_config::{ProjectConfig, ToolOutputLines};
+use maki_lua::test_support::runtime;
 use maki_lua::{
     MoveOutcome, Permission, PluginHost, PluginPermissions, RestoreItem, RestoreReason, UiAction,
 };
@@ -1145,4 +1149,322 @@ fn a_bad_codename_is_refused() {
         let result = exec(&host.reg, TASK_TOOL, input, &ctx);
         assert!(result.is_error, "codename {bad:?} must be refused");
     }
+}
+
+const DOWNSTREAM_RESULT: &str = "downstream answer";
+const DOWNSTREAM_PROMPT: &str = "Verify UI against API";
+const DEP_CONTEXT_MARKER: &str = "Dependency results (completed before this task started):";
+const UNKNOWN_DEP_ERR: &str = "unknown dependency";
+const SELF_DEP_ERR: &str = "cannot depend on itself";
+const CYCLE_DEP_ERR: &str = "dependency cycle";
+const DEP_FAILED_ERR: &str = "dependency 'Hawk' failed";
+const NON_ARRAY_AFTER_ERR: &str = "expected array, got string";
+const AFTER_EMPTY_ERR: &str = "after entries must be non-empty task codenames";
+
+#[test]
+fn after_waits_for_upstream_and_prepends_output() {
+    let mut host = Host::task(Arc::new(ToolRegistry::new()));
+    let chat = Chat::live();
+    let hawk = Parked::new(RESULT);
+    let nyx = Parked::new(DOWNSTREAM_RESULT);
+    let (_run, run_token) = CancelToken::new();
+
+    let (mut hawk_ctx, _hawk_events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    hawk_ctx.provider = Arc::clone(&hawk.provider);
+    assert!(exec(&host.reg, TASK_TOOL, task_input(), &hawk_ctx).backgrounded);
+    hawk.wait_started();
+
+    let (mut nyx_ctx, _nyx_events) = call_ctx(&host.reg, chat.id, &run_token, SECOND_CALL_ID);
+    nyx_ctx.provider = Arc::clone(&nyx.provider);
+    let nyx_input = json!({
+        "name": SECOND_CODENAME,
+        "description": SECOND_NAME,
+        "prompt": DOWNSTREAM_PROMPT,
+        "after": [CODENAME],
+    });
+    assert!(exec(&host.reg, TASK_TOOL, nyx_input, &nyx_ctx).backgrounded);
+
+    assert!(
+        nyx.started.try_recv().is_err(),
+        "downstream must not start LLM turn while upstream runs"
+    );
+
+    let _ = hawk.release.send(());
+    let first_done = next_task_done(&mut host.ui);
+    assert_eq!(done_text(&first_done), (RESULT.to_owned(), false));
+
+    nyx.wait_started();
+    let user_turns = nyx.user_turns.recv_timeout(WAIT).expect("nyx user turns");
+    let combined = user_turns.join("\n");
+    assert!(combined.contains(DEP_CONTEXT_MARKER), "{combined}");
+    assert!(
+        combined.contains(&format!("[{CODENAME}]\n{RESULT}")),
+        "{combined}"
+    );
+    assert!(combined.contains(DOWNSTREAM_PROMPT), "{combined}");
+
+    let _ = nyx.release.send(());
+    let second_done = next_task_done(&mut host.ui);
+    assert_eq!(
+        done_text(&second_done),
+        (DOWNSTREAM_RESULT.to_owned(), false)
+    );
+}
+
+#[test]
+fn after_in_batch_works_even_when_downstream_is_listed_first() {
+    let mut host = Host::task(Arc::new(ToolRegistry::new()));
+    host.host
+        .load_source_with_permissions(BATCH_PLUGIN, BATCH, PluginPermissions::trusted())
+        .unwrap();
+    let chat = Chat::live();
+    let shared = Parked::new(RESULT);
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    ctx.provider = Arc::clone(&shared.provider);
+
+    let batch_input = json!({
+        "tool_calls": [
+            {
+                "tool": TASK_TOOL,
+                "parameters": {
+                    "name": SECOND_CODENAME,
+                    "description": SECOND_NAME,
+                    "prompt": DOWNSTREAM_PROMPT,
+                    "after": [CODENAME],
+                    "background": true,
+                }
+            },
+            {
+                "tool": TASK_TOOL,
+                "parameters": {
+                    "name": CODENAME,
+                    "description": NAME,
+                    "prompt": PROMPT,
+                    "background": true,
+                }
+            }
+        ]
+    });
+
+    let batch_done = exec(&host.reg, BATCH_TOOL, batch_input, &ctx);
+    assert!(batch_done.backgrounded);
+
+    shared.wait_started();
+    let first_turns = shared.user_turns.recv_timeout(WAIT).expect("first turn");
+    assert_eq!(
+        first_turns.join("\n"),
+        PROMPT,
+        "upstream Hawk must run first"
+    );
+    assert!(
+        shared.started.try_recv().is_err(),
+        "downstream Nyx must stay queued until Hawk finishes"
+    );
+
+    let _ = shared.release.send(());
+    shared.wait_started();
+    let second_turns = shared.user_turns.recv_timeout(WAIT).expect("second turn");
+    let second_combined = second_turns.join("\n");
+    assert!(
+        second_combined.contains(&format!("[{CODENAME}]\n{RESULT}")),
+        "downstream Nyx must receive Hawk output: {second_combined}"
+    );
+    assert!(
+        second_combined.contains(DOWNSTREAM_PROMPT),
+        "{second_combined}"
+    );
+
+    let _ = shared.release.send(());
+    let final_done = host.task_done();
+    assert!(!final_done.is_error, "{}", final_done.output.as_text());
+}
+
+#[test]
+fn after_accepts_already_completed_dependency() {
+    let mut host = Host::task(Arc::new(ToolRegistry::new()));
+    let chat = Chat::live();
+    let hawk = Parked::new(RESULT);
+    let nyx = Parked::new(DOWNSTREAM_RESULT);
+    let (_run, run_token) = CancelToken::new();
+
+    let (mut hawk_ctx, _hawk_events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    hawk_ctx.provider = Arc::clone(&hawk.provider);
+    assert!(exec(&host.reg, TASK_TOOL, task_input(), &hawk_ctx).backgrounded);
+    hawk.wait_started();
+    let _ = hawk.release.send(());
+    assert_eq!(
+        done_text(&next_task_done(&mut host.ui)),
+        (RESULT.to_owned(), false)
+    );
+
+    let (mut nyx_ctx, _nyx_events) = call_ctx(&host.reg, chat.id, &run_token, SECOND_CALL_ID);
+    nyx_ctx.provider = Arc::clone(&nyx.provider);
+    let nyx_input = json!({
+        "name": SECOND_CODENAME,
+        "description": SECOND_NAME,
+        "prompt": DOWNSTREAM_PROMPT,
+        "after": [CODENAME],
+    });
+    assert!(exec(&host.reg, TASK_TOOL, nyx_input, &nyx_ctx).backgrounded);
+    nyx.wait_started();
+    let combined = nyx.user_turns.recv_timeout(WAIT).unwrap().join("\n");
+    assert!(
+        combined.contains(&format!("[{CODENAME}]\n{RESULT}")),
+        "{combined}"
+    );
+    let _ = nyx.release.send(());
+    assert_eq!(
+        done_text(&next_task_done(&mut host.ui)),
+        (DOWNSTREAM_RESULT.to_owned(), false)
+    );
+}
+
+#[test]
+fn after_fails_fast_when_upstream_is_stopped() {
+    let mut host = Host::task(Arc::new(ToolRegistry::new()));
+    let chat = Chat::live();
+    let hawk = Parked::new(RESULT);
+    let nyx = Parked::new(DOWNSTREAM_RESULT);
+    let (_run, run_token) = CancelToken::new();
+
+    let (mut hawk_ctx, _hawk_events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    hawk_ctx.provider = Arc::clone(&hawk.provider);
+    assert!(exec(&host.reg, TASK_TOOL, task_input(), &hawk_ctx).backgrounded);
+    hawk.wait_started();
+
+    let (mut nyx_ctx, _nyx_events) = call_ctx(&host.reg, chat.id, &run_token, SECOND_CALL_ID);
+    nyx_ctx.provider = Arc::clone(&nyx.provider);
+    let nyx_input = json!({
+        "name": SECOND_CODENAME,
+        "description": SECOND_NAME,
+        "prompt": DOWNSTREAM_PROMPT,
+        "after": [CODENAME],
+    });
+    assert!(exec(&host.reg, TASK_TOOL, nyx_input, &nyx_ctx).backgrounded);
+
+    let mut agent = chat.seed.tool_context(CancelToken::none());
+    agent.mailbox = Some(chat.mailbox.clone());
+    let stopped = exec(&host.reg, STOP_TOOL, json!({ "id": CODENAME }), &agent);
+    assert!(!stopped.is_error, "{}", stopped.output.as_text());
+
+    let nyx_done = host.task_dones(&[SECOND_CALL_ID]).remove(0);
+    let (nyx_text, nyx_err) = done_text(&nyx_done);
+    assert!(
+        nyx_err,
+        "downstream must fail when upstream was stopped: {nyx_text}"
+    );
+    assert!(nyx_text.contains(DEP_FAILED_ERR), "{nyx_text}");
+    assert!(
+        nyx.started.try_recv().is_err(),
+        "failed dependency must prevent downstream LLM turn"
+    );
+    drop(hawk);
+}
+
+#[test_case(json!({ "name": CODENAME, "description": NAME, "prompt": PROMPT, "after": ["Missing"] }), UNKNOWN_DEP_ERR ; "unknown_dependency")]
+#[test_case(json!({ "name": CODENAME, "description": NAME, "prompt": PROMPT, "after": [CODENAME] }), SELF_DEP_ERR ; "self_dependency")]
+#[test_case(json!({ "name": CODENAME, "description": NAME, "prompt": PROMPT, "after": ["  "] }), AFTER_EMPTY_ERR ; "empty_dependency")]
+#[test_case(json!({ "name": CODENAME, "description": NAME, "prompt": PROMPT, "after": CODENAME }), NON_ARRAY_AFTER_ERR ; "non_array_after")]
+fn after_rejects_invalid_dependencies(input: Value, expected_err: &str) {
+    let host = Host::task(Arc::new(ToolRegistry::new()));
+    let chat = Chat::live();
+    let (_run, run_token) = CancelToken::new();
+    let (ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    let result = exec(&host.reg, TASK_TOOL, input, &ctx);
+    assert!(result.is_error, "invalid after must fail");
+    let text = result.output.as_text();
+    assert!(text.contains(expected_err), "got: {text}");
+}
+
+#[test]
+fn after_rejects_dependency_cycles_in_batch() {
+    let host = Host::task(Arc::new(ToolRegistry::new()));
+    host.host
+        .load_source_with_permissions(BATCH_PLUGIN, BATCH, PluginPermissions::trusted())
+        .unwrap();
+    let chat = Chat::live();
+    let (_run, run_token) = CancelToken::new();
+    let (ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+
+    let batch_input = json!({
+        "tool_calls": [
+            {
+                "tool": TASK_TOOL,
+                "parameters": {
+                    "name": CODENAME,
+                    "description": NAME,
+                    "prompt": PROMPT,
+                    "after": [SECOND_CODENAME],
+                }
+            },
+            {
+                "tool": TASK_TOOL,
+                "parameters": {
+                    "name": SECOND_CODENAME,
+                    "description": SECOND_NAME,
+                    "prompt": DOWNSTREAM_PROMPT,
+                    "after": [CODENAME],
+                }
+            }
+        ]
+    });
+
+    let done = exec(&host.reg, BATCH_TOOL, batch_input, &ctx);
+    let text = done.output.as_text();
+    assert!(text.contains(CYCLE_DEP_ERR), "got: {text}");
+    assert!(text.contains("0/2 successfully. 2 failed."), "got: {text}");
+}
+
+#[test]
+fn task_schema_and_prompts_document_lifecycle_and_after() {
+    let host = Host::task(Arc::new(ToolRegistry::new()));
+    let task_entry = host.reg.get(TASK_TOOL).expect("task registered");
+    let task_schema = task_entry.tool.offered_schema(true).expect("schema");
+    assert_eq!(task_schema["properties"]["after"]["type"], "array");
+    let main_dctx = DescriptionContext {
+        filter: &ToolFilter::All,
+        audience: ToolAudience::MAIN,
+        workflow: false,
+        mcp: false,
+        mcp_libraries: None,
+    };
+    let task_desc = task_entry.tool.description(&main_dctx);
+    assert!(task_desc.contains("run-to-completion"), "got: {task_desc}");
+    assert!(task_desc.contains("after"), "got: {task_desc}");
+
+    let msg_entry = host.reg.get(MESSAGE_TOOL).expect("task_message registered");
+    let sub_desc = runtime()
+        .block_on(
+            msg_entry
+                .tool
+                .describe(&DescriptionContext {
+                    filter: &ToolFilter::All,
+                    audience: ToolAudience::RESEARCH_SUB,
+                    workflow: false,
+                    mcp: false,
+                    mcp_libraries: None,
+                })
+                .expect("task_message describes"),
+        )
+        .expect("sub description");
+    assert!(sub_desc.contains("run-to-completion"), "got: {sub_desc}");
+    assert!(sub_desc.contains("NEVER sleep"), "got: {sub_desc}");
+
+    let prompts = runtime().block_on(host.host.event_handle().collect_prompt_slots(None));
+    let research_prompt = assemble(PromptId::Research, &prompts, "");
+    assert!(
+        research_prompt.contains("run-to-completion"),
+        "{research_prompt}"
+    );
+    assert!(
+        research_prompt.contains("NEVER call `sleep`"),
+        "{research_prompt}"
+    );
+
+    let system_prompt = assemble(PromptId::System, &prompts, "");
+    assert!(
+        system_prompt.contains("use **after** on **task**"),
+        "{system_prompt}"
+    );
 }
