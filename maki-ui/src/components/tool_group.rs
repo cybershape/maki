@@ -2,7 +2,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use maki_agent::agent::tool_dispatch::MCP_SUMMARY_PREFIX;
 use maki_agent::mcp::{internal_tool_name, is_wire_name};
@@ -20,6 +20,7 @@ use super::compact_detail::CompactTarget;
 use super::tool_display::ToolLines;
 use super::{
     CompactDetail, GroupEntry, GroupThinkingEntry, GroupToolEntry, ToolGroupRole, ToolStatus,
+    truncate_to_width,
 };
 
 #[cfg(test)]
@@ -148,27 +149,6 @@ fn format_thinking_preview(text: &str) -> String {
         .filter(|line| !line.is_empty())
         .collect();
     lines.join(THINKING_NEWLINE_SEP)
-}
-
-fn truncate_to_width(s: &str, max_w: usize) -> String {
-    if s.width() <= max_w {
-        return s.to_string();
-    }
-    if max_w <= 3 {
-        return "...".chars().take(max_w).collect();
-    }
-    let target = max_w - 3;
-    let mut cur_w = 0;
-    let mut end_idx = 0;
-    for (idx, ch) in s.char_indices() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if cur_w + cw > target {
-            break;
-        }
-        cur_w += cw;
-        end_idx = idx + ch.len_utf8();
-    }
-    format!("{}...", &s[..end_idx])
 }
 
 fn shorten_path(path: &str) -> String {

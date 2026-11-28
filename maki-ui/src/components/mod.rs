@@ -49,15 +49,38 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use serde_json::Value;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::OpenSession;
 
 pub(crate) use maki_providers::IMAGE_PLACEHOLDER;
 
 pub(crate) const CHEVRON: &str = "❯ ";
+pub(crate) const ELLIPSIS: &str = "...";
 
 pub(crate) fn chevron_span() -> ratatui::text::Span<'static> {
     ratatui::text::Span::styled(CHEVRON, crate::theme::current().tool_dim)
+}
+
+pub(crate) fn truncate_to_width(s: &str, max_w: usize) -> String {
+    if s.width() <= max_w {
+        return s.to_string();
+    }
+    if max_w <= ELLIPSIS.len() {
+        return ELLIPSIS.chars().take(max_w).collect();
+    }
+    let target = max_w - ELLIPSIS.len();
+    let mut cur_w = 0;
+    let mut end_idx = 0;
+    for (idx, ch) in s.char_indices() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cur_w + cw > target {
+            break;
+        }
+        cur_w += cw;
+        end_idx = idx + ch.len_utf8();
+    }
+    format!("{}{ELLIPSIS}", &s[..end_idx])
 }
 
 /// A field's caret: the span it paints and the display column it should land
@@ -915,5 +938,17 @@ mod tests {
         width: u16,
     ) -> Option<Position> {
         painted_caret_in(text, cursor_byte, width)
+    }
+
+    #[test_case("abcdef", 10 => "abcdef" ; "fits_within_width")]
+    #[test_case("中文测试", 8 => "中文测试" ; "wide_chars_fit_exact_width")]
+    #[test_case("abcdefghij", 7 => "abcd..." ; "ascii_truncated")]
+    #[test_case("中文测试ab", 7 => "中文..." ; "wide_chars_fill_display_width")]
+    #[test_case("中文测试ab", 6 => "中..." ; "wide_char_boundary_stops_before_overflow")]
+    #[test_case("a中文bcdef", 6 => "a中..." ; "mixed_ascii_and_wide")]
+    #[test_case("abcdef", 2 => ".." ; "narrow_width_clips_ellipsis")]
+    #[test_case("abcdef", 0 => "" ; "zero_width")]
+    fn truncate_to_width_cases(input: &str, max_width: usize) -> String {
+        truncate_to_width(input, max_width)
     }
 }

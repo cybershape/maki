@@ -10,9 +10,9 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph},
 };
 
+use super::truncate_to_width;
 use crate::theme;
 
-const ELLIPSIS: &str = "...";
 const INBOX_LABEL: &str = " Inbox ";
 const MAX_ROWS: usize = 5;
 
@@ -49,8 +49,8 @@ pub fn view(frame: &mut Frame, area: Rect, previews: &[MailboxPreview]) {
         .iter()
         .take(MAX_ROWS)
         .map(|preview| {
-            let flat = preview_text(preview).replace('\n', " ");
-            truncate_line(&flat, content_width, style)
+            let flat = preview_text(preview).replace(['\n', '\r', '\t'], " ");
+            Line::from(Span::styled(truncate_to_width(&flat, content_width), style))
         })
         .collect();
     if previews.len() > MAX_ROWS {
@@ -74,22 +74,15 @@ pub fn view(frame: &mut Frame, area: Rect, previews: &[MailboxPreview]) {
     frame.render_widget(paragraph, area);
 }
 
-fn truncate_line(text: &str, max_width: usize, style: Style) -> Line<'static> {
-    if text.len() <= max_width {
-        return Line::from(Span::styled(text.to_string(), style));
-    }
-    let truncated_len = text.floor_char_boundary(max_width.saturating_sub(ELLIPSIS.len()));
-    Line::from(vec![
-        Span::styled(text[..truncated_len].to_string(), style),
-        Span::styled(ELLIPSIS, style),
-    ])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use ratatui::buffer::Buffer;
     use test_case::test_case;
+    use unicode_width::UnicodeWidthStr;
+
+    use crate::components::ELLIPSIS;
 
     const BODY: &str = "the IOC list is stale";
     const LABEL: &str = "Task toolu_01 reported: the IOC list is stale";
@@ -142,19 +135,59 @@ mod tests {
         assert!(content.contains("+2 more"));
     }
 
-    #[test]
-    fn view_truncates_a_long_line() {
-        let backend = ratatui::backend::TestBackend::new(12, 3);
+    fn row_text(buffer: &Buffer, y: u16, width: u16) -> String {
+        let mut out = String::new();
+        let mut x = 1;
+        while x < width - 1 {
+            let sym = buffer[(x, y)].symbol();
+            out.push_str(sym);
+            x += sym.width().max(1) as u16;
+        }
+        out.trim_end().to_owned()
+    }
+
+    #[test_case("abcdefghijklmnopqrstuvwxyz", "abcdefg...", "h" ; "ascii_uses_full_width")]
+    #[test_case("一二三四五六七八九十", "一二三...", "四" ; "cjk_uses_display_width_not_bytes")]
+    fn view_truncates_to_display_width(input: &str, expected_row: &str, excluded: &str) {
+        const WIDTH: u16 = 12;
+        const HEIGHT: u16 = 3;
+        let backend = ratatui::backend::TestBackend::new(WIDTH, HEIGHT);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let previews = [preview(None, "abcdefghijklmnopqrstuvwxyz")];
+        let previews = [preview(None, input)];
 
         terminal
-            .draw(|f| view(f, Rect::new(0, 0, 12, 3), &previews))
+            .draw(|f| view(f, Rect::new(0, 0, WIDTH, HEIGHT), &previews))
             .unwrap();
 
-        let buffer = terminal.backend().buffer().clone();
-        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
-        assert!(content.contains(ELLIPSIS));
-        assert!(!content.contains("qrstuvwxyz"));
+        let row = row_text(terminal.backend().buffer(), 1, WIDTH);
+        assert_eq!(row, expected_row);
+        assert!(!row.contains(excluded), "row={row:?}");
+    }
+
+    #[test]
+    fn view_truncates_cjk_and_ascii_lines_to_matching_visual_width() {
+        const WIDTH: u16 = 32;
+        const HEIGHT: u16 = 4;
+        const CJK_DISPLAY: &str = "Vega reported: 一二三四五六七八九十甲乙丙丁";
+        const ASCII_DISPLAY: &str = "Atlas reported: abcdefghijklmnopqrstuvwxyz";
+        let backend = ratatui::backend::TestBackend::new(WIDTH, HEIGHT);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let previews = [
+            preview(Some(CJK_DISPLAY), CJK_DISPLAY),
+            preview(Some(ASCII_DISPLAY), ASCII_DISPLAY),
+        ];
+
+        terminal
+            .draw(|f| view(f, Rect::new(0, 0, WIDTH, HEIGHT), &previews))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let cjk_row = row_text(buffer, 1, WIDTH);
+        let ascii_row = row_text(buffer, 2, WIDTH);
+        assert!(cjk_row.ends_with(ELLIPSIS), "{cjk_row:?}");
+        assert!(ascii_row.ends_with(ELLIPSIS), "{ascii_row:?}");
+        let content_width = usize::from(WIDTH - 2);
+        assert_eq!(ascii_row.width(), content_width);
+        assert!(cjk_row.width() >= content_width - 1, "{cjk_row:?}");
     }
 }
