@@ -108,6 +108,16 @@ local CALLABLE_TOOLS_ERR = "cannot list callable tools: "
 local JS_IMPORT_HINT =
   "\n\nHint: ES module `import` statements are not supported in script mode. Built-ins (`fs`, `path`, `process`, `env`, `gather`, `sleep`), tools, and external libraries are already pre-bound globals; use them directly without importing."
 local JS_PROMISE_ALL = "Promise.all("
+local JS_MISSING_GLOBAL_NOTES = {
+  URL = "Parse URLs with string operations",
+  URLSearchParams = "Parse query strings with string operations",
+  Buffer = "Use UTF-8 strings instead of Buffer",
+  fetch = "Fetch URLs with the `webfetch` tool",
+  setTimeout = "Use `await sleep(ms)` instead",
+  setInterval = "Use a loop with `await sleep(ms)` instead",
+}
+local MCP_CALL_ERR_HINT =
+  "\n\nHint: Parameter or runtime error in external library '%s'. Please inspect its schema using `%s` before retrying."
 -- `alias` covers hyphens; what is left is a name no substitution can fix, like
 -- a leading digit. Binding it would raise a SyntaxError the model cannot act on.
 local PY_IDENTIFIER = "^[%a_][%w_]*$"
@@ -219,6 +229,53 @@ local function apply_param_map(tool_input, param_map)
   return tool_input
 end
 
+local function js_missing_global_hint(tools, err)
+  local ident = err:match("ReferenceError:%s*'?([%a_][%w_]*)'?%s+is not defined")
+  local note = ident and JS_MISSING_GLOBAL_NOTES[ident]
+  if not note then
+    return ""
+  end
+  if ident == "fetch" and not tools.webfetch then
+    note = "Perform HTTP requests outside the sandbox"
+  end
+  local shell_tool = (tools.bash and "bash") or (tools.powershell and "powershell") or nil
+  local shell_note = shell_tool
+      and string.format(", or run full Node.js/scripts via the `%s` tool on the host.", shell_tool)
+    or "."
+  return string.format(
+    "\n\nHint: `%s` is not available in this minimal QuickJS-NG sandbox (not Node.js or a browser). %s%s",
+    ident,
+    note,
+    shell_note
+  )
+end
+
+local function js_stack_line_calls(code, err, lib_name, known_fns)
+  local line_str = err:match("agent%.js:(%d+)")
+  local line_nr = tonumber(line_str)
+  if not line_nr then
+    return nil
+  end
+  local lines = maki.split(code, "\n")
+  local candidates = { lines[line_nr] }
+  -- Top-level `return` triggers an async IIFE wrapper `(async () => {\n...\n})()`, shifting stack lines by +1.
+  if line_nr > 1 and code:find("return", 1, true) then
+    candidates[#candidates + 1] = lines[line_nr - 1]
+  end
+  for _, line in ipairs(candidates) do
+    if line then
+      local fn_call = line:match("%f[%w_]" .. lib_name .. "%.([%a_][%w_]*)")
+      if fn_call and not known_fns[fn_call] then
+        return fn_call
+      end
+      if line:match("%f[%w_]" .. lib_name .. "%s*%(") then
+        return "..."
+      end
+    end
+  end
+  return nil
+end
+
 local function mcp_library_hint(libs, code, err, is_js)
   if not libs or #libs == 0 then
     return ""
@@ -229,6 +286,8 @@ local function mcp_library_hint(libs, code, err, is_js)
     end
     return string.format('library_help(library_name="%s", function_name="%s")', lib_name, fn_name)
   end
+
+  local mcp_wires = {}
   for _, lib in ipairs(libs) do
     local lib_name = identifier_alias(lib.name)
     if lib_name then
@@ -255,33 +314,57 @@ local function mcp_library_hint(libs, code, err, is_js)
           help_call(lib_name, "...")
         )
       end
-      if not err:find("^parse error:") and not err:find("SyntaxError", 1, true) then
-        local is_call_err = err:find(lib_name, 1, true)
-          or err:find("RuntimeError", 1, true)
-          or err:find("TypeError", 1, true)
-          or (is_js and err:find("Error:", 1, true))
-        for _, fn in ipairs(lib.functions or {}) do
-          local name_str = type(fn) == "table" and fn.name or fn
-          local fn_name = identifier_alias(name_str) or name_str
-          if fn_name then
-            local wire = lib_name .. "__" .. fn_name
-            local dot_call = lib_name .. "." .. fn_name
-            if err:find(wire, 1, true) or (code:find(dot_call, 1, true) and is_call_err) then
-              return string.format(
-                "\n\nHint: Parameter or runtime error in external library '%s'. Please inspect its schema using `%s` before retrying.",
-                lib_name,
-                help_call(lib_name, fn_name)
-              )
-            end
+      for _, fn in ipairs(lib.functions or {}) do
+        local name_str = type(fn) == "table" and fn.name or fn
+        local fn_name = identifier_alias(name_str) or name_str
+        if fn_name then
+          mcp_wires[lib_name .. "__" .. fn_name] = { lib = lib_name, fn = fn_name }
+          mcp_wires[lib.name .. "__" .. name_str] = { lib = lib_name, fn = fn_name }
+        end
+      end
+    end
+  end
+
+  if err:find("^parse error:") or err:find("SyntaxError", 1, true) or err:find("ReferenceError:", 1, true) then
+    return ""
+  end
+
+  local tool_prefix = is_js and err:match("^runtime error: Error: ([%a_][%w_%-]*):")
+    or (err:match("\nRuntimeError: ([%a_][%w_%-]*):") or err:match("^RuntimeError: ([%a_][%w_%-]*):"))
+  if tool_prefix then
+    local matched = mcp_wires[tool_prefix]
+    if not matched then
+      return ""
+    end
+    return string.format(MCP_CALL_ERR_HINT, matched.lib, help_call(matched.lib, matched.fn))
+  end
+
+  for _, lib in ipairs(libs) do
+    local lib_name = identifier_alias(lib.name)
+    if lib_name then
+      local known_fns = {}
+      for _, fn in ipairs(lib.functions or {}) do
+        local name_str = type(fn) == "table" and fn.name or fn
+        local fn_name = identifier_alias(name_str) or name_str
+        if fn_name then
+          known_fns[fn_name] = true
+          local wire = lib_name .. "__" .. fn_name
+          local raw_wire = lib.name .. "__" .. name_str
+          if err:find(wire, 1, true) or err:find(raw_wire, 1, true) then
+            return string.format(MCP_CALL_ERR_HINT, lib_name, help_call(lib_name, fn_name))
           end
         end
-        local fn_call = code:match(lib_name .. "%.([%a_][%w_]*)")
-        if fn_call and is_call_err then
-          return string.format(
-            "\n\nHint: Parameter or runtime error in external library '%s'. Please inspect its schema using `%s` before retrying.",
-            lib_name,
-            help_call(lib_name, fn_call)
-          )
+      end
+      if is_js and err:find("TypeError: not a function", 1, true) then
+        local fn_call = js_stack_line_calls(code, err, lib_name, known_fns)
+        if fn_call then
+          return string.format(MCP_CALL_ERR_HINT, lib_name, help_call(lib_name, fn_call))
+        end
+      end
+      if not is_js then
+        local missing_attr = err:match("AttributeError: '_McpNamespace' object has no attribute '([%a_][%w_]*)'")
+        if missing_attr and code:find(lib_name .. "." .. missing_attr, 1, true) then
+          return string.format(MCP_CALL_ERR_HINT, lib_name, help_call(lib_name, missing_attr))
         end
       end
     end
@@ -968,6 +1051,7 @@ local function handler(input, ctx)
       then
         hint = hint .. JS_IMPORT_HINT
       end
+      hint = hint .. js_missing_global_hint(tools, err)
     else
       -- The run is already paid for, so point a script that reached for
       -- `asyncio.gather` at the wrapper that would have kept its other results.

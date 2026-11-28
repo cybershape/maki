@@ -1774,3 +1774,94 @@ fn js_engine_syntax_error_does_not_emit_mcp_call_hint() {
         "got: {import_err}"
     );
 }
+
+const JS_MISSING_GLOBAL_HINT_SUBSTR: &str = "is not available in this minimal QuickJS-NG sandbox";
+
+#[test_case::test_case(
+    "const doc = `see srv.fetch_issue for details`;\nconst x = 1;\nx();",
+    "TypeError: not a function"
+    ; "unrelated_typeerror_with_mcp_text"
+)]
+#[test_case::test_case(
+    "await interp_fail({});\nawait srv.fetch_issue({});",
+    FAIL_MSG
+    ; "builtin_tool_error_before_mcp_call"
+)]
+#[test_case::test_case(
+    "const u = new URL('https://example.com');\nawait srv.fetch_issue({ title: u.origin });",
+    "ReferenceError: URL is not defined"
+    ; "reference_error_url_with_mcp_call"
+)]
+fn js_non_mcp_errors_do_not_emit_mcp_hint(code: &str, expected_err: &str) {
+    let (reg, _host) = setup_js();
+    let ctx = shaped_ctx(&reg, with_mcp(MCP_TOOL_QUALIFIED));
+
+    let err = exec_code(&reg, &ctx, code).expect_err("script must fail");
+    assert!(err.contains(expected_err), "got: {err}");
+    assert!(
+        !err.contains(MCP_HINT_PREFIX),
+        "non-MCP error must not emit MCP parameter hint: {err}"
+    );
+}
+
+#[test_case::test_case("new URL('https://example.com');", "`URL`" ; "url")]
+#[test_case::test_case("new URLSearchParams('a=1');", "`URLSearchParams`" ; "url_search_params")]
+#[test_case::test_case("Buffer.from('hi');", "`Buffer`" ; "buffer")]
+#[test_case::test_case("await fetch('https://example.com');", "`fetch`" ; "fetch")]
+#[test_case::test_case("setTimeout(() => {}, 10);", "`setTimeout`" ; "set_timeout")]
+fn js_missing_web_global_emits_quickjs_hint(code: &str, expected_global: &str) {
+    let (reg, _host) = setup_js();
+    let ctx = shaped_ctx(&reg, with_mcp(MCP_TOOL_QUALIFIED));
+
+    let err = exec_code(&reg, &ctx, code).expect_err("missing global must fail");
+    assert!(err.contains(JS_MISSING_GLOBAL_HINT_SUBSTR), "got: {err}");
+    assert!(err.contains(expected_global), "got: {err}");
+    assert!(
+        !err.contains(MCP_HINT_PREFIX),
+        "ReferenceError must not emit MCP parameter hint: {err}"
+    );
+}
+
+#[test_case::test_case(
+    "await srv.fetch_issue({});",
+    "library_help({ library_name: \"srv\", function_name: \"fetch_issue\" })"
+    ; "real_mcp_call_failure"
+)]
+#[test_case::test_case(
+    "await srv.nonexistent({});",
+    "library_help({ library_name: \"srv\", function_name: \"nonexistent\" })"
+    ; "unknown_mcp_method_typeerror"
+)]
+#[test_case::test_case(
+    "await srv.nonexistent({});\nreturn 1;",
+    "library_help({ library_name: \"srv\", function_name: \"nonexistent\" })"
+    ; "unknown_mcp_method_typeerror_with_top_level_return"
+)]
+fn js_mcp_errors_still_emit_targeted_mcp_hint(code: &str, expected_help: &str) {
+    let (reg, _host) = setup_js();
+    let ctx = shaped_ctx(&reg, with_mcp(MCP_TOOL_QUALIFIED));
+
+    let err = exec_code(&reg, &ctx, code).expect_err("MCP failure must fail");
+    assert!(err.contains(MCP_HINT_PREFIX), "got: {err}");
+    assert!(err.contains(expected_help), "got: {err}");
+}
+
+#[test_case::test_case(
+    "await interp_fail()\nawait srv.fetch_issue()",
+    FAIL_MSG
+    ; "python_builtin_tool_failure_with_mcp_call"
+)]
+#[test_case::test_case(
+    "doc = 'srv.fetch_issue'\n_ = 1 + 'a'",
+    "TypeError"
+    ; "python_script_typeerror_with_mcp_text"
+)]
+fn python_non_mcp_errors_do_not_emit_mcp_hint(code: &str, expected_err: &str) {
+    let err =
+        run_code_with(code, with_mcp(MCP_TOOL_QUALIFIED)).expect_err("non-MCP error must fail");
+    assert!(err.contains(expected_err), "got: {err}");
+    assert!(
+        !err.contains(MCP_HINT_PREFIX),
+        "non-MCP error must not emit MCP parameter hint: {err}"
+    );
+}
