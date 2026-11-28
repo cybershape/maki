@@ -8,6 +8,7 @@
 //! it wakes the moment any of them has something and never blocks a worker:
 //! it runs under `block_on` on the main thread.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::future::{pending, ready};
 use std::mem;
@@ -77,8 +78,8 @@ use crate::app::mode::Mode;
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::tasks::TaskWatch;
 use crate::app::{
-    App, Attention, Msg, Notification, QueuedMessage, SubmitOutcome, session_has_content,
-    turn_response,
+    App, Attention, Msg, Notification, QueuedMessage, SubmitOutcome, normalize_preview,
+    session_has_content, turn_response,
 };
 use crate::appearance::{self, Background};
 use crate::color_compat;
@@ -209,12 +210,18 @@ enum PendingCompletion {
     Due(Notification),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProgramOutcome {
+    state: ProgramState,
+    msg: Option<String>,
+}
+
 #[derive(Default)]
 struct RunNotificationState {
     response_candidate: Option<String>,
     pending_completion: Option<PendingCompletion>,
     last_attention: Option<Attention>,
-    outcome: Option<ProgramState>,
+    outcome: Option<ProgramOutcome>,
 }
 
 impl RunNotificationState {
@@ -235,13 +242,18 @@ impl RunNotificationState {
     fn on_done(&mut self, event: &AgentEvent) {
         let notification = match event {
             AgentEvent::Done { .. } => {
-                self.outcome = Some(ProgramState::Done);
-                Notification::TurnComplete {
-                    response: self.response_candidate.take(),
-                }
+                let response = self.response_candidate.take();
+                self.outcome = Some(ProgramOutcome {
+                    state: ProgramState::Done,
+                    msg: response.clone(),
+                });
+                Notification::TurnComplete { response }
             }
-            AgentEvent::Error { .. } => {
-                self.outcome = Some(ProgramState::Error);
+            AgentEvent::Error { message, .. } => {
+                self.outcome = Some(ProgramOutcome {
+                    state: ProgramState::Error,
+                    msg: normalize_preview(message),
+                });
                 self.response_candidate = None;
                 Notification::error_completion()
             }
@@ -373,17 +385,19 @@ fn blocked_kind(attention: &Attention) -> BlockedKind {
     }
 }
 
-fn program_state_of(
+fn program_state_of<'a>(
     status: &SessionStatus,
-    outcome: Option<ProgramState>,
-) -> (ProgramState, Option<String>) {
+    outcome: Option<&'a ProgramOutcome>,
+) -> (ProgramState, Option<Cow<'a, str>>) {
     match status {
         SessionStatus::NeedsInput(attention) => (
             ProgramState::Blocked(blocked_kind(attention)),
-            Some(attention.message()),
+            Some(Cow::Owned(attention.message())),
         ),
         SessionStatus::Working => (ProgramState::Working, None),
-        SessionStatus::Idle => (outcome.unwrap_or(ProgramState::Idle), None),
+        SessionStatus::Idle => outcome.map_or((ProgramState::Idle, None), |outcome| {
+            (outcome.state, outcome.msg.as_deref().map(Cow::Borrowed))
+        }),
     }
 }
 
@@ -523,8 +537,8 @@ impl SessionRuntime {
         self.app.state.session.id
     }
 
-    fn program_state(&self) -> (ProgramState, Option<String>) {
-        program_state_of(&self.last_status, self.notifications.outcome)
+    fn program_state(&self) -> (ProgramState, Option<Cow<'_, str>>) {
+        program_state_of(&self.last_status, self.notifications.outcome.as_ref())
     }
 
     /// New work cancels an `exit_on_done` exit still waiting on its drain.
@@ -3083,11 +3097,11 @@ mod tests {
         open_question_float, streaming_app, test_app,
     };
     use crate::components::BackgroundOutcome;
-    use maki_agent::DoneReason;
+    use maki_agent::{DoneReason, RunTotals};
     use maki_providers::provider::BoxFuture;
     use maki_providers::{
-        AgentError, ModelInfo, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
-        TokenUsage, UsageLimit,
+        AgentError, ContentBlock, ModelInfo, ProviderEvent, ProviderUsage, RequestOptions, Role,
+        StreamResponse, TokenUsage, UsageLimit,
     };
     use serde_json::json;
     use tempfile::TempDir;
@@ -3140,24 +3154,39 @@ mod tests {
         assert_eq!(title, expected_title);
     }
 
-    #[test_case(SessionStatus::NeedsInput(Attention::PlanReady), None, ProgramState::Blocked(BlockedKind::Permission) ; "plan_form_blocks")]
-    #[test_case(SessionStatus::NeedsInput(Attention::PlanReady), Some(ProgramState::Done), ProgramState::Blocked(BlockedKind::Permission) ; "plan_form_beats_done_outcome")]
-    #[test_case(SessionStatus::NeedsInput(Attention::PackReview), None, ProgramState::Blocked(BlockedKind::Permission) ; "pack_review_blocks")]
-    #[test_case(SessionStatus::NeedsInput(Attention::Permission { tool: None }), None, ProgramState::Blocked(BlockedKind::Permission) ; "permission_prompt_blocks")]
-    #[test_case(SessionStatus::NeedsInput(Attention::Question), None, ProgramState::Blocked(BlockedKind::Question) ; "question_blocks")]
-    #[test_case(SessionStatus::NeedsInput(Attention::Authentication), None, ProgramState::Blocked(BlockedKind::Auth) ; "auth_blocks")]
-    #[test_case(SessionStatus::Working, None, ProgramState::Working ; "working")]
-    #[test_case(SessionStatus::Idle, Some(ProgramState::Done), ProgramState::Done ; "done_outcome")]
-    #[test_case(SessionStatus::Idle, None, ProgramState::Idle ; "idle")]
+    const FINAL_OUTPUT: &str = "final output";
+    const TOOL_CALL_ID: &str = "call_1";
+    const TOOL_NAME: &str = "bash";
+    const ERROR_MSG: &str = "provider failed\nwith details";
+    const NORMALIZED_ERROR_MSG: &str = "provider failed with details";
+
+    fn outcome(state: ProgramState, msg: Option<&str>) -> ProgramOutcome {
+        ProgramOutcome {
+            state,
+            msg: msg.map(str::to_owned),
+        }
+    }
+
+    #[test_case(SessionStatus::NeedsInput(Attention::PlanReady), None, ProgramState::Blocked(BlockedKind::Permission), Some("Plan ready") ; "plan_form_blocks")]
+    #[test_case(SessionStatus::NeedsInput(Attention::PlanReady), Some(outcome(ProgramState::Done, Some(FINAL_OUTPUT))), ProgramState::Blocked(BlockedKind::Permission), Some("Plan ready") ; "plan_form_beats_done_outcome")]
+    #[test_case(SessionStatus::NeedsInput(Attention::PackReview), None, ProgramState::Blocked(BlockedKind::Permission), Some("Package changes to review") ; "pack_review_blocks")]
+    #[test_case(SessionStatus::NeedsInput(Attention::Permission { tool: None }), None, ProgramState::Blocked(BlockedKind::Permission), Some("Permission requested") ; "permission_prompt_blocks")]
+    #[test_case(SessionStatus::NeedsInput(Attention::Question), None, ProgramState::Blocked(BlockedKind::Question), Some("Question requested") ; "question_blocks")]
+    #[test_case(SessionStatus::NeedsInput(Attention::Authentication), None, ProgramState::Blocked(BlockedKind::Auth), Some("Authentication required") ; "auth_blocks")]
+    #[test_case(SessionStatus::Working, Some(outcome(ProgramState::Done, Some(FINAL_OUTPUT))), ProgramState::Working, None ; "working")]
+    #[test_case(SessionStatus::Idle, Some(outcome(ProgramState::Done, Some(FINAL_OUTPUT))), ProgramState::Done, Some(FINAL_OUTPUT) ; "done_outcome_with_output")]
+    #[test_case(SessionStatus::Idle, Some(outcome(ProgramState::Done, None)), ProgramState::Done, None ; "done_outcome_without_output")]
+    #[test_case(SessionStatus::Idle, Some(outcome(ProgramState::Error, Some(NORMALIZED_ERROR_MSG))), ProgramState::Error, Some(NORMALIZED_ERROR_MSG) ; "error_outcome_with_message")]
+    #[test_case(SessionStatus::Idle, None, ProgramState::Idle, None ; "idle")]
     fn program_state_cases(
         status: SessionStatus,
-        outcome: Option<ProgramState>,
+        outcome: Option<ProgramOutcome>,
         expected: ProgramState,
+        expected_msg: Option<&str>,
     ) {
-        let expected_msg = status.attention().map(Attention::message);
-        let (state, msg) = program_state_of(&status, outcome);
+        let (state, msg) = program_state_of(&status, outcome.as_ref());
         assert_eq!(state, expected);
-        assert_eq!(msg, expected_msg);
+        assert_eq!(msg.as_deref(), expected_msg);
     }
 
     struct QuotaProvider {
@@ -3215,12 +3244,53 @@ mod tests {
         assert_eq!(reply["limits"][0]["label"], json!("rotated key"));
     }
 
+    fn assistant_msg(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text { text: text.into() }],
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn outcome_survives_drain_and_clears_on_next_run() {
-        let mut state = due_completion();
-        assert_eq!(state.outcome, Some(ProgramState::Done));
+        let mut state = RunNotificationState::default();
+        let tool_turn = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "running tool".into(),
+                },
+                ContentBlock::tool_use(TOOL_CALL_ID, TOOL_NAME, json!({})),
+            ],
+            ..Default::default()
+        };
+        let final_turn = assistant_msg(&format!("**{FINAL_OUTPUT}**"));
+        state.on_turn_complete(&tool_turn);
+        state.on_turn_complete(&final_turn);
+        state.on_done(&done_event());
+        state.on_drain();
+        assert_eq!(
+            state.outcome,
+            Some(outcome(ProgramState::Done, Some(FINAL_OUTPUT)))
+        );
         state.on_queue_item_consumed();
         assert_eq!(state.outcome, None);
+    }
+
+    #[test]
+    fn error_outcome_records_normalized_message() {
+        let mut state = RunNotificationState::default();
+        state.on_turn_complete(&assistant_msg(FINAL_OUTPUT));
+        state.on_done(&AgentEvent::Error {
+            message: ERROR_MSG.into(),
+            auth: false,
+            totals: RunTotals::default(),
+        });
+        assert_eq!(
+            state.outcome,
+            Some(outcome(ProgramState::Error, Some(NORMALIZED_ERROR_MSG)))
+        );
     }
 
     #[test]

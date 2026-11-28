@@ -598,11 +598,11 @@ fn notification_preview<'a>(chunks: impl Iterator<Item = &'a str>) -> Option<Str
     (!preview.is_empty()).then_some(preview)
 }
 
-fn normalize_preview(text: &str) -> Option<String> {
+pub fn normalize_preview(text: &str) -> Option<String> {
     notification_preview(std::iter::once(text))
 }
 
-pub(crate) fn turn_response(message: &Message) -> Option<String> {
+pub fn turn_response(message: &Message) -> Option<String> {
     if message.has_tool_calls() {
         return None;
     }

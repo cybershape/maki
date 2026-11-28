@@ -405,6 +405,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
             &maki_ui::program_status::ProgramStatusReport::working(Some("Working".into())),
         );
     }
+    let mut last_response: Option<String> = None;
 
     while let Some(envelope) = events.next().await {
         // Folded in first, so a plugin handling `TurnEnd` finds the finished
@@ -438,17 +439,20 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
             }
             AgentEvent::Done { .. } => {
                 if program_status {
+                    let msg = last_response
+                        .take()
+                        .unwrap_or_else(|| "Task complete".into());
                     let _ = maki_ui::program_status::emit_program_status(
-                        &maki_ui::program_status::ProgramStatusReport::done(Some(
-                            "Task complete".into(),
-                        )),
+                        &maki_ui::program_status::ProgramStatusReport::done(Some(msg)),
                     );
                 }
             }
             AgentEvent::Error { message, .. } => {
                 if program_status {
+                    let msg =
+                        maki_ui::app::normalize_preview(message).unwrap_or_else(|| message.clone());
                     let _ = maki_ui::program_status::emit_program_status(
-                        &maki_ui::program_status::ProgramStatusReport::error(Some(message.clone())),
+                        &maki_ui::program_status::ProgramStatusReport::error(Some(msg)),
                     );
                 }
             }
@@ -506,6 +510,9 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
                 }
             }
             AgentEvent::TurnComplete(tc) => {
+                if program_status && parent_tool_use_id.is_none() {
+                    last_response = maki_ui::app::turn_response(&tc.message);
+                }
                 if let Some(out) = &mut verbose_out {
                     let content_value = serde_json::to_value(&tc.message.content)?;
                     out.emit(&AssistantEvent {
